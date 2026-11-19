@@ -1036,14 +1036,17 @@ mod tests {
                 .map(|b| b.unit_names().iter().map(|n| n.to_string()).collect())
                 .collect()
         };
-        let alphabetical = vec![
-            vec!["testlib/alpha".to_string()],
-            vec!["testlib/beta".into()],
-        ];
-        let policy_first = vec![
-            vec!["testlib/beta".to_string()],
-            vec!["testlib/alpha".into()],
-        ];
+        // One 4 MB tape: the first unit is under the ceiling and the second
+        // carries the plan past it, so both are in the batch (item 289), in
+        // the order taken.
+        let alphabetical = vec![vec![
+            "testlib/alpha".to_string(),
+            "testlib/beta".to_string(),
+        ]];
+        let policy_first = vec![vec![
+            "testlib/beta".to_string(),
+            "testlib/alpha".to_string(),
+        ]];
 
         let (plain, _) = plan_for_collection(&conn, &config, &lib, None, None, false).unwrap();
         assert_eq!(order(&plain), alphabetical);
@@ -1058,14 +1061,14 @@ mod tests {
         assert_eq!(order(&run_aware.batches), policy_first);
     }
 
-    /// Issues #391 and #395 (ADR-0012 2026-10-06 items 16 and 17): a unit
-    /// bigger than one tape is refused by `collection plan`, and the refusal
-    /// names the overage, the generation, the capacity, the fill ceiling and
-    /// the reserve — every figure the limit is made of. A 9 MiB unit on a
-    /// 10 MB LTO-8 (virtual) tape at a 90% ceiling: it fits the capacity
-    /// and not the ceiling, so the ceiling is what binds.
+    /// ADR-0012 item 288 (issues #391 and #395's refusal is gone): a unit
+    /// bigger than the room under the fill ceiling is admitted by `collection
+    /// plan`, with no refusal for its size against one tape. A 9 MiB unit on
+    /// a 10 MB LTO-8 (virtual) tape at a 90% ceiling fits the capacity and
+    /// not the ceiling; it is a batch of its own and continues on the next
+    /// cartridge.
     #[test]
-    fn a_unit_bigger_than_one_tape_is_refused_naming_the_limit_and_the_overage() {
+    fn a_unit_bigger_than_one_tape_is_admitted_whatever_the_ceiling() {
         let conn = db::open_memory().unwrap();
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
@@ -1095,33 +1098,14 @@ mod tests {
 
         let mut config = config_with_tiny_backend();
         config.backends.lto[0].fill_ceiling = 0.9;
-        let msg = plan_for_collection(&conn, &config, &lib, None, None, false)
-            .unwrap_err()
-            .to_string();
         // 10,000,000 x 0.9 = 9,000,000; the unit pads to 9,437,184.
-        assert!(
-            msg.contains("exceeds the per-tape budget (9000000 bytes) by 437184 bytes"),
-            "the overage: {msg}"
-        );
-        assert!(
-            msg.contains(
-                "one LTO-8 tape takes 9.0 MB (9000000 bytes): its 10.0 MB capacity (the \
-                 drive's capacity_override) at the 90% fill ceiling"
-            ),
-            "the limit and its figures: {msg}"
-        );
-        // A unit that does not allow spanning is never split, and the
-        // refusal names the key that lets it span (ADR-0012 item 82).
-        assert!(
-            msg.contains(
-                "a unit that does not allow spanning (allow_spanning) is never split across tapes"
-            ) && msg.contains("set `allow_spanning = true` in the [policy] of its")
-                && msg.contains("declares `post_warning_bytes`"),
-            "{msg}"
-        );
-        assert!(!msg.contains("until spanning is designed"), "{msg}");
+        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None, false)
+            .expect("a unit over the ceiling is admitted");
+        assert!(refused.is_empty());
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].unit_names(), ["testlib/huge"]);
 
-        // Positive control: at a 100% ceiling the same unit fits one tape.
+        // And at a 100% ceiling the same unit is the same single batch.
         let (batches, _) = plan_for_collection(
             &conn,
             &config.with_fill_ceiling(Some(1.0)),
@@ -1148,7 +1132,7 @@ mod tests {
         .unwrap();
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        for name in ["alpha", "beta"] {
+        for name in ["alpha", "beta", "gamma"] {
             let dir = root.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
@@ -1220,7 +1204,7 @@ mod tests {
         .unwrap();
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        for name in ["alpha", "beta"] {
+        for name in ["alpha", "beta", "gamma"] {
             let dir = root.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
@@ -1292,7 +1276,7 @@ mod tests {
         .unwrap();
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        for name in ["alpha", "beta"] {
+        for name in ["alpha", "beta", "gamma"] {
             let dir = root.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
@@ -1913,44 +1897,6 @@ mod tests {
         assert_eq!(budget.binding_label, "L1");
     }
 
-    #[test]
-    fn plan_refuses_a_unit_larger_than_the_whole_tape() {
-        let conn = db::open_memory().unwrap();
-        conn.execute(
-            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
-            [],
-        )
-        .unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let dir = root.path().join("huge");
-        std::fs::create_dir_all(&dir).unwrap();
-        // 20 MiB unit against a 10 MiB tape (0 usable-factor loss, 0 enospc
-        // buffer, per `config_with_tiny_backend`) — must refuse, not split.
-        std::fs::write(dir.join("f.dat"), vec![0u8; 20 * 1024 * 1024]).unwrap();
-
-        let lib = CollectionConfig {
-            name: "testlib".into(),
-            root: root.path().to_string_lossy().to_string(),
-            tenant: "media".into(),
-            unit_depth: 1,
-            exclude: vec![],
-            archive_set: None,
-            dotfiles: true,
-            snapshot_command: None,
-            release_command: None,
-        };
-        let paths = TapectlPaths::new(home.path().to_path_buf());
-        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
-
-        let config = config_with_tiny_backend();
-        let err = plan_for_collection(&conn, &config, &lib, None, None, false).unwrap_err();
-        assert!(
-            err.to_string().contains("testlib/huge"),
-            "error must name the offending unit: {err}"
-        );
-    }
-
     /// Issue #229 (ADR-0012's 2026-09-17 amendment): `collection run` drives
     /// no changer, so a second `--label` always looped straight into a
     /// second `volume_write` against a device that still held the FIRST
@@ -2101,7 +2047,7 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        for name in ["alpha", "beta"] {
+        for name in ["alpha", "beta", "gamma"] {
             let dir = root.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
@@ -2592,80 +2538,6 @@ compression = "bogus"
         )
         .unwrap();
         conn
-    }
-
-    /// Issue #475 item 2: retained staged data that fills the destination
-    /// saturates the budget to zero, and every pending unit used to be
-    /// reported "can never be batched" -- false for a unit that fits an empty
-    /// tape. The refusal says the staged data fills the tape and names
-    /// `volume write`.
-    #[test]
-    fn a_destination_filled_by_staged_data_says_write_it_first_not_never_batched() {
-        let conn = destination_with_staged_data(10 * 1024 * 1024);
-        let (lib, _root, _home) = collection_of(&conn, &[("alpha", 1024 * 1024)]);
-        let msg = run_one(&conn, &lib).unwrap_err().to_string();
-        assert!(
-            msg.contains(
-                "staged data already fills this tape; write it first \
-                 (`tapectl volume write L1`)"
-            ),
-            "{msg}"
-        );
-        assert!(msg.contains("\"testlib/alpha\""), "{msg}");
-        assert!(!msg.contains("can never be batched"), "{msg}");
-        assert!(!msg.contains("spanning"), "{msg}");
-    }
-
-    /// The same defect short of zero: staged data takes 9 of the 10 MiB, so
-    /// a 3 MiB unit that fits an empty tape does not fit beside it.
-    #[test]
-    fn a_destination_mostly_filled_by_staged_data_names_what_is_left() {
-        let conn = destination_with_staged_data(9 * 1024 * 1024);
-        let (lib, _root, _home) = collection_of(&conn, &[("alpha", 3 * 1024 * 1024)]);
-        let msg = run_one(&conn, &lib).unwrap_err().to_string();
-        assert!(
-            msg.contains("staged data already takes")
-                && msg.contains("leaving")
-                && msg.contains("`tapectl volume write L1`"),
-            "{msg}"
-        );
-        assert!(!msg.contains("can never be batched"), "{msg}");
-    }
-
-    /// A unit bigger than the whole tape stays "can never be batched" with
-    /// staged data present -- writing the staged data first cannot help it
-    /// -- and is named beside the units the staged data is blocking.
-    #[test]
-    fn a_unit_too_big_for_any_tape_is_still_never_batched_beside_staged_data() {
-        let conn = destination_with_staged_data(10 * 1024 * 1024);
-        let (lib, _root, _home) =
-            collection_of(&conn, &[("alpha", 1024 * 1024), ("huge", 12 * 1024 * 1024)]);
-        let msg = run_one(&conn, &lib).unwrap_err().to_string();
-        assert!(
-            msg.contains("staged data already fills this tape; write it first"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("1 unit exceeds the per-tape budget and can never be batched")
-                && msg.contains("testlib/huge"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("1 pending unit fits an empty tape") && msg.contains("\"testlib/alpha\""),
-            "{msg}"
-        );
-    }
-
-    /// The positive control: with no staged data a unit that does not fit is
-    /// refused exactly as before.
-    #[test]
-    fn without_staged_data_an_oversized_unit_is_still_never_batched() {
-        let conn = destination_with_staged_data(1024 * 1024);
-        conn.execute("DELETE FROM stage_slices", []).unwrap();
-        let (lib, _root, _home) = collection_of(&conn, &[("huge", 12 * 1024 * 1024)]);
-        let msg = run_one(&conn, &lib).unwrap_err().to_string();
-        assert!(msg.contains("can never be batched"), "{msg}");
-        assert!(!msg.contains("staged data already"), "{msg}");
     }
 
     /// Issue #456: `collection plan` reports the largest pending unit as a

@@ -1835,17 +1835,6 @@ fn destination_facts(
     let mut sealed_not_read_back = false;
     let mut rest_pending = Vec::new();
     for ss in stage_sets {
-        // Done once every slice of the set is held by a fully read back
-        // write, here or elsewhere: the fact that lifts the hold.
-        let done: bool = conn.query_row(
-            &format!("SELECT {}", coverage::fully_read_back_copy("?1")),
-            params![ss],
-            |r| r.get(0),
-        )?;
-        if done {
-            continue;
-        }
-        fully = false;
         let (completed, verified, range): (i64, i64, i64) = conn.query_row(
             "SELECT COALESCE(SUM(status = 'completed'), 0),
                     COALESCE(SUM(CASE WHEN status = 'completed' THEN write_verified END), 0),
@@ -1854,11 +1843,33 @@ fn destination_facts(
             params![id, ss],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        if completed > 0 && verified == 0 {
+        // Whole on this volume and read back in full: done.
+        if completed > 0 && verified > 0 {
+            continue;
+        }
+        if completed > 0 {
+            fully = false;
             sealed_not_read_back = true;
-        } else if range > 0 || (completed == 0 && status == "sealed") {
-            // The sealed destination took part of the set, or none of it:
-            // the rest is the one thing left to write.
+            continue;
+        }
+        if status != "sealed" {
+            // Nothing of this set is on a destination not yet sealed: the
+            // write is still to run.
+            fully = false;
+            continue;
+        }
+        // The sealed destination took part of the set (a `range`) or none of
+        // it. Every slice of it held by a fully read back write, here or
+        // elsewhere, is done (the rest was written by another cartridge's
+        // ordinary write); otherwise the rest is the one thing left to write.
+        let _ = range;
+        let elsewhere: bool = conn.query_row(
+            &format!("SELECT {}", coverage::fully_read_back_copy("?1")),
+            params![ss],
+            |r| r.get(0),
+        )?;
+        if !elsewhere {
+            fully = false;
             rest_pending.push(*ss);
         }
     }
@@ -2741,7 +2752,11 @@ mod tests {
                         |r| r.get(0),
                     )
                     .unwrap();
-                let cut = self.cut_from.get().is_some_and(|from| i >= from);
+                // A set the destination's tape ended before was planned and
+                // not written: no row (ADR-0012 item 288).
+                if self.cut_from.get().is_some_and(|from| i >= from) {
+                    continue;
+                }
                 self.w
                     .conn
                     .execute(
@@ -2751,8 +2766,8 @@ mod tests {
                             ss,
                             snap,
                             vol_id,
-                            if cut { "cut" } else { "completed" },
-                            !cut && !self.quick_write.get()
+                            "completed",
+                            !self.quick_write.get()
                         ],
                     )
                     .unwrap();
@@ -3454,14 +3469,14 @@ mod tests {
     /// fully read back copy elsewhere, `--resume` closes the rewrite as
     /// completed and releases staging.
     #[test]
-    fn a_destination_that_seals_short_keeps_the_rewrite_open_with_the_cut_sets_held() {
+    fn a_destination_that_seals_short_keeps_the_rewrite_open_with_the_unwritten_sets_held() {
         let s = scene(1);
         copy_elsewhere(&s, &s.keepsake, &[1, 2], true, "OTHER-A");
         // docs has a copy elsewhere, but not one read back in full: the
         // hold's fact is still to be made.
         copy_elsewhere(&s, &s.docs, &[3], false, "OTHER-B");
         let fake = Fake::new(&s);
-        // keepsake whole on NEW, docs cut.
+        // keepsake whole on NEW, docs planned and not written (no row).
         fake.cut_from.set(Some(1));
         let err = rewrite(&s.w.conn, &s.w.config, &fake, &opts("SRC", "NEW")).unwrap_err();
         assert!(
@@ -3469,7 +3484,7 @@ mod tests {
             "not finished, resumable: {err:?}"
         );
         let msg = err.to_string();
-        assert!(msg.contains("sealed short"), "{msg}");
+        assert!(msg.contains("took only part of this rewrite"), "{msg}");
         assert!(msg.contains("after file 41"), "{msg}");
         assert!(msg.contains("docs v1"), "{msg}");
         assert!(

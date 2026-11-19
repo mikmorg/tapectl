@@ -11175,10 +11175,12 @@ mod tests {
         assert_eq!(left, 1);
 
         conn.execute(
-            "UPDATE writes SET status = 'cut' WHERE id = ?1",
+            "DELETE FROM write_positions WHERE write_id = ?1",
             params![write_id],
         )
         .unwrap();
+        conn.execute("DELETE FROM writes WHERE id = ?1", params![write_id])
+            .unwrap();
         snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
     }
 

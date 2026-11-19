@@ -2274,19 +2274,25 @@ mod tests {
     fn staged_sets_that_alone_overflow_the_volume_are_named_and_nothing_more_is_planned() {
         let c = Cat::new();
         let mut sets = Vec::new();
-        for (name, bytes) in [("s1", 4 * MIB), ("s2", 4 * MIB), ("s3", 3 * MIB)] {
+        for (name, bytes) in [
+            ("s1", 4 * MIB),
+            ("s2", 4 * MIB),
+            ("s3", 3 * MIB),
+            ("s4", MIB),
+        ] {
             let u = c.unit(name, "active", None);
             let v = c.version(u, 1, "staged");
             sets.push(c.set(v, &[bytes], "staged", true));
         }
         c.unit("new", "active", Some(&[("f", MIB as usize)]));
 
-        // 4 + 4 + 3 MiB against 10: s3 does not fit.
+        // 4 + 4 + 3 + 1 MiB against 10: s3 carries the plan past it (item 289),
+        // and s4 after it does not fit.
         let plan = c.plan("offsite").unwrap();
-        assert_eq!(plan.staged_overflow, ["\"s3\" v1"]);
+        assert_eq!(plan.staged_overflow, ["\"s4\" v1"]);
         assert_eq!(
             names(&plan.planned),
-            ["\"s1\" v1", "\"s2\" v1", "\"s3\" v1"]
+            ["\"s1\" v1", "\"s2\" v1", "\"s3\" v1", "\"s4\" v1"]
         );
         assert!(
             plan.planned
@@ -2298,7 +2304,7 @@ mod tests {
         assert_eq!(
             names(&plan.waiting),
             ["\"new\" (new version)"],
-            "1 MiB would fit beside s1 and s2 (8 MiB of 10), but nothing more is planned"
+            "the staged sets fill the tape, so nothing more is planned"
         );
         assert_eq!(
             staged_sets_for_location(&c.conn, &c.config, "offsite")
@@ -2316,7 +2322,7 @@ mod tests {
             overflow_warning(&err).as_deref(),
             Some(
                 "warning: what is already staged for offsite does not all fit volume \"L1\" \
-                 (\"s3\" v1): nothing more was planned, and `tapectl volume write L1 \
+                 (\"s4\" v1): nothing more was planned, and `tapectl volume write L1 \
                  --for-location offsite` leaves what does not fit staged for the next tape, or \
                  refuses"
             ),
@@ -2329,13 +2335,13 @@ mod tests {
             "{out:?}"
         );
         let json = to_json(&plan, None);
-        assert_eq!(json["staged_overflow"], serde_json::json!(["\"s3\" v1"]));
+        assert_eq!(json["staged_overflow"], serde_json::json!(["\"s4\" v1"]));
         assert_eq!(json["waiting"][0]["unit"], "new");
-        assert_eq!(json["planned"].as_array().unwrap().len(), 3);
+        assert_eq!(json["planned"].as_array().unwrap().len(), 4);
         let counts = (c.count("snapshots"), c.count("stage_sets"));
         let paths = TapectlPaths::new(c.tmp.path().join("home"));
         let staged = stage(&c.conn, &paths, &c.config, &plan, 1, true).unwrap();
-        assert_eq!(staged, vec![Staged::Already; 3]);
+        assert_eq!(staged, vec![Staged::Already; 4]);
         assert_eq!(
             (c.count("snapshots"), c.count("stage_sets")),
             counts,
@@ -2364,10 +2370,10 @@ mod tests {
         );
         assert_eq!(
             names(&plan.planned),
-            ["\"s1\" v1", "\"s2\" v1", "\"new\" (new version)"]
+            ["\"s1\" v1", "\"s2\" v1", "\"s4\" v1", "\"new\" (new version)"]
         );
         assert_eq!(
-            plan.planned[2].how,
+            plan.planned[3].how,
             How::Snapshot {
                 reason: PendingReason::New
             }

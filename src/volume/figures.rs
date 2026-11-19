@@ -402,16 +402,16 @@ mod tests {
     }
 
     /// The warning inside the first unit: a sealed volume holding no unit
-    /// whole, every write `cut`. It is still a sealed tape with figures.
+    /// whole, its one write a `range`. It is still a sealed tape with figures.
     #[test]
-    fn a_sealed_volume_with_only_cut_writes_gets_its_figures() {
-        let mut t = short_tape::cut_only_tape();
+    fn a_sealed_volume_with_only_a_range_gets_its_figures() {
+        let mut t = short_tape::range_only_tape();
         assert_eq!(
             t.rows(&t.conn)
                 .into_iter()
                 .map(|(_, w, _)| w)
                 .collect::<Vec<_>>(),
-            vec!["cut", "cut", "cut"]
+            vec!["range"]
         );
         full_verify(&mut t);
         assert!(recorded(&t));

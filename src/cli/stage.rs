@@ -1771,40 +1771,6 @@ mod tests {
         }
     }
 
-    /// #420 (ADR-0012 item 112): a version whose only write was CUT by a
-    /// short seal is written whole nowhere. The refusal names the volume
-    /// that cut it and the write that finishes it — `volume write` onto
-    /// another cartridge — and not `volume resume` (nothing is resumable)
-    /// nor the abandoned-session advice its `writes` row would otherwise
-    /// fall into.
-    #[test]
-    fn create_with_version_refusal_names_the_volume_that_cut_it_and_the_next_write() {
-        let (conn, paths, config, _tmp) = staged_unit_with_write("cut", "sealed", false);
-        conn.execute(
-            "UPDATE volumes SET ended_after = 9, sealed_at = datetime('now') WHERE label = 'L6-0007'",
-            [],
-        )
-        .unwrap();
-        let msg = stage_version_1_refusal(&conn, &paths, &config);
-        assert!(
-            msg.contains("already has a stage set with live slices"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("volume \"L6-0007\" sealed short before it"),
-            "{msg}"
-        );
-        assert!(msg.contains("`tapectl volume write <LABEL>`"), "{msg}");
-        assert!(msg.contains("another cartridge"), "{msg}");
-        assert!(
-            msg.contains("tapectl stage clean --unit unit1 --version 1"),
-            "{msg}"
-        );
-        assert!(!msg.contains("volume resume"), "{msg}");
-        assert!(!msg.contains("aborted"), "{msg}");
-        assert!(!msg.contains("copy floor"), "{msg}");
-    }
-
     /// #478 (ADR-0012 items 85 and 129): a version spanning cartridges,
     /// whose tape so far holds its slice 1 as a `range` row and whose slice
     /// 2 is still short of copies. The refusal names the short slice, says

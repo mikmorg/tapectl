@@ -564,10 +564,15 @@ mod tests {
                 assert_eq!(rows[0].volume_label.as_deref(), Some("VOL1"));
                 assert_eq!(rows[0].coverage, Coverage::Covered);
             }
-            // Positive control: a cut write left nothing of the set on the
-            // tape, and has no row.
+            // Positive control: a set the tape took none of has no row.
             conn.execute(
-                "UPDATE writes SET status = 'cut' WHERE stage_set_id = ?1",
+                "DELETE FROM write_positions WHERE write_id IN
+                   (SELECT id FROM writes WHERE stage_set_id = ?1)",
+                params![ss_id],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM writes WHERE stage_set_id = ?1",
                 params![ss_id],
             )
             .unwrap();

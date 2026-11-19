@@ -1578,14 +1578,15 @@ slice_size = "500M"
         assert!(err.to_string().contains("checksum_mode"), "got: {err}");
     }
 
-    /// #420: a volume's verify interval is the strictest of the units it
-    /// holds a copy of; a unit the early end of its tape cut is not one of
-    /// them, and a volume holding only cut writes has no interval.
+    /// #420, item 288: a volume's verify interval is the strictest of the
+    /// units it holds a write of: a unit the tape holds a range of binds it
+    /// as a whole one does (its slices are on the tape to be verified), and
+    /// a unit planned and not written, which has no row, does not.
     #[test]
-    fn a_cut_write_gives_its_volume_no_verify_interval() {
+    fn a_range_binds_its_volumes_verify_interval_and_an_unwritten_unit_does_not() {
         use crate::volume::restore::short_tape;
         let t = short_tape::short_tape();
-        // bravo (cut) asks for a far tighter interval than the default.
+        // bravo (a range) asks for a far tighter interval than the default.
         t.conn
             .execute(
                 "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('tight', 7)",
@@ -1600,23 +1601,32 @@ slice_size = "500M"
             .unwrap();
         assert_eq!(
             volume_verify_interval_days(&t.conn, t.volume_id, Some(365)).unwrap(),
-            Some(365),
-            "alpha's, the unit the tape holds whole"
+            Some(7),
+            "bravo's range binds the volume"
         );
-        // The positive control: were bravo's write a copy, its 7 days would
-        // bind the volume.
+        // charlie has no row: its tight interval binds nothing.
         t.conn
-            .execute("UPDATE writes SET status = 'completed'", [])
+            .execute(
+                "UPDATE units SET archive_set_id = (SELECT id FROM archive_sets WHERE name = 'tight')
+                 WHERE name = 'charlie'",
+                [],
+            )
+            .unwrap();
+        t.conn
+            .execute("UPDATE units SET archive_set_id = NULL WHERE name = 'bravo'", [])
             .unwrap();
         assert_eq!(
             volume_verify_interval_days(&t.conn, t.volume_id, Some(365)).unwrap(),
-            Some(7)
+            Some(365),
+            "charlie was planned and not written: no row, no interval"
         );
 
-        let cut_only = short_tape::cut_only_tape();
+        let range_only = short_tape::range_only_tape();
         assert_eq!(
-            volume_verify_interval_days(&cut_only.conn, cut_only.volume_id, Some(365)).unwrap(),
-            None
+            volume_verify_interval_days(&range_only.conn, range_only.volume_id, Some(365))
+                .unwrap(),
+            Some(365),
+            "a volume holding only a range still has its interval"
         );
     }
 }

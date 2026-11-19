@@ -593,8 +593,9 @@ mod tests {
         assert!(!other_copies_exist(&conn, 1, 4).unwrap());
         assert!(other_copies_exist(&conn, 1, 1).unwrap());
         // The positive control: without the range nothing live holds it.
-        conn.execute("UPDATE writes SET status = 'cut' WHERE id = 4", [])
+        conn.execute("DELETE FROM write_positions WHERE write_id = 4", [])
             .unwrap();
+        conn.execute("DELETE FROM writes WHERE id = 4", []).unwrap();
         assert!(!other_copies_exist(&conn, 1, 1).unwrap());
     }
 

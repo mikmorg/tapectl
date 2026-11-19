@@ -6465,9 +6465,8 @@ mod tests {
             "volume_verify_age",
             "tape_alert",
             "collection_unsynced",
-            "cut_without_ending",
             "completed_past_ending",
-            "range_without_may_span",
+            "completed_without_every_slice",
             "range_written_past_ending",
             "range_not_one_run",
             "range_without_written_slice",
@@ -6491,7 +6490,7 @@ mod tests {
             // `collection_unsynced`). `policy_unresolvable`
             // is not one of them (see below), `escrow_kit_missing`/
             // `escrow_kit_stale` share one row, and so do
-            // `cut_without_ending`/`completed_past_ending` (#420) and the
+            // `completed_past_ending` (#420) and the
             // four range invariants (#478, X27).
             assert_eq!(
                 names.len(),
@@ -6513,9 +6512,8 @@ mod tests {
                     // The two invariants of a short-sealed volume's rows,
                     // and the four of a range (#478, X27): one `short_seal`
                     // row, one statement (#420).
-                    "cut_without_ending"
-                    | "completed_past_ending"
-                    | "range_without_may_span"
+                    "completed_past_ending"
+                    | "completed_without_every_slice"
                     | "range_written_past_ending"
                     | "range_not_one_run"
                     | "range_without_written_slice" => "short_seal",
@@ -6795,9 +6793,8 @@ mod tests {
                     // The two invariants of a short-sealed volume's rows,
                     // and the four of a range (#478, X27): one `short_seal`
                     // row, one statement (#420).
-                    "cut_without_ending"
-                    | "completed_past_ending"
-                    | "range_without_may_span"
+                    "completed_past_ending"
+                    | "completed_without_every_slice"
                     | "range_written_past_ending"
                     | "range_not_one_run"
                     | "range_without_written_slice" => "short_seal",
@@ -6989,19 +6986,23 @@ mod tests {
     /// (layout-session.md, `volumes.ended_after`), on the shared fixture.
     mod short_seal {
         use super::*;
-        use crate::volume::restore::short_tape::{self, LABEL};
+        use crate::volume::restore::short_tape::self;
 
         fn short_seal_warnings(conn: &Connection) -> Vec<AuditFinding> {
             let (violations, warnings) = collect_findings(conn, &Config::default(), None).unwrap();
             assert!(
                 violations
                     .iter()
-                    .all(|f| f.check != "cut_without_ending" && f.check != "completed_past_ending"),
+                    .all(|f| f.check != "completed_past_ending"
+                        && f.check != "completed_without_every_slice"),
                 "{violations:?}"
             );
             warnings
                 .into_iter()
-                .filter(|f| f.check == "cut_without_ending" || f.check == "completed_past_ending")
+                .filter(|f| {
+                    f.check == "completed_past_ending"
+                        || f.check == "completed_without_every_slice"
+                })
                 .collect()
         }
 
@@ -7035,24 +7036,6 @@ mod tests {
         }
 
         #[test]
-        fn a_cut_row_on_a_volume_with_no_ending_is_named() {
-            let t = short_tape::short_tape();
-            t.conn
-                .execute("UPDATE volumes SET ended_after = NULL", [])
-                .unwrap();
-            let found = short_seal_warnings(&t.conn);
-            assert_eq!(found.len(), 1, "{found:?}");
-            assert_eq!(found[0].check, "cut_without_ending");
-            assert_eq!(found[0].unit, format!("volume:{LABEL}"));
-            assert!(
-                found[0].message.contains("2 writes recorded `cut`"),
-                "{}",
-                found[0].message
-            );
-            assert_eq!(found[0].action, format!("tapectl volume verify {LABEL}"));
-        }
-
-        #[test]
         fn a_completed_row_past_the_end_is_named() {
             let t = short_tape::short_tape();
             let k = t.ended_after;
@@ -7066,7 +7049,13 @@ mod tests {
                 )
                 .unwrap();
             let found = short_seal_warnings(&t.conn);
-            assert_eq!(found.len(), 1, "{found:?}");
+            // bravo's second slice is past the end, so its `completed` row
+            // is also one that lacks a `written` position of every slice.
+            assert_eq!(found.len(), 2, "{found:?}");
+            let found: Vec<AuditFinding> = found
+                .into_iter()
+                .filter(|f| f.check == "completed_past_ending")
+                .collect();
             assert_eq!(found[0].check, "completed_past_ending");
             assert!(
                 found[0]
@@ -7092,7 +7081,7 @@ mod tests {
         use crate::policy::coverage::tests::SpanCatalog;
 
         const RANGE_CHECKS: [&str; 4] = [
-            "range_without_may_span",
+            "completed_without_every_slice",
             "range_written_past_ending",
             "range_not_one_run",
             "range_without_written_slice",
@@ -7159,18 +7148,28 @@ mod tests {
             assert!(short_seal_findings(&c.conn).unwrap().is_empty());
         }
 
+        /// Item 288's new invariant: a `completed` row holds a `written`
+        /// position of every slice of its set.
         #[test]
-        fn a_range_without_may_span_is_named() {
-            let (c, w1, _) = item_93();
-            // Migration 039's row CHECK refuses this row; only an edit around
-            // it makes one.
+        fn a_completed_row_lacking_a_written_slice_is_named() {
+            let (c, _, _) = item_93();
             c.conn
-                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .execute(
+                    "UPDATE write_positions SET status = 'pending'
+                      WHERE write_id = (SELECT id FROM writes WHERE status = 'completed')
+                        AND id = (SELECT MIN(id) FROM write_positions
+                                   WHERE write_id = (SELECT id FROM writes
+                                                      WHERE status = 'completed'))",
+                    [],
+                )
                 .unwrap();
-            c.conn
-                .execute("UPDATE writes SET may_span = 0 WHERE id = ?1", params![w1])
-                .unwrap();
-            assert_eq!(found(&c), one("range_without_may_span", "SPAN-1"));
+            assert_eq!(found(&c), one("completed_without_every_slice", "SPAN-2"));
+            let f = short_seal_findings(&c.conn).unwrap();
+            assert!(
+                f[0].message.contains("1 writes") || f[0].message.contains("1 write"),
+                "{}",
+                f[0].message
+            );
         }
 
         #[test]

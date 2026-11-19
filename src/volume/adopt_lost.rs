@@ -1914,14 +1914,14 @@ mod tests {
             (conn, report)
         }
 
-        /// `(writes.status, may_span, snapshots.status)` of the unit's row on
+        /// `(writes.status, snapshots.status)` of the unit's row on
         /// `volume_id`.
-        fn row(conn: &rusqlite::Connection, volume_id: i64) -> (String, bool, String) {
+        fn row(conn: &rusqlite::Connection, volume_id: i64) -> (String, String) {
             conn.query_row(
-                "SELECT w.status, w.may_span, s.status FROM writes w
+                "SELECT w.status, s.status FROM writes w
                    JOIN snapshots s ON s.id = w.snapshot_id WHERE w.volume_id = ?1",
                 params![volume_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap()
         }
@@ -1965,7 +1965,7 @@ mod tests {
             assert!(report.ended_after_recorded);
             assert_eq!(
                 row(&conn, volume_id),
-                ("range".to_string(), true, "staged".to_string())
+                ("range".to_string(), "staged".to_string())
             );
             assert!(is_lost_write(&conn, volume_id).unwrap());
 
@@ -1982,12 +1982,12 @@ mod tests {
             assert_eq!(ended_after, report.ended_after.map(|k| k as i64));
             assert_eq!(
                 row(&conn, volume_id),
-                ("range".to_string(), true, "staged".to_string()),
+                ("range".to_string(), "staged".to_string()),
                 "slice 3 is on no sealed volume: the version is not promoted"
             );
             let detail = last_write_completed(&conn);
             assert_eq!(detail["ending"], "short");
-            assert_eq!(detail["cut_units"], serde_json::json!([]));
+            assert_eq!(detail["unwritten_units"], serde_json::json!([]));
             assert_eq!(
                 detail["range_units"],
                 serde_json::json!([{"unit": UNIT, "first_slice": 1, "last_slice": 2}])
@@ -2052,7 +2052,7 @@ mod tests {
             assert!(report.versions_promoted.is_empty(), "{report:?}");
             assert_eq!(
                 row(&conn, volume_id),
-                ("range".to_string(), true, "staged".to_string()),
+                ("range".to_string(), "staged".to_string()),
                 "the rebuild counts no volume the catalog does not record sealed"
             );
             assert!(promotion_events(&conn).is_empty());
@@ -2061,7 +2061,7 @@ mod tests {
             assert_eq!(verdict, LostAdoption::Adopted { slices: 1 });
             assert_eq!(
                 row(&conn, volume_id),
-                ("range".to_string(), true, "current".to_string())
+                ("range".to_string(), "current".to_string())
             );
             assert_eq!(
                 promotion_events(&conn),
@@ -2100,18 +2100,16 @@ mod tests {
             assert!(report.range_units.is_empty(), "{report:?}");
             assert!(report.versions_promoted.is_empty(), "{report:?}");
             assert_eq!(report.found_volume_status.as_deref(), Some("initialized"));
-            // A Layout 3 block states no `may_span` (item 288), so a whole
-            // set's row records none: only a `range` row sets it (T4.9).
             assert_eq!(
                 row(&conn, volume_id),
-                ("completed".to_string(), false, "staged".to_string())
+                ("completed".to_string(), "staged".to_string())
             );
 
             let verdict = adopt(&conn, &mut store, volume_id, "SPAN01", BS).unwrap();
             assert_eq!(verdict, LostAdoption::Adopted { slices: 3 });
             assert_eq!(
                 row(&conn, volume_id),
-                ("completed".to_string(), false, "current".to_string())
+                ("completed".to_string(), "current".to_string())
             );
             let detail: String = conn
                 .query_row(
@@ -2286,7 +2284,7 @@ mod tests {
         }
 
         #[test]
-        fn a_lost_write_that_sealed_short_is_adopted_with_its_cut_units_cut() {
+        fn a_lost_write_that_sealed_short_is_adopted_with_its_unwritten_units_given_no_row() {
             let mut lost = rebuilt_and_verified();
             let k = lost.t.ended_after;
             assert!(is_lost_write(&lost.conn, lost.t.volume_id).unwrap());
@@ -2305,10 +2303,9 @@ mod tests {
                 vec![
                     ("alpha".into(), "completed".into(), "current".into()),
                     ("bravo".into(), "range".into(), "staged".into()),
-                    ("charlie".into(), "cut".into(), "staged".into()),
                 ],
-                "item 288: the unit the warning interrupted is a range, and neither \
-                 it nor the one after it is promoted"
+                "item 288: the unit the warning interrupted is a range, the one after \
+                 it has no row, and neither is promoted"
             );
             let (status, ended_after, files): (String, Option<i64>, i64) = lost
                 .conn
@@ -2336,7 +2333,11 @@ mod tests {
             let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
             assert_eq!(detail["ending"], "short");
             assert_eq!(detail["ended_after"], k);
-            assert_eq!(detail["cut_units"], serde_json::json!(["charlie"]));
+            assert_eq!(
+                detail["unwritten_units"],
+                serde_json::json!([]),
+                "the rows say nothing of a set the tape took none of"
+            );
             assert_eq!(
                 detail["range_units"],
                 serde_json::json!([{"unit": "bravo", "first_slice": 1, "last_slice": 1}])

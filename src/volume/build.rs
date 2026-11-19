@@ -2158,20 +2158,11 @@ mod tests {
         assert_eq!(frozen.budget.plan_bound_bytes, Some(total));
         assert_eq!(frozen, built.layout);
 
-        // One byte under the plan's end: refused by the bound, and charlie,
-        // the unit that crosses it, is wholly beyond it.
+        // One byte under the plan's end: charlie, the last unit, is the tail
+        // (item 289), so the gate lets it pass the bound.
         let session = tempfile::tempdir().unwrap();
         let built = build_with_plan_bound(&inputs, Some(total - 1), session.path()).unwrap();
-        let errs = built
-            .validate(&ok_keys(&inputs), SliceCheck::Size)
-            .unwrap_err();
-        assert_eq!(
-            errs,
-            vec![LayoutError::PlanBoundExceeded {
-                needed: total,
-                bound: total - 1
-            }]
-        );
+        built.validate(&ok_keys(&inputs), SliceCheck::Size).unwrap();
         let p = built.place(&inputs.units, &queued);
         assert_eq!(
             p.placed,
@@ -3008,22 +2999,17 @@ mod tests {
         let frozen: Layout = serde_json::from_str(&sidecar).unwrap();
         assert_eq!(frozen, built.layout, "a resume revalidates the same tail");
 
-        // The span first: no tail is frozen, and the bound refuses the plan.
+        // The span first: the tail is the last unit's first slice, whichever
+        // unit it is (item 289), frozen with the Layout.
         let mut span_first = inputs(vec![span, whole]);
         span_first.usable_bytes = in_order.usable_bytes;
         let session = tempfile::tempdir().unwrap();
         let built = build_with_plan_bound(&span_first, Some(bound), session.path()).unwrap();
-        assert_eq!(built.layout.budget.span_tail_from, None);
-        let errs = built
-            .validate(&ok_keys(&span_first), SliceCheck::Size)
-            .unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| matches!(e, LayoutError::PlanBoundExceeded { .. })),
-            "{errs:?}"
+        let last_first = span_first.units.last().unwrap().slices[0].slice_id;
+        assert_eq!(
+            built.layout.budget.span_tail_from,
+            Some(slice_position(&built.layout, last_first))
         );
-        let sidecar = std::fs::read_to_string(session.path().join(LAYOUT_SIDECAR)).unwrap();
-        assert!(!sidecar.contains("span_tail_from"), "{sidecar}");
     }
 
     /// [`BuiltLayout::place`] reads a built plan back in the plan order,

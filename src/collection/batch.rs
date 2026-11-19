@@ -809,7 +809,7 @@ mod tests {
     #[test]
     fn execute_batch_asks_the_confirm_choice_per_copy() {
         const SRC: &str = include_str!("batch.rs");
-        let f = "pub fn execute_batch_with(";
+        let f = "pub fn execute_batch_rounds(";
         let start = SRC.find(f).unwrap();
         let end = SRC[start..].find("\n}\n").unwrap() + start;
         let body = &SRC[start..end];
@@ -1386,7 +1386,7 @@ mod tests {
     #[test]
     fn execute_batch_still_delegates_release_to_the_scoped_helper() {
         const SRC: &str = include_str!("batch.rs");
-        let f = "pub fn execute_batch_with(";
+        let f = "pub fn execute_batch_rounds(";
         let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
         // Function bodies end at the first `\n}` in column 0.
         let end = SRC[start..].find("\n}\n").unwrap() + start;

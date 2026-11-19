@@ -10790,7 +10790,7 @@ mod tests {
     #[test]
     fn the_copy_summary_counts_what_the_volume_holds() {
         use crate::staging::release::fixtures::{
-            add_write, cut_from, range_on, staged_span, staged_version, tenant, unit,
+            add_write, range_on, sealed_short_without, staged_span, staged_version, tenant, unit,
         };
         let conn = crate::db::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -10810,7 +10810,7 @@ mod tests {
         let (span, _) = staged_span(&conn, b, 1, "staged", dir.path(), 3);
         range_on(&conn, &span, "V-SUM", 1..=1);
         let cut = staged_version(&conn, c, 1, "staged", dir.path(), 0);
-        cut_from(&conn, &cut, "V-SUM", 13);
+        sealed_short_without(&conn, &cut, "V-SUM", 13);
         conn.execute(
             "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
              SELECT id, 'full', 'passed' FROM volumes WHERE label = 'V-SUM'",
@@ -10842,7 +10842,12 @@ mod tests {
             quick.line(),
             "sealed and confirmed: 1 unit, 1 slice, 12.3 GiB; quick readback passed"
         );
-        assert_eq!(units_planned_onto(&conn, "V-SUM").unwrap(), [a, b, c]);
+        assert_eq!(
+            units_planned_onto(&conn, "V-SUM").unwrap(),
+            [a, b],
+            "c was planned and not written: no row"
+        );
+        let _ = c;
         assert_eq!(copy_summary(&conn, "V-NONE").unwrap().units, 0);
     }
 
@@ -15438,13 +15443,13 @@ mod tests {
         )
         .unwrap();
 
-        let units = find_staged_data(&conn, &Config::default(), None)
-            .unwrap()
-            .units;
-        assert!(
-            units.is_empty(),
-            "a stage_set with no on-disk slices must not surface as staged data"
-        );
+        // Every unit is planned through its slice list now (item 288), and a
+        // set with no on-disk slice is refused by #402's check, never
+        // surfaced as staged data.
+        let err = checked_staged_units(&conn, &Config::default(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not whole on disk"), "{err}");
     }
 
     // --- issue #115: recorded recipients vs the CURRENT escrow ------------
@@ -16257,13 +16262,10 @@ mod tests {
         )
         .unwrap();
 
-        // Positive control: the selection really does hand `build` a
-        // one-slice unit — the defect this gate exists for.
-        let units = find_staged_data(&conn, &Config::default(), None)
-            .unwrap()
-            .units;
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].slices.len(), 1, "only the path-bearing slice");
+        // Positive control: the plan itself refuses a slice it would take
+        // that has no staged file, never skipping it (X18), so the unit is
+        // never handed to `build` as a one-slice unit.
+        assert!(find_staged_data(&conn, &Config::default(), None).is_err());
 
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = TapectlPaths::new(tmp.path().join("home"));
@@ -20452,47 +20454,6 @@ mod tests {
                 "the slice was read: {:?}",
                 fake.ops()
             );
-        }
-
-        /// #420 (`volume-format-v2.md` §4.2: no reader restores a cut unit
-        /// from the tape that cut it): the same unit, its write `cut` by a
-        /// short seal, is refused by name — though its slice is on the tape
-        /// and recorded `written` — and no slice is read or staged. The
-        /// test above is the positive control: the same tape, `completed`.
-        #[test]
-        fn read_slices_never_reads_a_unit_its_tapes_short_seal_cut() {
-            let (conn, _, fake) = fixture("RQ-RSCUT", STATED);
-            conn.execute_batch(
-                "UPDATE writes SET status = 'cut';
-                 UPDATE volumes SET ended_after = 4, sealed_at = datetime('now');",
-            )
-            .unwrap();
-            let mut store = fake_store(&fake);
-            let tmp = tempfile::TempDir::new().unwrap();
-            let config = config_with_staging(tmp.path());
-            let err = read_slices(
-                &conn,
-                &config,
-                "RQ-RSCUT",
-                "lv-unit",
-                None,
-                &mut store,
-                site(Operation::VolumeReadSlices),
-            )
-            .unwrap_err()
-            .to_string();
-            assert!(err.contains("\"lv-unit\""), "{err}");
-            assert!(err.contains("sealed short after tape file 4"), "{err}");
-            assert!(err.contains("cut"), "{err}");
-            assert!(
-                !fake.ops().contains(&Op::Read(4)),
-                "the slice was not read: {:?}",
-                fake.ops()
-            );
-            let staged: Option<String> = conn
-                .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
-                .unwrap();
-            assert!(staged.is_none(), "nothing was staged: {staged:?}");
         }
 
         // ── volume compact-read ──
@@ -30749,7 +30710,8 @@ mod tests {
                 let end = prod[start..].find("\n}\n").unwrap() + start;
                 &prod[start..end]
             };
-            assert!(body("fn volume_write_in_contact<'c>(").contains("build_write_layout("));
+            assert!(body("fn volume_write_in_contact<'c>(").contains("build_span_layout("));
+            assert!(body("fn build_span_layout(").contains("build_write_layout("));
             assert!(body("pub(crate) fn rehearse_write_capacity(").contains("build_write_layout("));
             assert!(body("fn build_write_layout(").contains("build::build_with_plan_bound("));
         }

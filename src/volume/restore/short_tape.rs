@@ -120,8 +120,9 @@ mod tests {
     }
 
     /// The same write with the early warning in `alpha`'s first slice: a sealed
-    /// volume that holds no unit whole, every write on it `cut`.
-    pub(crate) fn cut_only_tape() -> ShortTape {
+    /// volume that holds no unit whole, its one write a `range` of `alpha`
+    /// (the units after it have no row).
+    pub(crate) fn range_only_tape() -> ShortTape {
         written_tape(Some(0))
     }
 

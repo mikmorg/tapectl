@@ -3376,7 +3376,7 @@ mod tests {
             text.starts_with(&b.describe())
                 && text.contains(&format!("({} bytes)", b.capacity_bytes))
                 && text.contains("post_warning_bytes")
-                && text.contains("ADR-0012 item 113"),
+                && text.contains("ADR-0012 items 113, 288 and 289"),
             "{text}"
         );
         // Another generation's cartridge is bounded at its own capacity.

@@ -3501,8 +3501,8 @@ pub(crate) mod tests {
 
     /// Every slice with the same copies (one each, on two ranges): every
     /// slice is next, so a range holder at the destination's place is warned
-    /// as a whole copy is, named with its slice run. A `cut` write left
-    /// nothing on its tape and is no holder.
+    /// as a whole copy is, named with its slice run. A set the tape was
+    /// planned to take and did not has no row and is no holder.
     #[test]
     fn a_set_with_equal_copies_on_every_slice_warns_naming_the_range() {
         let c = SpanCatalog::new();
@@ -3527,10 +3527,10 @@ pub(crate) mod tests {
         );
 
         c.conn
-            .execute(
-                "UPDATE writes SET status = 'cut' WHERE id = ?1",
-                params![w1],
-            )
+            .execute("DELETE FROM write_positions WHERE write_id = ?1", params![w1])
+            .unwrap();
+        c.conn
+            .execute("DELETE FROM writes WHERE id = ?1", params![w1])
             .unwrap();
         let d = copy_distinctness(&c.conn, dest, &[set]).unwrap();
         assert!(d.shared_location.is_empty(), "{d:?}");
@@ -4708,7 +4708,7 @@ pub(crate) mod tests {
         assert_eq!(sole.len(), 2, "alpha's two slices: {sole:?}");
         assert!(sole.iter().all(|s| s.unit_name == "alpha"), "{sole:?}");
 
-        let cut_only = short_tape::cut_only_tape();
+        let cut_only = short_tape::range_only_tape();
         assert!(has_completed_write(&cut_only.conn, cut_only.volume_id).unwrap());
     }
 
@@ -6644,7 +6644,7 @@ pub(crate) mod tests {
     /// §1.5 from 1.7.0 (ADR-0012 items 121, 126, 141): a `range` write is a
     /// holder, listed with the run of slices the catalog records `written`
     /// there; a whole write's run is 1..N; this tape's row carries the run
-    /// its plan holds; a `cut` write holds nothing. A spanning version that is
+    /// its plan holds. A spanning version that is
     /// not yet current is listed only by a write that carries it.
     #[test]
     fn the_index_names_each_holders_run_of_slices() {
@@ -6655,14 +6655,12 @@ pub(crate) mod tests {
         let whole = c.volume("L6-0001", "sealed", "ok", at);
         let head = c.volume("L6-0002", "sealed", "ok", at);
         let tail = c.volume("L6-0003", "sealed", "ok", at);
-        let cut = c.volume("L6-0004", "sealed", "ok", at);
         let unsealed = c.volume("L6-0006", "initialized", "ok", at);
 
         let (_, p1) = c.version(photos, 1, "current", &[10, 10, 10, 10]);
         c.write(p1, whole, "completed");
         c.range(p1, head, 1..=2);
         c.range(p1, tail, 3..=4);
-        c.write(p1, cut, "cut");
         c.range(p1, unsealed, 1..=4);
 
         // docs v1: a span in progress, staged, on one tape so far.
