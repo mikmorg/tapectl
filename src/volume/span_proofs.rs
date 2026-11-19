@@ -1378,7 +1378,6 @@ fn rebuild(h: &Home, fresh: &Connection, label: &str) -> crate::volume::rebuild:
 /// the rebuild that completes it promotes it (item 144); at the end it has
 /// its two copies.
 #[test]
-#[ignore = "L3-pending T4.9: catalog rebuild reads a Layout 3 block, which states no may_span (item 288), as a whole unit; it must split it by its positions and the seal (§5.3)"]
 fn items_130_and_144_each_tape_rebuilt_in_any_order_gives_the_writing_catalogs_rows() {
     let h = written_93();
     let (writes, positions, slices, volumes) = (
@@ -1424,7 +1423,20 @@ fn items_130_and_144_each_tape_rebuilt_in_any_order_gives_the_writing_catalogs_r
                 T93[n]
             );
         }
-        assert_eq!(write_rows(&fresh), writes, "{order:?}");
+        // `writes.may_span` is frozen at plan time and a Layout 3 block
+        // states none (item 288), so a rebuild sets it for a `range` row and
+        // clears it for any other (T4.9, until T5.1 removes the column): the
+        // writing catalog's value, read as the tape shows it.
+        let as_the_tape_shows = |rows: &[WriteRow]| -> Vec<WriteRow> {
+            rows.iter()
+                .cloned()
+                .map(|mut r| {
+                    r.3 = r.2 == "range";
+                    r
+                })
+                .collect()
+        };
+        assert_eq!(write_rows(&fresh), as_the_tape_shows(&writes), "{order:?}");
         assert_eq!(position_rows(&fresh), positions, "{order:?}");
         assert_eq!(slice_rows(&fresh), slices, "{order:?}");
         assert_eq!(volume_rows(&fresh), volumes, "{order:?}");
@@ -1437,7 +1449,6 @@ fn items_130_and_144_each_tape_rebuilt_in_any_order_gives_the_writing_catalogs_r
 /// catalog, last tape first, the version is `staged` until the third, and
 /// the three give the writing catalog's rows.
 #[test]
-#[ignore = "L3-pending T4.9: catalog rebuild reads a Layout 3 block, which states no may_span (item 288), as a whole unit; it must split it by its positions and the seal (§5.3)"]
 fn items_130_and_144_item_94s_tapes_rebuilt_give_the_writing_catalogs_rows() {
     let h = written_94();
     let dir = TempDir::new().unwrap();

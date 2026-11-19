@@ -494,25 +494,23 @@ fn rebuild_scratch(paths: &crate::config::TapectlPaths) -> Result<tempfile::Temp
     Ok(work)
 }
 
-/// What a rebuild did about the dar catalogues (issue #473): the sets that
-/// got theirs back from the operator envelope, and the ones left without.
-/// Empty when there is nothing to say.
-fn catalogue_lines(report: &crate::volume::rebuild::RebuildReport) -> Vec<String> {
+/// What a rebuild did about the file tables (ADR-0012 item 265, #557): the
+/// stage sets that got theirs back from the operator envelope's `catalog.db`,
+/// and the ones left without. Empty when there is nothing to say.
+fn table_lines(report: &crate::volume::rebuild::RebuildReport) -> Vec<String> {
     let mut lines = Vec::new();
-    if report.catalogues_restored > 0 {
+    if report.tables_restored > 0 {
         lines.push(format!(
-            "  dar catalogues: {} got theirs back from the operator envelope, so a copy \
-             written from them carries it again",
-            crate::render::plural(report.catalogues_restored as i64, "stage set", "stage sets")
+            "  file tables: {} got theirs (and the id map) back from the operator envelope, so \
+             a copy written from them carries them again",
+            crate::render::plural(report.tables_restored as i64, "stage set", "stage sets")
         ));
     }
-    if !report.sets_without_catalogue.is_empty() {
+    if !report.sets_without_table.is_empty() {
         lines.push(format!(
-            "  note: no dar catalogue for {} — the tape carried none for them, or it could not \
-             be put back. A copy written from them has none in its envelopes: RESTORE.sh \
-             `--list` shows no files and `--path` cannot pick any; whole-unit restore is \
-             unaffected, and `tapectl volume write` names them again",
-            report.sets_without_catalogue.join(", ")
+            "  note: no file table for {} — this tape's catalog.db carried none for them. A \
+             write of them is refused by name until each is staged again",
+            report.sets_without_table.join(", ")
         ));
     }
     lines
@@ -867,10 +865,11 @@ fn dispatch(
                 // could be read, which the rebuild went on without.
                 obj["unreadable_tenant_envelopes"] =
                     serde_json::json!(report.unreadable_tenant_envelopes);
-                // Issue #473: additive. The dar catalogues put back from the
-                // operator envelope, and the stage sets still without one.
-                obj["catalogues_restored"] = serde_json::json!(report.catalogues_restored);
-                obj["sets_without_catalogue"] = serde_json::json!(report.sets_without_catalogue);
+                // ADR-0012 item 265 (#557): the file tables put back from the
+                // operator envelope's `catalog.db`, and the stage sets still
+                // without one. They replace #473's dar-catalogue pair.
+                obj["tables_restored"] = serde_json::json!(report.tables_restored);
+                obj["sets_without_table"] = serde_json::json!(report.sets_without_table);
                 // #418 R4: additive. The tapes this tape's cross-volume index
                 // names that the catalog lacks: a to-do list, nothing added.
                 obj["cross_volume_index"] = index_json(&report);
@@ -1057,7 +1056,7 @@ fn dispatch(
                 for line in unreadable_envelope_lines(&report) {
                     println!("{line}");
                 }
-                for line in catalogue_lines(&report) {
+                for line in table_lines(&report) {
                     println!("{line}");
                 }
                 for line in index_lines(&report) {

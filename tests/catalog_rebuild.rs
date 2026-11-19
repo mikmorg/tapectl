@@ -5658,7 +5658,6 @@ fn tape_3_of_a_span_rebuilt_alone_is_a_range_and_its_version_stays_staged() {
 /// hold them, tape 1 (its range 1..2) and tape 2 (the whole set), beside the
 /// index's list of volumes the catalog lacks.
 #[test]
-#[ignore = "L3-pending T4.9: catalog rebuild reads a Layout 3 block, which states no may_span (item 288), as a whole unit; it must split it by its positions and the seal (§5.3)"]
 fn tape_3_rebuilt_alone_names_tapes_1_and_2_and_the_slices_they_hold() {
     let mut s = span_tapes();
     let secret = s.operator_secret.clone();
@@ -5737,7 +5736,6 @@ fn tape_3_rebuilt_alone_names_tapes_1_and_2_and_the_slices_they_hold() {
 /// statuses (tape 1's slices 3 and 4 `pending`), one stage set, and the
 /// version `current` with two copies once its last tape is in.
 #[test]
-#[ignore = "L3-pending T4.9: catalog rebuild reads a Layout 3 block, which states no may_span (item 288), as a whole unit; it must split it by its positions and the seal (§5.3)"]
 fn the_three_tapes_rebuilt_in_any_order_give_the_writing_catalogs_rows() {
     let mut s = span_tapes();
     let secret = s.operator_secret.clone();
@@ -5776,7 +5774,22 @@ fn the_three_tapes_rebuilt_in_any_order_give_the_writing_catalogs_rows() {
                 report.spans_in_progress
             );
         }
-        assert_eq!(span_write_rows(&fresh), written_rows, "order {order:?}");
+        // `writes.may_span` is frozen at plan time and a Layout 3 block
+        // states none (item 288), so a rebuild sets it for a `range` row and
+        // clears it for any other (T4.9, until T5.1 removes the column).
+        let as_the_tape_shows: Vec<SpanWriteRow> = written_rows
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                r.3 = r.2 == "range";
+                r
+            })
+            .collect();
+        assert_eq!(
+            span_write_rows(&fresh),
+            as_the_tape_shows,
+            "order {order:?}"
+        );
         assert_eq!(span_positions(&fresh), written_positions, "order {order:?}");
         let stage_sets: i64 = fresh
             .query_row(
@@ -6161,4 +6174,562 @@ fn a_unit_renamed_since_the_tape_was_written_is_attested() {
     assert_eq!(second.units, 0, "the renamed unit is found by its uuid");
     assert_eq!(second.attested, UNITS.len(), "{second:?}");
     assert_eq!(second.unknown_remaining, 0);
+}
+
+// ── T4.9: the file table and the id map come back from the tape ──
+//
+// ADR-0012 items 265 and 276 (#557, #564), `volume-format-v3.md` §1.4: a
+// rebuild restores each staging's file table and id map from the operator
+// envelope's `catalog.db`, and from nowhere else, so a copy written after a
+// rebuild carries both. Everything here is made by `stage create` and the
+// real write session on a `MemStore`; no staged unit is built by hand.
+
+mod tables {
+    use std::fs;
+    use std::io::Read;
+    use std::path::PathBuf;
+
+    use rusqlite::{params, Connection};
+
+    use tapectl::config::{Config, TapectlPaths};
+    use tapectl::policy::coverage::IndexThisTape;
+    use tapectl::volume::build::{self, BuildInputs, TenantInfo};
+    use tapectl::volume::format;
+    use tapectl::volume::layout_model::{KeyAvailability, Layout, SliceCheck, ZoneKind};
+    use tapectl::volume::session::{ConfirmOutcome, ExecuteOutcome};
+    use tapectl::volume::{index, write};
+
+    use super::*;
+
+    const TBS: u64 = 4096;
+    const OPERATOR: &str = "quandong-operator-t49";
+    const TENANT: &str = "loquat-tenant-t49";
+    const UNIT: &str = "loquat-unit-t49";
+    const UUID_A: &str = "a4900000-0000-4000-8000-0000000000a1";
+    const UUID_B: &str = "a4900000-0000-4000-8000-0000000000b2";
+    /// An id in the unit's ACL that no host names: a row with no name.
+    const ACL_ID: u32 = 4_242_931;
+
+    /// A tapectl home with its operator, one tenant and the escrow
+    /// recipient, and one unit made by `stage create`.
+    struct Home {
+        conn: Connection,
+        paths: TapectlPaths,
+        stage_set_id: i64,
+        _tmp: tempfile::TempDir,
+    }
+
+    fn noise(len: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 11) as u8
+            })
+            .collect()
+    }
+
+    fn config(staging: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.staging.directory = staging.to_string_lossy().into_owned();
+        config.defaults.slice_size = "64K".to_string();
+        config
+    }
+
+    fn home() -> Home {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        paths.ensure_dirs().unwrap();
+        let conn = db::open(&paths.db_file).unwrap();
+        let staging = tmp.path().join("staging");
+        let sources = tmp.path().join("sources");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(sources.join(UNIT).join("inner")).unwrap();
+        let config = config(&staging);
+        tapectl::tenant::add_tenant(&conn, &paths, OPERATOR, None, true).unwrap();
+        tapectl::tenant::add_tenant(&conn, &paths, TENANT, None, false).unwrap();
+        tapectl::cli::key::create_escrow_recipient(&conn, &paths, None).unwrap();
+
+        // A file larger than a slice (a long member's run), small files, a
+        // symbolic link, a hard link and an ACL entry naming an id no host
+        // names.
+        let dir = sources.join(UNIT);
+        fs::write(dir.join("large.bin"), noise(150_000, 3)).unwrap();
+        fs::write(dir.join("small.txt"), noise(3_000, 4)).unwrap();
+        fs::write(dir.join("inner/deep.dat"), noise(20_000, 5)).unwrap();
+        std::os::unix::fs::symlink("small.txt", dir.join("a-symlink")).unwrap();
+        fs::hard_link(dir.join("small.txt"), dir.join("hardlink.txt")).unwrap();
+        let acl = std::process::Command::new("setfacl")
+            .arg("-m")
+            .arg(format!("u:{ACL_ID}:r"))
+            .arg(dir.join("small.txt"))
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(acl, "setfacl must work on the test's file system");
+        tapectl::unit::init_unit_with_config(
+            &conn,
+            &config,
+            dir.to_str().unwrap(),
+            TENANT,
+            Some(UNIT),
+            &[],
+            None,
+        )
+        .unwrap();
+        let snapshot = tapectl::staging::snapshot_create(&conn, UNIT, &config).unwrap();
+        let stage_set_id = tapectl::staging::stage_create(&conn, &paths, &config, snapshot, true)
+            .unwrap_or_else(|e| panic!("stage create: {e}"));
+        Home {
+            conn,
+            paths,
+            stage_set_id,
+            _tmp: tmp,
+        }
+    }
+
+    fn public_keys(conn: &Connection, tenant: &str) -> Vec<String> {
+        conn.prepare(
+            "SELECT k.public_key FROM encryption_keys k JOIN tenants t ON t.id = k.tenant_id
+              WHERE t.name = ?1 AND k.is_active = 1 ORDER BY k.id",
+        )
+        .unwrap()
+        .query_map(params![tenant], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// `volume write` of everything staged in `conn`, as it builds a tape,
+    /// through the real session into a `MemStore`. `strip_tables` empties
+    /// the on-tape `catalog.db`'s `stage_files` and `stage_ids` before it is
+    /// packed: a tape whose operator envelope carries no table.
+    fn write_tape(
+        conn: &Connection,
+        label: &str,
+        uuid: &str,
+        strip_tables: bool,
+    ) -> (Layout, MemStore) {
+        let units = write::staged_build_units(conn).expect("the staged selection");
+        let ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+        let work = tempfile::tempdir().unwrap();
+        let index = index::generate_files(
+            conn,
+            &IndexThisTape {
+                label,
+                uuid,
+                cartridge_serial: "",
+                generation: "LTO-6",
+            },
+            &ids,
+            &work.path().join("index"),
+        )
+        .unwrap();
+        let tables = write::generate_tables(conn, &units, &work.path().join("tables")).unwrap();
+        let catalog_db = work.path().join("catalog.db");
+        db::ontape_catalog::write(conn, &ids, &catalog_db).unwrap();
+        if strip_tables {
+            let c = Connection::open(&catalog_db).unwrap();
+            c.execute_batch("DELETE FROM stage_files; DELETE FROM stage_ids;")
+                .unwrap();
+        }
+        let tenant_ids: Vec<i64> = vec![units[0].tenant_id];
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                  status, uuid)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', ?2)",
+            params![label, uuid],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        let escrow: String = conn
+            .query_row(
+                "SELECT public_key FROM encryption_keys WHERE is_escrow = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let inputs = BuildInputs {
+            label: label.to_string(),
+            volume_uuid: uuid.to_string(),
+            media_type: "LTO-6".to_string(),
+            tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
+            created_at: "2026-11-18T00:00:00Z".to_string(),
+            block_size: TBS,
+            usable_bytes: 512 * 1024 * 1024,
+            enospc_buffer: 0,
+            nominal_capacity: 2_500_000_000_000,
+            mam_capacity: 2_500_000_000_000,
+            mam_manufacturer: "TAPECTL-TEST".to_string(),
+            mam_serial: String::new(),
+            cartridge_identity_source: None,
+            mam_length: 0,
+            mam_loads: 0,
+            units: units.clone(),
+            tenants: vec![TenantInfo {
+                tenant_id: tenant_ids[0],
+                tenant_name: TENANT.to_string(),
+                public_keys: public_keys(conn, TENANT),
+            }],
+            operator_public_keys: public_keys(conn, OPERATOR),
+            escrow_public_key: Some(escrow),
+            catalog_db_path: Some(catalog_db),
+            index: Some(index),
+            tables: Some(tables),
+        };
+        let session_dir = tempfile::tempdir().unwrap();
+        let built = build::build(&inputs, session_dir.path()).expect("build succeeds");
+        let layout = built.layout.clone();
+        let keys = KeyAvailability {
+            tenant_ids: tenant_ids.clone(),
+            tenants_with_active_key: tenant_ids.iter().copied().collect(),
+            operator_key_present: true,
+            escrow_recipient_present: Some(true),
+            stage_sets_lacking_escrow: None,
+        };
+        let mut store = MemStore::new(TBS as usize);
+        let validated = built
+            .into_validated(&keys, SliceCheck::FullHash, &mut store)
+            .expect("validate passes for a tape of real stagings");
+        let planned = validated.plan(conn, volume_id, &units).expect("plan");
+        let ExecuteOutcome::Ready(ready) = planned.execute(conn, &mut store).expect("execute")
+        else {
+            panic!("the write must reach Ready");
+        };
+        let pending = ready.seal(&mut store).expect("seal");
+        match pending
+            .confirm(conn, &mut store, Tier::Integrity)
+            .expect("confirm")
+        {
+            ConfirmOutcome::Sealed(_) => {}
+            _ => panic!("the tape must seal"),
+        }
+        drop(work);
+        (layout, store)
+    }
+
+    /// The catalog a lost home is rebuilt into: new, with the tenants and
+    /// every key the writing home had (the keys adopted, ADR-0012 item 42),
+    /// and nothing else.
+    fn lost_home(from: &Home, dir: &std::path::Path) -> Connection {
+        let dr = db::open(&dir.join("dr.db")).unwrap();
+        dr.execute(
+            "ATTACH DATABASE ?1 AS writing",
+            [from.paths.db_file.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        dr.execute_batch(
+            "INSERT INTO main.tenants SELECT * FROM writing.tenants;
+             INSERT INTO main.encryption_keys SELECT * FROM writing.encryption_keys;
+             DETACH DATABASE writing;",
+        )
+        .unwrap();
+        dr
+    }
+
+    fn rebuild_tape(
+        dr: &Connection,
+        from: &Home,
+        store: &mut MemStore,
+        label: &str,
+    ) -> rebuild::RebuildReport {
+        let ids = tapectl::crypto::keys::load_tenant_identities(
+            &from.conn,
+            &from.paths.keys_dir,
+            OPERATOR,
+        )
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        rebuild::rebuild_from_store(
+            dr,
+            store,
+            &ids,
+            Some(label),
+            "recovered",
+            Some("lto0"),
+            scratch.path(),
+            "memstore",
+            ContactSite::new(
+                cfg(),
+                Operation::CatalogRebuild,
+                "memstore",
+                Medium::NoBackend,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("rebuild of {label}: {e}"))
+    }
+
+    /// `volume read-slices` of the rebuilt unit from `store` into a staging
+    /// directory of its own.
+    fn stage_again(dr: &Connection, store: &mut MemStore, label: &str, staging: &std::path::Path) {
+        write::read_slices(
+            dr,
+            &config(staging),
+            label,
+            UNIT,
+            None,
+            store,
+            ContactSite::new(
+                cfg(),
+                Operation::VolumeReadSlices,
+                "memstore",
+                Medium::NoBackend,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("read-slices: {e}"));
+    }
+
+    fn the_stage_set(conn: &Connection) -> i64 {
+        conn.query_row("SELECT id FROM stage_sets", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// One tar's members, `(name, bytes)` in order.
+    type Members = Vec<(String, Vec<u8>)>;
+
+    /// The members of every envelope of `store`'s tape that `identities`
+    /// open, `(position, type label, members)`, the members `(name, bytes)`
+    /// in tar order.
+    fn envelopes(
+        layout: &Layout,
+        store: &MemStore,
+        identities: &[age::x25519::Identity],
+    ) -> Vec<(i32, String, Members)> {
+        let size = layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::FrontIndex))
+            .and_then(|e| e.size_bytes)
+            .expect("File 3 is sized") as usize;
+        let fi =
+            format::parse_front_index(&String::from_utf8_lossy(&store.files[3][..size])).unwrap();
+        let mut out = Vec::new();
+        for e in fi.iter().filter(|e| e.type_label.contains("envelope")) {
+            let bytes = &store.files[e.position as usize][..e.size_bytes.unwrap() as usize];
+            let Ok(reader) = age::Decryptor::new(bytes)
+                .unwrap()
+                .decrypt(identities.iter().map(|i| i as &dyn age::Identity))
+            else {
+                continue;
+            };
+            let mut archive = tar::Archive::new(reader);
+            let members = archive
+                .entries()
+                .unwrap()
+                .map(|m| {
+                    let mut m = m.unwrap();
+                    let name = m.path().unwrap().to_string_lossy().into_owned();
+                    let mut bytes = Vec::new();
+                    m.read_to_end(&mut bytes).unwrap();
+                    (name, bytes)
+                })
+                .collect();
+            out.push((e.position, e.type_label.clone(), members));
+        }
+        out
+    }
+
+    /// The staging's file table and id map text in a tenant envelope:
+    /// `(file table, id map)`.
+    fn tenant_tables(members: &[(String, Vec<u8>)]) -> (Vec<u8>, Vec<u8>) {
+        let pick = |want_ids: bool| {
+            let found: Vec<_> = members
+                .iter()
+                .filter(|(n, _)| n.starts_with("tables/") && n.ends_with(".ids.tsv") == want_ids)
+                .collect();
+            assert_eq!(found.len(), 1, "one table in {:?}", names(members));
+            found[0].1.clone()
+        };
+        (pick(false), pick(true))
+    }
+
+    fn names(members: &[(String, Vec<u8>)]) -> Vec<&str> {
+        members.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// The staging's facts a copy's MANIFEST and a later write read.
+    type Facts = (Option<i64>, Option<String>, Option<i64>, Option<String>);
+
+    fn facts(conn: &Connection, id: i64) -> Facts {
+        conn.query_row(
+            "SELECT stream_bytes, compression, compression_level, tar_version
+               FROM stage_sets WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    fn slice_facts(conn: &Connection, id: i64) -> Vec<(i64, i64, i64, String, String, bool)> {
+        conn.prepare(
+            "SELECT slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted,
+                    continues
+               FROM stage_slices WHERE stage_set_id = ?1 ORDER BY slice_number",
+        )
+        .unwrap()
+        .query_map(params![id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// T4.9's Done-when. A tape is written from real stagings, the catalog is
+    /// lost, the tape is rebuilt into a new one: its rows for the staging
+    /// (the table, the map, the stream's length, the compression, the
+    /// writer's tar and each slice's `continues`) equal the writing
+    /// catalog's. The unit is staged again from the tape and a second copy
+    /// is written from the rebuilt catalog: its tenant envelope carries the
+    /// very text of the table and the map the first copy's does, byte for
+    /// byte, and its operator `catalog.db` carries the rows.
+    #[test]
+    fn a_copy_written_after_a_rebuild_carries_the_same_table_and_map() {
+        let h = home();
+        let (layout_a, mut store_a) = write_tape(&h.conn, "T49-A", UUID_A, false);
+        let dir = tempfile::tempdir().unwrap();
+        let dr = lost_home(&h, dir.path());
+
+        let report = rebuild_tape(&dr, &h, &mut store_a, "T49-A");
+        assert_eq!(report.tables_restored, 1, "{report:?}");
+        assert!(report.sets_without_table.is_empty(), "{report:?}");
+        let rebuilt = the_stage_set(&dr);
+
+        // The rows equal the writing catalog's.
+        let table = db::stage_files::load(&h.conn, h.stage_set_id).unwrap();
+        assert!(table.len() >= 6, "the unit's members: {}", table.len());
+        assert_eq!(db::stage_files::load(&dr, rebuilt).unwrap(), table);
+        let map = db::stage_ids::load(&h.conn, h.stage_set_id).unwrap();
+        assert!(
+            map.iter().any(|r| r.id == ACL_ID && r.name.is_none()),
+            "the ACL's id is a row with no name: {map:?}"
+        );
+        assert_eq!(db::stage_ids::load(&dr, rebuilt).unwrap(), map);
+        assert_eq!(facts(&dr, rebuilt), facts(&h.conn, h.stage_set_id));
+        assert!(facts(&dr, rebuilt).0.is_some(), "the stream's length");
+        let slices = slice_facts(&h.conn, h.stage_set_id);
+        assert!(slices.iter().any(|s| s.5), "the large file is a run");
+        assert_eq!(slice_facts(&dr, rebuilt), slices);
+
+        // The second copy, written from the rebuilt catalog.
+        let staging = tempfile::tempdir().unwrap();
+        stage_again(&dr, &mut store_a, "T49-A", staging.path());
+        let (layout_b, store_b) = write_tape(&dr, "T49-B", UUID_B, false);
+
+        let tenant =
+            tapectl::crypto::keys::load_tenant_identities(&h.conn, &h.paths.keys_dir, TENANT)
+                .unwrap();
+        let of_a = envelopes(&layout_a, &store_a, &tenant);
+        let of_b = envelopes(&layout_b, &store_b, &tenant);
+        assert_eq!(of_a.len(), 2, "the envelope and its backup");
+        assert_eq!(of_b.len(), 2, "the envelope and its backup");
+        let (table_a, map_a) = tenant_tables(&of_a[0].2);
+        for (position, _, members) in of_a.iter().chain(&of_b) {
+            let (t, m) = tenant_tables(members);
+            assert_eq!((&t, &m), (&table_a, &map_a), "envelope at {position}");
+        }
+        assert!(!table_a.is_empty() && !map_a.is_empty());
+
+        // The second copy's operator `catalog.db` carries the same rows.
+        let operator =
+            tapectl::crypto::keys::load_tenant_identities(&h.conn, &h.paths.keys_dir, OPERATOR)
+                .unwrap();
+        let operator_b = envelopes(&layout_b, &store_b, &operator);
+        let (_, _, members) = operator_b
+            .iter()
+            .find(|(_, label, _)| label == "operator_envelope")
+            .expect("an operator envelope");
+        let out = tempfile::tempdir().unwrap();
+        let path: PathBuf = out.path().join("catalog.db");
+        fs::write(
+            &path,
+            &members.iter().find(|(n, _)| n == "catalog.db").unwrap().1,
+        )
+        .unwrap();
+        let (on_tape, _) = db::ontape_catalog::read_all_but_files(&path).unwrap();
+        let on_tape_set = db::ontape_catalog::stage_sets_with_tables(&on_tape).unwrap();
+        assert_eq!(on_tape_set.len(), 1);
+        assert_eq!(
+            db::ontape_catalog::file_table(&on_tape)
+                .unwrap()
+                .rows(on_tape_set[0])
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            table
+        );
+        assert_eq!(
+            db::ontape_catalog::id_map(&on_tape, on_tape_set[0]).unwrap(),
+            map
+        );
+    }
+
+    /// A rebuild only adds: the same tape rebuilt again records nothing, and
+    /// a catalog that kept the table but lost the map gets the map back and
+    /// the table untouched.
+    #[test]
+    fn a_second_rebuild_adds_nothing_and_a_lost_map_alone_comes_back() {
+        let h = home();
+        let (_, mut store) = write_tape(&h.conn, "T49-A", UUID_A, false);
+        let dir = tempfile::tempdir().unwrap();
+        let dr = lost_home(&h, dir.path());
+        let first = rebuild_tape(&dr, &h, &mut store, "T49-A");
+        assert_eq!(first.tables_restored, 1);
+        let again = rebuild_tape(&dr, &h, &mut store, "T49-A");
+        assert!(again.is_noop(), "{again:?}");
+        assert_eq!(again.tables_restored, 0);
+
+        let id = the_stage_set(&dr);
+        let map = db::stage_ids::load(&dr, id).unwrap();
+        let table = db::stage_files::load(&dr, id).unwrap();
+        dr.execute("DELETE FROM stage_ids", []).unwrap();
+        let third = rebuild_tape(&dr, &h, &mut store, "T49-A");
+        assert_eq!(third.tables_restored, 1, "{third:?}");
+        assert_eq!(db::stage_ids::load(&dr, id).unwrap(), map);
+        assert_eq!(db::stage_files::load(&dr, id).unwrap(), table);
+
+        // The writing catalog itself, rebuilt from its own tape, keeps what
+        // it holds.
+        let before = db::stage_files::load(&h.conn, h.stage_set_id).unwrap();
+        let own = rebuild_tape(&h.conn, &h, &mut store, "T49-A");
+        assert_eq!(own.tables_restored, 0, "{own:?}");
+        assert_eq!(
+            db::stage_files::load(&h.conn, h.stage_set_id).unwrap(),
+            before
+        );
+    }
+
+    /// A tape whose operator `catalog.db` carries no table for a staging is
+    /// still rebuilt (its slices and positions are worth recording), the
+    /// report names the staging, and the write of it is refused by name
+    /// until it is staged again (item 265).
+    #[test]
+    fn a_tape_with_no_table_in_its_catalog_db_is_named_and_a_write_of_it_is_refused() {
+        let h = home();
+        let (_, mut store) = write_tape(&h.conn, "T49-A", UUID_A, true);
+        let dir = tempfile::tempdir().unwrap();
+        let dr = lost_home(&h, dir.path());
+        let report = rebuild_tape(&dr, &h, &mut store, "T49-A");
+        assert_eq!(report.tables_restored, 0, "{report:?}");
+        assert_eq!(report.sets_without_table, [format!("{UNIT} v1")]);
+        assert!(!db::stage_files::exists(&dr, the_stage_set(&dr)).unwrap());
+
+        let staging = tempfile::tempdir().unwrap();
+        stage_again(&dr, &mut store, "T49-A", staging.path());
+        let refusal = write::staged_build_units(&dr)
+            .expect_err("a unit with no table is refused")
+            .to_string();
+        assert!(
+            refusal.contains(UNIT) && refusal.contains("file table"),
+            "{refusal}"
+        );
+    }
 }
