@@ -746,10 +746,12 @@ const T94: [&str; 3] = ["SPN94-T1", "SPN94-T2", "SPN94-T3"];
 /// shrank, and the figure by the same 245,760 bytes. Since T4.11
 /// the figure is computed from File 2's size in blocks (RESTORE.sh alone,
 /// `build.rs`), so a change to the script moves it by exactly what the tape's
-/// own files moved and every cut stays where it was. 2,433,024 bytes is the
-/// rest of the figure: a change to any other file before `S`'s slice 1 still
-/// moves it by hand, as above.
-const CAP94: u64 = 2_433_024 + RESTORE_SH_BLOCKS * BS as u64;
+/// own files moved and every cut stays where it was. Layout 3's File 1 and
+/// RECOVERY.md (T4.13) moved the bytes before `S`'s slice 1 from 552,960 to
+/// 585,728, and the figure by the same 32,768. 2,465,792 bytes is the rest of
+/// the figure: a change to any other file before `S`'s slice 1 still moves it
+/// by hand, as above.
+const CAP94: u64 = 2_465_792 + RESTORE_SH_BLOCKS * BS as u64;
 /// File 2's size in blocks: RESTORE.sh, padded to the block.
 const RESTORE_SH_BLOCKS: u64 = (crate::volume::heir::RESTORE_SH.len() as u64).div_ceil(BS as u64);
 
