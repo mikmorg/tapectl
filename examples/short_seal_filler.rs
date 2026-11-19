@@ -17,11 +17,13 @@
 //! stage 2.5 TB (item 115). Instead the filler unit is staged NORMALLY by
 //! `tapectl stage create` from a source a little larger than one slice, so its
 //! stage set is real in every respect (unit, snapshot, file rows, file
-//! table, recipients, escrow receipt) and its slice 1 is a full tar slice,
-//! age-encrypted to the set's recipients. `fill` then gives that set N slice
-//! rows: slice 1 and N-1 copies of it, every one naming the same staged file
-//! with the same sizes and hashes, and the set's own later slices renumbered
-//! after them. Nothing else in the catalog changes.
+//! table, recipients, escrow receipt) and one of its slices is a full tar
+//! slice (Layout 3 cuts at member starts, so the first full slice is one of
+//! the large file's run), age-encrypted to the set's recipients. `fill` then
+//! gives that slice N-1 copies after it, every one naming the same staged file
+//! with the same sizes and hashes; the set's slices before it keep their
+//! numbers, and the later ones, with their file-table rows, move past the
+//! copies. Nothing else in the catalog changes.
 //!
 //! That passes the checks between staging and the tape without a 2.6 TB
 //! staging area:
@@ -286,29 +288,27 @@ fn fill(raw: &[String]) -> Result<i32> {
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
-    let Some(template) = rows.first() else {
+    if rows.is_empty() {
         bail!("stage set {set_id} of {unit:?} has no slice rows");
+    }
+    // Layout 3 ends a slice at a member's start (item 283): slice 1 holds the
+    // unit's small first members, and a full slice is one of a long member's
+    // run. The template is the set's first full slice; the slices before it
+    // keep their numbers.
+    let Some(at) = rows.iter().position(|r| r.size_bytes == slice_size) else {
+        bail!(
+            "no slice of {unit:?} is the set's full slice size {slice_size}: stage the filler \
+             from a source holding one file larger than a slice, so a run of full slices is cut"
+        );
     };
-    if template.number != 1 {
-        bail!(
-            "stage set {set_id}'s first slice is number {}, not 1",
+    let template = &rows[at];
+    let head: &[SliceRow] = &rows[..at];
+    let src = PathBuf::from(template.staging_path.as_deref().ok_or_else(|| {
+        anyhow!(
+            "slice {} of {unit:?} records no staged file",
             template.number
-        );
-    }
-    if template.size_bytes != slice_size {
-        bail!(
-            "slice 1 of {unit:?} is {} bytes of tar stream, not the set's full slice size \
-             {slice_size}: stage the filler from a source larger than one slice, so its slice 1 \
-             is a full slice like every slice but the last of a real unit",
-            template.size_bytes
-        );
-    }
-    let src = PathBuf::from(
-        template
-            .staging_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("slice 1 of {unit:?} records no staged file"))?,
-    );
+        )
+    })?);
     let meta = fs::metadata(&src).with_context(|| format!("reading {}", src.display()))?;
     if meta.len() != template.encrypted_bytes as u64 {
         bail!(
@@ -327,8 +327,8 @@ fn fill(raw: &[String]) -> Result<i32> {
             template.sha256_encrypted
         );
     }
-    let tail: &[SliceRow] = &rows[1..];
-    for t in tail {
+    let tail: &[SliceRow] = &rows[at + 1..];
+    for t in head.iter().chain(tail) {
         if t.staging_path.is_none() {
             bail!("slice {} of {unit:?} records no staged file", t.number);
         }
@@ -358,8 +358,9 @@ fn fill(raw: &[String]) -> Result<i32> {
         }
     }
     let t_padded = padded(template.encrypted_bytes as u64, block);
-    let tail_padded: u64 = tail
+    let own_padded: u64 = head
         .iter()
+        .chain(tail)
         .map(|t| padded(t.encrypted_bytes as u64, block))
         .sum();
 
@@ -372,10 +373,10 @@ fn fill(raw: &[String]) -> Result<i32> {
                     rows.len()
                 );
             }
-            (n - tail.len()) as u64
+            (n - head.len() - tail.len()) as u64
         }
         (None, Some(end)) => {
-            let fixed = allowance + before + after + tail_padded;
+            let fixed = allowance + before + after + own_padded;
             if end <= fixed {
                 bail!("--plan-end {end} leaves no room: the rest of the plan takes {fixed}");
             }
@@ -387,8 +388,8 @@ fn fill(raw: &[String]) -> Result<i32> {
         }
         _ => unreachable!("checked above"),
     };
-    let total = copies as usize + tail.len();
-    let filler_bytes = copies * t_padded + tail_padded;
+    let total = head.len() + copies as usize + tail.len();
+    let filler_bytes = copies * t_padded + own_padded;
     let plan_estimate = allowance + before + filler_bytes + after;
 
     // The figures, before anything changes.
@@ -403,9 +404,10 @@ fn fill(raw: &[String]) -> Result<i32> {
     println!("ALLOWANCE_BYTES={allowance}");
     println!("PLAN_END_ESTIMATE_BYTES={plan_estimate}");
     eprintln!(
-        "filler {unit:?} (stage set {set_id}): {total} slices ({copies} rows of slice 1, {} of its \
-         own after them), {filler_bytes} bytes on tape; the plan ends near {plan_estimate} bytes",
-        tail.len()
+        "filler {unit:?} (stage set {set_id}): {total} slices ({copies} rows of slice {}, {} of its \
+         own around them), {filler_bytes} bytes on tape; the plan ends near {plan_estimate} bytes",
+        template.number,
+        head.len() + tail.len()
     );
     if dry_run {
         eprintln!("--dry-run: nothing changed");
@@ -456,11 +458,18 @@ fn fill(raw: &[String]) -> Result<i32> {
             params![t.number + shift, t.id],
         )?;
     }
+    // The file table follows: a member in a later slice names its new number.
+    // (The template's member keeps its offsets, so its run is not one a
+    // restore could read; the filler is never restored.)
+    tx.execute(
+        "UPDATE stage_files SET slice = slice + ?2 WHERE stage_set_id = ?1 AND slice > ?3",
+        params![set_id, shift, template.number],
+    )?;
     tx.execute(
         "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
         params![shared_text, template.id],
     )?;
-    for n in 2..=copies as i64 {
+    for n in template.number + 1..=template.number + shift {
         tx.execute(
             "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
                                        sha256_plain, sha256_encrypted, staging_path)
@@ -477,8 +486,10 @@ fn fill(raw: &[String]) -> Result<i32> {
         )?;
     }
     let note = format!(
-        "short-seal acceptance filler (ADR-0012 item 115): slices 1-{copies} are one staged file, \
-         {shared_text}"
+        "short-seal acceptance filler (ADR-0012 item 115): slices {}-{} are one staged file, \
+         {shared_text}",
+        template.number,
+        template.number + shift
     );
     tx.execute(
         "UPDATE stage_sets
@@ -504,8 +515,10 @@ fn fill(raw: &[String]) -> Result<i32> {
     }
     println!("FILLER_FILE={shared_text}");
     eprintln!(
-        "stage set {set_id} now has {count} slices, {enc} bytes of ciphertext, slices 1-{copies} \
-         reading {shared_text}"
+        "stage set {set_id} now has {count} slices, {enc} bytes of ciphertext, slices {}-{} \
+         reading {shared_text}",
+        template.number,
+        template.number + shift
     );
     Ok(0)
 }
