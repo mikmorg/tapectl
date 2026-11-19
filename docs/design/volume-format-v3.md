@@ -1422,7 +1422,18 @@ clears a `TAR_OPTIONS` in the heir's environment.
   have it" is an answer (items 255, 266, 267; §5.3 R7). It waits without a time limit and
   holds no device. A cartridge is taken only by R8. A blank, foreign or unreadable
   cartridge at the prompt is named and the prompt asks again (#521). Nothing is kept in the
-  work directory between cartridges.
+  work directory between cartridges. The answers (a determination at T4.12, 2026-11-19):
+  ENTER after loading the cartridge; `done` or the end of input for "I do not have it", after
+  which that unit is not asked for again and what it lacks is listed with the cartridges an
+  index names for it; `quit` to stop, keeping the files restored and checked. The prompt
+  comes whenever a restore, a path restore or the repair needs a slice the cartridge in the
+  drive does not hold.
+- **A later run into the same destination** (a determination at T4.12). Where the unit's
+  restored directory holds a damaged-file list (§1.7) of the same unit and version, a whole
+  restore of that unit continues it: only the files this tape holds whole that do not pass
+  their sha256 are fed, a file that passes is never rewritten, and the list is rewritten.
+  A hard-linked name whose own member was not read is made from its first name when that is
+  on disk, as tar makes it.
 - **The tool check** for each mode is drawn from one table, before the first tape read. The
   decompressor is checked for a unit that states compression, and only for such a unit.
 - **After a restore** it prints the damaged-file list, the id map of each unit restored,
