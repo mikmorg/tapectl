@@ -11959,21 +11959,21 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(done.ending, Ending::Short { ended_after: k });
-            assert_eq!(done.unwritten_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
             assert_eq!(
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "cut", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
             assert_eq!(
                 volume(&s),
                 ("sealed".into(), Some(i64::from(k)), "ok".into())
             );
-            // A cut unit's slice that reached the tape stays recorded; the
-            // ones that did not stay pending.
+            // The range's slice that reached the tape stays recorded; the
+            // one that did not stays pending. A unit planned and not written
+            // has no row and no positions.
             assert_eq!(
                 positions(&s, 1),
                 [
@@ -11981,15 +11981,12 @@ mod tests {
                     (i64::from(k) + 1, "pending".to_string())
                 ]
             );
-            assert_eq!(
-                positions(&s, 2),
-                [(i64::from(k) + 2, "pending".to_string())]
-            );
+            assert_eq!(positions(&s, 2), []);
 
             let report = done.short_ending_report().unwrap();
             assert!(report.contains("sealed short"), "{report}");
             assert!(report.contains(&format!("tape file {k}")), "{report}");
-            assert!(report.contains("b, c"), "names the cut units: {report}");
+            assert!(report.contains("Planned and not written (still staged): c."), "{report}");
             assert!(
                 report.contains("`tapectl volume write <label>`"),
                 "{report}"
@@ -12018,8 +12015,7 @@ mod tests {
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "completed", "current"),
-                    row("c", "cut", "staged")
+                    row("b", "completed", "current")
                 ]
             );
             assert_eq!(volume(&s).1, Some(i64::from(k)));
@@ -12241,7 +12237,7 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Integrity)
                     .unwrap(),
             );
-            assert_eq!(done.unwritten_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
         }
 
         /// What `volume resume` finds after a crash between the event and
@@ -12348,13 +12344,12 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert_eq!(done.unwritten_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
             assert_eq!(
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "cut", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
             assert_eq!(volume(&s).1, Some(i64::from(k)));
@@ -12408,11 +12403,8 @@ mod tests {
             );
             assert_eq!(
                 rows(&s),
-                [
-                    row("a", "completed", "current"),
-                    row("b", "cut", "staged"),
-                    row("c", "cut", "staged")
-                ]
+                [row("a", "completed", "current")],
+                "b and c were planned and not written: no row"
             );
             assert_eq!(volume(&s).1, Some(i64::from(a_last)));
         }
@@ -12515,7 +12507,7 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert_eq!(done.unwritten_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
         }
 
         /// Step 1: `sealed_at` and `ended_after` are recorded, and the seal
@@ -12560,46 +12552,6 @@ mod tests {
                 volume(&s),
                 ("sealed".into(), Some(i64::from(k)), "ok".into())
             );
-        }
-
-        /// `cut` is written only inside the passing confirm's transaction
-        /// (#420, ADR-0012 item 112). An Inconclusive confirm's
-        /// `interrupted` never overwrites a `cut` row: here the readback
-        /// fails at File 3 (the drive, not the medium), on a session one of
-        /// whose rows is already `cut`.
-        #[test]
-        fn an_inconclusive_confirm_never_overwrites_a_cut_row() {
-            let s = three_units();
-            let k = slice_at(&s, 1, 0);
-            let mut store = warning_in(&s, k);
-            let (s, outcome) = execute(s, &mut store);
-            let pending = ready(outcome).seal(&mut store).unwrap();
-            s.conn
-                .execute(
-                    "UPDATE writes SET status = 'cut' WHERE stage_set_id = ?1",
-                    params![s.units[2].stage_set_id],
-                )
-                .unwrap();
-            let mut failing = unreadable_at(store, 3);
-            let outcome = pending
-                .confirm(&s.conn, &mut failing, Tier::Navigable)
-                .unwrap();
-            assert!(matches!(outcome, ConfirmOutcome::Inconclusive(_)));
-            assert_eq!(
-                rows(&s).into_iter().map(|(_, w, _)| w).collect::<Vec<_>>(),
-                ["interrupted", "interrupted", "cut"]
-            );
-            // And `mark_writes` itself never writes over one.
-            let ids: Vec<(i64, i64)> = s
-                .conn
-                .prepare("SELECT id, snapshot_id FROM writes WHERE volume_id = ?1 ORDER BY id")
-                .unwrap()
-                .query_map(params![s.volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            mark_writes(&s.conn, &ids, "aborted").unwrap();
-            assert_eq!(rows(&s)[2].1, "cut");
         }
 
         /// A short-sealed cartridge on a MemStore: files 0 to K of a plan
@@ -12749,22 +12701,6 @@ mod tests {
             .requires
         }
 
-        /// Each unit's `writes.may_span` on `s`'s volume, in plan order.
-        fn may_span_rows(s: &Short) -> Vec<(String, bool)> {
-            s.conn
-                .prepare(
-                    "SELECT u.name, w.may_span FROM writes w
-                     JOIN snapshots sn ON sn.id = w.snapshot_id
-                     JOIN units u ON u.id = sn.unit_id
-                     WHERE w.volume_id = ?1 ORDER BY w.id",
-                )
-                .unwrap()
-                .query_map(params![s.volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        }
-
         /// `writes.write_verified` of unit `unit`'s row on `s`'s volume.
         fn write_verified(s: &Short, unit: usize) -> bool {
             s.conn
@@ -12814,24 +12750,6 @@ mod tests {
             )
         }
 
-        /// `plan` freezes whether each write may span into its row
-        /// (ADR-0012 item 121): set for the unit with a span, not for the
-        /// others.
-        #[test]
-        fn plan_records_may_span_from_the_units_span() {
-            let s = a_span_between_whole_units();
-            let mut store = MemStore::new(SBS as usize);
-            let (s, _) = execute(s, &mut store);
-            assert_eq!(
-                may_span_rows(&s),
-                [
-                    ("a".to_string(), false),
-                    ("b".to_string(), true),
-                    ("c".to_string(), false)
-                ]
-            );
-        }
-
         /// The early warning inside a spannable set (item 121, X2): the slice
         /// in flight finishes, the tape seals short after it, and the set is
         /// a `range` — its written positions are at or before K, the one
@@ -12863,8 +12781,7 @@ mod tests {
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "range", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
             assert_eq!(
@@ -12885,7 +12802,7 @@ mod tests {
             assert!(report.contains("b (slices 1-2)"), "{report}");
             assert!(report.contains("same generation"), "{report}");
             assert!(
-                report.contains("Cut (not on this tape, still staged): c."),
+                report.contains("Planned and not written (still staged): c."),
                 "{report}"
             );
             let details: serde_json::Value =
@@ -12941,7 +12858,7 @@ mod tests {
         /// before K and its row is `completed`, promoted as today, on a short
         /// seal that states both features.
         #[test]
-        fn a_spannable_set_wholly_before_the_warning_is_completed_on_a_short_tape() {
+        fn a_set_wholly_before_the_warning_is_completed_on_a_short_tape() {
             let s = span_fixture(&[("b", &[SLICE, SLICE]), ("c", &[SLICE, SLICE])], &["b"]);
             let k = slice_at(&s, 1, 0);
             let mut store = warning_in(&s, k);
@@ -12957,11 +12874,11 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert!(done.range_units.is_empty());
-            assert_eq!(done.unwritten_units, ["c"]);
+            assert_eq!(done.range_units, [range("c", 1, 1)]);
+            assert!(done.unwritten_units.is_empty());
             assert_eq!(
                 rows(&s),
-                [row("b", "completed", "current"), row("c", "cut", "staged")]
+                [row("b", "completed", "current"), row("c", "range", "staged")]
             );
         }
 
@@ -12970,7 +12887,7 @@ mod tests {
         /// still states `spanning`: the fence follows the plan
         /// (`volume-format-v2.md` §1.2).
         #[test]
-        fn the_early_warning_before_a_spannable_sets_first_slice_cuts_it() {
+        fn the_early_warning_before_a_sets_first_slice_leaves_it_unwritten() {
             let s = span_fixture(&[("a", &[SLICE, SLICE]), ("b", &[SLICE, SLICE])], &["b"]);
             let k = slice_at(&s, 0, 1);
             let mut store = warning_in(&s, k);
@@ -12990,7 +12907,8 @@ mod tests {
             assert_eq!(done.unwritten_units, ["b"]);
             assert_eq!(
                 rows(&s),
-                [row("a", "completed", "current"), row("b", "cut", "staged")]
+                [row("a", "completed", "current")],
+                "b was planned and not written: no row"
             );
             assert!(!done.short_ending_report().unwrap().contains("range"));
         }
@@ -13137,8 +13055,7 @@ mod tests {
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "range", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
             assert_eq!(warning_events(&s).len(), 1, "no second event");
@@ -13233,13 +13150,12 @@ mod tests {
         /// completed/cut, no range is named, and the event's details are
         /// 1.6.0's bytes, which `write::write_completed_details` now passes on.
         #[test]
-        fn a_write_with_no_spannable_unit_is_1_6_0s() {
+        fn a_short_write_names_its_range_and_its_unwritten_units_in_its_details() {
             let s = three_units();
             let k = slice_at(&s, 1, 0);
             let mut store = warning_in(&s, k);
             let (s, outcome) = execute(s, &mut store);
             let pending = ready(outcome).seal(&mut store).unwrap();
-            assert!(may_span_rows(&s).iter().all(|(_, may)| !may));
             let seal_text = String::from_utf8(store.files[k as usize + 1].clone()).unwrap();
             assert!(
                 seal_text.contains("\nrequires = []\n") && !seal_text.contains("spanning"),
@@ -13251,32 +13167,34 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert!(done.range_units.is_empty());
+            assert_eq!(done.range_units, [range("b", 1, 1)]);
             assert_eq!(
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "cut", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
-            // 1.6.0's details, built as `write::write_completed_details` built
-            // them before it delegated to the session (#478).
+            // The event's details (ADR-0012 item 288): the ending, the units
+            // planned and not written, and the ranges.
             let Ending::Short { ended_after } = done.ending else {
                 panic!("a short seal");
             };
-            let v1_6_0 = serde_json::json!({
+            let details = serde_json::json!({
                 "ending": "short",
                 "ended_after": ended_after,
-                "unwritten_units": done.unwritten_units,
+                "unwritten_units": ["c"],
+                "range_units": [{"unit": "b", "first_slice": 1, "last_slice": 1}],
             })
             .to_string();
-            assert_eq!(done.write_completed_details(), Some(v1_6_0.clone()));
+            assert_eq!(done.write_completed_details(), Some(details.clone()));
             assert_eq!(
                 crate::volume::write::write_completed_details(&done),
-                Some(v1_6_0)
+                Some(details)
             );
-            assert!(!done.short_ending_report().unwrap().contains("range"));
+            let report = done.short_ending_report().unwrap();
+            assert!(report.contains("Held here as a range"), "{report}");
+            assert!(report.contains("Planned and not written (still staged): c."), "{report}");
 
             // And a full seal: no details, as before 1.6.0.
             let s = three_units();
@@ -13584,8 +13502,7 @@ mod tests {
                     rows(&s),
                     [
                         row("a", "completed", "current"),
-                        row("b", "cut", "staged"),
-                        row("c", "cut", "staged"),
+                        row("b", "range", "staged"),
                     ],
                     "torn={torn}"
                 );

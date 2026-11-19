@@ -1806,11 +1806,12 @@ fn waiting_notice(label: &str, deferred: &[BuildUnit]) -> Option<String> {
         let one = deferred.len() == 1;
         format!(
             "volume \"{label}\": {} planned and not written: the plan ends before {}, so {} not \
-             on this tape and stay staged (ADR-0012 items 288 and 289). The next `tapectl volume \
+             on this tape and {} staged (ADR-0012 items 288 and 289). The next `tapectl volume \
              write` onto another cartridge writes {}",
             unit_names(deferred),
             if one { "it" } else { "them" },
             if one { "it is" } else { "they are" },
+            if one { "stays" } else { "stay" },
             if one { "it" } else { "them" },
         )
     })
@@ -26835,15 +26836,16 @@ mod tests {
                 assert_eq!(seal.ended_after, Some(u64::from(B_FIRST)));
                 assert_eq!(seal.file_count as u32, B_FIRST + 2);
 
-                // The catalog: sealed, ended_after K, `a` the copy, `b` and
-                // `c` cut.
+                // The catalog: sealed, ended_after K, `a` the copy, `b` a range
+                // of the slice that reached the tape and `c`, planned and not
+                // written, with no row (item 288).
                 assert_eq!(
                     volume_row(&f, "SE-1"),
                     ("sealed".into(), true, Some(i64::from(B_FIRST)))
                 );
                 assert_eq!(
                     writes_of(&f, "SE-1"),
-                    pairs(&[("a", "completed"), ("b", "cut"), ("c", "cut")])
+                    pairs(&[("a", "completed"), ("b", "range")])
                 );
                 let warned = events(&f, "SE-1", "write_early_warning");
                 assert_eq!(warned.len(), 1, "{warned:?}");
@@ -26857,7 +26859,8 @@ mod tests {
                     serde_json::json!({
                         "ending": "short",
                         "ended_after": 9,
-                        "cut_units": ["b", "c"],
+                        "unwritten_units": ["c"],
+                        "range_units": [{"unit": "b", "first_slice": 1, "last_slice": 1}],
                     })
                 );
                 // The figures count what is on the tape: `a`'s slice and
@@ -26873,8 +26876,8 @@ mod tests {
                 assert_eq!(figures, (2 * 3 * SBS as i64, 2));
 
                 // The release `volume write` runs after it: `a` has its one
-                // copy and is released; `b` and `c` are cut, so they are no
-                // copy and keep their staging, named as cut on SE-1.
+                // copy and is released; `b` is a range and `c` has no row, so
+                // they keep their staging.
                 let release = crate::cli::volume::release_staging_after_write(
                     &f.conn, &f.config, "SE-1", false,
                 );
@@ -26893,31 +26896,41 @@ mod tests {
                 );
 
                 // The next ordinary `volume write`, onto another cartridge,
-                // writes the cut units whole, and seals full.
+                // continues `b` from its owed slice and writes `c`, and seals
+                // full.
                 let mut next = MemStore::new(SBS);
                 let (r, code) = write(&f, "SE-2", &mut next, false);
-                r.expect("the cut units are written whole on the next cartridge");
+                r.expect("the rest is written on the next cartridge");
                 assert_eq!(code, 0);
                 assert_eq!(
                     writes_of(&f, "SE-2"),
-                    pairs(&[("b", "completed"), ("c", "completed")])
+                    pairs(&[("b", "range"), ("c", "completed")])
                 );
                 assert_eq!(volume_row(&f, "SE-2"), ("sealed".into(), true, None));
+                let details: serde_json::Value = serde_json::from_str(
+                    events(&f, "SE-2", "write_completed")[0]
+                        .1
+                        .as_deref()
+                        .expect("a full seal holding a range names it"),
+                )
+                .unwrap();
                 assert_eq!(
-                    events(&f, "SE-2", "write_completed"),
-                    vec![(None, None)],
-                    "a full seal's event is what it was before 1.6.0"
+                    details,
+                    serde_json::json!({
+                        "ending": "full",
+                        "range_units": [{"unit": "b", "first_slice": 2, "last_slice": 2}],
+                    })
                 );
                 assert_eq!(
                     release_blocker(&f.conn, stage_set_of(&f, "b")).unwrap(),
                     ReleaseBlocker::None,
-                    "b is written whole elsewhere: its cut row no longer holds it"
+                    "b's range blocks nothing (a range row is terminal)"
                 );
             }
 
             /// The same short ending under `--full-confirm`: the integrity
             /// tier walks files 0 to K and the short seal, reads no position
-            /// after it, and passes — the copy is `a`, `b` and `c` are cut,
+            /// after it, and passes — the copy is `a`, `b` is a range and `c` has no row,
             /// and the readback is recorded as the full one it was.
             #[test]
             fn a_full_confirm_of_a_short_seal_walks_through_ended_after_and_passes() {
@@ -26932,7 +26945,7 @@ mod tests {
                 );
                 assert_eq!(
                     writes_of(&f, "SE-F"),
-                    pairs(&[("a", "completed"), ("b", "cut"), ("c", "cut")])
+                    pairs(&[("a", "completed"), ("b", "range")])
                 );
                 let sessions: Vec<(String, String)> = f
                     .conn
@@ -27603,25 +27616,26 @@ mod tests {
                     let mut f = fixture(A_B3_C, &["SP-1", "SP-2", "SP-3"]);
                     f.config.defaults.min_copies = 2;
 
-                    // Tape 1: a at 8, c at 9, b last at 10-12; the warning in
-                    // b's second slice (11).
-                    let mut store = ArmedAt::new(11, warning);
+                    // Tape 1: the queue in name order, a at 8 and b at 9-11; the
+                    // warning in b's second slice (10); c is planned after it
+                    // and not written.
+                    let mut store = ArmedAt::new(10, warning);
                     let (r, code) = write(&f, "SP-1", &mut store, false);
                     r.expect("tape 1 seals short");
                     assert_eq!(code, 0);
                     assert_eq!(
                         [
                             position_of(&f, "SP-1", "a", 1),
-                            position_of(&f, "SP-1", "c", 1),
                             position_of(&f, "SP-1", "b", 1),
                         ],
-                        [8, 9, 10],
-                        "whole units first, the spannable set last (item 83)"
+                        [8, 9],
+                        "the queue in the order taken (item 289)"
                     );
-                    assert_eq!(volume_row(&f, "SP-1"), ("sealed".into(), true, Some(11)));
+                    assert_eq!(volume_row(&f, "SP-1"), ("sealed".into(), true, Some(10)));
                     assert_eq!(
                         writes_of(&f, "SP-1"),
-                        pairs(&[("a", "completed"), ("b", "range"), ("c", "completed")])
+                        pairs(&[("a", "completed"), ("b", "range")]),
+                        "c was planned and not written: no row"
                     );
                     assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert_eq!(
@@ -27753,29 +27767,31 @@ mod tests {
                     assert_eq!(tapes, ["SG-1", "SG-6"]);
                 }
 
-                /// Item 123: on a drive with no `post_warning_bytes`, a unit
-                /// that may span and would pass the fill ceiling is refused,
-                /// and the refusal names the key; nothing is written. Positive
-                /// control: with the key it is planned past the ceiling, and
-                /// this medium takes it whole.
+                /// Item 289, D20: on a drive with no `post_warning_bytes` a unit
+                /// that would pass the fill ceiling is NOT refused (the refusal
+                /// naming the key is gone): the plan ends at the ceiling, `a` is
+                /// committed and `b` is planned only as the slices that fit, or
+                /// not at all, and the rest stays staged. Positive control: with
+                /// the key it is planned past the ceiling, and this medium takes
+                /// it whole.
                 #[test]
-                fn without_post_warning_bytes_a_span_past_the_ceiling_is_refused_naming_the_key() {
-                    span_past_the_ceiling_is_refused_naming_the_key(0);
+                fn without_post_warning_bytes_a_span_past_the_ceiling_ends_at_the_ceiling() {
+                    span_past_the_ceiling_ends_at_the_ceiling(0);
                 }
 
-                /// #491's positive control: the same refusal and write however
+                /// #491's positive control: the same plan and write however
                 /// heavy the envelopes are ([`grow_envelopes`]).
                 #[test]
-                fn a_span_past_the_ceiling_is_refused_however_heavy_the_envelopes() {
+                fn a_span_past_the_ceiling_ends_at_it_however_heavy_the_envelopes() {
                     for bytes in [512, 2048, 4096, 4608] {
-                        span_past_the_ceiling_is_refused_naming_the_key(bytes);
+                        span_past_the_ceiling_ends_at_the_ceiling(bytes);
                     }
                 }
 
                 /// The body of the two tests above, with the envelopes grown
                 /// by a catalogue of `catalogue_bytes`. Every figure is
                 /// placed from [`wide_fixed`], a slice or more from its edge.
-                fn span_past_the_ceiling_is_refused_naming_the_key(catalogue_bytes: usize) {
+                fn span_past_the_ceiling_ends_at_the_ceiling(catalogue_bytes: usize) {
                     let mut f =
                         fixture(&[("a", &[WIDE_SLICE]), ("b", &[WIDE_SLICE; 3])], &["SN-1"]);
                     grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
@@ -27790,44 +27806,47 @@ mod tests {
 
                     let mut store = MemStore::new(SBS);
                     let (r, code) = write(&f, "SN-1", &mut store, false);
-                    let err = r.unwrap_err().to_string();
+                    r.expect("the plan ends at the ceiling and is written");
+                    assert_eq!(code, 0);
+                    let rows = writes_of(&f, "SN-1");
+                    assert_eq!(rows[0], ("a".to_string(), "completed".to_string()), "{rows:?}");
                     assert!(
-                        err.starts_with(
-                            "volume \"SN-1\" failed pre-write validation: capacity exceeded: a \
-                             unit that allows spanning would pass the fill ceiling"
-                        ),
-                        "{err}"
+                        rows.iter().all(|(u, s)| u != "b" || s == "range"),
+                        "b is never whole on this tape: {rows:?}"
                     );
-                    assert!(err.contains("post_warning_bytes"), "{err}");
-                    assert!(err.contains("ADR-0012 item 123"), "{err}");
-                    assert_eq!(code, 2);
-                    assert!(store.files.is_empty(), "nothing was written");
-                    assert!(writes_of(&f, "SN-1").is_empty(), "no session was planned");
+                    assert_eq!(stage_set_status(&f, "b"), "staged", "the rest stays staged");
 
+                    // With the key: planned past the ceiling, whole on a
+                    // medium that takes it.
+                    let mut f2 =
+                        fixture(&[("a", &[WIDE_SLICE]), ("b", &[WIDE_SLICE; 3])], &["SN-2"]);
+                    grow_envelopes(&f2.conn, &f2._tmp.path().join("catalogue"), catalogue_bytes);
+                    let fixed = wide_fixed(&f2, "SN-2");
                     budget(
-                        &mut f,
-                        "SN-1",
+                        &mut f2,
+                        "SN-2",
                         fixed + 6 * WIDE_PADDED,
                         fixed + 2 * WIDE_PADDED,
                         true,
                     );
                     let mut store = MemStore::new(SBS);
-                    write(&f, "SN-1", &mut store, false)
+                    write(&f2, "SN-2", &mut store, false)
                         .0
                         .expect("planned past the ceiling");
                     assert_eq!(
-                        writes_of(&f, "SN-1"),
+                        writes_of(&f2, "SN-2"),
                         pairs(&[("a", "completed"), ("b", "completed")])
                     );
                 }
 
-                /// Item 142 (X20): a write scoped as `volume rewrite` scopes it
-                /// plans a unit that allows spanning whole and never makes a
-                /// range: the early warning in it cuts it, as in 1.6.0, with
-                /// `may_span` unset and File 0 stating `short-seal` alone.
-                /// Positive control: the same write unscoped makes a range.
+                /// Items 142 and 289: a write scoped as `volume rewrite` scopes it
+                /// plans under the fill ceiling and never past it, and when the
+                /// early warning comes in a unit the unit is a range, as for
+                /// any write (there is no `cut` unit), with File 0 stating
+                /// `requires = []`. The rewrite's hold and close are slice by
+                /// slice (`rewrite::holds`).
                 #[test]
-                fn a_rewrite_scoped_write_never_makes_a_range() {
+                fn a_rewrite_scoped_write_leaves_a_range_when_the_warning_comes() {
                     let f = fixture(B3, &["SR-1", "SR-2"]);
                     let b = stage_set_of(&f, "b");
 
@@ -27835,9 +27854,12 @@ mod tests {
                     let (r, code) = write_scoped(&f, "SR-1", &mut store, Some(&[b]));
                     r.expect("a short seal is a success");
                     assert_eq!(code, 0);
-                    assert_eq!(writes_of(&f, "SR-1"), pairs(&[("b", "cut")]));
+                    assert_eq!(writes_of(&f, "SR-1"), pairs(&[("b", "range")]));
                     assert_eq!(requires_line(&store.inner.files), "requires = []");
-                    assert!(recorded_ranges(&f.conn, "SR-1").unwrap().is_empty());
+                    assert_eq!(
+                        recorded_ranges(&f.conn, "SR-1").unwrap(),
+                        [range("b", 1, 2)]
+                    );
 
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SR-2", &mut store, false).0.expect("seals short");
@@ -27847,7 +27869,7 @@ mod tests {
                 /// #493 (ADR-0012 items 151 and 159): a write scoped as `volume
                 /// write --for-location` scopes it writes only its sets and plans
                 /// them by policy, so a unit that allows spanning makes a range
-                /// where a rewrite's scope (above) would cut it; a staged set
+                /// like any other write; a staged set
                 /// outside the scope is left staged, untouched.
                 #[test]
                 fn a_for_location_scoped_write_spans_by_policy_and_leaves_the_rest_staged() {
@@ -27969,9 +27991,10 @@ mod tests {
 
                 /// The body of the two tests above, with the envelopes grown
                 /// by a catalogue of `catalogue_bytes`. The fill budget
-                /// sits half a slice past `a` on the probe ([`wide_fixed`]):
-                /// `a` under it and `c` past it, whichever way the write's
-                /// own build drifts.
+                /// sits half a slice past `a` on the probe ([`wide_fixed`]) and
+                /// the bound half a slice short of `b`'s end: `b` carries the
+                /// plan past the bound, is the tape's last unit, and `c` after
+                /// it waits, whichever way the write's own build drifts.
                 fn whole_units_the_span_leaves_no_room_for_wait(catalogue_bytes: usize) {
                     let mut f = fixture(
                         &[
@@ -27986,7 +28009,7 @@ mod tests {
                     budget(
                         &mut f,
                         "SD-1",
-                        fixed + 5 * WIDE_PADDED,
+                        fixed + 7 * WIDE_PADDED / 2,
                         fixed + 3 * WIDE_PADDED / 2,
                         true,
                     );
@@ -28291,18 +28314,17 @@ mod tests {
                 #[test]
                 fn a_full_verify_marks_a_range_write_verified_and_a_quick_one_does_not() {
                     let f = fixture(A_B3_C, &["SV-1"]);
-                    let mut store = ArmedAt::new(11, warning);
+                    let mut store = ArmedAt::new(10, warning);
                     write(&f, "SV-1", &mut store, false)
                         .0
                         .expect("tape 1 seals short");
                     assert_eq!(
                         writes_of(&f, "SV-1"),
-                        pairs(&[("a", "completed"), ("b", "range"), ("c", "completed")])
+                        pairs(&[("a", "completed"), ("b", "range")])
                     );
                     let none = vec![
                         ("a".to_string(), false),
                         ("b".to_string(), false),
-                        ("c".to_string(), false),
                     ];
                     assert_eq!(verified(&f, "SV-1"), none, "a quick confirm");
 
@@ -28315,7 +28337,6 @@ mod tests {
                         [
                             ("a".to_string(), true),
                             ("b".to_string(), true),
-                            ("c".to_string(), true),
                         ],
                         "the full readback read the range too"
                     );
@@ -28381,12 +28402,12 @@ mod tests {
                 #[test]
                 fn a_full_verify_records_the_figures_of_a_tape_holding_a_range() {
                     let f = fixture(A_B3_C, &["SG-1", "SG-2"]);
-                    let mut tape1 = ArmedAt::new(11, warning);
+                    let mut tape1 = ArmedAt::new(10, warning);
                     write(&f, "SG-1", &mut tape1, false)
                         .0
                         .expect("tape 1 seals short");
-                    // a and c have their copy: the release cleans them.
-                    for unit in ["a", "c"] {
+                    // a has its copy: the release cleans it.
+                    for unit in ["a"] {
                         f.conn
                             .execute(
                                 "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
@@ -28398,11 +28419,14 @@ mod tests {
                     write(&f, "SG-2", &mut tape2, false)
                         .0
                         .expect("tape 2 continues it");
-                    assert_eq!(writes_of(&f, "SG-2"), pairs(&[("b", "range")]));
+                    assert_eq!(
+                        writes_of(&f, "SG-2"),
+                        pairs(&[("b", "range"), ("c", "completed")])
+                    );
 
                     for (label, store, slices) in [
-                        ("SG-1", &mut tape1 as &mut dyn Store, 4),
-                        ("SG-2", &mut tape2 as &mut dyn Store, 1),
+                        ("SG-1", &mut tape1 as &mut dyn Store, 3),
+                        ("SG-2", &mut tape2 as &mut dyn Store, 2),
                     ] {
                         let written = figures(&f, label);
                         assert_eq!(written, (slices * PADDED as i64, slices), "{label}");

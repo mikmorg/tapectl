@@ -546,7 +546,9 @@ fn sealing(conn: &Connection, label: &str) -> (bool, Option<i64>) {
 // ── item 93: two copies over three tapes ──
 
 const A93: &str = "kumquat-whole-alpha";
-const B93: &str = "kumquat-span-bravo";
+// Named so that it sorts after the whole units: the queue takes the units in
+// name order (item 288), and item 93's layout has the set that spans last.
+const B93: &str = "kumquat-zspan-bravo";
 const C93: &str = "kumquat-whole-charlie";
 const T93: [&str; 3] = ["SPN93-T1", "SPN93-T2", "SPN93-T3"];
 
