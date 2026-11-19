@@ -5,16 +5,19 @@
 #
 # WHAT IT PROVES. A write that meets the drive's real early warning seals short, and what it
 # wrote past the warning (at most one slice and the seal) reads back (item 110: a failed
-# readback stops #420). Around it, with real units: the cut is recorded, every whole unit
+# readback stops #420). Around it, with real units: the ending is recorded (the unit the warning
+# interrupts is a range, the unit planned after it has no row; item 288), every whole unit
 # restores through tapectl and through RESTORE.sh, the catalog rebuilds from the short tape to
-# the rows the write recorded, and the cut unit is then written whole onto the same cartridge,
-# erased and initialised again as a second volume (home2 has one test cartridge).
+# the rows the write recorded, and the unit planned after the filler is then written whole onto
+# the same cartridge, erased and initialised again as a second volume (home2 has one test
+# cartridge).
 #
 # HOW THE TAPE IS FILLED (item 115). Three small real units and, sorting between them, one
 # filler unit: staged normally from a source a little larger than one slice, then given N slice
 # rows that all name its one real staged slice (examples/short_seal_filler.rs, `fill`, which
 # says how that passes `stage create`'s and `volume write`'s checks). Nothing but the filler's
-# rows is synthetic, and the filler is cut, so nothing of it is ever restored.
+# rows is synthetic, and the filler ends as a range whose owed slices are never written, so
+# nothing of it is ever restored (step 7 releases it).
 #
 # THE CAPACITY. Item 113 lets a plan reach 100% of the cartridge's capacity and no further, and
 # the HP LTO-6's first refusal came at 2,502,136,168,448 bytes on this cartridge (2026-10-20
@@ -63,7 +66,7 @@ LABEL2="SSA-0002"
 OPERATOR="ssa-op"
 TENANT="ssa"
 # `volume write` orders the batch by unit name, so the filler sorts between the real units and
-# the one after it is cut with it (item 112): that is "the cut real unit" of step 7.
+# the one after it is planned and not written (item 288): that is "the real unit left over" of step 7.
 UNIT_A="ssa-a-docs"
 UNIT_B="ssa-b-photos"
 UNIT_F="ssa-m-filler"
@@ -171,16 +174,16 @@ reads at the 140 MiB/s production verify ran at, RECORD #326):
                  $LABEL1 initialised without --force.                                 ~5 min
   3 volume write the plan reaches past the $ceil_tb TB fill ceiling to ~$cap_tb TB; the drive's
                  warning comes near 2.502 TB, inside the filler: a short seal, exit 0, the
-                 filler and $UNIT_Z cut, and item 114's readback of the slice
+                 filler held as a range, $UNIT_Z planned and not written (no row), and item 114's readback of the slice
                  past the warning and the seal.                                    ~4.5-5 h
   4 verify       volume verify --full, then RESTORE.sh --info and --verify with the real
                  tools: two whole-tape reads.                                       ~9-10 h
   5 restore      $UNIT_B (1.5 GiB, 2 slices) by tapectl and by RESTORE.sh, each
-                 diffed against its source; the cut unit refused by RESTORE.sh.     ~15 min
+                 diffed against its source; the unit left over refused by RESTORE.sh. ~15 min
   6 rebuild      catalog rebuild --from-volume into a second home, compared row by row.
                                                                                    ~15 min
   7 rewrite      the filler released, $LABEL1 retired, cartridge erase (short), $LABEL2
-                 initialised without --force, the cut unit written whole onto it,
+                 initialised without --force, the left-over unit written whole onto it,
                  verified and restored.                                            ~20 min
   In all about 14-16 hours of drive time; step 4's two whole-tape reads are most of it.
 
@@ -190,7 +193,7 @@ THE COMMAND (operator's login on home2):
     scripts/short-seal-acceptance.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst \\
       --i-will-lose-the-cartridge EW7VWMVKF6
 
-Afterwards the cartridge holds $LABEL2 (the cut unit only) and belongs to the throwaway home:
+Afterwards the cartridge holds $LABEL2 (the left-over unit only) and belongs to the throwaway home:
 retire $LABEL2 and run cartridge erase from that home before it is a test cartridge again, and
 start the drive-poll timer.
 PLAN
@@ -476,7 +479,7 @@ make_sources() {
     for i in $(seq 1 "$n"); do random_file "$SRC/b/raw/img-$i.raw" "$each"; done
     echo "photos manifest $STAMP" > "$SRC/b/index.txt"
     random_file "$SRC/z/tail.bin" "$SIZE_Z"
-    echo "the unit after the filler, cut with it $STAMP" > "$SRC/z/README.txt"
+    echo "the unit after the filler, planned after it $STAMP" > "$SRC/z/README.txt"
     random_file "$SRC/m/filler.bin" "$SIZE_F"
 }
 
@@ -613,17 +616,27 @@ else
 fi
 ENDING="$(json_get "$STEP_DIR/write.out" 'd["ending"]')"
 K="$(json_get "$STEP_DIR/write.out" 'd["ended_after"]')"
-CUT="$(json_get "$STEP_DIR/write.out" '" ".join(sorted(d["cut_units"]))')"
-log "  ending=$ENDING ended_after=$K cut: $CUT"
+# Item 288: no unit is cut. The unit the warning interrupts is held as a range; every staged set
+# with no row on the volume is in deferred_units (planned and not written, or not planned).
+RANGES="$(json_get "$STEP_DIR/write.out" '" ".join(sorted(r["unit"] for r in d["range_units"]))')"
+WAITING="$(json_get "$STEP_DIR/write.out" '" ".join(sorted(d["deferred_units"]))')"
+HAS_CUT_KEY="$(json_get "$STEP_DIR/write.out" '"cut_units" in d')"
+log "  ending=$ENDING ended_after=$K range: $RANGES; staged and not on this tape: $WAITING"
 [ "$ENDING" = "short" ] || fail "the write sealed '$ENDING', not short: the warning never came inside the plan"
 case "$K" in ''|*[!0-9]*) fail "the write reported ended_after '$K'" ;; esac
-[ "$CUT" = "$UNIT_F $UNIT_Z" ] || fail "the cut units are '$CUT', expected '$UNIT_F $UNIT_Z'"
+[ "$RANGES" = "$UNIT_F" ] || fail "the units held as a range are '$RANGES', expected '$UNIT_F'"
+[ "$WAITING" = "$UNIT_Z" ] || fail "the staged units not on the tape are '$WAITING', expected '$UNIT_Z'"
+[ "$HAS_CUT_KEY" = False ] || fail "the write's JSON still has cut_units (item 288)"
 grep -F "sealed short" "$STEP_DIR/write.err" >/dev/null || fail "the write's stderr does not report the short seal"
+grep -F "Held here as a range, the rest of each still staged: $UNIT_F (slice" "$STEP_DIR/write.err" >/dev/null \
+    || fail "the write's stderr does not name $UNIT_F as held here as a range"
+grep -F "Planned and not written (still staged): $UNIT_Z." "$STEP_DIR/write.err" >/dev/null \
+    || fail "the write's stderr does not name $UNIT_Z as planned and not written (the plan did not reach it, or the text changed)"
 VOL_ROW="$(dbq "$DB" "SELECT status, ended_after, observed_condition FROM volumes WHERE label = ?" "$LABEL1")"
 [ "$VOL_ROW" = "$(printf 'sealed\t%s\tok' "$K")" ] || fail "volumes row for $LABEL1 is '$VOL_ROW', expected sealed, ended_after $K, ok"
 WRITES="$(dbq "$DB" "SELECT u.name || '=' || w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
     JOIN snapshots s ON s.id = w.snapshot_id JOIN units u ON u.id = s.unit_id WHERE v.label = ? ORDER BY u.name" "$LABEL1" | tr '\n' ' ')"
-[ "$WRITES" = "$UNIT_A=completed $UNIT_B=completed $UNIT_F=cut $UNIT_Z=cut " ] || fail "write rows are '$WRITES'"
+[ "$WRITES" = "$UNIT_A=completed $UNIT_B=completed $UNIT_F=range " ] || fail "write rows are '$WRITES', expected $UNIT_A and $UNIT_B completed, $UNIT_F a range and none for $UNIT_Z (item 288)"
 # Item 114: the confirm read back what was written past the warning, the slice at file K and
 # the seal, whatever the tier. The confirm phase's bytes (phase_timings, the session's own
 # count) hold at least that slice, block-padded, and the seal's block; a quick confirm that
@@ -647,18 +660,36 @@ log "  write_early_warning: $(tail -1 "$STEP_DIR/early-warning-event.tsv")"
 dbq "$DB" "SELECT action, details FROM events WHERE action IN ('write_feed_ratio', 'write_capacity_used', 'write_completed')
     ORDER BY id" > "$STEP_DIR/write-events.tsv" || true
 log "  feed ratio: $(grep '^write_feed_ratio' "$STEP_DIR/write-events.tsv" | sed -n 1p | cut -f2 || true)"
-# Item 112: a cut set stays staged and whole, and does not hold back the release of the whole
-# units beside it (min_copies = 1, so their one copy releases them).
+# Item 129: the range's owed slices stay staged (the interrupted set is not released whole) and
+# the set planned after it stays staged, and neither holds back the release of the whole units
+# beside them (min_copies = 1, so their one copy releases them).
 STAGED="$(dbq "$DB" "SELECT u.name || '=' || ss.status FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
     JOIN units u ON u.id = s.unit_id ORDER BY u.name" | tr '\n' ' ')"
 log "  stage sets after the write: $STAGED"
-[ "$STAGED" = "$UNIT_A=cleaned $UNIT_B=cleaned $UNIT_F=staged $UNIT_Z=staged " ] || fail "stage sets after the write are '$STAGED', expected the whole units released and the cut ones staged (item 112)"
+[ "$STAGED" = "$UNIT_A=cleaned $UNIT_B=cleaned $UNIT_F=staged $UNIT_Z=staged " ] || fail "stage sets after the write are '$STAGED', expected the whole units released and $UNIT_F and $UNIT_Z staged (items 129, 288)"
+# $UNIT_Z: every slice still staged, its files there. $UNIT_F: the slices on the tape were
+# released with their copies (the filler's rows share ONE staged file, so that release unlinked it
+# for all of them: the fixture's artifact, never restored), and the owed slices after them are
+# still staged, which is what the next tape's write would continue.
 dbq "$DB" "SELECT sl.staging_path FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
-    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name IN (?, ?)
-    GROUP BY sl.staging_path" "$UNIT_F" "$UNIT_Z" > "$STEP_DIR/cut-staged-paths.txt"
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = ?
+    GROUP BY sl.staging_path" "$UNIT_Z" > "$STEP_DIR/left-over-staged-paths.txt"
+[ -s "$STEP_DIR/left-over-staged-paths.txt" ] || fail "$UNIT_Z has no staged slice file recorded"
 while IFS= read -r p; do
-    [ -f "$p" ] || fail "the cut set's staged file $p is gone"
-done < "$STEP_DIR/cut-staged-paths.txt"
+    [ -f "$p" ] || fail "$UNIT_Z's staged file '$p' is gone"
+done < "$STEP_DIR/left-over-staged-paths.txt"
+F_TOTAL="$(dbq "$DB" "SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = ?" "$UNIT_F")"
+F_STAGED="$(dbq "$DB" "SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+    WHERE u.name = ? AND sl.released_at IS NULL" "$UNIT_F")"
+F_ON_TAPE="$(dbq "$DB" "SELECT COUNT(*) FROM write_positions wp JOIN writes w ON w.id = wp.write_id
+    JOIN volumes v ON v.id = w.volume_id JOIN stage_sets ss ON ss.id = w.stage_set_id
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+    WHERE u.name = ? AND v.label = ? AND wp.status = 'written'" "$UNIT_F" "$LABEL1")"
+log "  $UNIT_F: $F_TOTAL slices, $F_ON_TAPE written on $LABEL1, $F_STAGED still staged"
+[ "$F_ON_TAPE" -ge 1 ] && [ "$F_ON_TAPE" -lt "$F_TOTAL" ] || fail "$UNIT_F has $F_ON_TAPE of $F_TOTAL slices on the tape: the warning did not land inside it"
+[ "$F_STAGED" -ge $(( F_TOTAL - F_ON_TAPE )) ] || fail "$UNIT_F has $F_STAGED slices staged, fewer than the $(( F_TOTAL - F_ON_TAPE )) owed (item 129)"
 run volume-info 0 tctl volume info "$LABEL1"
 cp -a "$DB" "$RUN/catalog-after-write.db"
 end_step
@@ -681,7 +712,7 @@ log "  RESTORE.sh --verify: PASSED; $(grep "NOT ON TAPE" "$STEP_DIR/heir-verify.
 end_step
 
 # ------------------------------------------------------------
-begin_step 5 restore "$UNIT_B whole, by tapectl and by RESTORE.sh; the cut unit refused"
+begin_step 5 restore "$UNIT_B whole, by tapectl and by RESTORE.sh; the unit left over refused"
 run restore-tapectl 0 tctl restore unit --unit "$UNIT_B" --from "$LABEL1" --to "$WORK/restore-tapectl-b" --device "$TAPE_DEV"
 assert_identical "$SRC/b" "$WORK/restore-tapectl-b" tapectl-restore
 TENANT_KEY="$TAPECTL_HOME/keys/$TENANT-primary.age.key"
@@ -689,9 +720,9 @@ TENANT_KEY="$TAPECTL_HOME/keys/$TENANT-primary.age.key"
 heir restore-heir 0 --restore --unit "$UNIT_B" --key "$TENANT_KEY" --to "$WORK/restore-heir-b"
 assert_identical "$SRC/b" "$WORK/restore-heir-b" heir-restore
 heir restore-heir-cut any --restore --unit "$UNIT_Z" --key "$TENANT_KEY" --to "$WORK/restore-heir-z"
-[ "$RC" != 0 ] || fail "RESTORE.sh restored the cut unit $UNIT_Z from a tape that does not hold it whole"
-# Layout 3's script restores what a short tape holds and says the rest is missing: the cut unit
-# is in the tape's envelope, none of its slices is on the tape, so it names them NOT ON THIS
+[ "$RC" != 0 ] || fail "RESTORE.sh restored $UNIT_Z from a tape that does not hold it"
+# Layout 3's script restores what a short tape holds and says the rest is missing: $UNIT_Z was
+# planned (so it is in the tape's envelope, the write's text says so) and withdrawn, none of its slices is on the tape, so it names them NOT ON THIS
 # CARTRIDGE and ends RESTORE INCOMPLETE with the list of the files it left out (measured on
 # mhvtl 2026-11-19; tests/heir_restore.rs::
 # a_whole_unit_restores_from_a_short_tape_and_a_partial_one_restores_what_it_holds).
@@ -702,7 +733,7 @@ grep -F "RESTORE INCOMPLETE" "$STEP_DIR/restore-heir-cut.out" "$STEP_DIR/restore
 [ -s "$WORK/restore-heir-z/.tapectl-damaged-files.txt" ] \
     || fail "RESTORE.sh called the restore of $UNIT_Z incomplete but left no list of the files it left out"
 run restore-tapectl-cut any tctl restore unit --unit "$UNIT_Z" --from "$LABEL1" --to "$WORK/restore-tapectl-z" --device "$TAPE_DEV"
-[ "$RC" != 0 ] || fail "tapectl restored the cut unit $UNIT_Z from $LABEL1"
+[ "$RC" != 0 ] || fail "tapectl restored $UNIT_Z from $LABEL1, which holds none of it"
 end_step
 
 # ------------------------------------------------------------
@@ -719,10 +750,12 @@ tee -a "$RUN/run.log" < "$STEP_DIR/compare.out"
 end_step
 
 # ------------------------------------------------------------
-begin_step 7 rewrite "the cut unit written whole onto the same cartridge as $LABEL2"
-# `volume write` writes every staged set, so before the next one only the cut real unit may be
-# staged. The whole units were released after step 3; the filler, cut and with no copy
-# anywhere, is released by hand, which needs --force (ReleaseBlocker::Cut).
+begin_step 7 rewrite "the left-over unit written whole onto the same cartridge as $LABEL2"
+# `volume write` writes every staged set, and lays a range's owed slices FIRST (item 122): the
+# filler's would be tens of thousands of synthetic slices, and their one staged file is gone. So
+# before the next write only the left-over real unit may be staged. The whole units were released
+# after step 3; the filler, a range with owed slices that nothing will ever write, is released by
+# hand, whole, which needs --force (item 129 releases a range slice by slice only as copies land).
 run release-filler 0 tctl stage clean --unit "$UNIT_F" --force
 STAGED="$(dbq "$DB" "SELECT u.name || '=' || ss.status FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
     JOIN units u ON u.id = s.unit_id ORDER BY u.name" | tr '\n' ' ')"
@@ -732,6 +765,8 @@ log "  stage sets before the second write: $STAGED"
 # (ADR-0008 Tier 3) names the one command that does that on purpose.
 run reclaim-a 0 tctl snapshot mark-reclaimable "$UNIT_A" --version 1 --force
 run reclaim-b 0 tctl snapshot mark-reclaimable "$UNIT_B" --version 1 --force
+# The filler's range holds the last copy of its slices on $LABEL1: the same floor names it.
+run reclaim-f 0 tctl snapshot mark-reclaimable "$UNIT_F" --version 1 --force
 run retire 0 tctl --yes volume retire "$LABEL1"
 run erase 0 tctl cartridge erase --device "$TAPE_DEV" --confirm-label "$LABEL1"
 run init2 0 tctl --json volume init "$LABEL2" --device "$TAPE_DEV"
@@ -743,19 +778,19 @@ WRITES2="$(dbq "$DB" "SELECT u.name || '=' || w.status FROM writes w JOIN volume
 [ "$WRITES2" = "$UNIT_Z=completed " ] || fail "$LABEL2's write rows are '$WRITES2', expected only $UNIT_Z completed"
 run verify2 0 tctl volume verify "$LABEL2" --full --device "$TAPE_DEV"
 run restore-z 0 tctl restore unit --unit "$UNIT_Z" --from "$LABEL2" --to "$WORK/restore-tapectl-z2" --device "$TAPE_DEV"
-assert_identical "$SRC/z" "$WORK/restore-tapectl-z2" cut-unit-restore
+assert_identical "$SRC/z" "$WORK/restore-tapectl-z2" left-over-unit-restore
 end_step
 
 # ------------------------------------------------------------
 cp -a "$DB" "$RUN/catalog-at-end.db"
 {
     echo "RESULT: PASS"
-    echo "every step passed; ended_after $K on $LABEL1; the cut unit $UNIT_Z whole on $LABEL2"
+    echo "every step passed; ended_after $K on $LABEL1; the left-over unit $UNIT_Z whole on $LABEL2"
     echo "the cartridge now holds $LABEL2 and belongs to $TAPECTL_HOME"
 } > "$RUN/RESULT.txt"
 [ -z "$FILLER_DIR" ] || rm -rf "$FILLER_DIR"
 log "RESULT: PASS. $RUN"
-log "The cartridge holds $LABEL2 (the cut unit only), in the throwaway home. Before it is a test"
+log "The cartridge holds $LABEL2 (the left-over unit only), in the throwaway home. Before it is a test"
 log "cartridge again, with THIS tapectl (an older installed one refuses this home's catalog):"
 log "  $TAPECTL_BIN --home $TAPECTL_HOME snapshot mark-reclaimable $UNIT_Z --version 1 --force"
 log "  (it holds $UNIT_Z's only copy, so retire is refused until then), then"
