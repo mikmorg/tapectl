@@ -43,6 +43,17 @@
 #   need not be empty); --no-file-check.
 #   The tape is TAPE_DEVICE in the environment, /dev/nst0 when it is not set.
 #
+# A unit may continue on another cartridge. A restore reads its slices in
+# order; when the next slice is not on the cartridge in the drive it asks for
+# the cartridge that holds it (after telling you to eject the one in the
+# drive), waits for as long as you take, and goes on in the same tar run.
+# Press ENTER once the cartridge is loaded; type done and ENTER (or end the
+# input) if you do not have it: the restore goes on with what it has and
+# lists the rest with the tapes that hold it; type quit and ENTER to stop.
+# A restore may start on any tape of a span and takes the files that tape
+# holds whole. A later run into the same --to, from another tape of the same
+# unit, adds that tape's files and leaves alone those that already pass.
+#
 # The tape is read forward from one rewind: every read leaves the head at the
 # start of the next file, and the script rewinds only for a file behind it.
 #
@@ -101,6 +112,18 @@ NO_FILE_CHECK=0
 
 WORK=""
 WORK_MADE_IN=""
+# The cartridge in the drive, as far as this run knows: it is the one the run
+# started on until a cartridge is taken (HOME_CART 0), and nothing known after
+# one was offered and refused.
+HOME_CART=1
+LOADED_UUID=""
+GAVE_UP=0        # 1 once the heir said "I do not have it" for this unit
+QUIT=0           # 1 once the heir typed quit
+TO_HELD_LIST=0   # 1 when --to held an earlier run's damaged-file list
+TAR_OPEN=0       # 1 while tar's input (fd 4) is open
+FEEDING=0        # the slice being prepared or fed
+INFLIGHT_DEST="" # where, and from which table, a signal's cleanup looks for a partial member
+INFLIGHT_TABLE=""
 umask 077 # decrypted plaintext is not world-readable
 
 # ---- messages and the way out ----
@@ -116,6 +139,10 @@ say() { printf '%s\n' "$*"; }
 cleanup() {
   local rc=$?
   trap - EXIT
+  # Order: tar's input is closed and tar ends, a member it had begun is
+  # removed (the member being fed when a signal came), then the work directory.
+  tar_close 300 || true
+  scrub_inflight || true
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
     chmod -R u+rwx "$WORK" 2>/dev/null || true
     if ! rm -rf "$WORK" 2>/dev/null; then
@@ -141,9 +168,9 @@ die_usage() {
   exit 2
 }
 
-# Modes of the format that a later build of this script carries.
-later_build() {
-  die "$1 is not in this build of RESTORE.sh yet. This build restores whole units and named paths (--restore --all, --restore --unit U [--path P]), makes the one repair (--paths-from), lists a unit's files, reads the index (--where, --find) and checks a tape (--info, --verify, --find-envelope). A unit across cartridges is not in it."
+# Spellings of Layout 2's script that Layout 3 does not have (item 255).
+removed_option() {
+  die_usage "$1 is not in this RESTORE.sh: Layout 3 has one repair, --paths-from LIST (LIST is the .tapectl-damaged-files.txt of an earlier restore, given on a tape that holds the same unit and version), and a unit across cartridges asks for the next cartridge at its own prompt."
 }
 
 is_uint() { case ${1:-} in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
@@ -219,7 +246,7 @@ while [ $# -gt 0 ]; do
   --overwrite) OVERWRITE=1 ;;
   --no-file-check) NO_FILE_CHECK=1 ;;
   --slices-from | --swap-tapes | --fill-from | --stream-tapes)
-    later_build "$1"
+    removed_option "$1"
     ;;
   --scratch) die_usage "--scratch is now --work DIR" ;;
   -h | --help)
@@ -616,6 +643,12 @@ bootstrap() {
     warn "File 0 states no magic or no layout_version (a damaged File 0?). Going on as a Layout 3 tape; the seal marker's own claims decide."
   fi
   check_requires "File 0" "$WORK/file0.txt"
+  file0_fields
+}
+
+# The facts File 0 states, from $WORK/file0.txt.
+file0_fields() {
+  LABEL=$(toml_val "$WORK/file0.txt" label)
   UUID=$(toml_val "$WORK/file0.txt" uuid)
   TAPECTL_VERSION=$(toml_val "$WORK/file0.txt" tapectl_version)
   MEDIA_TYPE=$(toml_val "$WORK/file0.txt" media_type)
@@ -743,6 +776,7 @@ on_tape() { # <position>: is it on this tape?
 
 establish() {
   bootstrap
+  [ -n "$LOADED_UUID" ] || LOADED_UUID=$UUID
   if try_front_index; then
     FILES_TXT="$WORK/files_from_index.txt"
     FILES_SOURCE="front index (File $FRONT_INDEX)"
@@ -1152,6 +1186,259 @@ do_list() {
   done <"$WORK/chosen.txt"
 }
 
+# ---- the next cartridge of a unit (R5, R7, R8, R9; volume-format-v3.md 5.3, 7.4) ----
+
+# The tapes the index in the envelope this unit came from names as holders of
+# this version of this unit, other than the loaded tape, one a line in
+# $WORK/holders.txt: volume, first slice, last slice, state, chip serial
+# (TAB-separated). With $1, only those whose run holds that slice. Returns 1
+# when the envelope has no index or names none.
+holders_of() { # [slice]
+  local f="$WORK/env.$U_POS/index/units.tsv"
+  : >"$WORK/holders.txt"
+  [ -f "$f" ] || return 1
+  U_ID="$U_UUID" U_V="$U_VER" U_K="${1:-}" awk -F'\t' '
+    NR == 1 {
+      for (i = 1; i <= NF; i++) col[$i] = i
+      ok = ("unit_uuid" in col) && ("version" in col) && ("state" in col) && ("first_slice" in col) && ("last_slice" in col) && ("volume" in col)
+      next
+    }
+    !ok { next }
+    {
+      if ($(col["unit_uuid"]) != ENVIRON["U_ID"]) next
+      if (($(col["version"]) + 0) != (ENVIRON["U_V"] + 0)) next
+      st = $(col["state"])
+      if (st == "this-tape") next
+      f = $(col["first_slice"]); l = $(col["last_slice"])
+      if (f !~ /^[0-9]+$/ || l !~ /^[0-9]+$/) next
+      k = ENVIRON["U_K"]
+      if (k != "" && (k + 0 < f + 0 || k + 0 > l + 0)) next
+      ser = ("cartridge_serial" in col) ? $(col["cartridge_serial"]) : ""
+      printf "%s\t%s\t%s\t%s\t%s\n", $(col["volume"]), f, l, st, ser
+    }
+  ' "$f" >"$WORK/holders.txt"
+  [ -s "$WORK/holders.txt" ]
+}
+
+# $WORK/holders.txt as lines of words, each starting with $1.
+print_holders() { # <prefix>
+  local lab f l st ser
+  while IFS=$'\t' read -r lab f l st ser; do
+    printf '%s  tape %s (cartridge serial %s): slices %s to %s%s\n' "$1" "$(safe_str "$lab")" "${ser:-not recorded}" "$f" "$l" "$([ "$st" = quarantined ] && echo '; QUARANTINED: a verify proved it bad, it may still read in part')"
+  done <"$WORK/holders.txt"
+}
+
+eject_first() {
+  echo ">>> First eject the cartridge now in the drive: its eject button, or mt -f $DEVICE offline in another" >&2
+  echo ">>> terminal, which is safe while this waits (no tape device is held open)." >&2
+}
+
+# What the prompt for the next cartridge says: the slice needed, the tapes the
+# index names for it, how to answer.
+ask_cartridge() { # <slice>
+  local k=$1 f="$WORK/env.$U_POS/index/units.tsv"
+  {
+    echo ""
+    echo ">>> Unit $(safe_str "$U_NAME") (version $U_VER) needs slice $k of $NSL next: ${SL_ENC[$k]} bytes, sha256 ${SL_SHAE[$k]}"
+    if holders_of "$k"; then
+      echo ">>> The index in this tape's envelope names these tapes as holding slice $k:"
+      print_holders ">>>"
+    elif [ -f "$f" ]; then
+      echo ">>> No tape the index in this tape's envelope names holds slice $k (an index never names a tape"
+      echo ">>> written after its own tape): $0 --where $(safe_str "$U_NAME") --key KEY on the newest tape you hold names them."
+    else
+      echo ">>> This tape's envelope carries no index, so no tape is named: $0 --where $(safe_str "$U_NAME") --key KEY"
+      echo ">>> on the newest tape you hold may name them."
+    fi
+    eject_first
+    echo ">>> Load the cartridge that holds slice $k into $DEVICE, wait until the drive is ready, then press ENTER."
+    echo ">>> A cartridge is taken only when its front index lists that sha256 at a position its seal marker covers:"
+    echo ">>> its label is never taken for it. This waits for as long as you take."
+    echo ">>> Type done and ENTER (or end the input) if you do not have it: the restore goes on with what it has and"
+    echo ">>> lists the rest with the tapes that hold it. Type quit and ENTER to stop the restore."
+  } >&2
+}
+
+# Read the cartridge now in the drive, in a subshell of its own that reports
+# through files in $1, so that nothing it refuses ends the restore (#521).
+# Exit 0: it gives slice $2 (its facts are in $1/vars); 3: it is the cartridge
+# already in the drive; anything else: refused, and the words say why.
+probe_cartridge() { # <dir> <slice>
+  trap - EXIT
+  local dir=$1 k=$2 rc=0 magic lv label uuid pos feats v h16
+  WORK=$dir
+  tape_init
+  CUR=""
+  seek_to 0 || {
+    echo "NOTE: this cartridge is unreadable: the drive cannot reach its first file. Nothing is taken from it." >&2
+    exit 2
+  }
+  dd if="$DEVICE" bs="$BLOCK" of="$WORK/file0.raw" 2>"$WORK/dd.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "NOTE: this cartridge is unreadable: its first file cannot be read ($(dd_detail)). Nothing is taken from it." >&2
+    exit 2
+  fi
+  if [ ! -s "$WORK/file0.raw" ]; then
+    echo "NOTE: this cartridge is blank: nothing can be read at its first file. Nothing is taken from it." >&2
+    exit 2
+  fi
+  CUR=1
+  tr -d '\0' <"$WORK/file0.raw" >"$WORK/file0.txt"
+  magic=$(toml_val "$WORK/file0.txt" magic)
+  lv=$(toml_val "$WORK/file0.txt" layout_version)
+  label=$(toml_val "$WORK/file0.txt" label)
+  uuid=$(toml_val "$WORK/file0.txt" uuid)
+  if [ -z "$magic$lv$label$uuid" ]; then
+    echo "NOTE: this cartridge is not a tapectl volume: its first file states no magic, layout_version, label or uuid. Nothing is taken from it." >&2
+    exit 2
+  fi
+  if { [ -n "$magic" ] && [ "$magic" != tapectl-volume-v3 ]; } || { [ -n "$lv" ] && [ "$lv" != 3 ]; }; then
+    echo "NOTE: this cartridge is a tapectl volume of Layout $(safe_str "${lv:-unknown}") (magic $(safe_str "${magic:-none}")), label $(safe_str "$label"); this RESTORE.sh reads Layout 3 only, so nothing is taken from it. Read it with the tapectl that wrote it or with the RESTORE.sh in its own File 2." >&2
+    exit 2
+  fi
+  feats=$(requires_of "$WORK/file0.txt")
+  if [ -n "$feats" ]; then
+    echo "NOTE: this cartridge requires feature(s) $(safe_str "$feats"), which this RESTORE.sh does not know, so nothing is taken from it." >&2
+    exit 2
+  fi
+  if [ -n "$uuid" ] && [ "$uuid" = "$LOADED_UUID" ]; then
+    echo "NOTE: this is the same cartridge as the one already in the drive (label $(safe_str "$label")), which does not hold slice $k. Eject it and load the cartridge that does." >&2
+    exit 3
+  fi
+  file0_fields
+  if try_front_index; then
+    FILES_TXT="$WORK/files_from_index.txt"
+    FILES_SOURCE="front index (File $FRONT_INDEX)"
+    learn_end
+  elif read_seal && seal_valid; then
+    echo "WARNING: the front index of this cartridge is unreadable: using the seal marker's copy of it." >&2
+    check_requires "the seal marker" "$WORK/seal.toml"
+    FILES_TXT="$WORK/files_from_seal.txt"
+    FILES_SOURCE="the seal marker's copy of the front index"
+    SEAL_STATE=$([ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ] && echo short || echo full)
+    SEAL_BINDS=""
+  else
+    echo "NOTE: neither the front index nor the seal marker of this cartridge can be read, so nothing is taken from it." >&2
+    exit 2
+  fi
+  if [ -z "$ENDED_AFTER" ] || { [ "$SEAL_STATE" != full ] && [ "$SEAL_STATE" != short ]; }; then
+    echo "NOTE: Its seal marker cannot be read (or the tape is not sealed), so nothing is taken from it: a cartridge gives a slice only at a position its seal marker says the tape holds (R8)." >&2
+    exit 2
+  fi
+  h16=$(printf '%s' "$NEED_HASH" | head -c 16)
+  pos=$(awk -F'|' -v h="$NEED_HASH" -v s="$NEED_SIZE" '$2 == "data_slice" && ($4 "") == (h "") && ($3 "") == (s "") { print $1; exit }' "$FILES_TXT")
+  if [ -z "$pos" ]; then
+    echo "NOTE: This cartridge (label $(safe_str "$label")) lists no data slice with the sha256 of slice $k ($h16...) in its front index, so it does not hold that slice. Nothing is taken from it." >&2
+    exit 2
+  fi
+  if [ "$pos" -gt "$ENDED_AFTER" ]; then
+    echo "NOTE: This cartridge (label $(safe_str "$label")) lists slice $k (sha256 $h16...) at tape file $pos, but the tape ended after file $ENDED_AFTER (its seal marker says so): that slice is not on it. Nothing is taken from it." >&2
+    exit 2
+  fi
+  {
+    for v in LABEL UUID FILES_TXT FILES_SOURCE ENDED_AFTER SEAL_STATE SEAL_BINDS SEAL_FILE_COUNT TOTAL_FILES FRONT_INDEX SEAL_MARKER; do
+      printf '%s=%q\n' "$v" "${!v-}"
+    done
+  } >"$dir/vars"
+  exit 0
+}
+
+CART_SEQ=0
+# Is the cartridge now in the drive one that gives slice $1 (R8)? On success
+# it is the loaded cartridge: its facts are taken, and SL_HERE says which of
+# the unit's slices it holds.
+accept_cartridge() { # <slice>
+  local k=$1 sub rc=0 a b j
+  CART_SEQ=$((CART_SEQ + 1))
+  sub="$WORK/cart.$CART_SEQ"
+  mkdir -p "$sub" || die_io "cannot make a directory for the cartridge" "" "$WORK"
+  CUR=""
+  NEED_HASH=${SL_SHAE[$k]} NEED_SIZE=${SL_ENC[$k]}
+  (probe_cartridge "$sub" "$k") 2>"$sub/err" || rc=$?
+  CUR=""
+  sed 's/^FATAL: /NOTE: /' "$sub/err" >&2 || true
+  if [ "$rc" = 3 ]; then
+    return 1
+  fi
+  if [ "$rc" != 0 ] || [ ! -f "$sub/vars" ]; then
+    # Another cartridge is in the drive now, one this run cannot use.
+    HOME_CART=0
+    FILES_TXT=""
+    ENDED_AFTER=""
+    LOADED_UUID=""
+    SL_HERE=()
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  . "$sub/vars"
+  HOME_CART=0
+  LOADED_UUID=$UUID
+  locate_here
+  [ -n "${SL_HERE[$k]:-}" ] || return 1
+  a=$k
+  b=$k
+  for ((j = k + 1; j <= NSL; j++)); do
+    [ -n "${SL_HERE[$j]:-}" ] || break
+    b=$j
+  done
+  echo "This cartridge identifies as: $(safe_str "$LABEL")" >&2
+  echo "It gives slice(s) $a to $b of $(safe_str "$U_NAME"): its front index lists each one's sha256, at positions its seal marker covers." >&2
+  return 0
+}
+
+# Ask for the cartridge that gives slice $1, until one does or the heir
+# answers. The answer is read from standard input with no time limit, and no
+# tape device is open while it waits (every mt and dd opens it by itself).
+# done, or the end of the input, is "I do not have it": the restore goes on
+# with what it has. quit ends the restore.
+swap_for() { # <slice>: 0 when the cartridge in the drive now holds it
+  [ "$GAVE_UP" = 0 ] || return 1
+  local reply
+  while :; do
+    ask_cartridge "$1"
+    reply="done"
+    IFS= read -r reply || reply="done"
+    case $reply in
+    done | Done | DONE)
+      GAVE_UP=1
+      echo "NOTE: going on without it: what the cartridges read so far hold is restored, and the rest is listed with the tapes that hold it." >&2
+      return 1
+      ;;
+    quit | Quit | QUIT | q | Q)
+      GAVE_UP=1
+      QUIT=1
+      echo "NOTE: stopping the restore at your request. The files restored and checked so far stay; a file tar had begun is removed." >&2
+      return 1
+      ;;
+    esac
+    if accept_cartridge "$1"; then return 0; fi
+  done
+}
+
+# SL_HERE[k]: the tape file of slice k on the cartridge in the drive, or
+# nothing. On the cartridge the run started on, the manifest's tape_position
+# at or before the seal's ended_after; on any other, the file its front index
+# lists with the slice's sha256 and size at or before ITS ended_after (R8).
+SL_HERE=()
+locate_here() {
+  local k p num pos
+  SL_HERE=()
+  if [ "$HOME_CART" = 1 ]; then
+    for ((k = 1; k <= NSL; k++)); do
+      p=${SL_POS[$k]:-}
+      if is_uint "$p" && on_tape "$((10#$p))"; then SL_HERE[$k]=$((10#$p)); fi
+    done
+    return 0
+  fi
+  [ -n "$FILES_TXT" ] && [ -f "$FILES_TXT" ] && is_uint "$ENDED_AFTER" || return 0
+  for ((k = 1; k <= NSL; k++)); do printf '%s|%s|%s\n' "$k" "${SL_ENC[$k]}" "${SL_SHAE[$k]}"; done >"$WORK/slices.want"
+  awk -F'|' -v end="$ENDED_AFTER" '
+    FILENAME == ARGV[1] { if ($2 == "data_slice" && $1 ~ /^[0-9]+$/ && $1 + 0 <= end + 0 && !(($4 "|" $3) in at)) at[$4 "|" $3] = $1; next }
+    { key = $3 "|" $2; if (key in at) print $1 "|" at[key] }
+  ' "$FILES_TXT" "$WORK/slices.want" >"$WORK/slices.here"
+  while IFS='|' read -r num pos; do SL_HERE[$num]=$pos; done <"$WORK/slices.here"
+}
+
 # ---- restoring whole units ----
 
 TAR_NAME=""
@@ -1188,6 +1475,13 @@ tar_init() {
 check_destination() {
   if [ -e "$TO" ] && [ ! -d "$TO" ]; then die "--to $(safe_str "$TO") exists and is not a directory"; fi
   if [ -d "$TO" ] && [ -n "$(ls -A -- "$TO" 2>/dev/null)" ] && [ "$OVERWRITE" = 0 ]; then
+    # A destination that holds the damaged-file list of an earlier run is one a
+    # later run from another tape adds to (whether it is the same unit and
+    # version is judged when the unit is read).
+    if [ -f "$TO/.tapectl-damaged-files.txt" ] || compgen -G "$TO/*/.tapectl-damaged-files.txt" >/dev/null 2>&1; then
+      TO_HELD_LIST=1
+      return 0
+    fi
     die "--to $(safe_str "$TO") is not empty. Restore into an empty or new directory, or give --overwrite to replace files that are there (to finish a restore that stopped)."
   fi
 }
@@ -1230,6 +1524,28 @@ feeder_fatal() {
   exit 1
 }
 
+# Slice $1 is not on the cartridge in the drive and none that holds it was
+# given: it is left out, and its files are listed. Said as it is: not on this
+# cartridge (never damage), by the manifest's position or by the hash.
+absent_slice() { # <slice number>
+  local k=$1 p why
+  p=${SL_POS[$k]:-}
+  if [ "$HOME_CART" = 1 ] && is_uint "$p" && [ -n "$ENDED_AFTER" ] && [ "$((10#$p))" -gt "$ENDED_AFTER" ]; then
+    why="file $((10#$p)) is after the end of this tape (it ended after file $ENDED_AFTER)"
+  elif [ "$HOME_CART" = 1 ]; then
+    why="this tape's plan does not hold it (it is on another cartridge)"
+  else
+    why="the cartridge in the drive does not hold it (it is on another cartridge)"
+  fi
+  if [ "$QUIT" = 1 ]; then
+    why="$why; you stopped the restore"
+  elif [ "$GAVE_UP" = 1 ]; then
+    why="$why; no cartridge that holds it was given"
+  fi
+  printf '%s\n' "$k" >>"$WORK/absent.slices"
+  mark_bad "$k" "$why"
+}
+
 # Check slice $1 from the tape and leave its plain cut in slice.plain, or mark
 # it bad and return 1. A slice is checked against the front index (hash of
 # the file as written), then against the manifest after decryption (length
@@ -1237,14 +1553,15 @@ feeder_fatal() {
 # decompressor says about its own exit status is the verdict; the lengths and
 # hashes are.
 prepare_slice() { # <slice number>
-  local k=$1 pos=${SL_POS[$1]} enc=${SL_ENC[$1]} arc="" got="" text="" why="" want_h
+  local k=$1 pos="${SL_HERE[$1]:-}" enc=${SL_ENC[$1]} arc="" got="" text="" why="" want_h rc=0
   rm -f "$WORK/slice.enc" "$WORK/slice.plain" "$WORK/age.rc"
-  if [ -z "$pos" ]; then
-    mark_bad "$k" "this tape's plan does not hold it (it is on another cartridge)"
-    return 1
+  FEEDING=$k
+  if [ -z "$pos" ] && [ "$QUIT" = 0 ]; then
+    # The cartridge in the drive does not hold it: ask for the one that does.
+    if swap_for "$k"; then pos="${SL_HERE[$k]:-}"; fi
   fi
-  if ! on_tape "$pos"; then
-    mark_bad "$k" "file $pos is after the end of this tape (it ended after file $ENDED_AFTER)"
+  if [ -z "$pos" ]; then
+    absent_slice "$k"
     return 1
   fi
   if [ "$(file_type_at "$pos" "$FILES_TXT")" != data_slice ] ||
@@ -1312,7 +1629,7 @@ prepare_slice() { # <slice number>
 # stopped reading.
 send_slice() {
   local rc=0
-  cat "$WORK/slice.plain" || rc=$?
+  cat "$WORK/slice.plain" >&4 || rc=$?
   rm -f "$WORK/slice.plain"
   return "$rc"
 }
@@ -1341,10 +1658,16 @@ feed_from() { # <slice number>
         local j
         if [ "$k" -eq "$a" ]; then
           # The run's first slice is bad: the member never begins.
-          for ((j = a + 1; j <= b; j++)); do mark_bad "$j" "part of the long member whose first slice is bad"; done
+          for ((j = a + 1; j <= b; j++)); do
+            mark_bad "$j" "part of the long member whose first slice is bad"
+            if grep -x "$a" "$WORK/absent.slices" >/dev/null 2>&1; then printf '%s\n' "$j" >>"$WORK/absent.slices"; fi
+          done
           k=$b
         else
-          for ((j = k + 1; j <= b; j++)); do mark_bad "$j" "part of a long member with a bad piece"; done
+          for ((j = k + 1; j <= b; j++)); do
+            mark_bad "$j" "part of a long member with a bad piece"
+            if grep -x "$k" "$WORK/absent.slices" >/dev/null 2>&1; then printf '%s\n' "$j" >>"$WORK/absent.slices"; fi
+          done
           echo "resume $((b + 1)) $a" >"$WORK/feed.state"
           printf '%s\n' "$CUR" >"$WORK/feed.cur"
           return 0
@@ -1442,11 +1765,76 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
   CHECK_FAILED=$(wc -l <"$out" | tr -d ' ')
 }
 
-# Extract one tar run's stream from our standard input.
+# Extract one tar run's stream from our standard input. It runs as a process
+# substitution (tar_open), so a signal for it is answered with an rc file the
+# waiting shell can read.
 tar_extract() { # <destination>
   local rc=0
+  trap 'echo 143 >"$WORK/tar.rc"; exit 143' TERM HUP INT
   tar -x -f - -C "$1" ${TAR_FLAGS[@]+"${TAR_FLAGS[@]}"} 2>"$WORK/tar.err" || rc=$?
   echo "$rc" >"$WORK/tar.rc"
+}
+
+# One tar run takes its input on fd 4, written by this shell: the prompt for a
+# cartridge must be read here (a trap waits for a foreground pipeline, so a
+# prompt read in the left side of one would not answer a signal), and what a
+# run learns of the cartridge in the drive must stay here. No FIFO file is
+# made, and no process id is remembered.
+wait_tar() { # [tenths of a second to wait]
+  local n=0 max=${1:-6000}
+  until [ -e "$WORK/tar.rc" ]; do
+    sleep 0.1 2>/dev/null || sleep 1
+    n=$((n + 1))
+    if [ "$n" -ge "$max" ]; then
+      warn "tar did not report its end; going on."
+      return 0
+    fi
+  done
+}
+
+tar_open() { # <destination>
+  rm -f "$WORK/tar.rc" "$WORK/tar.err"
+  exec 4> >(tar_extract "$1")
+  TAR_OPEN=1
+}
+
+tar_close() { # [tenths of a second to wait for tar]
+  [ "$TAR_OPEN" = 1 ] || return 0
+  exec 4>&-
+  TAR_OPEN=0
+  wait_tar "${1:-6000}"
+}
+
+# A signal, or a failure, while a unit is being fed: the member tar was
+# extracting may be partial. Every regular member whose slices include the
+# slice being prepared or fed is looked at, and one that is not whole (its
+# length or its sha256 differs from the table) is removed; a file that is
+# whole stays, so a file an earlier run restored and checked is never lost.
+scrub_inflight() {
+  [ -n "$INFLIGHT_TABLE" ] && [ -f "$INFLIGHT_TABLE" ] && [ -n "$WORK" ] && [ -f "$WORK/slices.off" ] || return 0
+  [ "$FEEDING" -gt 0 ] || return 0
+  local sz sha esc f
+  while IFS=$'\t' read -r sz sha esc; do
+    [ -n "$esc" ] || continue
+    unesc "$esc"
+    f="$INFLIGHT_DEST/$REPLY"
+    [ -f "$f" ] || continue
+    if [ "$(wc -c <"$f" | tr -d ' ')" != "$sz" ] || [ "$(sha_of_file "$f" 2>/dev/null || true)" != "$sha" ]; then
+      rm -f -- "$f" 2>/dev/null || true
+    fi
+  done <<EOF
+$(awk -F'\t' -v at="$FEEDING" '
+    FILENAME == ARGV[1] { n++; off[$1 + 0] = $2 + 0; sz[$1 + 0] = $3 + 0; next }
+    /^#/ { next }
+    $1 == "f" {
+      b = $2 + 0
+      if (b > at) next
+      last = b
+      while (last < n && off[last] + sz[last] < $4 + 0) last++
+      if (last >= at) print $5 "\t" $6 "\t" $7
+    }
+  ' "$WORK/slices.off" "$INFLIGHT_TABLE")
+EOF
 }
 
 DAMAGED_TOTAL=0
@@ -1469,6 +1857,14 @@ unit_open() { # <chosen row>
   fi
   load_slices "$U_POS" "$U_IDX"
   [ "$NSL" -gt 0 ] || die "the manifest lists no slice for unit $(safe_str "$U_NAME")"
+  # Where each slice's cut begins in the stream, for the cleanup of a member
+  # a signal left partial.
+  local k
+  for ((k = 1; k <= NSL; k++)); do printf '%s\t%s\t%s\n' "$k" "${SL_OFF[$k]}" "${SL_SIZE[$k]}"; done >"$WORK/slices.off"
+  : >"$WORK/absent.slices"
+  FEEDING=0
+  GAVE_UP=0
+  locate_here
 }
 
 # The damaged-file list of a unit's restored directory (volume-format-v3.md
@@ -1496,11 +1892,74 @@ print_id_map() { # <envelope position> <id map name>
   fi
 }
 
+# The first line of the damaged-file list of the unit and version open.
+list_header() {
+  printf '#tapectl-damaged-files\t1\tunit=%s\tuuid=%s\tversion=%s' "$U_NAME" "$U_UUID" "$U_VER"
+}
+
+# What a unit read in more than one run, or with some of its slices on other
+# cartridges, loses (measured, T0.7 and #567): said once when it happens.
+say_run_limits() {
+  note "A unit read in more than one run has two limits, both measured: a folder's modification time is that of the last run that touched the folder, and a hard-linked name whose first name was not read is not made until that name is (the repair makes it once the tape that holds the first name has been read)."
+}
+
+# The slices left out because they were on another cartridge: where the rest
+# of the unit is, from this tape's MANIFEST (which gives those slices no
+# position here) and the index in its envelope (which names the tapes), and the
+# hard-linked names whose first name is among them.
+report_absent() { # <damaged paths file>
+  [ -s "$WORK/absent.slices" ] || return 0
+  local ranges nh
+  ranges=$(sort -n -u "$WORK/absent.slices" | awk '
+    { n = $1 + 0; if (have && n == last + 1) { last = n; next } if (have) printf "%s%s", (c++ ? ", " : ""), (first == last ? first : first "-" last); first = last = n; have = 1 }
+    END { if (have) printf "%s%s", (c++ ? ", " : ""), (first == last ? first : first "-" last) }')
+  say "NOT ON THIS CARTRIDGE: slices $ranges of $NSL of unit $(safe_str "$U_NAME") (version $U_VER). Read from this tape's MANIFEST: it gives those slices no place on this tape, or a place after the end its seal marker states. Their files are on the damaged-file list."
+  if holders_of; then
+    say "The index in this tape's envelope names these other tapes as holding the unit, with the slices each holds:"
+    print_holders "  "
+    # The slices no named tape holds.
+    local none
+    none=$(sort -n -u "$WORK/absent.slices" | U_H="$WORK/holders.txt" awk '
+      BEGIN { while ((getline l < ENVIRON["U_H"]) > 0) { split(l, f, "\t"); for (i = f[2] + 0; i <= f[3] + 0; i++) held[i] = 1 } }
+      { if (!(($1 + 0) in held)) printf "%s%s", (c++ ? ", " : ""), $1 }')
+    if [ -n "$none" ]; then
+      say "No tape the index names holds slice(s) $none (an index never names a tape written after its own tape): $0 --where $(safe_str "$U_NAME") --key KEY on the newest tape you hold names them."
+    fi
+  elif [ -f "$WORK/env.$U_POS/index/units.tsv" ]; then
+    say "No tape the index in this tape's envelope names holds the slices (an index never names a tape written after its own tape): $0 --where $(safe_str "$U_NAME") --key KEY on the newest tape you hold names them."
+  else
+    say "This tape's envelope carries no index, so no tape is named: $0 --where $(safe_str "$U_NAME") --key KEY on the newest tape you hold may name them."
+  fi
+  # Hard-linked names whose first name lies in a slice not read.
+  nh=$(awk -F'\t' '
+    FILENAME == ARGV[1] { gone[$1 + 0] = 1; next }
+    FILENAME == ARGV[2] { want[$0] = 1; next }
+    /^#/ { next }
+    { at[$7] = $2 + 0; if ($1 == "h") { hp[++n] = $7; ht[n] = $8 } }
+    END { for (i = 1; i <= n; i++) if ((hp[i] in want) && (ht[i] in at) && (at[ht[i]] in gone)) print hp[i] "\t" ht[i] "\t" at[ht[i]] }
+  ' "$WORK/absent.slices" "$1" "$U_TABLE" | head -n 20)
+  if [ -n "$nh" ]; then
+    say "Hard-linked names whose first name is in a slice that was not read (restored by the repair once that tape has been read):"
+    printf '%s\n' "$nh" | while IFS=$'\t' read -r hp ht sl; do
+      say "  $(visible_text "$hp") -> first name $(visible_text "$ht"), slice $sl"
+    done
+  fi
+  say_run_limits
+}
+
 restore_one() { # <chosen row> <destination>
   local dest=$2 table pos name ver uuid idm ns sb
   unit_open "$1"
   table=$U_TABLE pos=$U_POS name=$U_NAME ver=$U_VER uuid=$U_UUID idm=$U_IDM ns=$U_NS sb=$U_SB
   mkdir -p -- "$dest" || die "cannot create $(safe_str "$dest")"
+  local earlier="$dest/.tapectl-damaged-files.txt"
+  if [ -f "$earlier" ] && [ "$(head -n 1 "$earlier" 2>/dev/null || true)" = "$(list_header)" ]; then
+    continue_unit "$dest"
+    return 0
+  fi
+  if [ "$OVERWRITE" = 0 ] && { { [ "$dest" != "$TO" ] && [ -n "$(ls -A -- "$dest" 2>/dev/null)" ]; } || { [ "$dest" = "$TO" ] && [ "$TO_HELD_LIST" = 1 ]; }; }; then
+    die "$(safe_str "$dest") is not empty, and the damaged-file list in it is not this unit's and version's. Restore into an empty or new directory, or give --overwrite to replace files that are there."
+  fi
   # Space: the unit's files, and one slice twice (the cut, and its plain form).
   local files_bytes biggest=0 k
   files_bytes=$(awk -F'\t' '!/^#/ && $1 == "f" { s += $5 } END { printf "%.0f", s }' "$table")
@@ -1512,12 +1971,14 @@ restore_one() { # <chosen row> <destination>
   say ">>> Unit $(safe_str "$name") version $ver: $NSL slice(s), $sb bytes of stream, into $dest"
   : >"$WORK/bad.slices"
   rm -f "$WORK/fatal.flag"
+  INFLIGHT_DEST=$dest
+  INFLIGHT_TABLE=$table
   local resume=1 state="" tarrc partial_first
   while :; do
     rm -f "$WORK/feed.state" "$WORK/tar.rc" "$WORK/feed.cur"
-    {
-      { feed_from "$resume"; } || true
-    } | tar_extract "$dest"
+    tar_open "$dest"
+    feed_from "$resume" || true
+    tar_close
     if [ -e "$WORK/fatal.flag" ]; then exit 1; fi
     CUR=$(cat "$WORK/feed.cur" 2>/dev/null || true)
     state=$(cat "$WORK/feed.state" 2>/dev/null || echo "gone ?")
@@ -1568,6 +2029,7 @@ restore_one() { # <chosen row> <destination>
   else
     note "--no-file-check: the restored files were not checked against the file table."
   fi
+  INFLIGHT_TABLE=""
   sort -u "$WORK/left.out" "$WORK/failed.paths" >"$WORK/damaged.paths"
   local ndam
   ndam=$(wc -l <"$WORK/damaged.paths" | tr -d ' ')
@@ -1576,11 +2038,45 @@ restore_one() { # <chosen row> <destination>
     write_damaged_list "$dest" "$name" "$uuid" "$ver" "$WORK/damaged.paths"
     print_damaged "$WORK/damaged.paths" "$ndam" "$list"
     DAMAGED_TOTAL=$((DAMAGED_TOTAL + ndam))
+    report_absent "$WORK/damaged.paths"
   else
     rm -f -- "$list"
   fi
   print_id_map "$pos" "$idm"
   UNITS_DONE=$((UNITS_DONE + 1))
+}
+
+# A destination that holds the damaged-file list of this unit and version is an
+# earlier run's: this run adds to it. Only the rows this tape holds whole that
+# do not already pass their sha256 are restored (the members are fed one by
+# one, by their offsets, as a path restore feeds them), so a file that passes
+# is never rewritten, and the list follows the merge rule of the repair.
+continue_unit() { # <destination>
+  local dest=$1 k
+  note "$(safe_str "$dest") holds the damaged-file list of an earlier run of unit $(safe_str "$U_NAME") version $U_VER: this run adds to it. Only the files this tape holds whole that do not already pass the table's sha256 are restored; a file that passes is left alone."
+  GAVE_UP=1
+  : >"$WORK/failed.paths"
+  if [ "$NO_FILE_CHECK" = 0 ]; then
+    file_check "$U_TABLE" "$dest" "$WORK/failed.paths"
+  fi
+  # A folder, a link or a special file is wanted when it is not there.
+  awk -F'\t' '!/^#/ && $1 != "f" && $1 != "h" { print $7 }' "$U_TABLE" >"$WORK/other.rows"
+  : >"$WORK/other.missing"
+  local esc
+  while IFS= read -r esc; do
+    unesc "$esc"
+    if [ ! -e "$dest/$REPLY" ] && [ ! -L "$dest/$REPLY" ]; then printf '%s\n' "$esc" >>"$WORK/other.missing"; fi
+  done <"$WORK/other.rows"
+  sort -u "$WORK/failed.paths" "$WORK/other.missing" >"$WORK/want.paths"
+  if [ ! -s "$WORK/want.paths" ]; then
+    rm -f -- "$dest/.tapectl-damaged-files.txt"
+    say "File check: every file the unit's table lists is here and passes; the damaged-file list in $dest is removed: nothing is left to restore."
+    print_id_map "$U_POS" "$U_IDM"
+    UNITS_DONE=$((UNITS_DONE + 1))
+    return 0
+  fi
+  say_run_limits
+  restore_paths "$dest" continue
 }
 
 # ---- named paths and the one repair (volume-format-v3.md 7.2 "One file", 1.7) ----
@@ -1603,8 +2099,7 @@ NM=0
 # Is slice $1 on this tape whole: planned here and at or before the seal's
 # ended_after (a range holds some of a unit's slices, a short tape fewer)?
 slice_here() { # <slice number>
-  local p=${SL_POS[$1]:-}
-  is_uint "$p" && on_tape "$((10#$p))"
+  [ -n "${SL_HERE[$1]:-}" ]
 }
 
 # Load the rows of $1 (table rows, stream order) as the members to feed, each
@@ -1628,8 +2123,12 @@ load_members() { # <rows file>
       [ "$last" -lt "$NSL" ] || die "the file table of unit $(safe_str "$U_NAME") puts $(safe_str "$path") past the last slice. The envelope is damaged; try another copy of this tape."
       last=$((last + 1))
     done
+    # With no cartridge to ask for, a member whose slices are not all here is
+    # listed now; otherwise it is fed, and the cartridge is asked for.
     here=1
-    for ((k = slice; k <= last; k++)); do slice_here "$k" || here=0; done
+    if [ "$GAVE_UP" = 1 ]; then
+      for ((k = slice; k <= last; k++)); do slice_here "$k" || here=0; done
+    fi
     if [ "$here" = 0 ]; then
       printf '%s\n' "$path" >>"$WORK/absent.paths"
       continue
@@ -1670,7 +2169,7 @@ emit_part() { # <member> <slice>
   to=${M_END[$j]}
   [ "$from" -ge "$off" ] || from=$off
   [ "$to" -le $((off + SL_SIZE[k])) ] || to=$((off + SL_SIZE[k]))
-  { tail -c +$((from - off + 1)) "$WORK/slice.plain" || true; } | head -c $((to - from)) || rc=$?
+  { tail -c +$((from - off + 1)) "$WORK/slice.plain" || true; } | head -c $((to - from)) >&4 || rc=$?
   return "$rc"
 }
 
@@ -1767,6 +2266,30 @@ merge_damaged_list() { # <destination> <requested and brought paths file>
   fi
 }
 
+# A hard-linked name whose member was not read (its slices are on a cartridge
+# not given) but whose first name is here: the name is made from the first
+# name. A hard link has no data of its own, so nothing is lost by it; the
+# per-file check that follows judges the result.
+make_links() { # <destination>
+  local dest=$1 kind p t
+  : >"$WORK/linked.paths"
+  [ -s "$WORK/wanted.rows" ] || return 0
+  while IFS=$'\t' read -r kind _ _ _ _ _ p t; do
+    [ "$kind" = h ] || continue
+    unesc "$p"
+    p=$REPLY
+    unesc "$t"
+    t=$REPLY
+    if [ -e "$dest/$p" ] || [ -L "$dest/$p" ] || [ ! -f "$dest/$t" ]; then continue; fi
+    mkdir -p -- "$(dirname -- "$dest/$p")" 2>/dev/null || continue
+    if ln -- "$dest/$t" "$dest/$p" 2>/dev/null; then
+      note "made the hard-linked name $(visible_text "$p") from its first name $(visible_text "$t") (its own member was not read)."
+      esc "$p"
+      printf '%s\n' "$REPLY" >>"$WORK/linked.paths"
+    fi
+  done <"$WORK/wanted.rows"
+}
+
 # Restore the paths of $WORK/want.paths from the unit open (unit_open) into
 # $1, by the file table; $2 is "repair" for --paths-from, "path" for --path.
 restore_paths() { # <destination> <how>
@@ -1798,6 +2321,16 @@ restore_paths() { # <destination> <how>
   if [ "$nm" -gt 0 ]; then
     note "$nm of the paths is a folder: a folder names only its own entry (its mode, owner and times), never what lies under it. Name each file under it to restore those."
   fi
+  if [ "$how" = continue ] && [ -s "$WORK/brought.paths" ]; then
+    # A first name that is already here and passes is not fed again.
+    : >"$WORK/skip.paths"
+    while IFS= read -r p; do
+      unesc "$p"
+      if [ -f "$dest/$REPLY" ]; then printf '%s\n' "$p" >>"$WORK/skip.paths"; fi
+    done <"$WORK/brought.paths"
+    awk -F'\t' 'FILENAME == ARGV[1] { skip[$0] = 1; next } !(($7 "") in skip)' "$WORK/skip.paths" "$WORK/wanted.rows" >"$WORK/wanted.rows.new"
+    mv "$WORK/wanted.rows.new" "$WORK/wanted.rows"
+  fi
   load_members "$WORK/wanted.rows"
   files_bytes=$(awk -F'\t' '$1 == "f" { s += $5 } END { printf "%.0f", s }' "$WORK/wanted.rows")
   for ((k = 1; k <= NSL; k++)); do
@@ -1815,12 +2348,14 @@ restore_paths() { # <destination> <how>
   : >"$WORK/bad.slices"
   : >"$WORK/left.out"
   rm -f "$WORK/fatal.flag"
+  INFLIGHT_DEST=$dest
+  INFLIGHT_TABLE=$U_TABLE
   local resume=1 state="" tarrc
   while [ "$resume" -le "$NM" ]; do
     rm -f "$WORK/feed.state" "$WORK/tar.rc" "$WORK/feed.cur"
-    {
-      { feed_members "$resume"; } || true
-    } | tar_extract "$dest"
+    tar_open "$dest"
+    feed_members "$resume" || true
+    tar_close
     if [ -e "$WORK/fatal.flag" ]; then exit 1; fi
     CUR=$(cat "$WORK/feed.cur" 2>/dev/null || true)
     state=$(cat "$WORK/feed.state" 2>/dev/null || echo "gone ?")
@@ -1847,12 +2382,16 @@ restore_paths() { # <destination> <how>
       ;;
     esac
   done
+  if [ -s "$WORK/absent.slices" ] && [ ! -s "$WORK/absent.paths" ]; then
+    note "$(wc -l <"$WORK/left.out" | tr -d ' ') of the paths lie in slices this tape does not hold whole (a unit across cartridges, or a tape that ended early): they were not read and stay on the list."
+  fi
   local nbad
   nbad=$(wc -l <"$WORK/bad.slices" | tr -d ' ')
   if [ "$nbad" -gt 0 ]; then
     warn "$nbad slice(s) of unit $(safe_str "$U_NAME") were left out; the paths in them are listed as damaged:"
     awk -F'|' '{ printf "         slice %s: %s\n", $1, $2 }' "$WORK/bad.slices" >&2
   fi
+  make_links "$dest"
   : >"$WORK/failed.paths"
   if [ "$NO_FILE_CHECK" = 0 ]; then
     file_check "$WORK/wanted.rows" "$dest" "$WORK/failed.paths"
@@ -1866,7 +2405,15 @@ restore_paths() { # <destination> <how>
   else
     note "--no-file-check: the restored files were not checked against the file table."
   fi
-  sort -u "$WORK/left.out" "$WORK/failed.paths" "$WORK/absent.paths" >"$WORK/damaged.paths"
+  INFLIGHT_TABLE=""
+  # A name made from its first name is whole if the check passed it (a name it
+  # failed is in failed.paths and stays).
+  sort -u "$WORK/left.out" "$WORK/absent.paths" >"$WORK/notread.paths"
+  if [ -s "$WORK/linked.paths" ]; then
+    awk 'FILENAME == ARGV[1] { made[$0] = 1; next } !(($0 "") in made)' "$WORK/linked.paths" "$WORK/notread.paths" >"$WORK/notread.new"
+    mv "$WORK/notread.new" "$WORK/notread.paths"
+  fi
+  sort -u "$WORK/notread.paths" "$WORK/failed.paths" >"$WORK/damaged.paths"
   ndam=$(wc -l <"$WORK/damaged.paths" | tr -d ' ')
   sort -u "$WORK/want.sorted" "$WORK/brought.paths" >"$WORK/asked.paths"
   local merged=0
@@ -1879,7 +2426,8 @@ restore_paths() { # <destination> <how>
       head -n 41 "$WORK/damaged.paths" | sed 's/^/  /'
     fi
     DAMAGED_TOTAL=$((DAMAGED_TOTAL + ndam))
-  elif [ "$how" = repair ] && [ "$merged" = 0 ]; then
+    report_absent "$WORK/damaged.paths"
+  elif [ "$how" != path ] && [ "$merged" = 0 ]; then
     if [ "$LIST_LEFT" -eq 0 ]; then
       say "The damaged-file list in $dest is removed: nothing is left to repair."
     else
@@ -1995,10 +2543,15 @@ do_restore() {
     while IFS= read -r row <&3; do
       IFS='|' read -r _ _ name _ <<<"$row"
       if [ "$n" -eq 1 ]; then dest=$TO; else dest="$TO/$name"; fi
+      [ "$QUIT" = 0 ] || break
       restore_one "$row" "$dest"
     done 3<"$WORK/chosen.txt"
   fi
   say "The tar used: ${TAR_NAME:-unknown}. What it does not restore: $TAR_LOSES."
+  if [ "$QUIT" = 1 ]; then
+    say "RESTORE STOPPED at your request: the files restored and checked so far stay, a file tar had begun was removed, and what was left out is on the damaged-file list."
+    return 1
+  fi
   if [ "$DAMAGED_TOTAL" -gt 0 ]; then
     say "RESTORE INCOMPLETE: $DAMAGED_TOTAL path(s) are damaged or left out; restore them from another copy (the list is the one repair: give it to --paths-from on a tape that holds the same version)."
     return 1

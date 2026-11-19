@@ -32,7 +32,7 @@ use rusqlite::{params, Connection};
 
 use tapectl::config::{Config, TapectlPaths};
 use tapectl::db;
-use tapectl::policy::coverage::IndexThisTape;
+use tapectl::policy::coverage::{IndexRun, IndexThisTape};
 use tapectl::store::{MemStore, Tier};
 use tapectl::volume::build::{self, BuildInputs, TenantInfo};
 use tapectl::volume::format;
@@ -144,6 +144,21 @@ pub struct Shape {
     pub index_edit: Option<fn(&index::IndexFiles)>,
     /// Build the tape with no cross-volume index at all.
     pub no_index: bool,
+    /// Write the units across cartridges as a real write plans them
+    /// (`staged_build_units_spanning`, `allow_spanning` set on every unit).
+    pub span: Option<Span>,
+}
+
+/// A unit written across cartridges (T4.12): one tape for each entry of
+/// `warns`, each planned from what the earlier tapes' confirms recorded.
+#[derive(Clone)]
+pub struct Span {
+    /// `[defaults] min_copies`: 1 gives each slice one copy over the series,
+    /// 2 gives item 93's two copies.
+    pub min_copies: i32,
+    /// For each tape in order, the slice of its OWN plan (0-based) the
+    /// drive's early warning comes in, or `None` when the tape seals full.
+    pub warns: Vec<Option<usize>>,
 }
 
 /// What a second staging of the first unit changes (#528).
@@ -171,6 +186,7 @@ impl Shape {
             restage: Restage::None,
             index_edit: None,
             no_index: false,
+            span: None,
         }
     }
     /// One big unit of tenant A, compressed.
@@ -184,6 +200,7 @@ impl Shape {
             restage: Restage::None,
             index_edit: None,
             no_index: false,
+            span: None,
         }
     }
 }
@@ -205,6 +222,11 @@ pub struct Tape {
     pub volume_uuid: String,
     /// The unit's uuid of each unit, by name.
     pub unit_uuids: BTreeMap<String, String>,
+    /// For each unit the tape's plan holds a slice of: the first and last
+    /// slice number of the plan's run, and of the run the seal covers (what
+    /// the tape holds), `(unit, planned first, planned last, held first,
+    /// held last)`; held is `(0, 0)` when no planned slice is on the tape.
+    pub runs: Vec<(String, i64, i64, i64, i64)>,
     _home: std::sync::Arc<tempfile::TempDir>,
 }
 
@@ -222,6 +244,8 @@ struct Home {
     paths: TapectlPaths,
     config: Config,
     sources: PathBuf,
+    /// Units may span (`allow_spanning`).
+    span: bool,
 }
 
 /// What writing a tape needs besides the catalog.
@@ -320,6 +344,12 @@ fn make_unit(h: &Home, name: &str, tenant: &'static str, big: bool, seed: u32) -
         None,
     )
     .unwrap();
+    if h.span {
+        let dotfile = dir.join(".tapectl-unit.toml");
+        let mut d = tapectl::unit::dotfile::read_dotfile(&dotfile).unwrap();
+        d.allow_spanning = Some(true);
+        tapectl::unit::dotfile::write_dotfile(&dotfile, &d).unwrap();
+    }
     let snapshot = tapectl::staging::snapshot_create(&h.conn, name, &h.config).unwrap();
     let stage_set_id = tapectl::staging::stage_create(&h.conn, &h.paths, &h.config, snapshot, true)
         .unwrap_or_else(|e| panic!("stage create {name}: {e}"));
@@ -349,6 +379,7 @@ fn write_tape(
     units: &[UnitTruth],
     bu: Vec<build::BuildUnit>,
     n: usize,
+    warn: Option<usize>,
 ) -> Tape {
     let label = label_of(n);
     let volume_uuid = volume_uuid_of(n);
@@ -357,7 +388,19 @@ fn write_tape(
     let idx = if shape.no_index {
         None
     } else {
-        let idx = index::generate_files(
+        // As `index_runs` does for a write: a unit that may span states the
+        // run its plan holds, any other the whole set.
+        let runs: Vec<IndexRun> = bu
+            .iter()
+            .map(|u| match (&u.span, u.slices.first(), u.slices.last()) {
+                (Some(_), Some(first), Some(last)) => IndexRun {
+                    stage_set_id: u.stage_set_id,
+                    slices: Some((first.slice_number, last.slice_number)),
+                },
+                _ => IndexRun::whole(u.stage_set_id),
+            })
+            .collect();
+        let idx = index::generate_files_for_runs(
             &h.conn,
             &IndexThisTape {
                 label: &label,
@@ -365,7 +408,7 @@ fn write_tape(
                 cartridge_serial: SERIAL,
                 generation: "LTO-6",
             },
-            &ids,
+            &runs,
             &work.path().join("index"),
         )
         .unwrap();
@@ -432,7 +475,7 @@ fn write_tape(
         stage_sets_lacking_escrow: None,
     };
     let mut store = MemStore::new(BS as usize);
-    if let Some(k) = shape.warning_in_slice.filter(|_| n == shape.warn_tape) {
+    if let Some(k) = warn {
         let slices: Vec<(i32, u64)> = built
             .layout
             .entries
@@ -488,6 +531,36 @@ fn write_tape(
     drop(work);
     drop(session_dir);
     let files = store.files.clone();
+    let end = files.len() - 2;
+    let on_tape: Vec<usize> = entries
+        .iter()
+        .filter(|e| e.type_label == "data_slice" && (e.position as usize) <= end)
+        .map(|e| e.position as usize)
+        .collect();
+    let mut runs = Vec::new();
+    let mut at = 0usize;
+    let all_slices: Vec<usize> = entries
+        .iter()
+        .filter(|e| e.type_label == "data_slice")
+        .map(|e| e.position as usize)
+        .collect();
+    for u in &bu {
+        let nums: Vec<i64> = u.slices.iter().map(|s| s.slice_number).collect();
+        let mut held = Vec::new();
+        for (i, num) in nums.iter().enumerate() {
+            if on_tape.contains(&all_slices[at + i]) {
+                held.push(*num);
+            }
+        }
+        at += nums.len();
+        runs.push((
+            u.unit_name.clone(),
+            *nums.first().unwrap(),
+            *nums.last().unwrap(),
+            held.first().copied().unwrap_or(0),
+            held.last().copied().unwrap_or(0),
+        ));
+    }
     let mut unit_uuids = BTreeMap::new();
     for u in units {
         let uuid: String = h
@@ -510,6 +583,7 @@ fn write_tape(
         label,
         volume_uuid,
         unit_uuids,
+        runs,
         _home: ctx.tmp.clone(),
     }
 }
@@ -537,6 +611,9 @@ impl Tape {
         config.staging.directory = staging.to_string_lossy().into_owned();
         config.defaults.slice_size = SLICE.to_string();
         config.defaults.compression = shape.compression.to_string();
+        if let Some(sp) = &shape.span {
+            config.defaults.min_copies = sp.min_copies;
+        }
         tapectl::tenant::add_tenant(&conn, &paths, OPERATOR, None, true).unwrap();
         for tenant in [TENANT_A, TENANT_B] {
             tapectl::tenant::add_tenant(&conn, &paths, tenant, None, false).unwrap();
@@ -547,6 +624,7 @@ impl Tape {
             paths,
             config,
             sources,
+            span: shape.span.is_some(),
         };
         let mut units = Vec::new();
         for (i, (name, tenant, big)) in shape.units.iter().enumerate() {
@@ -566,12 +644,22 @@ impl Tape {
         let mut tapes = Vec::new();
         match shape.restage {
             Restage::None => {
-                for n in 0..shape.copies.max(1) {
-                    tapes.push(write_tape(&h, &ctx, shape, &units, all.clone(), n));
+                if let Some(sp) = &shape.span {
+                    for (n, warn) in sp.warns.iter().enumerate() {
+                        let bu = write::staged_build_units_spanning(&h.conn, &h.config)
+                            .expect("the spanning selection");
+                        tapes.push(write_tape(&h, &ctx, shape, &units, bu, n, *warn));
+                    }
+                } else {
+                    for n in 0..shape.copies.max(1) {
+                        let warn = shape.warning_in_slice.filter(|_| n == shape.warn_tape);
+                        tapes.push(write_tape(&h, &ctx, shape, &units, all.clone(), n, warn));
+                    }
                 }
             }
             r => {
-                tapes.push(write_tape(&h, &ctx, shape, &units, all.clone(), 0));
+                let warn0 = shape.warning_in_slice.filter(|_| shape.warn_tape == 0);
+                tapes.push(write_tape(&h, &ctx, shape, &units, all.clone(), 0, warn0));
                 // The first staging is released, as a write releases it; the
                 // second is made after a change, as `stage create` makes it.
                 let first = &shape.units[0];
@@ -627,7 +715,8 @@ impl Tape {
                 let mut again = write::staged_build_units(&h.conn).expect("the staged selection");
                 again.retain(|u| u.stage_set_id == set);
                 assert_eq!(again.len(), 1, "the second staging alone");
-                tapes.push(write_tape(&h, &ctx, shape, &truth, again, 1));
+                let warn1 = shape.warning_in_slice.filter(|_| shape.warn_tape == 1);
+                tapes.push(write_tape(&h, &ctx, shape, &truth, again, 1, warn1));
             }
         }
         drop(h);
@@ -695,7 +784,7 @@ while [ $# -gt 0 ]; do
 done
 echo "mt $op${n:+ $n}" >>"$T/ops"
 pos=$(cat "$T/pos")
-count=$(ls "$D" | wc -l)
+count=$(ls "$D/" | wc -l)
 case "$op" in
   rewind) echo 0 >"$T/pos" ;;
   eod | eom) [ -z "${FAKE_MT_NO_EOD:-}" ] || exit 2; echo "$count" >"$T/pos" ;;
@@ -767,6 +856,15 @@ case "$pos" in
     if [ -n "$of" ]; then printf 'NOT-A-FILE-START' >"$of"; else printf 'NOT-A-FILE-START'; fi
     exit 0 ;;
 esac
+if [ -n "${FAKE_DD_SLOW:-}" ] && [ "${FAKE_DD_SLOW%%:*}" = "$pos" ]; then
+  : >"$T/dd.slow"
+  sleep "${FAKE_DD_SLOW#*:}"
+fi
+if [ -e "$D/.fail.$pos" ]; then
+  echo "dd: error reading '/dev/nst0': Input/output error" >&2
+  echo "?" >"$T/pos"
+  exit 1
+fi
 if [ "${FAKE_DD_FAIL:-none}" = "$pos" ]; then
   echo "dd: error reading '/dev/nst0': Input/output error" >&2
   echo "?" >"$T/pos"
@@ -858,6 +956,81 @@ fn write_exec(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// The line RESTORE.sh prints when it waits for the cartridge that holds the
+/// next slice it needs.
+pub const PROMPT: &str = "Load the cartridge that holds slice ";
+
+/// A run in progress (`Heir::spawn`).
+pub struct Running {
+    pub child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    out_path: PathBuf,
+    asked: usize,
+}
+
+impl Running {
+    /// Everything it has said so far, both streams.
+    pub fn text(&self) -> String {
+        fs::read_to_string(&self.out_path).unwrap_or_default()
+    }
+    pub fn type_line(&mut self, line: &str) {
+        use std::io::Write;
+        if let Some(w) = self.stdin.as_mut() {
+            let _ = writeln!(w, "{line}");
+            let _ = w.flush();
+        }
+    }
+    pub fn close_input(&mut self) {
+        self.stdin = None;
+    }
+    pub fn try_wait(&mut self) -> Option<i32> {
+        self.child
+            .try_wait()
+            .unwrap()
+            .map(|s| s.code().unwrap_or(-1))
+    }
+    /// Wait until the output holds `needle` the `n`-th time (at most `secs`).
+    pub fn wait_for(&mut self, needle: &str, n: usize, secs: u64) -> String {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            let t = self.text();
+            if t.matches(needle).count() >= n {
+                return t;
+            }
+            if self.try_wait().is_some() || std::time::Instant::now() > until {
+                panic!("waiting for {needle:?} x{n}:\n{t}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    /// Send `kill -SIG` to the script alone.
+    pub fn signal(&self, sig: &str) {
+        let st = Command::new("kill")
+            .args([format!("-{sig}"), self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(st.success(), "kill -{sig}");
+    }
+    /// Wait for the end (at most 60 s) and return what it said.
+    pub fn finish(&mut self) -> Out {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Some(code) = self.try_wait() {
+                return Out {
+                    code,
+                    stdout: self.text(),
+                    stderr: String::new(),
+                };
+            }
+            if std::time::Instant::now() > until {
+                let _ = self.child.kill();
+                panic!("still running:\n{}", self.text());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 /// What a run printed and how it ended.
 pub struct Out {
     pub code: i32,
@@ -887,12 +1060,186 @@ impl Heir {
         Heir::with_files(tape, tape.files.clone())
     }
 
+    /// A drive with `tapes[0]` loaded and every tape of the series on the
+    /// shelf (`load` puts one in the drive).
+    pub fn of_series(tapes: &[&Tape]) -> Heir {
+        let h = Heir::of(tapes[0]);
+        for t in &tapes[1..] {
+            h.shelve(&t.label, &t.files);
+        }
+        h
+    }
+
+    /// Put a cartridge of `files` on the shelf under `name`, block-padded.
+    pub fn shelve(&self, name: &str, files: &[Vec<u8>]) -> PathBuf {
+        let dir = self.root.path().join("cart").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        for (n, bytes) in files.iter().enumerate() {
+            let p = dir.join(n.to_string());
+            fs::write(&p, bytes).unwrap();
+            let blocks = bytes.len().div_ceil(BLOCK).max(1);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_len((blocks * BLOCK) as u64)
+                .unwrap();
+        }
+        dir
+    }
+
+    /// A shelved cartridge with no file on it.
+    pub fn shelve_blank(&self, name: &str) -> PathBuf {
+        self.shelve(name, &[])
+    }
+
+    /// Copy the shelved cartridge `from` as `to`.
+    pub fn copy_cart(&self, from: &str, to: &str) -> PathBuf {
+        let src = self.root.path().join("cart").join(from);
+        let dst = self.root.path().join("cart").join(to);
+        fs::create_dir_all(&dst).unwrap();
+        for e in fs::read_dir(&src).unwrap() {
+            let e = e.unwrap();
+            fs::copy(e.path(), dst.join(e.file_name())).unwrap();
+        }
+        dst
+    }
+
+    /// Make the read of file `n` of the shelved cartridge `name` fail with an
+    /// I/O error, as a cartridge the drive cannot read does.
+    pub fn fail_file(&self, name: &str, n: usize) {
+        fs::write(
+            self.root
+                .path()
+                .join("cart")
+                .join(name)
+                .join(format!(".fail.{n}")),
+            "",
+        )
+        .unwrap();
+    }
+
+    /// The path of file `n` of the shelved cartridge `name`.
+    pub fn cart_file(&self, name: &str, n: usize) -> PathBuf {
+        self.root.path().join("cart").join(name).join(n.to_string())
+    }
+
+    /// The cartridge in the drive changes to `name`: the head is at the
+    /// start of its first file, as after a load.
+    pub fn load(&self, name: &str) {
+        let r = self.root.path();
+        let files = r.join("files");
+        let _ = fs::remove_file(&files);
+        std::os::unix::fs::symlink(r.join("cart").join(name), &files).unwrap();
+        fs::write(r.join("state/pos"), "0").unwrap();
+        use std::io::Write;
+        let mut ops = fs::OpenOptions::new()
+            .append(true)
+            .open(r.join("state/ops"))
+            .unwrap();
+        writeln!(ops, "swap").unwrap();
+    }
+
+    /// The name of the cartridge in the drive.
+    pub fn loaded(&self) -> String {
+        fs::read_link(self.root.path().join("files"))
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The tape files `dd` read, one list for each cartridge of the run (a
+    /// `swap` in the log starts the next).
+    pub fn reads_by_cartridge(&self) -> Vec<Vec<usize>> {
+        let mut out = vec![Vec::new()];
+        for l in self.ops() {
+            if l == "swap" {
+                out.push(Vec::new());
+            } else if let Some(n) = l.strip_prefix("dd ").and_then(|n| n.parse().ok()) {
+                out.last_mut().unwrap().push(n);
+            }
+        }
+        out
+    }
+
+    /// Start the script with its standard input a pipe the test writes to;
+    /// both its streams go to one file, so the order is the script's own.
+    pub fn spawn(&self, args: &[&str], envs: &[(&str, &str)]) -> Running {
+        let out_path = self.root.path().join("state/run.out");
+        let out = fs::File::create(&out_path).unwrap();
+        let mut c = Command::new("bash");
+        c.arg(&self.script)
+            .args(args)
+            .env_clear()
+            .env("PATH", self.bin())
+            .env("HOME", self.root.path())
+            .env("TMPDIR", self.root.path().join("tmp"))
+            .env("FAKE_TAPE", self.root.path().join("state"))
+            .env("FAKE_FILES", self.root.path().join("files"))
+            .env("TAPE_DEVICE", "/dev/nst0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(out.try_clone().unwrap()))
+            .stderr(Stdio::from(out));
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        fs::create_dir_all(self.root.path().join("tmp")).unwrap();
+        let mut child = c.spawn().expect("spawn RESTORE.sh");
+        let stdin = child.stdin.take();
+        Running {
+            child,
+            stdin,
+            out_path,
+            asked: 0,
+        }
+    }
+
+    /// Run with a person at the prompt: `on_prompt(k, text so far)` is
+    /// called for the k-th time the script asks for a cartridge, and what it
+    /// returns is typed in (`None` ends the input).
+    pub fn run_prompted(
+        &self,
+        args: &[&str],
+        mut on_prompt: impl FnMut(usize, &str) -> Option<String>,
+    ) -> Out {
+        let mut r = self.spawn(args, &[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(280);
+        loop {
+            let text = r.text();
+            let asked = text.matches(PROMPT).count();
+            while r.asked < asked {
+                r.asked += 1;
+                match on_prompt(r.asked, &text) {
+                    Some(line) => r.type_line(&line),
+                    None => r.close_input(),
+                }
+            }
+            if let Some(code) = r.try_wait() {
+                return Out {
+                    code,
+                    stdout: r.text(),
+                    stderr: String::new(),
+                };
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = r.child.kill();
+                panic!("RESTORE.sh {args:?} did not end:\n{text}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// A directory tape of `files` (a copy of the tape's, damaged by the
     /// test), with the tape's keys and script.
     pub fn with_files(tape: &Tape, files: Vec<Vec<u8>>) -> Heir {
         let root = tempfile::tempdir().unwrap();
         let r = root.path();
-        fs::create_dir_all(r.join("files")).unwrap();
+        // The cartridge in the drive is `files`, a link to `cart/<label>`.
+        let cart = r.join("cart").join(&tape.label);
+        fs::create_dir_all(&cart).unwrap();
+        std::os::unix::fs::symlink(&cart, r.join("files")).unwrap();
         fs::create_dir_all(r.join("state")).unwrap();
         fs::create_dir_all(r.join("bin")).unwrap();
         fs::create_dir_all(r.join("keys")).unwrap();

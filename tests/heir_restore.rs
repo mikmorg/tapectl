@@ -320,11 +320,12 @@ fn an_unknown_option_a_missing_mode_and_a_missing_key_are_told_by_name() {
     assert!(h.ops().is_empty(), "no usage error reads the tape");
 }
 
-/// The modes part three carries are still refused by name, before the tape
-/// moves; `--scratch` is spelled `--work` (the cross-cartridge prompt is
-/// T4.12's).
+/// Layout 2's spellings for a second cartridge are gone (item 255, §9): each
+/// is refused by name, before the tape moves, with the Layout 3 way
+/// (`--paths-from`, and the prompt a unit across cartridges asks at);
+/// `--scratch` is spelled `--work`.
 #[test]
-fn the_modes_part_three_carries_are_refused_by_name() {
+fn the_removed_spellings_are_refused_by_name_before_the_tape_moves() {
     let h = Heir::of(two());
     let ka = key(&h, Who::TenantA);
     for args in [
@@ -338,11 +339,15 @@ fn the_modes_part_three_carries_are_refused_by_name() {
             "/y",
         ],
         vec!["--restore", "--key", &ka, "--to", "/x", "--swap-tapes"],
+        vec!["--restore", "--key", &ka, "--to", "/x", "--stream-tapes"],
+        vec!["--restore", "--key", &ka, "--to", "/x", "--fill-from", "/y"],
     ] {
         let o = h.run(&args);
-        assert_eq!(o.code, 1, "{args:?}: {}", o.all());
+        assert_eq!(o.code, 2, "{args:?}: {}", o.all());
         assert!(
-            o.stderr.contains("is not in this build of RESTORE.sh yet"),
+            o.stderr.contains("is not in this RESTORE.sh")
+                && o.stderr.contains("--paths-from")
+                && o.stderr.contains("prompt"),
             "{args:?}: {}",
             o.stderr
         );
@@ -4263,4 +4268,824 @@ fn an_existing_folder_named_with_a_backslash_is_not_refused_as_an_existing_file(
     ]);
     assert_eq!(o.code, 0, "an existing folder is no refusal: {}", o.all());
     assert!(dest.join("dir\\one/leaf.txt").is_file());
+}
+
+// ---- a unit across cartridges (the plan's T4.12) ----
+//
+// The tapes are written by tapectl's own pieces with the planner's selection
+// (`staged_build_units_spanning`): the big unit has eight slices of 64 KiB,
+// and its 150,000-byte file is a run of slices 2 to 4. `Span` gives each tape
+// of a series the slice the drive's early warning comes in.
+
+fn span_series(
+    alg: &'static str,
+    min_copies: i32,
+    warns: Vec<Option<usize>>,
+    no_index: bool,
+) -> Vec<Tape> {
+    let mut shape = Shape::one(alg);
+    shape.no_index = no_index;
+    shape.span = Some(heir::Span { min_copies, warns });
+    Tape::build_series(&shape)
+}
+
+/// What each tape holds of the unit, `(first, last)` slice, as the seal covers it.
+fn held(tapes: &[Tape]) -> Vec<(i64, i64)> {
+    tapes
+        .iter()
+        .map(|t| {
+            let r = &t.runs[0];
+            (r.3, r.4)
+        })
+        .collect()
+}
+
+/// HEIR01 holds slices 1-3, HEIR02 4-5, HEIR03 6-8: the file of slices 2 to 4
+/// lies across the first two cartridges.
+fn span3() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let t = span_series("none", 1, vec![Some(2), Some(1), None], false);
+        assert_eq!(held(&t), [(1, 3), (4, 5), (6, 8)]);
+        t
+    })
+}
+
+fn span3_alg(alg: &'static str) -> Vec<Tape> {
+    let t = span_series(alg, 1, vec![Some(2), Some(1), None], false);
+    assert_eq!(held(&t), [(1, 3), (4, 5), (6, 8)], "{alg}");
+    t
+}
+
+/// HEIR01 holds slice 1 (the folder's dotfile, a symlink and the first name of
+/// a hard link), HEIR02 slices 2-8, with the hard link's other name.
+fn span2() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let t = span_series("none", 1, vec![Some(0), None], false);
+        assert_eq!(held(&t), [(1, 1), (2, 8)]);
+        t
+    })
+}
+
+/// Item 93's two copies: copy 1 is HEIR01 (1-3) and HEIR03 (4-8); copy 2 is
+/// HEIR02 (1-6) and HEIR04 (7-8).
+fn copies2() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let t = span_series("none", 2, vec![Some(2), Some(5), None, None], false);
+        assert_eq!(held(&t), [(1, 3), (1, 6), (4, 8), (7, 8)]);
+        t
+    })
+}
+
+/// The data slices of `t` the log of a run reads, in order.
+fn slice_reads(t: &Tape, reads: &[usize]) -> Vec<usize> {
+    // The seal of a tape that ended early lies at the place the plan gave a
+    // slice after the last one it holds: it is no slice read.
+    let all = t.slice_positions();
+    let end = t.ended_after();
+    reads
+        .iter()
+        .copied()
+        .filter(|p| all.contains(p) && *p <= end)
+        .collect()
+}
+
+/// The tape positions of slices `first..=last` of the unit on `t`.
+fn positions(t: &Tape, first: usize, last: usize) -> Vec<usize> {
+    let all = t.slice_positions();
+    let base = t.runs[0].1 as usize;
+    (first..=last).map(|n| all[n - base]).collect()
+}
+
+fn no_work_dir_in(dest: &Path) -> bool {
+    std::fs::read_dir(dest).unwrap().all(|e| {
+        !e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tapectl-work")
+    })
+}
+
+/// A `tar` that logs each run's arguments, then is the host's.
+fn log_tar(h: &Heir) {
+    let real = heir::host_tool("tar").unwrap();
+    h.put_tool(
+        "tar",
+        &format!(
+            "#!/bin/bash\nfor a; do case \"$a\" in --version) exec {real} \"$a\" ;; esac; done\necho \"$*\" >>\"$FAKE_TAPE/tar.log\"\nexec {real} \"$@\"\n",
+            real = real.display()
+        ),
+    );
+}
+
+/// The runs of tar that extracted into `dest`.
+fn tar_runs(h: &Heir, dest: &Path) -> usize {
+    std::fs::read_to_string(h.root.path().join("state/tar.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains(&format!("-C {} ", dest.display())))
+        .count()
+}
+
+fn restore_all<'a>(ka: &'a str, dest: &'a Path) -> Vec<&'a str> {
+    vec!["--restore", "--key", ka, "--all", "--to", dest_str(dest)]
+}
+
+const LARGE: &str = "alpha-unit-large.bin";
+
+/// Three tapes, two swaps, ONE tar run (item 267): the prompt asks for the
+/// next cartridge after the eject line, each cartridge is read by the hash of
+/// the slice needed, nothing past a seal is read, and the unit comes back
+/// byte for byte, whatever the compression.
+#[test]
+fn a_unit_on_three_tapes_restores_across_two_swaps_as_one_run_for_each_algorithm() {
+    for alg in ["none", "gzip", "xz", "zstd"] {
+        let built;
+        let tapes: &[Tape] = if alg == "none" {
+            span3()
+        } else {
+            built = span3_alg(alg);
+            &built
+        };
+        let h = Heir::of_series(&[&tapes[0], &tapes[1], &tapes[2]]);
+        log_tar(&h);
+        let dest = h.dest("out");
+        let ka = key(&h, Who::TenantA);
+        let o = h.run_prompted(&restore_all(&ka, &dest), |k, text| {
+            assert!(k <= 2, "two cartridge changes: {text}");
+            let eject = text
+                .rfind("First eject the cartridge now in the drive")
+                .unwrap();
+            assert!(
+                eject < text.rfind(heir::PROMPT).unwrap(),
+                "eject first: {text}"
+            );
+            h.load(["HEIR02", "HEIR03"][k - 1]);
+            Some(String::new())
+        });
+        assert_eq!(o.code, 0, "{alg}: {}", o.all());
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{alg}: {}", o.stdout);
+        assert_restored(&tapes[0], UNIT_A, &dest);
+        assert_eq!(
+            tar_runs(&h, &dest),
+            1,
+            "{alg}: one tar run across both swaps"
+        );
+        assert!(no_work_dir_in(&dest), "{alg}");
+        assert!(!dest.join(".tapectl-damaged-files.txt").exists(), "{alg}");
+        // Each cartridge gave the slices it holds and nothing past its seal.
+        let by = h.reads_by_cartridge();
+        assert_eq!(by.len(), 3, "{alg}: {:?}", h.ops());
+        for (i, (a, z)) in [(1, 3), (4, 5), (6, 8)].into_iter().enumerate() {
+            assert_eq!(
+                slice_reads(&tapes[i], &by[i]),
+                positions(&tapes[i], a, z),
+                "{alg}: cartridge {i}"
+            );
+        }
+        assert!(
+            o.stdout.contains("This cartridge identifies as: HEIR02"),
+            "{alg}"
+        );
+    }
+}
+
+/// Item 93's two copies, each across cartridges, and a mix of the two: the
+/// order of the tapes is the copy's, and any tape that lists the slice's
+/// sha256 inside its seal gives it.
+#[test]
+fn either_copy_restores_across_its_own_tapes_and_the_two_mixed() {
+    let t = copies2();
+    for (name, start, offers) in [
+        ("copy 1", "HEIR01", vec!["HEIR03"]),
+        ("copy 2", "HEIR02", vec!["HEIR04"]),
+        ("mixed", "HEIR01", vec!["HEIR02", "HEIR04"]),
+    ] {
+        let mut series: Vec<&Tape> = t.iter().filter(|x| x.label == start).collect();
+        series.extend(t.iter().filter(|x| x.label != start));
+        let h = Heir::of_series(&series);
+        let dest = h.dest("out");
+        let ka = key(&h, Who::TenantA);
+        let o = h.run_prompted(&restore_all(&ka, &dest), |k, text| {
+            assert!(k <= offers.len(), "{name}: asked too often: {text}");
+            h.load(offers[k - 1]);
+            Some(String::new())
+        });
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert_restored(&t[0], UNIT_A, &dest);
+        assert_eq!(h.reads_by_cartridge().len(), offers.len() + 1, "{name}");
+    }
+}
+
+fn truth<'a>(t: &'a Tape, path: &str) -> &'a [u8] {
+    &unit_files(t, UNIT_A)
+        .iter()
+        .find(|(p, _)| p == path)
+        .unwrap_or_else(|| panic!("no file {path}"))
+        .1
+}
+
+fn list_of(dest: &Path) -> Vec<String> {
+    damaged_list(dest)
+}
+
+/// The file of slices 2 to 4 lies across the first two cartridges. The first
+/// is read to its end, the prompt asks for the second, and the file is
+/// restored whole through it; the third cartridge is not had, and the restore
+/// goes on without it, listing what is in its slices.
+#[test]
+fn a_file_larger_than_a_slice_across_two_cartridges_restores_through_the_prompt() {
+    let t = span3();
+    let h = Heir::of_series(&[&t[0], &t[1], &t[2]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(&restore_all(&ka, &dest), |k, _| match k {
+        1 => {
+            h.load("HEIR02");
+            Some(String::new())
+        }
+        _ => Some("done".to_string()),
+    });
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert_eq!(
+        std::fs::read(dest.join(LARGE)).unwrap(),
+        truth(&t[0], LARGE)
+    );
+    let list = list_of(&dest);
+    assert!(!list.iter().any(|p| p == LARGE), "{list:?}");
+    for left in ["inner/mid-2.dat", "notes.txt"] {
+        assert!(list.iter().any(|p| p == left), "{left}: {list:?}");
+        assert!(!dest.join(left).exists(), "{left}");
+    }
+    // Slices 1 to 5 are all here.
+    assert!(dest.join("alpha-unit-hardlink.txt").exists());
+    assert!(dest.join("inner/mid-1.dat").exists());
+    assert_eq!(o.stdout.matches(heir::PROMPT).count(), 2, "{}", o.stdout);
+    assert!(no_work_dir_in(&dest));
+}
+
+/// The same file, with the second cartridge not had: "I do not have it" is an
+/// answer, the restore goes on with what it has, and the file tar had begun
+/// is removed and listed. The end of the input is the same answer.
+#[test]
+fn the_same_file_answered_i_do_not_have_it_is_listed_and_leaves_no_partial_file() {
+    let t = span3();
+    for answer in [Some("done"), None] {
+        let h = Heir::of_series(&[&t[0], &t[1], &t[2]]);
+        let dest = h.dest("out");
+        let ka = key(&h, Who::TenantA);
+        let mut asked = Vec::new();
+        let o = h.run_prompted(&restore_all(&ka, &dest), |k, _| {
+            asked.push(k);
+            answer.map(str::to_string)
+        });
+        assert_eq!(o.code, 1, "{answer:?}: {}", o.all());
+        assert_eq!(
+            asked,
+            vec![1],
+            "no second prompt after the answer: {}",
+            o.stdout
+        );
+        assert!(!dest.join(LARGE).exists(), "no partial file");
+        let list = list_of(&dest);
+        assert!(list.iter().any(|p| p == LARGE), "{list:?}");
+        // What slice 1 holds is restored and checked.
+        assert_eq!(
+            std::fs::read(dest.join("alpha-unit-hardlink.txt")).unwrap(),
+            truth(&t[0], "alpha-unit-hardlink.txt")
+        );
+        assert!(
+            o.stdout.contains("NOT ON THIS CARTRIDGE: slices 4-8 of 8"),
+            "{}",
+            o.stdout
+        );
+        assert!(no_work_dir_in(&dest));
+    }
+}
+
+/// A start on the second tape alone restores what it holds whole and lists
+/// the rest, with the tape the index names for it; both measured limits are
+/// printed. A second run on the first tape then completes the unit, and
+/// leaves alone every file the first run restored.
+#[test]
+fn a_start_on_the_second_tape_alone_restores_what_it_holds_whole_and_lists_the_rest() {
+    use std::os::unix::fs::MetadataExt;
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run(&restore_all(&ka, &dest));
+    assert_eq!(o.code, 1, "{}", o.all());
+    let all = o.all();
+    for f in [
+        ".tapectl-unit.toml",
+        "a-symlink",
+        "alpha-unit-hardlink.txt",
+        "alpha-unit-small.txt",
+    ] {
+        assert!(
+            list_of(&dest).iter().any(|p| p == f),
+            "{f}: {:?}",
+            list_of(&dest)
+        );
+        assert!(!dest.join(f).exists(), "{f} is not restored");
+    }
+    // Every other file came back whole.
+    for (p, bytes) in unit_files(&t[0], UNIT_A) {
+        if p == "alpha-unit-hardlink.txt" || p == "alpha-unit-small.txt" {
+            continue;
+        }
+        assert_eq!(&std::fs::read(dest.join(p)).unwrap(), bytes, "{p}");
+    }
+    // Where the rest is: the index names the first tape and its run; and the
+    // two limits, and the hard-linked name with the tape of its first name.
+    for needle in [
+        "NOT ON THIS CARTRIDGE: slices 1 of 8",
+        "tape HEIR01 (cartridge serial not recorded): slices 1 to 1",
+        "a folder's modification time is that of the last run that touched the folder",
+        "a hard-linked name whose first name was not read is not made until that name is",
+        "alpha-unit-small.txt -> first name alpha-unit-hardlink.txt, slice 1",
+    ] {
+        assert!(all.contains(needle), "{needle:?}:\n{all}");
+    }
+    let before: Vec<_> = ["notes.txt", LARGE]
+        .iter()
+        .map(|f| {
+            let m = std::fs::metadata(dest.join(f)).unwrap();
+            (m.ino(), m.mtime(), m.mtime_nsec())
+        })
+        .collect();
+
+    // The second run, on the first tape, into the same --to.
+    h.load("HEIR01");
+    h.reset_ops();
+    let o = h.run(&restore_all(&ka, &dest));
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.all());
+    assert_restored(&t[0], UNIT_A, &dest);
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists());
+    assert!(no_work_dir_in(&dest));
+    let after: Vec<_> = ["notes.txt", LARGE]
+        .iter()
+        .map(|f| {
+            let m = std::fs::metadata(dest.join(f)).unwrap();
+            (m.ino(), m.mtime(), m.mtime_nsec())
+        })
+        .collect();
+    assert_eq!(before, after, "a file that passes is not rewritten");
+    // Only the first tape's own slice was read, and the hard link is one file.
+    assert_eq!(slice_reads(&t[0], &h.dd_reads()), positions(&t[0], 1, 1));
+    let a = std::fs::metadata(dest.join("alpha-unit-hardlink.txt")).unwrap();
+    let b = std::fs::metadata(dest.join("alpha-unit-small.txt")).unwrap();
+    assert_eq!(a.ino(), b.ino(), "the two names are one file");
+}
+
+/// The hard-linked name the first run listed (its first name is on the other
+/// tape) is restored by the repair once that tape is read: the list the first
+/// run wrote is the repair's input.
+#[test]
+fn a_hard_linked_name_listed_by_the_first_run_is_restored_by_the_repair() {
+    use std::os::unix::fs::MetadataExt;
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run(&restore_all(&ka, &dest));
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(list_of(&dest).iter().any(|p| p == "alpha-unit-small.txt"));
+    assert!(!dest.join("alpha-unit-small.txt").exists());
+    h.load("HEIR01");
+    h.reset_ops();
+    let list = dest.join(".tapectl-damaged-files.txt");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        dest_str(&list),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.all());
+    assert_restored(&t[0], UNIT_A, &dest);
+    assert!(!list.exists(), "nothing is left to repair");
+    let a = std::fs::metadata(dest.join("alpha-unit-hardlink.txt")).unwrap();
+    let b = std::fs::metadata(dest.join("alpha-unit-small.txt")).unwrap();
+    assert_eq!(a.ino(), b.ino(), "the two names are one file");
+}
+
+/// The prompt reads from the input with no time limit and holds no device: no
+/// `mt` or `dd` starts while it waits, and an answer that comes late is taken.
+#[test]
+fn the_prompt_waits_without_a_time_limit_and_holds_no_device() {
+    let t = span3();
+    let h = Heir::of_series(&[&t[0], &t[1], &t[2]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(&restore_all(&ka, &dest), |k, _| {
+        if k == 1 {
+            let before = h.ops();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            assert_eq!(h.ops(), before, "no mt or dd while the prompt waits");
+            h.load("HEIR02");
+            Some(String::new())
+        } else {
+            h.load("HEIR03");
+            Some(String::new())
+        }
+    });
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains("This waits for as long as you take."),
+        "{}",
+        o.stdout
+    );
+}
+
+/// Nothing is kept in the work directory between cartridges (item 267): at
+/// the prompt no slice, ciphertext or plain, waits there.
+#[test]
+fn nothing_of_a_slice_waits_in_the_work_directory_at_the_prompt() {
+    let t = span3();
+    let h = Heir::of_series(&[&t[0], &t[1], &t[2]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(&restore_all(&ka, &dest), |k, _| {
+        let work = std::fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".tapectl-work")
+            })
+            .expect("the work directory");
+        for e in std::fs::read_dir(&work).unwrap() {
+            let e = e.unwrap();
+            let name = e.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with("slice."),
+                "{name} waits in the work directory at prompt {k}"
+            );
+        }
+        h.load(["HEIR02", "HEIR03"][k - 1]);
+        Some(String::new())
+    });
+    assert_eq!(o.code, 0, "{}", o.all());
+}
+
+/// `quit` ends the restore: files restored and checked stay, the file tar
+/// had begun is removed, the work directory is gone, and the exit is 1.
+#[test]
+fn quitting_at_the_prompt_keeps_what_is_checked_and_removes_what_tar_had_begun() {
+    let t = span3();
+    let h = Heir::of_series(&[&t[0], &t[1], &t[2]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(&restore_all(&ka, &dest), |_, _| Some("quit".to_string()));
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stdout.contains("RESTORE STOPPED at your request"),
+        "{}",
+        o.stdout
+    );
+    assert_eq!(o.stdout.matches(heir::PROMPT).count(), 1, "{}", o.stdout);
+    assert!(
+        !dest.join(LARGE).exists(),
+        "the file tar had begun is removed"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("alpha-unit-hardlink.txt")).unwrap(),
+        truth(&t[0], "alpha-unit-hardlink.txt")
+    );
+    assert!(list_of(&dest).iter().any(|p| p == LARGE));
+    assert!(no_work_dir_in(&dest));
+}
+
+/// Ctrl-C (INT), a hangup (HUP) and a kill (TERM), at the prompt and in the
+/// middle of reading a slice, leave no work directory and no partial file.
+/// The signal goes to the script alone.
+#[test]
+fn a_signal_at_the_prompt_or_mid_slice_leaves_no_work_directory_and_no_partial_file() {
+    let t = span3();
+    for (sig, code) in [("INT", 130), ("HUP", 129), ("TERM", 143)] {
+        for mid in [false, true] {
+            let h = Heir::of_series(&[&t[0], &t[1], &t[2]]);
+            let dest = h.dest("out");
+            let ka = key(&h, Who::TenantA);
+            // Mid-slice: the read of slice 3, the second piece of the long
+            // file, takes a few seconds (the signal is taken when it ends).
+            let slow = format!("{}:3", positions(&t[0], 3, 3)[0]);
+            let envs: Vec<(&str, &str)> = if mid {
+                vec![("FAKE_DD_SLOW", slow.as_str())]
+            } else {
+                vec![]
+            };
+            let args = restore_all(&ka, &dest);
+            let mut r = h.spawn(&args, &envs);
+            if mid {
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !h.root.path().join("state/dd.slow").exists() {
+                    assert!(std::time::Instant::now() < until, "{}", r.text());
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            } else {
+                r.wait_for(heir::PROMPT, 1, 60);
+            }
+            // Positive control: tar has begun the long file.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !dest.join(LARGE).exists() {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "tar began nothing: {}",
+                    r.text()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            r.signal(sig);
+            let o = r.finish();
+            let what = format!("SIG{sig} mid-slice {mid}: {}", o.all());
+            assert_eq!(o.code, code, "{what}");
+            assert!(no_work_dir_in(&dest), "{what}");
+            assert!(!dest.join(LARGE).exists(), "no partial file: {what}");
+        }
+    }
+}
+
+/// R8: a cartridge is taken only by the sha256 of the slice needed, listed in
+/// its front index at a position its own seal covers. Each wrong cartridge is
+/// named, the prompt asks again, and the right one is taken at the end: the
+/// same cartridge again, a blank one, another layout's, one that is not
+/// tapectl's, one the drive cannot read, one with no readable seal, one that
+/// lists the slice past its seal, and one that lists no such slice. A
+/// cartridge whose front index is unreadable is read by the seal's copy.
+#[test]
+fn a_cartridge_is_taken_only_by_the_next_slices_hash_at_a_position_its_seal_covers() {
+    let t = span3();
+    let h = Heir::of_series(&[&t[0], &t[1], &t[2]]);
+    h.shelve_blank("BLANK");
+    let mut f = t[2].files.clone();
+    f[0] = file_0_with(&t[2], |s| {
+        s.replace("tapectl-volume-v3", "tapectl-volume-v2")
+            .replace("layout_version = 3", "layout_version = 2")
+    });
+    h.shelve("LAYOUT2", &f);
+    let mut f = t[2].files.clone();
+    f[0] = b"the first file of some other tape".to_vec();
+    h.shelve("NOTTAPE", &f);
+    h.copy_cart("HEIR02", "UNREAD");
+    h.fail_file("UNREAD", 0);
+    let mut f = t[1].files.clone();
+    let last = f.len() - 1;
+    f[last] = b"junk where the seal marker was".to_vec();
+    h.shelve("NOSEAL", &f);
+    // The first tape's own plan lists slice 4 past its seal; this copy is a
+    // different cartridge (another uuid).
+    let mut f = t[0].files.clone();
+    f[0] = file_0_with(&t[0], |s| {
+        s.replace(&t[0].volume_uuid, "00000000-0000-4000-8000-00000000f0f0")
+    });
+    h.shelve("PAST", &f);
+    let mut f = t[1].files.clone();
+    f[3] = b"the front index is gone".to_vec();
+    h.shelve("RUNG2", &f);
+    let offers = [
+        "HEIR01", "BLANK", "LAYOUT2", "NOTTAPE", "UNREAD", "NOSEAL", "PAST", "HEIR03", "RUNG2",
+        "HEIR03",
+    ];
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(&restore_all(&ka, &dest), |k, _| {
+        assert!(k <= offers.len(), "asked too often");
+        h.load(offers[k - 1]);
+        Some(String::new())
+    });
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_restored(&t[0], UNIT_A, &dest);
+    let all = o.all();
+    assert_eq!(all.matches(heir::PROMPT).count(), offers.len(), "{all}");
+    for (needle, n) in [
+        ("is the same cartridge as the one already in the drive", 1),
+        ("this cartridge is blank", 1),
+        ("a tapectl volume of Layout 2", 1),
+        ("this cartridge is not a tapectl volume", 1),
+        ("this cartridge is unreadable: its first file", 1),
+        ("Its seal marker cannot be read", 1),
+        ("but the tape ended after file", 1),
+        ("lists no data slice with the sha256 of slice 4", 1),
+        (
+            "the front index of this cartridge is unreadable: using the seal marker's copy",
+            1,
+        ),
+    ] {
+        assert_eq!(all.matches(needle).count(), n, "{needle:?}:\n{all}");
+    }
+    assert!(!all.contains("FATAL"), "{all}");
+    // Nothing is read from a cartridge not taken but File 0, the front index
+    // and the seal (R5): never one of its slices.
+    let by = h.reads_by_cartridge();
+    // File 0, File 3 and the last file (the seal, where there is one).
+    let ends: Vec<usize> = t.iter().map(|x| x.files.len() - 1).collect();
+    for (i, reads) in by.iter().enumerate().skip(1).take(7) {
+        assert!(
+            reads.iter().all(|p| *p == 0 || *p == 3 || ends.contains(p)),
+            "refused cartridge {i} was read past its seal: {reads:?}"
+        );
+    }
+}
+
+/// Where the rest is, by the index of the tape the restore started on. From
+/// the last tape: the index names the earlier ones, each with its run. From
+/// the first: a tape never names one written after it, so the prompt says
+/// so and sends to `--where` on the newest tape. With no index: that is said.
+#[test]
+fn the_prompt_names_the_tapes_the_index_names_and_says_where_to_look_when_it_names_none() {
+    let t = span3();
+    // From the last tape.
+    let h = Heir::of_series(&[&t[2], &t[0], &t[1]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run(&restore_all(&ka, &dest));
+    assert_eq!(o.code, 1, "{}", o.all());
+    let all = o.all();
+    for needle in [
+        "needs slice 1 of 8 next",
+        "tape HEIR01 (cartridge serial not recorded): slices 1 to 3",
+        "NOT ON THIS CARTRIDGE: slices 1-5 of 8",
+        "tape HEIR02 (cartridge serial not recorded): slices 4 to 5",
+    ] {
+        assert!(all.contains(needle), "{needle:?}:\n{all}");
+    }
+    // The last tape's own files came back whole, and nothing else.
+    assert_eq!(
+        std::fs::read(dest.join("notes.txt")).unwrap(),
+        truth(&t[0], "notes.txt")
+    );
+    assert!(!dest.join(LARGE).exists());
+    // From the first.
+    let h = Heir::of_series(&[&t[0]]);
+    let dest = h.dest("out");
+    let o = h.run(&restore_all(&key(&h, Who::TenantA), &dest));
+    let all = o.all();
+    assert!(
+        all.contains("No tape the index in this tape's envelope names holds slice 4")
+            && all.contains("--where alpha-unit --key KEY on the newest tape you hold names them"),
+        "{all}"
+    );
+    // With no index.
+    let no_index = span_series("none", 1, vec![Some(2), Some(1), None], true);
+    let h = Heir::of_series(&[&no_index[0]]);
+    let dest = h.dest("out");
+    let o = h.run(&restore_all(&key(&h, Who::TenantA), &dest));
+    let all = o.all();
+    assert!(
+        all.contains("This tape's envelope carries no index, so no tape is named"),
+        "{all}"
+    );
+    assert!(
+        all.contains("carries no index, so no tape is named: "),
+        "{all}"
+    );
+}
+
+/// A start on the middle tape: the file that began on the first tape is not
+/// restored (its first slice is not here), the files of its own slices are.
+#[test]
+fn a_start_on_the_middle_tape_skips_the_file_begun_before_it_and_restores_the_rest() {
+    let t = span3();
+    let h = Heir::of_series(&[&t[1], &t[0], &t[2]]);
+    let dest = h.dest("out");
+    let o = h.run(&restore_all(&key(&h, Who::TenantA), &dest));
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.all().contains("needs slice 1 of 8 next"), "{}", o.all());
+    assert!(!dest.join(LARGE).exists(), "no piece of the long file");
+    assert!(list_of(&dest).iter().any(|p| p == LARGE));
+    // Slice 5 holds the folders, the link and the first mid files.
+    assert_eq!(
+        std::fs::read(dest.join("inner/mid-1.dat")).unwrap(),
+        truth(&t[0], "inner/mid-1.dat")
+    );
+    assert!(no_work_dir_in(&dest));
+}
+
+/// `--path` across cartridges: the file lies in slices 2 to 4. Started on the
+/// first tape it reads slices 2 and 3 there and asks for the cartridge that
+/// holds slice 4 and no other; started on the second it asks for the one that
+/// holds slice 2, then for the second again.
+#[test]
+fn a_path_across_cartridges_asks_for_the_cartridge_that_holds_each_slice() {
+    let t = span3();
+    for (start, offers) in [
+        ("HEIR01", vec!["HEIR02"]),
+        ("HEIR02", vec!["HEIR01", "HEIR02"]),
+    ] {
+        let mut series: Vec<&Tape> = t.iter().filter(|x| x.label == start).collect();
+        series.extend(t.iter().filter(|x| x.label != start));
+        let h = Heir::of_series(&series);
+        let dest = h.dest("out");
+        let ka = key(&h, Who::TenantA);
+        let o = h.run_prompted(
+            &[
+                "--restore",
+                "--key",
+                &ka,
+                "--unit",
+                UNIT_A,
+                "--path",
+                LARGE,
+                "--to",
+                dest_str(&dest),
+            ],
+            |k, text| {
+                assert!(k <= offers.len(), "{start}: asked too often: {text}");
+                h.load(offers[k - 1]);
+                Some(String::new())
+            },
+        );
+        assert_eq!(o.code, 0, "{start}: {}", o.all());
+        assert_eq!(
+            std::fs::read(dest.join(LARGE)).unwrap(),
+            truth(&t[0], LARGE)
+        );
+        let others: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != LARGE)
+            .collect();
+        assert!(
+            others.is_empty(),
+            "{start}: only the named file: {others:?}"
+        );
+        let by = h.reads_by_cartridge();
+        assert_eq!(by.len(), offers.len() + 1, "{start}: {:?}", h.ops());
+        if start == "HEIR01" {
+            // The second cartridge gives its slice 4 and nothing else.
+            assert_eq!(slice_reads(&t[1], &by[1]), positions(&t[1], 4, 4));
+        }
+    }
+}
+
+/// The repair asks for a cartridge too: a file that lies across two
+/// cartridges is on the list of a run that had only one of them, and the
+/// repair, given both in turn, restores it whole.
+#[test]
+fn the_repair_asks_for_the_cartridge_a_listed_file_needs() {
+    let t = span3();
+    let h = Heir::of_series(&[&t[1], &t[0], &t[2]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run(&restore_all(&ka, &dest));
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(list_of(&dest).iter().any(|p| p == LARGE));
+    h.load("HEIR01");
+    let list = dest.join(".tapectl-damaged-files.txt");
+    let o = h.run_prompted(
+        &[
+            "--restore",
+            "--key",
+            &ka,
+            "--to",
+            dest_str(&dest),
+            "--paths-from",
+            dest_str(&list),
+        ],
+        |k, text| {
+            assert!(k <= 3, "{text}");
+            // The listed files lie in slices 1-3 and 6-8: slice 4 (the last
+            // piece of the long file) comes from HEIR02, slice 6 on from
+            // HEIR03.
+            h.load(["HEIR02", "HEIR03", "HEIR03"][k - 1]);
+            Some(String::new())
+        },
+    );
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_restored(&t[0], UNIT_A, &dest);
+    assert!(!list.exists());
+}
+
+/// BusyBox tar across a swap: one tar run of three cartridges' slices.
+#[test]
+fn busybox_tar_restores_across_the_swaps() {
+    let Some(bb) = optional_tool("busybox") else {
+        return;
+    };
+    let t = span3();
+    let h = Heir::of_series(&[&t[0], &t[1], &t[2]]);
+    h.put_tool(
+        "tar",
+        &format!("#!/bin/sh\nexec {} tar \"$@\"\n", bb.display()),
+    );
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(&restore_all(&ka, &dest), |k, _| {
+        h.load(["HEIR02", "HEIR03"][k - 1]);
+        Some(String::new())
+    });
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("CONTENT ONLY"), "{}", o.stdout);
+    assert_restored(&t[0], UNIT_A, &dest);
 }
