@@ -2373,8 +2373,7 @@ compression = "bogus"
             .expect("one unit's [policy] fault must not abort `collection run --policy-aware`");
         check(&run.batches, &run.refused);
 
-        // Since 1.7.0 (#478) every pending unit's policy is resolved, for
-        // `allow_spanning`, so the plain plan refuses the unit the same way
+        // Since 1.7.0 (#478) every pending unit's policy is resolved, so the plain plan refuses the unit the same way
         // instead of batching it for `stage create` to refuse.
         let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None, false)
             .expect("one unit's [policy] fault must not abort `collection plan`");

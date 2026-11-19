@@ -13025,7 +13025,7 @@ mod tests {
         /// (`layout-session.md`, "Resume after a crash past the warning"
         /// step 3): the rehydrated session seals short at K+1 stating the
         /// two features its frozen File 0 states, and confirm records the
-        /// range from the rows' `may_span`.
+        /// range from the plan (a unit with some slices written and some not).
         #[test]
         fn a_resume_after_a_crash_past_the_warning_records_the_range() {
             let s = a_span_between_whole_units();
