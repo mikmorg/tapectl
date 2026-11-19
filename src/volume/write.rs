@@ -6588,6 +6588,18 @@ fn decide_fresh_write_contact_on(
                  volume first, then `tapectl cartridge erase` reads it, asks for its label and \
                  erases it. {NEVER_DEGAUSS}"
         ))),
+        // `volume-format-v3.md` §7.6 (ADR-0012 item 269; #560): a tapectl
+        // volume of another layout. Its seal was not read, so whether it is
+        // sealed is not known, and it is not a mismatch `--force` may
+        // overwrite either: like a sealed volume, only `cartridge erase` and
+        // the typed label reach it. No `allow_overwrite` is consulted.
+        ContactOutcome::OtherLayout(other) => Err(TapectlError::Other(format!(
+            "refusing to write volume \"{label}\" (uuid {volume_uuid}): the loaded cartridge \
+             holds a volume of another layout: {}. Nothing was written, and --force cannot \
+             override this. If the cartridge is to be reused, `tapectl cartridge erase` reads \
+             it, asks for its label and erases it. {NEVER_DEGAUSS}",
+            other.sentence()
+        ))),
         ContactOutcome::IdentityMismatch { found } => {
             let found_desc = describe_file0_identity(found.as_ref());
             if allow_overwrite {
@@ -19219,6 +19231,75 @@ mod tests {
         assert!(msg.contains("ADR-0003"), "expected ADR citation in: {msg}");
     }
 
+    /// `volume-format-v3.md` §7.6 (item 269; #560), the fresh-write check on
+    /// recorded bytes: another layout's File 0 and seal in front of a write,
+    /// with and without `--force`. Refused both ways, naming the layout and
+    /// the label, and the tape is exactly as it was.
+    #[test]
+    fn check_fresh_write_contact_a_tape_of_another_layout_refuses_even_with_force() {
+        use crate::volume::format::foreign_layouts as f;
+        for (n, file0, seal) in [
+            (
+                2,
+                f::LAYOUT_2_FILE_0.to_string(),
+                f::LAYOUT_2_SEAL.to_string(),
+            ),
+            (4, f::layout_4_file_0(), f::layout_4_seal()),
+        ] {
+            for force in [false, true] {
+                let mut store = MemStore::new(FW_BS as usize);
+                let mut f0 = file0.clone().into_bytes();
+                f0.resize(FW_BS as usize, 0);
+                fw_put_file(&mut store, 0, f0);
+                let mut sl = seal.clone().into_bytes();
+                sl.resize(FW_BS as usize, 0);
+                fw_put_file(&mut store, 5, sl);
+                let before = store.files.clone();
+                let err = check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, None, force)
+                    .unwrap_err();
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains(&format!("volume of Layout {n}"))
+                        && msg.contains("label \"L6-0001\"")
+                        && msg.contains("RESTORE.sh in its own file 2")
+                        && msg.contains("--force cannot override")
+                        && msg.contains("tapectl cartridge erase"),
+                    "layout {n}, force={force}: {msg}"
+                );
+                assert_eq!(store.files, before, "nothing was written");
+            }
+        }
+    }
+
+    /// `volume identify` names a volume of another layout, as a note
+    /// and not a contradiction (it reports, it does not refuse), whether or
+    /// not the catalog has ever heard of its uuid.
+    #[test]
+    fn identify_names_a_tapectl_volume_of_another_layout() {
+        use crate::volume::format::foreign_layouts as f;
+        for (n, file0) in [
+            (2, f::LAYOUT_2_FILE_0.to_string()),
+            (4, f::layout_4_file_0()),
+        ] {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = MemStore::new(FW_BS as usize);
+            let mut f0 = file0.into_bytes();
+            f0.resize(FW_BS as usize, 0);
+            fw_put_file(&mut store, 0, f0);
+            let id = identify_contacted(&conn, &mut store, None).expect("identify answers");
+            assert!(id.contradiction.is_none(), "{:?}", id.contradiction);
+            let note = id.catalog_note.expect("a note names it");
+            assert!(
+                note.contains(&format!("volume of Layout {n}"))
+                    && note.contains("label \"L6-0001\"")
+                    && note.contains("the tapectl that wrote it"),
+                "{note}"
+            );
+            // The text itself is still printed as File 0 reads.
+            assert!(id.text.contains("TAPECTL ARCHIVAL VOLUME"));
+        }
+    }
+
     #[test]
     fn check_fresh_write_contact_foreign_sealed_tape_refuses_even_with_force() {
         // The headline scenario from issue #27's own description: "loading
@@ -29654,6 +29735,67 @@ mod tests {
 
         fn file0_text(fake: &FakeTape) -> String {
             String::from_utf8_lossy(&fake.state().files[0]).into_owned()
+        }
+
+        // ---- another layout (volume-format-v3.md §7.6; item 269; #560) ----
+
+        /// A tape of another layout: File 0 and seal as recorded, with
+        /// stand-in files between.
+        fn another_layout_tape(file0: &str, seal: &str) -> FakeTape {
+            FakeTape::with_files(
+                vec![
+                    padded(file0.as_bytes().to_vec()),
+                    padded(b"guide".to_vec()),
+                    padded(b"#!/bin/sh".to_vec()),
+                    padded(b"front index".to_vec()),
+                    padded(vec![7u8; 1000]),
+                    padded(seal.as_bytes().to_vec()),
+                ],
+                BS,
+            )
+        }
+
+        /// `volume init` and `volume init --force` over a volume of
+        /// another layout, Layout 2 as 1.9.2 wrote it and a later one: both
+        /// refused, naming the layout and the label, with nothing written,
+        /// nothing recorded and no seal read; a chip that says the cartridge
+        /// was never written is no proof against a File 0 that reads.
+        #[test]
+        fn init_over_a_tape_of_another_layout_is_refused_with_and_without_force() {
+            use crate::volume::format::foreign_layouts as f;
+            for (n, file0, seal) in [
+                (
+                    2,
+                    f::LAYOUT_2_FILE_0.to_string(),
+                    f::LAYOUT_2_SEAL.to_string(),
+                ),
+                (4, f::layout_4_file_0(), f::layout_4_seal()),
+            ] {
+                for force in [false, true] {
+                    let conn = crate::db::open_memory().unwrap();
+                    let fake = another_layout_tape(&file0, &seal);
+                    let before = fake.state().files.clone();
+                    let det = chip(Some("SER-NEW"), Some(0));
+                    let msg = refusal(init_with(&conn, "NEWVOL", &fake, &det, force, None));
+                    assert!(
+                        msg.contains(&format!("volume of Layout {n}"))
+                            && msg.contains("label \"L6-0001\"")
+                            && msg.contains("RESTORE.sh in its own file 2")
+                            && msg.contains("--force cannot override")
+                            && msg.contains("tapectl cartridge erase"),
+                        "layout {n}, force={force}: {msg}"
+                    );
+                    assert_eq!(fake.state().files, before, "nothing was written");
+                    assert!(
+                        !fake.ops().iter().any(|op| matches!(
+                            op,
+                            crate::tape::fake::Op::Write(_) | crate::tape::fake::Op::Erase(_)
+                        )),
+                        "layout {n}: the drive was written to"
+                    );
+                    assert_eq!(volume_count(&conn), 0);
+                }
+            }
         }
 
         // ---- the chip proof -------------------------------------------

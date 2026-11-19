@@ -1857,6 +1857,10 @@ pub(crate) struct File0Facts {
     /// a key or reads a slice; the facts carry the verdict so that costs no
     /// second read of File 0.
     pub unreadable: Option<String>,
+    /// File 0 is a volume of another layout than 3 (`volume-format-v3.md`
+    /// §7.6; item 269): its label and layout, nothing else of it. Set with
+    /// [`File0Facts::unreadable`], whose sentence names it.
+    pub other_layout: Option<crate::volume::format::OtherLayout>,
 }
 
 impl File0Facts {
@@ -1972,6 +1976,10 @@ pub(crate) fn file0_facts_from_text(text: &str) -> File0Facts {
         unreadable: format::check_id_thunk_readable(text)
             .err()
             .map(|e| e.to_string()),
+        other_layout: identity
+            .as_ref()
+            .and_then(|_| format::parse_id_thunk_claims(text).ok())
+            .and_then(|claims| claims.other_layout()),
     }
 }
 
@@ -4625,6 +4633,7 @@ mod tests {
                     tape_length_meters: None,
                 }),
                 unreadable: None,
+                other_layout: None,
             }
         }
 

@@ -1032,6 +1032,15 @@ pub enum ContactOutcome {
     /// nothing. `position` is where it was read: File 0's own seal
     /// pointer, or the caller's.
     SealUnreadable { position: u32, error: String },
+    /// File 0 is a tapectl ID thunk whose layout is not 3
+    /// (`volume-format-v3.md` §7.6; ADR-0012 item 269; #560): a Layout 1 or 2
+    /// tape, or one of a later layout. Only File 0's label and layout were
+    /// read: no seal, index or envelope of that layout is parsed, so no
+    /// caller can learn from this whether the tape is sealed. It is a
+    /// tapectl-written volume, never "not written by tapectl", never a plain
+    /// mismatch `--force` may overwrite: the way past it is `cartridge
+    /// erase` and the typed label.
+    OtherLayout(format::OtherLayout),
 }
 
 /// The one check both [`InterruptedSession::resume_checking`] and the
@@ -1249,6 +1258,18 @@ pub(crate) fn contact_report(
             let text = String::from_utf8_lossy(&id_thunk_bytes);
             let identity = format::parse_id_thunk_identity(&text);
             facts.identity = identity.as_ref().ok().cloned();
+            // `volume-format-v3.md` §7.6: a volume of another layout
+            // is known by File 0's label and layout alone, BEFORE anything
+            // else of it is read: its seal pointer and seal are of a layout
+            // this tapectl does not parse, so they are not asked.
+            if identity.is_ok() {
+                if let Some(other) = format::parse_id_thunk_claims(&text)
+                    .ok()
+                    .and_then(|claims| claims.other_layout())
+                {
+                    return (ContactOutcome::OtherLayout(other), facts);
+                }
+            }
             let matches = matches!(
                 &identity,
                 Ok(id) if id.label == expected_label && id.uuid == expected_uuid
@@ -2545,10 +2566,14 @@ impl InterruptedSession {
                     self.built.layout.label, self.built.layout.label
                 )));
             }
-            contact @ (ContactOutcome::IdentityMismatch { .. } | ContactOutcome::EmptyFileZero) => {
+            contact @ (ContactOutcome::IdentityMismatch { .. }
+            | ContactOutcome::EmptyFileZero
+            | ContactOutcome::OtherLayout(_)) => {
                 // Issue #327: an empty File 0 at resume is divergence too —
                 // this session wrote a real ID thunk there. It quarantines
-                // exactly as an unparseable File 0 does (`found: None`).
+                // exactly as an unparseable File 0 does (`found: None`). So
+                // does another layout's (#560): this session wrote a Layout 3
+                // File 0 there, and what is there now is not it.
                 let found = match contact {
                     ContactOutcome::IdentityMismatch { found } => found,
                     _ => None,
@@ -9246,6 +9271,76 @@ mod tests {
         );
         let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(7));
         assert_eq!(outcome, ContactOutcome::Matches);
+    }
+
+    /// `volume-format-v3.md` §7.6 (item 269; #560): File 0 of another
+    /// layout's volume, with its seal at file 5, is known by its
+    /// label and layout and nothing else. The seal is not located, read or
+    /// parsed: no caller can take "sealed" or "unsealed" from it.
+    #[test]
+    fn check_tape_contact_a_tapectl_volume_of_another_layout_is_named_and_its_seal_unread() {
+        use crate::volume::format::foreign_layouts as f;
+        for (layout, file0, seal) in [
+            (
+                2,
+                f::LAYOUT_2_FILE_0.to_string(),
+                f::LAYOUT_2_SEAL.to_string(),
+            ),
+            (4, f::layout_4_file_0(), f::layout_4_seal()),
+        ] {
+            for seal_position in [None, Some(5), Some(9)] {
+                let mut store = MemStore::new(BS as usize);
+                let mut f0 = file0.clone().into_bytes();
+                f0.resize(BS as usize, 0);
+                put_file(&mut store, 0, f0);
+                let mut sl = seal.clone().into_bytes();
+                sl.resize(BS as usize, 0);
+                put_file(&mut store, 5, sl);
+                let (outcome, facts) =
+                    contact_report(&mut store, CONTACT_LABEL, CONTACT_UUID, seal_position);
+                assert_eq!(
+                    outcome,
+                    ContactOutcome::OtherLayout(format::OtherLayout {
+                        layout,
+                        label: Some(f::LABEL.to_string()),
+                    }),
+                    "layout {layout}, {seal_position:?}"
+                );
+                assert!(
+                    facts.seal_bytes(5).is_none(),
+                    "layout {layout}: the seal was read"
+                );
+            }
+        }
+    }
+
+    /// The same label and uuid as the caller's own, on another layout: still
+    /// another layout, never `Matches` (a resume would write over it).
+    #[test]
+    fn check_tape_contact_another_layout_with_the_callers_own_identity_is_not_a_match() {
+        use crate::volume::format::foreign_layouts as f;
+        let mut store = MemStore::new(BS as usize);
+        let mut f0 = f::LAYOUT_2_FILE_0.as_bytes().to_vec();
+        f0.resize(BS as usize, 0);
+        put_file(&mut store, 0, f0);
+        let outcome = check_tape_contact(&mut store, f::LABEL, f::UUID, Some(5));
+        assert!(
+            matches!(outcome, ContactOutcome::OtherLayout(_)),
+            "{outcome:?}"
+        );
+    }
+
+    /// A File 0 that is not tapectl's stays "not written by tapectl", even
+    /// when it happens to say `layout_version` (positive control for the
+    /// classification: it needs a tapectl identity, not a number).
+    #[test]
+    fn check_tape_contact_a_foreign_file_zero_stating_a_layout_is_still_foreign() {
+        let mut store = MemStore::new(BS as usize);
+        let mut f0 = b"[volume]\nlayout_version = 9\nsomething = 1\n".to_vec();
+        f0.resize(BS as usize, 0);
+        put_file(&mut store, 0, f0);
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None);
+        assert_eq!(outcome, ContactOutcome::IdentityMismatch { found: None });
     }
 
     #[test]

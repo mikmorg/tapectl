@@ -64,6 +64,7 @@ impl ParsedSeal {
             requires: self.requires.clone(),
             requires_stated: self.requires_stated,
             tapectl_version: None,
+            label: Some(self.volume.clone()),
         }
         .refusal("the seal marker")
     }
@@ -559,6 +560,8 @@ pub struct FormatClaims {
     pub requires_stated: bool,
     /// The writer's version, for the message only.
     pub tapectl_version: Option<String>,
+    /// File 0's label, for the message only (§7.6 names it).
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -567,6 +570,7 @@ struct ClaimsToml {
     layout_version: Option<i64>,
     requires: Option<Vec<String>>,
     tapectl_version: Option<String>,
+    label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -587,10 +591,75 @@ pub fn parse_id_thunk_claims(raw: &str) -> Result<FormatClaims> {
         requires_stated: doc.volume.requires.is_some(),
         requires: doc.volume.requires.unwrap_or_default(),
         tapectl_version: doc.volume.tapectl_version,
+        label: doc.volume.label,
     })
 }
 
+/// The prefix of every tapectl File 0's `magic` (`tapectl-volume-v<N>`).
+const MAGIC_PREFIX: &str = "tapectl-volume-v";
+
+/// A tapectl volume of a layout this tapectl does not read, as File 0 names
+/// it (`volume-format-v3.md` §7.6; ADR-0012 item 269; #560). Read from File 0
+/// and nothing else: no envelope, index or seal of that layout is parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherLayout {
+    /// The layout number File 0 states (`layout_version`, else the number in
+    /// `magic`): 1, 2, or any later one.
+    pub layout: i64,
+    pub label: Option<String>,
+}
+
+impl OtherLayout {
+    /// The sentence every command that meets such a tape says (§7.6).
+    pub fn sentence(&self) -> String {
+        other_layout_sentence(self.layout, self.label.as_deref())
+    }
+}
+
+/// "this is a tapectl volume of Layout N, label L; read it with the tapectl
+/// that wrote it, or with the RESTORE.sh in its own file 2" (§7.6).
+pub fn other_layout_sentence(layout: i64, label: Option<&str>) -> String {
+    let label = match label {
+        Some(l) => format!("label \"{l}\""),
+        None => "no label".to_string(),
+    };
+    format!(
+        "this is a tapectl volume of Layout {layout}, {label}; read it with the tapectl that \
+         wrote it, or with the RESTORE.sh in its own file 2"
+    )
+}
+
 impl FormatClaims {
+    /// The layout number these claims state: `layout_version`, else the
+    /// number a `tapectl-volume-v<N>` magic carries.
+    fn layout_number(&self) -> Option<i64> {
+        self.layout_version.or_else(|| {
+            self.magic
+                .as_deref()?
+                .strip_prefix(MAGIC_PREFIX)?
+                .parse()
+                .ok()
+        })
+    }
+
+    /// Whether these claims are a tapectl File 0 of a layout other than
+    /// [`LAYOUT_VERSION`]: a `magic` that is tapectl's (or absent: a damaged
+    /// File 0 still says its `layout_version`, §1.2 rule 2) and a layout
+    /// number that is not ours. A File 0 that is not tapectl's, or states no
+    /// layout, is `None`.
+    pub fn other_layout(&self) -> Option<OtherLayout> {
+        if let Some(m) = &self.magic {
+            if !m.starts_with(MAGIC_PREFIX) {
+                return None;
+            }
+        }
+        let layout = self.layout_number()?;
+        (layout != LAYOUT_VERSION).then(|| OtherLayout {
+            layout,
+            label: self.label.clone(),
+        })
+    }
+
     /// `None` when this tapectl can read a tape making these claims;
     /// otherwise the sentence that says why not, naming what it would need.
     pub fn refusal(&self, what: &str) -> Option<String> {
@@ -600,6 +669,20 @@ impl FormatClaims {
             .as_deref()
             .map(|v| format!(" (it was written by tapectl {v})"))
             .unwrap_or_default();
+        // §7.6: a tapectl volume of another layout is named as one, with its
+        // label, and the way to a reader that knows it.
+        if let Some(other) = self.other_layout() {
+            let magic = match &self.magic {
+                Some(m) => format!(", magic = \"{m}\""),
+                None => String::new(),
+            };
+            return Some(format!(
+                "{what} says layout_version = {}{magic}: {}{writer}. This tapectl ({ours}) \
+                 reads layout {LAYOUT_VERSION} only and has read nothing else of it",
+                other.layout,
+                other.sentence(),
+            ));
+        }
         if let Some(m) = &self.magic {
             if m != MAGIC {
                 return Some(format!(
@@ -1355,6 +1438,57 @@ mod forward_compat_tests {
         parse_id_thunk_identity(&t).unwrap();
         let s = parse_seal_marker(&set_requires(&seal(), "requires = []\nfuture_key = 7")).unwrap();
         assert_eq!(s.refusal(), None);
+    }
+
+    /// `volume-format-v3.md` §7.6 (item 269; #560): what is "a tapectl
+    /// volume of another layout". Its claims, and the sentence every command
+    /// says. Positive control: this tapectl's own File 0 is not one, and a
+    /// document that is not tapectl's, or states no layout, is not one.
+    #[test]
+    fn a_tapectl_volume_of_another_layout_is_named_with_its_label() {
+        use super::foreign_layouts as f;
+        let claims = |t: &str| parse_id_thunk_claims(t).unwrap();
+        assert_eq!(claims(&thunk()).other_layout(), None, "our own File 0");
+        for (n, text) in [
+            (2, f::LAYOUT_2_FILE_0.to_string()),
+            (4, f::layout_4_file_0()),
+            (
+                1,
+                f::LAYOUT_2_FILE_0
+                    .replace("v2", "v1")
+                    .replace("layout_version = 2", "layout_version = 1"),
+            ),
+        ] {
+            let other = claims(&text).other_layout().expect("another layout");
+            assert_eq!(other.layout, n);
+            assert_eq!(other.label.as_deref(), Some(f::LABEL));
+            assert_eq!(
+                other.sentence(),
+                format!(
+                    "this is a tapectl volume of Layout {n}, label \"L6-0001\"; read it with \
+                     the tapectl that wrote it, or with the RESTORE.sh in its own file 2"
+                )
+            );
+            let why = check_id_thunk_readable(&text).unwrap_err().to_string();
+            assert!(why.contains(&other.sentence()), "{why}");
+        }
+        // The layout from the magic alone, when layout_version is damaged away.
+        let t = f::LAYOUT_2_FILE_0.replace("layout_version = 2\n", "");
+        assert_eq!(claims(&t).other_layout().unwrap().layout, 2);
+        // Not tapectl's: another magic, whatever number it states.
+        let t = f::LAYOUT_2_FILE_0.replace("tapectl-volume-v2", "some-other-format");
+        assert_eq!(claims(&t).other_layout(), None);
+        // No magic and no layout at all: nothing to name.
+        let t = f::LAYOUT_2_FILE_0
+            .replace("magic = \"tapectl-volume-v2\"\n", "")
+            .replace("layout_version = 2\n", "");
+        assert_eq!(claims(&t).other_layout(), None);
+        // The seal's refusal names its volume.
+        let seal = parse_seal_marker(f::LAYOUT_2_SEAL).unwrap();
+        assert!(seal
+            .refusal()
+            .unwrap()
+            .contains("tapectl volume of Layout 2, label \"L6-0001\""));
     }
 
     /// Another layout or magic is refused with a named error (#384; D1):
@@ -2616,5 +2750,137 @@ cartridge_serial = \"SERIAL1\"
             &parse_front_index(&generate_front_index("RT01", &sample_files())).unwrap(),
         );
         assert_eq!(clean, Vec::new());
+    }
+}
+
+/// Recorded bytes of tapectl volumes of other layouts, for the tests of
+/// `volume-format-v3.md` §7.6 (#560). They are samples of a FOREIGN format, not
+/// fixtures of this tapectl's own staging (plan invariant 8): nothing here is
+/// generated by this tapectl, so a change to its writers cannot move them.
+#[cfg(test)]
+pub(crate) mod foreign_layouts {
+    pub const LABEL: &str = "L6-0001";
+    pub const UUID: &str = "4d1f0c52-8a3e-4b7a-9c61-0e2f5a7b9d13";
+
+    /// File 0 as tapectl 1.9.2 wrote it for a Layout 2 tape (the text of its
+    /// `layout::generate_id_thunk_v2`, `requires` as 1.9.2 stated it).
+    pub const LAYOUT_2_FILE_0: &str = r#"================================================================
+                     TAPECTL ARCHIVAL VOLUME
+================================================================
+
+Label:   L6-0001
+Media:   LTO-6
+Created: 2026-10-14T09:30:00Z
+
+This tape contains encrypted archival data managed by tapectl,
+an open-source archival storage tool.
+
+>>> COMPLETE INSTRUCTIONS ARE IN THE NEXT FILE ON THIS TAPE. <<<
+>>> THE FULL MAP OF THIS TAPE IS FILE 3 (the front index).   <<<
+
+Your drive may not be /dev/nst0. That is an example, not a fact
+about this tape. List the tape drives on the machine you are
+using and substitute the right one everywhere below:
+
+    ls -l /dev/tape/by-id/
+
+A wrong device reads a DIFFERENT tape, or fails outright.
+
+To read the next file (the full recovery guide):
+
+    mt -f /dev/nst0 setblk 524288
+    mt -f /dev/nst0 fsf 1
+    dd if=/dev/nst0 bs=512k | tr -d '\0' > GUIDE.md
+    less GUIDE.md
+
+If you just read this file and the tape is already positioned
+past it, read the next file directly:
+
+    mt -f /dev/nst0 setblk 524288
+    dd if=/dev/nst0 bs=512k | tr -d '\0' > GUIDE.md
+
+The guide explains everything: what tools you need, how to find
+your encryption key, and how to recover your data step by step.
+It is written so that an AI assistant can follow it to help you.
+
+================================================================
+              MACHINE-READABLE METADATA (TOML)
+================================================================
+
+[volume]
+magic = "tapectl-volume-v2"
+label = "L6-0001"
+uuid = "4d1f0c52-8a3e-4b7a-9c61-0e2f5a7b9d13"
+layout_version = 2
+requires = ["short-seal"]
+tapectl_version = "1.9.2"
+media_type = "LTO-6"
+nominal_capacity_bytes = 2500000000000
+mam_capacity_bytes = 2400000000000
+created_at = "2026-10-14T09:30:00Z"
+
+[layout]
+front_index = 3
+seal_marker = 5
+total_files = 6
+
+[media]
+cartridge_manufacturer = "FUJIFILM"
+cartridge_serial = "EW7VWMVKF6"
+cartridge_identity_source = "mam"
+tape_length_meters = 846
+load_count_at_write = 7
+"#;
+
+    /// The seal marker of that tape, at file 5, as 1.9.2's
+    /// `generate_seal_marker` wrote it.
+    pub const LAYOUT_2_SEAL: &str = r#"================================================================
+                    TAPECTL SEAL MARKER
+================================================================
+
+Volume: L6-0001
+This file seals the tape: its presence means every file before it is
+present. Its absence means the tape is unsealed (interrupted or aborted).
+
+================================================================
+              MACHINE-READABLE DATA (TOML)
+================================================================
+
+[seal]
+volume = "L6-0001"
+layout_version = 2
+requires = ["short-seal"]
+file_count = 6
+ended_after = 4
+sealed_at = "2026-10-14T11:02:41Z"
+front_index_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[files]]
+position = 0
+type = "id_thunk"
+size_bytes = 2113
+sha256_encrypted = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[files]]
+position = 5
+type = "seal_marker"
+"#;
+
+    /// A File 0 of a layout later than this tapectl's: the same keys, the
+    /// version and magic moved, and a table this tapectl does not know.
+    pub fn layout_4_file_0() -> String {
+        let mut t = LAYOUT_2_FILE_0
+            .replace("tapectl-volume-v2", "tapectl-volume-v4")
+            .replace("layout_version = 2", "layout_version = 4")
+            .replace("requires = [\"short-seal\"]", "requires = []");
+        t.push_str("\n[future]\nanything = \"a later tapectl wrote this\"\n");
+        t
+    }
+
+    /// The seal of a layout 4 tape.
+    pub fn layout_4_seal() -> String {
+        LAYOUT_2_SEAL
+            .replace("layout_version = 2", "layout_version = 4")
+            .replace("requires = [\"short-seal\"]", "requires = []")
     }
 }

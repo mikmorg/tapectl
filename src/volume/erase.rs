@@ -259,7 +259,8 @@ impl EraseReport {
                     s.front_index_files, s.front_index_bytes, s.file_count
                 ));
             }
-            None if self.medium == MediumKind::Tapectl => {
+            // Another layout's seal is not read (§7.6): nothing is said of it.
+            None if self.medium == MediumKind::Tapectl && !self.other_layout() => {
                 out.push("  sealed:       no seal marker found where File 0 points".into());
             }
             None => {}
@@ -286,6 +287,15 @@ impl EraseReport {
             out.push(format!("  note: {n}"));
         }
         out
+    }
+
+    /// Whether File 0 states a layout other than this tapectl's: a tapectl
+    /// volume whose seal was not read (`volume-format-v3.md` §7.6).
+    fn other_layout(&self) -> bool {
+        matches!(
+            self.file0.as_ref().and_then(|f| f.layout_version),
+            Some(v) if v != format::LAYOUT_VERSION
+        )
     }
 
     /// What consent is asked for, naming whose volume the tape holds as the
@@ -533,6 +543,14 @@ fn identify(
         | ContactOutcome::Matches
         | ContactOutcome::AlreadySealed { .. } => {
             report.medium = MediumKind::Tapectl;
+        }
+        // `volume-format-v3.md` §7.6 (item 269; #560): a volume of
+        // another layout. File 0's label and layout are all that was read;
+        // the label is the consent word, as for any tapectl tape, and the
+        // catalog cross-check below gates the erase as it does for one.
+        ContactOutcome::OtherLayout(other) => {
+            report.medium = MediumKind::Tapectl;
+            report.detail = Some(other.sentence());
         }
         // Issue #460. File 0 parsed, so this is a tapectl tape, and the
         // typed label File 0 carries is still the consent word. What cannot
@@ -1059,7 +1077,8 @@ fn erase_in_contact(
         ContactOutcome::IdentityMismatch { found: Some(_) }
         | ContactOutcome::Matches
         | ContactOutcome::AlreadySealed { .. }
-        | ContactOutcome::SealUnreadable { .. } => Some(MediumKind::Tapectl),
+        | ContactOutcome::SealUnreadable { .. }
+        | ContactOutcome::OtherLayout(_) => Some(MediumKind::Tapectl),
     };
     report.medium_after = medium_after;
     report.chip_serial_after = after_det.mam.serial.clone();
@@ -2649,6 +2668,120 @@ mod tests {
             assert_eq!(report.outcome, EraseOutcome::NothingToErase, "{what}");
             assert!(writes(&fake).is_empty(), "{what}");
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM events"), 0, "{what}");
+        }
+    }
+
+    // ---- `volume-format-v3.md` §7.6 (item 269; #560): a volume of
+    // another layout. Recorded bytes (`format::foreign_layouts`), File 0 and
+    // a seal at file 5, on the in-memory tape; the label File 0 carries is
+    // the consent word and the way to reuse the cartridge.
+
+    /// A tape of another layout: its File 0 and seal text, with stand-in
+    /// files between.
+    fn another_layout_tape(file0: &str, seal: &str) -> FakeTape {
+        FakeTape::with_files(
+            vec![
+                pad(file0.as_bytes().to_vec()),
+                pad(b"guide".to_vec()),
+                pad(b"#!/bin/sh".to_vec()),
+                pad(b"front index".to_vec()),
+                pad(vec![7u8; 1000]),
+                pad(seal.as_bytes().to_vec()),
+            ],
+            BS,
+        )
+    }
+
+    fn layouts() -> [(i64, String, String); 2] {
+        use crate::volume::format::foreign_layouts as f;
+        [
+            (
+                2,
+                f::LAYOUT_2_FILE_0.to_string(),
+                f::LAYOUT_2_SEAL.to_string(),
+            ),
+            (4, f::layout_4_file_0(), f::layout_4_seal()),
+        ]
+    }
+
+    /// The facts name it: a volume of Layout N, its label, how to
+    /// read it. Its seal is not read, and nothing says it is unsealed.
+    #[test]
+    fn a_tape_of_another_layout_is_named_by_its_label_and_its_seal_is_not_read() {
+        for (n, file0, seal) in layouts() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = another_layout_tape(&file0, &seal);
+            let report = run(
+                &conn,
+                &fake,
+                opts(EraseMode::Short, None, true),
+                &[Some(SERIAL)],
+            )
+            .expect("a dry run succeeds");
+            assert_eq!(report.medium, MediumKind::Tapectl, "layout {n}");
+            let f = report.file0.as_ref().expect("File 0 reported");
+            assert_eq!(f.label.as_deref(), Some("L6-0001"));
+            assert_eq!(f.layout_version, Some(n));
+            assert_eq!(report.confirm_label.as_deref(), Some("L6-0001"));
+            assert!(report.sealed.is_none(), "layout {n}: no seal was parsed");
+            let detail = report.detail.as_deref().expect("said");
+            assert!(
+                detail.contains(&format!("volume of Layout {n}"))
+                    && detail.contains("label \"L6-0001\"")
+                    && detail.contains("the tapectl that wrote it")
+                    && detail.contains("RESTORE.sh in its own file 2"),
+                "{detail}"
+            );
+            let lines = report.lines().join("\n");
+            assert!(!lines.contains("no seal marker found"), "{lines}");
+            assert!(writes(&fake).is_empty());
+        }
+    }
+
+    /// With the typed label the erase works on such a tape, verified and
+    /// recorded as for any tapectl tape.
+    #[test]
+    fn a_tape_of_another_layout_is_erased_with_the_typed_label() {
+        for (n, file0, seal) in layouts() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = another_layout_tape(&file0, &seal);
+            let report = run(
+                &conn,
+                &fake,
+                opts(EraseMode::Short, Some("L6-0001"), false),
+                &[Some(SERIAL)],
+            )
+            .unwrap_or_else(|e| panic!("layout {n}: {e}"));
+            assert_eq!(report.outcome, EraseOutcome::Erased, "layout {n}");
+            assert_eq!(report.medium_after, Some(MediumKind::Empty));
+            assert_eq!(fake.state().files, vec![Vec::<u8>::new()]);
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM events WHERE action = 'erased'"),
+                1
+            );
+        }
+    }
+
+    /// Without the typed label, or with another, it is refused and the tape
+    /// is untouched: no seal is read to say it is safe.
+    #[test]
+    fn a_tape_of_another_layout_is_not_erased_without_the_typed_label() {
+        for (n, file0, seal) in layouts() {
+            for confirm in [None, Some("L6-0002")] {
+                let conn = crate::db::open_memory().unwrap();
+                let fake = another_layout_tape(&file0, &seal);
+                let before = fake.state().files.clone();
+                let err = run(
+                    &conn,
+                    &fake,
+                    opts(EraseMode::Short, confirm, false),
+                    &[Some(SERIAL)],
+                )
+                .unwrap_err();
+                assert_eq!(exit_code(err), 2, "layout {n}, {confirm:?}");
+                assert_eq!(fake.state().files, before);
+                assert!(writes(&fake).is_empty());
+            }
         }
     }
 }

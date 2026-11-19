@@ -214,6 +214,19 @@ pub(crate) struct CatalogAccount {
 
 /// [`CatalogAccount`] for `located`, the lookup of `file0`.
 pub(crate) fn account(located: &Located, file0: &File0Facts) -> CatalogAccount {
+    // `volume-format-v3.md` §7.6: a volume of another layout is named
+    // as one, whatever the catalog makes of its uuid; a uuid the catalog
+    // knows under another label is still a contradiction.
+    if let Some(other) = &file0.other_layout {
+        let contradiction = match located {
+            Located::UnderAnotherLabel { .. } => located.refusal(file0),
+            _ => None,
+        };
+        return CatalogAccount {
+            note: contradiction.is_none().then(|| other.sentence()),
+            contradiction,
+        };
+    }
     match located {
         Located::NoIdentity => CatalogAccount::default(),
         Located::Unknown => CatalogAccount {
@@ -271,6 +284,11 @@ pub(crate) fn identify<'s>(
         ))
     })?;
     let file0 = binding::file0_facts_from_text(&String::from_utf8_lossy(&raw));
+    // A volume of another layout is named before the catalog is
+    // asked about it (§7.6): the way on is the tapectl that wrote it.
+    if let (Some(_), Some(why)) = (&file0.other_layout, &file0.unreadable) {
+        return Err(TapectlError::Other(why.clone()));
+    }
     let volume = resolve(conn, &file0)?;
     Ok((volume, Peeked::new(store, raw)))
 }
@@ -551,6 +569,7 @@ mod tests {
             uuid: uuid.map(str::to_string),
             media: None,
             unreadable: None,
+            other_layout: None,
         }
     }
 
@@ -924,6 +943,44 @@ mod tests {
             err.contains("STRANGER") && err.contains("uuid-stranger"),
             "{err}"
         );
+    }
+
+    /// `volume-format-v3.md` §7.6 (item 269; #560): a read that takes the
+    /// loaded tape as the volume refuses a volume of another layout
+    /// BY NAME, with its label and the way to read it, not as a tape "this
+    /// catalog has no volume with that uuid" for. And `volume identify`'s
+    /// account notes it, whatever the catalog makes of the uuid.
+    #[test]
+    fn a_tape_of_another_layout_is_named_by_identify_and_by_the_read_contact() {
+        use crate::volume::format::foreign_layouts as f;
+        let (conn, _) = catalog_with("P2", "uuid-p2", "sealed", "ok");
+        for (n, text) in [
+            (2, f::LAYOUT_2_FILE_0.to_string()),
+            (4, f::layout_4_file_0()),
+        ] {
+            let mut store = crate::store::MemStore::new(4096);
+            let mut bytes = text.clone().into_bytes();
+            bytes.resize(bytes.len().div_ceil(4096) * 4096, 0);
+            store.files.push(bytes);
+            store.syncs.push(false);
+            let err = identify(&conn, &mut store)
+                .err()
+                .expect("refused")
+                .to_string();
+            assert!(
+                err.contains(&format!("volume of Layout {n}"))
+                    && err.contains("label \"L6-0001\"")
+                    && err.contains("RESTORE.sh in its own file 2"),
+                "{err}"
+            );
+            assert!(!err.contains("no volume with that uuid"), "{err}");
+
+            let facts = binding::file0_facts_from_text(&text);
+            let account = account(&locate(&conn, &facts).unwrap(), &facts);
+            assert!(account.contradiction.is_none());
+            let note = account.note.expect("noted");
+            assert!(note.contains(&format!("volume of Layout {n}")), "{note}");
+        }
     }
 
     /// `Peeked` implements every method of `Store`, so none runs the trait's
