@@ -1546,10 +1546,7 @@ fn write_left_out(
         } else {
             format!("{why}, {}", crate::util::format_bytes_binary(row.bytes))
         };
-        out.push_str(&format!(
-            "\n  left out: {} ({what})",
-            crate::volume::index::escape(&row.path)
-        ));
+        out.push_str(&format!("\n  left out: {} ({what})", row.path));
     }
     if rows.len() > LEFT_OUT_NAMED {
         out.push_str(&format!(
@@ -2004,7 +2001,13 @@ fn stream_estimate(
         bytes = bytes
             .saturating_add(ENTRY_HEADER_BYTES)
             .saturating_add(round_up_512(2 * path.len() as u64));
-        let full = std::ffi::CString::new(root.join(&path).as_os_str().as_bytes());
+        let full = std::ffi::CString::new(
+            root.join(
+                crate::volume::index::unescape_os(&path).unwrap_or_else(|_| path.clone().into()),
+            )
+            .as_os_str()
+            .as_bytes(),
+        );
         // SAFETY: a NUL-terminated string; a null buffer of length 0 asks
         // only for the attribute list's size.
         let has_xattr = full.is_ok_and(|c| unsafe {
@@ -2966,7 +2969,7 @@ fn walk_directory_reporting(path: &str, global_excludes: &[String]) -> Result<Wa
                 left_out.push(LeftOut {
                     reason: Reason::Pattern,
                     pattern: Some(pattern.to_string()),
-                    path: rel.to_string_lossy().into_owned(),
+                    path: crate::volume::index::escape_os(rel.as_os_str()).into_owned(),
                     folder: true,
                     files,
                     bytes,
@@ -3000,7 +3003,7 @@ fn walk_directory_reporting(path: &str, global_excludes: &[String]) -> Result<Wa
                 left_out.push(LeftOut {
                     reason,
                     pattern,
-                    path: rel.to_string_lossy().into_owned(),
+                    path: crate::volume::index::escape_os(rel.as_os_str()).into_owned(),
                     folder: false,
                     files: 1,
                     bytes: if meta.is_file() { meta.len() as i64 } else { 0 },
@@ -3008,21 +3011,12 @@ fn walk_directory_reporting(path: &str, global_excludes: &[String]) -> Result<Wa
                 continue;
             }
         }
-        // Issue #465: names are recorded as UTF-8 text, and one that is not
-        // used to be stored lossily — every stage of the unit then failed as
-        // "source file missing", and two names that collapsed to the same
-        // text collided on the paths index. Refused here, once, naming the
-        // path (`{:?}` escapes the bytes that are not UTF-8). Checked after
-        // the exclusion above: a name that will not be archived is not recorded
-        // and not a reason to refuse. A symlink's target is not a name tapectl
-        // looks up, and stays lossy.
-        let Some(rel_path) = rel.to_str().map(str::to_string) else {
-            return Err(TapectlError::Other(format!(
-                "cannot record the file name {rel:?} under {path}: it is not valid UTF-8, \
-                 and tapectl records and looks up names as text. Rename it (for example \
-                 with `convmv -f latin1 -t utf8`), or move it out of the unit"
-            )));
-        };
+        // A name is bytes (ADR-0012 item 297, #569): it is recorded in the
+        // escaped form of `volume-format-v3.md` §1.5, the one the catalog, the
+        // file table and the index hold, and nothing converts it lossily. A
+        // name that is UTF-8 with no backslash, TAB, LF or CR is recorded as
+        // it is.
+        let rel_path = crate::volume::index::escape_os(rel.as_os_str()).into_owned();
         // lstat's own size for the entry — for a symlink this is the length
         // of the *target path string*, not any real content size. Kept
         // as-is (not zeroed for a symlink/special below): it's what
@@ -3055,7 +3049,10 @@ fn walk_directory_reporting(path: &str, global_excludes: &[String]) -> Result<Wa
             let target = fs::read_link(entry.path()).map_err(|e| {
                 TapectlError::Other(format!("cannot read symlink target: {rel_path} ({e})"))
             })?;
-            ("symlink", Some(target.to_string_lossy().to_string()))
+            (
+                "symlink",
+                Some(crate::volume::index::escape_os(target.as_os_str()).into_owned()),
+            )
         } else if ft.is_file() {
             ("regular", None)
         } else {
@@ -3164,6 +3161,45 @@ mod tests {
         )
         .unwrap();
         kp.public_key
+    }
+
+    /// ADR-0012 item 297 (#569): the walk records a name's bytes in the escaped
+    /// form (it used to refuse such a unit by name), a symbolic link's target
+    /// likewise, and a pattern reads a name that is not UTF-8 by that form: a
+    /// glob matches it, and what it leaves out is reported escaped.
+    #[test]
+    fn walk_directory_records_names_that_are_not_utf8_in_the_escaped_form() {
+        use std::os::unix::ffi::OsStrExt;
+        let os = std::ffi::OsStr::from_bytes;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(os(b"caf\xe9.txt")), b"kept").unwrap();
+        fs::write(tmp.path().join(os(b"caf\xe9.tmp")), b"junk").unwrap();
+        fs::write(tmp.path().join("back\\slash.txt"), b"slash").unwrap();
+        fs::create_dir(tmp.path().join(os(b"n\xe9"))).unwrap();
+        fs::write(tmp.path().join(os(b"n\xe9")).join("inside"), b"x").unwrap();
+        std::os::unix::fs::symlink(os(b"\xfe\xfdtarget"), tmp.path().join(os(b"l\xe9"))).unwrap();
+
+        let walk = walk_directory_reporting(
+            tmp.path().to_str().unwrap(),
+            &["*.tmp".to_string(), "n*/".to_string()],
+        )
+        .unwrap();
+        let mut paths: Vec<&str> = walk.entries.iter().map(|e| e.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            ["back\\\\slash.txt", "caf\\xe9.txt", "l\\xe9", "n\\xe9"],
+            "the escaped forms; the .tmp is out, the pruned folder stays, empty"
+        );
+        let link = walk.entries.iter().find(|e| e.path == "l\\xe9").unwrap();
+        assert_eq!(link.link_target.as_deref(), Some("\\xfe\\xfdtarget"));
+        let mut left: Vec<(&str, bool)> = walk
+            .left_out
+            .iter()
+            .map(|l| (l.path.as_str(), l.folder))
+            .collect();
+        left.sort_unstable();
+        assert_eq!(left, [("caf\\xe9.tmp", false), ("n\\xe9", true)]);
     }
 
     #[test]
@@ -5173,51 +5209,56 @@ mod tests {
         assert_eq!(recorded(".cache/cached-top.bin"), 0);
     }
 
-    /// Issue #465 item 4: a file name that is not UTF-8 was stored lossily
-    /// (`to_string_lossy`), so every stage of the unit was refused as "source
-    /// file missing" and two names that collapsed to the same text collided
-    /// on the paths index. `snapshot create` refuses it instead, naming the
-    /// path with the bytes that are not UTF-8 escaped. A name inside an
-    /// excluded subtree is not archived, so it is not refused.
+    /// ADR-0012 item 297 (#569), which replaces issue #465's refusal: a file
+    /// name that is not UTF-8 is recorded by its bytes in the escaped form
+    /// (`volume-format-v3.md` 1.5), never lossily, so two names cannot collapse
+    /// to one and every stage finds the file. A name inside an excluded
+    /// subtree is not recorded.
     #[test]
-    fn snapshot_create_refuses_a_file_name_that_is_not_utf8_naming_it() {
+    fn snapshot_create_records_a_file_name_that_is_not_utf8_escaped() {
         use std::os::unix::ffi::OsStrExt;
         let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
-        for (dir, shown) in [("", "caf\\xE9.txt"), ("sub", "sub/caf\\xE9.txt")] {
+        let other = std::ffi::OsStr::from_bytes(b"caf\xe8.txt");
+        for (dir, recorded) in [("", "caf\\xe9.txt"), ("sub", "sub/caf\\xe9.txt")] {
             let tmp = TempDir::new().unwrap();
             let (conn, _paths, _config, src) = setup_unit_with_excludes(&tmp, vec![]);
             fs::write(src.join("keep.txt"), b"kept").unwrap();
             fs::create_dir_all(src.join(dir)).unwrap();
             fs::write(src.join(dir).join(latin1), b"latin one").unwrap();
+            // Two names that a lossy conversion would make one.
+            fs::write(src.join(dir).join(other), b"latin two").unwrap();
 
-            let err = snapshot_create(&conn, "unit1", &Config::default())
-                .expect_err("a name that is not UTF-8 cannot be recorded");
-            let msg = err.to_string();
-            assert!(
-                msg.contains(shown),
-                "{dir:?}: names the path, escaped: {msg}"
+            let snap = snapshot_create(&conn, "unit1", &Config::default())
+                .expect("a name that is not UTF-8 is recorded");
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, snap, Some(recorded)),
+                1,
+                "{dir:?}: recorded escaped"
             );
-            assert!(msg.contains("UTF-8"), "{dir:?}: says why: {msg}");
-            let snapshots: i64 = conn
-                .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(snapshots, 0, "{dir:?}: nothing was recorded");
+            let twin = recorded.replace("xe9", "xe8");
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, snap, Some(&twin)),
+                1,
+                "{dir:?}: the other name is its own row"
+            );
         }
 
-        // Positive control for the exception: the same name under an
-        // excluded directory is neither archived nor recorded, so it is not
-        // a reason to refuse.
+        // The same name under an excluded directory is neither archived nor
+        // recorded.
         let tmp = TempDir::new().unwrap();
         let (conn, _paths, _config, src) =
             setup_unit_with_excludes(&tmp, vec![".cache/".to_string()]);
         fs::write(src.join("keep.txt"), b"kept").unwrap();
         fs::create_dir_all(src.join(".cache")).unwrap();
         fs::write(src.join(".cache").join(latin1), b"cache").unwrap();
-        let snap = snapshot_create(&conn, "unit1", &Config::default())
-            .expect("an excluded name is not a reason to refuse");
+        let snap = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         assert_eq!(
             crate::db::files::fixture::count(&conn, snap, Some("keep.txt")),
             1
+        );
+        assert_eq!(
+            crate::db::files::fixture::count(&conn, snap, Some(".cache/caf\\xe9.txt")),
+            0
         );
     }
 

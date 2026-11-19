@@ -251,7 +251,9 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
     };
 
     for (rel_path, expected_size, expected_sha, recorded_mtime) in &staged_files {
-        let full_path = Path::new(current_path).join(rel_path);
+        // The catalog's path is the escaped form (§1.5; ADR-0012 item 297): the
+        // name on disk is its bytes.
+        let full_path = Path::new(current_path).join(crate::volume::index::on_disk(rel_path));
         if !full_path.exists() {
             report.missing += 1;
             report.details.push(IntegrityDetail {
@@ -5914,6 +5916,39 @@ mod tests {
         let gone = check_integrity(&conn, "unit1").unwrap();
         assert_eq!(gone.missing, 1);
         assert_eq!(gone.exit_code(), crate::error::EXIT_WARNING);
+    }
+
+    /// ADR-0012 item 297 (#569): the catalog holds a path in the escaped form,
+    /// `unit check-integrity` finds the file by its bytes, and what it prints,
+    /// plain and `--json`, is the escaped form.
+    #[test]
+    fn check_integrity_finds_names_that_are_not_utf8_and_shows_them_escaped() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TempDir::new().unwrap();
+        let latin = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+        let slash = tmp.path().join("back\\slash.txt");
+        std::fs::write(&latin, b"hello").unwrap();
+        std::fs::write(&slash, b"hello").unwrap();
+        let (conn, sid) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        let hash = direct_old_style_hash(b"hello");
+        insert_file(&conn, sid, "caf\\xe9.txt", 5, &hash);
+        insert_file(&conn, sid, "back\\\\slash.txt", 5, &hash);
+        let clean = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(
+            (clean.ok, clean.missing),
+            (2, 0),
+            "both names are found by their bytes: {:?}",
+            clean.details
+        );
+        std::fs::remove_file(&latin).unwrap();
+        let gone = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!((gone.ok, gone.missing), (1, 1));
+        let plain = render_integrity(&gone);
+        assert!(plain.contains("caf\\xe9.txt \u{2014} MISSING"), "{plain}");
+        let json = integrity_json(&gone);
+        assert_eq!(json["details"][0]["path"], "caf\\xe9.txt", "{json}");
+        // Nothing in the JSON is a byte outside UTF-8.
+        assert!(serde_json::to_string(&json).is_ok());
     }
 
     /// Q40, with the CTO: the exit of a check whose only finding is CHANGED

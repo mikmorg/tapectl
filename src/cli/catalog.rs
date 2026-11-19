@@ -34,7 +34,12 @@ pub enum CatalogCommands {
         /// must match (AND). So "foo bar" finds paths containing a word
         /// starting with foo AND one starting with bar -- it is not a substring
         /// match, and "ar" will not find "bar".
-        pattern: String,
+        ///
+        /// Typed as the shell has it: a name's own bytes, so a name that is not
+        /// UTF-8 or has a backslash is searched as it is. The catalog holds a
+        /// path escaped (`\\` for a backslash, `\xHH` for a byte outside UTF-8),
+        /// and so does this command print it
+        pattern: std::ffi::OsString,
         /// Limit results
         #[arg(long, default_value = "50")]
         limit: i64,
@@ -611,7 +616,10 @@ fn dispatch(
             limit,
             all_versions,
         } => {
-            let rows = search_rows(conn, pattern, *limit, *all_versions)?;
+            // The query is a name's bytes as typed; the catalog keeps a path
+            // escaped (§1.5; ADR-0012 item 297), so it is searched so.
+            let rows = search_typed(conn, pattern, *limit, *all_versions)?;
+            let pattern = crate::volume::index::escape_os(pattern);
 
             if json_output {
                 let json: Vec<serde_json::Value> = rows
@@ -1160,6 +1168,23 @@ fn match_expression(pattern: &str) -> Option<String> {
         .map(|t| format!("{}*", t.to_lowercase()))
         .collect();
     (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
+/// [`search_rows`] for a query as typed on the command line: a name's own
+/// bytes, escaped as the catalog keeps a path (§1.5; ADR-0012 item 297), so a
+/// name that is not UTF-8 or has a backslash is found as it is typed.
+fn search_typed(
+    conn: &Connection,
+    typed: &std::ffi::OsStr,
+    limit: i64,
+    all_versions: bool,
+) -> Result<Vec<SearchHit>> {
+    search_rows(
+        conn,
+        &crate::volume::index::escape_os(typed),
+        limit,
+        all_versions,
+    )
 }
 
 /// `catalog search` (issue #380). By default only each unit's NEWEST version
@@ -3116,6 +3141,44 @@ mod tests {
     ];
     const REPORT_V2: &[SeedFile<'static>] =
         &[("docs", 0, "dir"), ("docs/report.txt", 10, "regular")];
+
+    /// ADR-0012 item 297 (#569): a query typed as bytes finds a name that is
+    /// not UTF-8, and one with a backslash, which the catalog keeps escaped;
+    /// the hit shows the escaped form.
+    #[test]
+    fn search_takes_the_typed_query_as_bytes_and_escapes_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let conn = db::open_memory().unwrap();
+        seed_versions(
+            &conn,
+            "u",
+            &[(
+                1,
+                "current",
+                3,
+                30,
+                &[
+                    ("docs", 0, "dir"),
+                    ("docs/caf\\xe9 menu.txt", 10, "regular"),
+                    ("docs/back\\\\slash notes.txt", 10, "regular"),
+                    ("docs/plain.txt", 10, "regular"),
+                ],
+            )],
+        );
+        let found = |typed: &[u8]| -> Vec<String> {
+            search_typed(&conn, std::ffi::OsStr::from_bytes(typed), 50, false)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.path)
+                .collect()
+        };
+        assert_eq!(found(b"caf\xe9 menu"), ["docs/caf\\xe9 menu.txt"]);
+        assert_eq!(
+            found(b"back\\slash notes"),
+            ["docs/back\\\\slash notes.txt"]
+        );
+        assert_eq!(found(b"plain"), ["docs/plain.txt"]);
+    }
 
     /// The acceptance test of #380: a file unchanged across two versions is
     /// ONE hit by default, from the newest version. It used to be one hit per

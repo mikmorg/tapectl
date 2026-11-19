@@ -227,7 +227,17 @@ pub fn plan_new_unit(
 ) -> Result<NewUnit> {
     let abs_path = std::fs::canonicalize(dir_path)
         .map_err(|_| TapectlError::UnitPathNotFound(dir_path.to_string()))?;
-    let abs_str = abs_path.to_string_lossy().to_string();
+    // A unit's own root is configuration text and stays UTF-8 (ADR-0012 item
+    // 297, #569): what is inside a unit is carried by its bytes, the root it
+    // is registered under is not. Refused by name, never converted lossily.
+    let Some(abs_str) = abs_path.to_str().map(str::to_string) else {
+        return Err(TapectlError::Other(format!(
+            "cannot register {}: the unit's own folder path is not valid UTF-8, and a unit's \
+             root is recorded as text (names inside a unit may be any bytes). Rename the \
+             folder, or register it through a link whose path is UTF-8.",
+            crate::volume::index::escape_os(abs_path.as_os_str())
+        )));
+    };
 
     // Check the directory exists
     if !abs_path.is_dir() {
@@ -615,7 +625,17 @@ pub fn init_bulk(
             continue;
         }
 
-        let path_str = path.to_string_lossy().to_string();
+        // A unit's root stays UTF-8 text (item 297): one that is not is
+        // refused by name, as `unit init` refuses it, never lossily renamed.
+        let Some(path_str) = path.to_str().map(str::to_string) else {
+            let shown = crate::volume::index::escape_os(path.as_os_str()).into_owned();
+            let refusal = TapectlError::Other(format!(
+                "cannot register {shown}: the unit's own folder path is not valid UTF-8, and a \
+                 unit's root is recorded as text"
+            ));
+            results.push((shown, Err(refusal)));
+            continue;
+        };
         let result = init_unit_with_config(conn, config, &path_str, tenant_name, None, tags, None);
         results.push((path_str, result));
     }

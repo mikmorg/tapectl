@@ -323,13 +323,13 @@ fn fill_from(
 
     let by_path: HashMap<&str, &Row> = ctx.rows.iter().map(|r| (r.path.as_str(), r)).collect();
     for path in &wanted {
-        let source = out.join(path);
+        let source = out.join(crate::volume::index::on_disk(path));
         if read.lost.contains_key(*path) || fs::symlink_metadata(&source).is_err() {
             continue;
         }
         match verified(&source, by_path.get(*path).copied()) {
             Ok(how) => {
-                install(&source, &ex.root.join(path))?;
+                install(&source, &ex.root.join(crate::volume::index::on_disk(path)))?;
                 supply.note_here(format!(
                     "supplied {path} of unit \"{}\" v{} for the restore",
                     ctx.unit_name, ctx.version

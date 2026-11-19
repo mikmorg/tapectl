@@ -48,6 +48,9 @@ pub(crate) enum RestoreTarget<'a> {
     /// $TMPDIR), and it is then placed into `dest_dir`, the directory the
     /// operator named.
     File {
+        /// In the escaped form of §1.5 (ADR-0012 item 297): the file table's
+        /// own spelling of the path, so a lookup compares text and a name
+        /// that is not UTF-8 is carried by its bytes.
         file_path: &'a str,
         dest_dir: &'a str,
     },
@@ -655,7 +658,7 @@ fn preflight_checks(
                         "refusing to restore \"{file_path}\": {} already exists. Choose another \
                          --to, move that file away, or pass --overwrite to replace it. Nothing \
                          was read from tape.",
-                        placed.display()
+                        crate::volume::index::escape_os(placed.as_os_str())
                     )));
                 }
             }
@@ -671,7 +674,7 @@ fn first_entry(dir: &Path) -> Result<Option<String>> {
         Ok(mut entries) => Ok(entries
             .next()
             .transpose()?
-            .map(|e| e.file_name().to_string_lossy().into_owned())),
+            .map(|e| crate::volume::index::escape_os(&e.file_name()).into_owned())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Err(TapectlError::Other(
             format!("--to {} exists and is not a directory", dir.display()),
@@ -683,14 +686,12 @@ fn first_entry(dir: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Where `restore file` puts `file_path`: its last component, directly in
-/// the destination (the directory the operator named).
+/// Where `restore file` puts `file_path` (in the escaped form, §1.5): its
+/// last component, as the bytes it is, directly in the destination (the
+/// directory the operator named).
 fn placed_path(destination: &Path, file_path: &str) -> PathBuf {
-    destination.join(
-        Path::new(file_path)
-            .file_name()
-            .unwrap_or(std::ffi::OsStr::new(file_path)),
-    )
+    let name = crate::volume::index::on_disk(file_path);
+    destination.join(name.file_name().unwrap_or(name.as_os_str()))
 }
 
 /// Refuse a restore the disk cannot hold, before the first slice is read
@@ -2354,7 +2355,7 @@ fn restore_planned_unit(
 /// the default, scratch inside `--to` — so a large file is never written
 /// twice (issue #406's space check counts on it); a copy otherwise.
 fn place_one_entry(extracted: &Path, file_path: &str, dest_dir: &Path) -> Result<()> {
-    let source_file = extracted.join(file_path);
+    let source_file = extracted.join(crate::volume::index::on_disk(file_path));
     let meta = fs::symlink_metadata(&source_file).map_err(|_| {
         TapectlError::Other(format!("file \"{file_path}\" not found in restored unit"))
     })?;
@@ -2365,7 +2366,7 @@ fn place_one_entry(extracted: &Path, file_path: &str, dest_dir: &Path) -> Result
         place_restored_entry(&source_file, &meta, &dest)?;
     }
 
-    info!(file = file_path, dest = %dest.display(), "file restored");
+    info!(file = file_path, dest = %crate::volume::index::escape_os(dest.as_os_str()), "file restored");
     Ok(())
 }
 
@@ -5040,3 +5041,5 @@ mod restore_volume_tests;
 mod short_ending_tests;
 #[cfg(test)]
 mod span_restore_tests;
+#[cfg(test)]
+mod utf8_tests;

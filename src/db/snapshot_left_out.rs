@@ -36,7 +36,8 @@ pub struct LeftOut {
     pub reason: Reason,
     /// The pattern as written (`*.nfo`, `.cache/`); `None` for a socket.
     pub pattern: Option<String>,
-    /// Relative to the unit, unescaped (the table stores it escaped).
+    /// Relative to the unit, in the escaped form of §1.5 (ADR-0012 item
+    /// 297), which the table stores as it is.
     pub path: String,
     /// A folder is left out with what was under it: its own entry stays in
     /// the snapshot, empty.
@@ -73,7 +74,7 @@ pub fn insert(conn: &Connection, snapshot_id: i64, rows: &[LeftOut]) -> Result<u
             seq as i64,
             row.reason.as_str(),
             row.pattern,
-            crate::volume::index::escape(&row.path),
+            row.path,
             row.kind(),
             row.files,
             row.bytes,
@@ -82,7 +83,7 @@ pub fn insert(conn: &Connection, snapshot_id: i64, rows: &[LeftOut]) -> Result<u
     Ok(rows.len())
 }
 
-/// `snapshot_id`'s left-out list in `seq` order, paths unescaped.
+/// `snapshot_id`'s left-out list in `seq` order, paths as stored (escaped).
 pub fn load(conn: &Connection, snapshot_id: i64) -> Result<Vec<LeftOut>> {
     let mut stmt = conn.prepare(
         "SELECT reason, pattern, path, kind, files, bytes FROM snapshot_left_out
@@ -102,7 +103,7 @@ pub fn load(conn: &Connection, snapshot_id: i64) -> Result<Vec<LeftOut>> {
         .collect::<std::result::Result<_, _>>()?;
     raw.into_iter()
         .map(|(reason, pattern, path, kind, files, bytes)| {
-            let path = crate::volume::index::unescape(&path).map_err(|e| {
+            crate::volume::index::unescape(&path).map_err(|e| {
                 crate::error::TapectlError::Other(format!(
                     "snapshot {snapshot_id}'s left-out path {path:?} is not escaped as the \
                      index escapes a field: {e}"
@@ -152,7 +153,7 @@ mod tests {
             LeftOut {
                 reason: Reason::Pattern,
                 pattern: Some(".cache/".into()),
-                path: "a\tb\\c".into(),
+                path: "a\\tb\\\\c\\xe9".into(),
                 folder: true,
                 files: 3,
                 bytes: 99,
@@ -174,7 +175,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(stored, "a\\tb\\\\c");
+        assert_eq!(stored, "a\\tb\\\\c\\xe9", "stored as it is held: escaped");
         assert_eq!(load(&conn, 1).unwrap(), rows);
         // A socket with a pattern, or a pattern row without one, is refused.
         assert!(conn

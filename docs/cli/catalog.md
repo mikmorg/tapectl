@@ -51,6 +51,8 @@ tapectl catalog search [OPTIONS] <PATTERN>
 - `<PATTERN>` — Search pattern.
   
     Split on non-alphanumerics; each token is PREFIX-matched and all must match (AND). So "foo bar" finds paths containing a word starting with foo AND one starting with bar -- it is not a substring match, and "ar" will not find "bar".
+  
+    Typed as the shell has it: a name's own bytes, so a name that is not UTF-8 or has a backslash is searched as it is. The catalog holds a path escaped (`\\` for a backslash, `\xHH` for a byte outside UTF-8), and so does this command print it
 
 **Options**
 

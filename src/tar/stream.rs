@@ -434,28 +434,36 @@ enum Got {
     Partial,
 }
 
-fn lossy(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+/// Bytes shown in a refusal: escaped as §1.5 escapes them (a byte outside
+/// UTF-8 is `\xHH`), never converted lossily.
+fn shown_bytes(bytes: &[u8]) -> String {
+    crate::volume::index::escape_bytes(bytes).into_owned()
 }
 
 /// A member's name as the file table writes a path (§1.6): one leading
 /// `./` taken off, and the trailing `/` GNU tar gives a folder; the root
-/// (`././`) is `.`.
+/// (`././`) is `.`. The name's bytes are escaped as §1.5 escapes them
+/// (ADR-0012 item 297), never converted lossily.
 fn shown_path(name: &[u8]) -> String {
     let n = name.strip_prefix(b"./").unwrap_or(name);
     let n = match n.strip_suffix(b"/") {
         Some(t) if !t.is_empty() => t,
         _ => n,
     };
-    lossy(n)
+    crate::volume::index::escape_bytes(n).into_owned()
 }
 
 /// Whether a member named `name` (as the stream has it) of `kind` is the
 /// listed `path`: tar was given `./<path>`, and names a folder's member
-/// with a trailing `/` (`./d/`, the root `././`).
+/// with a trailing `/` (`./d/`, the root `././`). `path` is in the escaped
+/// form; tar was given its bytes (item 297), and the stream's bytes are
+/// compared with those.
 fn names_entry(name: &[u8], path: &str, kind: Kind) -> bool {
+    let Ok(bytes) = crate::volume::index::unescape(path) else {
+        return false;
+    };
     let mut want = b"./".to_vec();
-    want.extend_from_slice(path.as_bytes());
+    want.extend_from_slice(&bytes);
     if name == want.as_slice() {
         return true;
     }
@@ -651,8 +659,8 @@ where
                             ext.path.as_deref().map(shown_path),
                             format!(
                                 "the `{}` record is not a number: {:?}",
-                                lossy(&key),
-                                lossy(&value)
+                                shown_bytes(&key),
+                                shown_bytes(&value)
                             ),
                         )
                     })?;
@@ -692,8 +700,8 @@ where
             format!(
                 "the header's user name is {:?} and its group name {:?}; the writer passes \
                  --numeric-owner, so both are empty",
-                lossy(uname),
-                lossy(gname)
+                shown_bytes(uname),
+                shown_bytes(gname)
             ),
         ))
     }
@@ -732,7 +740,7 @@ where
                 path,
                 format!(
                     "not a POSIX ustar header (magic {:?})",
-                    lossy(header.magic())
+                    shown_bytes(header.magic())
                 ),
             ));
         }
@@ -743,8 +751,8 @@ where
                 path,
                 format!(
                     "a `{}` record ({:?}); the stream holds owners by number only",
-                    lossy(key),
-                    lossy(value)
+                    shown_bytes(key),
+                    shown_bytes(value)
                 ),
             ));
         }
@@ -795,7 +803,7 @@ where
                 format!(
                     "the member is `{}` {:?}; the list's next entry is `{}` {:?}",
                     kind.letter(),
-                    lossy(&name),
+                    crate::volume::index::escape_bytes(&name),
                     listed.kind.letter(),
                     listed.path
                 ),
@@ -1052,6 +1060,25 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// ADR-0012 item 297 (#569): the list holds a path in the escaped form and
+    /// tar was given its bytes, so a member is the entry when its bytes are
+    /// those; a name that is UTF-8 with a backslash is told from a byte.
+    #[test]
+    fn names_entry_compares_the_unescaped_bytes() {
+        assert!(names_entry(b"./caf\xe9.txt", "caf\\xe9.txt", Kind::File));
+        assert!(!names_entry(b"./caf\\xe9.txt", "caf\\xe9.txt", Kind::File));
+        assert!(names_entry(b"./a\\b", "a\\\\b", Kind::File));
+        assert!(names_entry(b"./d\xff/", "d\\xff", Kind::Folder));
+        assert!(!names_entry(b"./d\xff", "d\\xfe", Kind::File));
+        assert!(
+            !names_entry(b"./x", "bad\\", Kind::File),
+            "not well escaped"
+        );
+        assert_eq!(shown_path(b"./caf\xe9.txt"), "caf\\xe9.txt");
+        assert_eq!(shown_path(b"./a\\b"), "a\\\\b");
+        assert_eq!(shown_path(b"./d\xff/"), "d\\xff");
+    }
+
     use super::*;
     use crate::tar::writer::{create_args, spawn_archive, write_list, CreateParams, TarFinish};
     use std::ffi::{CString, OsString};

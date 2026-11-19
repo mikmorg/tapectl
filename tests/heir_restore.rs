@@ -2856,7 +2856,7 @@ fn a_path_restore_checks_only_the_paths_it_restored_even_with_a_quoting_sha256su
         "--unit",
         UNIT_B,
         "--path",
-        "odd\\back name.txt",
+        &escaped("odd\\back name.txt"),
     ]);
     assert_eq!(o.code, 0, "{}", o.all());
     assert!(
@@ -2950,7 +2950,7 @@ fn a_tab_a_newline_and_a_backslash_in_a_path_round_trip_through_the_list() {
     let t2 = &copies()[1];
     let tab_nl = "tab\tand\nnewline.txt";
     let back = "odd\\back name.txt";
-    // Both are named raw to --path.
+    // Both are named to --path as --list prints them: escaped (item 297).
     let h = Heir::of(t);
     let kb = key(&h, Who::TenantB);
     let dest = h.dest("raw");
@@ -2963,9 +2963,9 @@ fn a_tab_a_newline_and_a_backslash_in_a_path_round_trip_through_the_list() {
         "--unit",
         UNIT_B,
         "--path",
-        tab_nl,
+        &escaped(tab_nl),
         "--path",
-        back,
+        &escaped(back),
     ]);
     assert_eq!(o.code, 0, "{}", o.all());
     let got = heir::tree(&dest);
@@ -4262,9 +4262,9 @@ fn an_existing_folder_named_with_a_backslash_is_not_refused_as_an_existing_file(
         "--unit",
         UNIT_B,
         "--path",
-        "dir\\one",
+        &escaped("dir\\one"),
         "--path",
-        "dir\\one/leaf.txt",
+        &escaped("dir\\one/leaf.txt"),
     ]);
     assert_eq!(o.code, 0, "an existing folder is no refusal: {}", o.all());
     assert!(dest.join("dir\\one/leaf.txt").is_file());
@@ -5088,4 +5088,323 @@ fn busybox_tar_restores_across_the_swaps() {
     assert_eq!(o.code, 0, "{}", o.all());
     assert!(o.stdout.contains("CONTENT ONLY"), "{}", o.stdout);
     assert_restored(&t[0], UNIT_A, &dest);
+}
+
+// ---- a name that is not UTF-8 (ADR-0012 item 297, #569; the plan's T4.17) ----
+//
+// The big unit of a `raw_names` tape holds a Latin-1 file, a folder so named with
+// a file in it, a hard link and two symbolic links (one whose target is such a
+// name, one whose target is not UTF-8 and is nowhere), and a UTF-8 file whose
+// name holds the TEXT `\xe9`. Every name is a real one on this host's filesystem.
+
+fn raw_shape() -> Shape {
+    let mut shape = Shape::two();
+    shape.raw_names = true;
+    shape
+}
+
+fn raw() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| Tape::build(&raw_shape()))
+}
+
+fn raw_copies() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = raw_shape();
+        shape.copies = 2;
+        Tape::build_series(&shape)
+    })
+}
+
+fn os(bytes: &[u8]) -> &std::ffi::OsStr {
+    std::os::unix::ffi::OsStrExt::from_bytes(bytes)
+}
+
+/// A name's bytes as `--list` and the damaged-file list write them.
+fn escaped_bytes(name: &[u8]) -> String {
+    tapectl::volume::index::escape_bytes(name).into_owned()
+}
+
+/// Every raw-named regular file of unit B came back, byte for byte.
+fn assert_raw_restored(t: &Tape, dest: &Path, except: &[&[u8]]) {
+    let got = heir::tree_bytes(dest);
+    let truth = &t.units.iter().find(|u| u.name == UNIT_B).unwrap().raw_files;
+    assert!(
+        !truth.is_empty(),
+        "positive control: the tape has raw names"
+    );
+    for (name, bytes) in truth {
+        if except.contains(&name.as_slice()) {
+            continue;
+        }
+        assert_eq!(
+            got.get(name),
+            Some(bytes),
+            "{} came back byte for byte",
+            escaped_bytes(name)
+        );
+    }
+}
+
+/// `--list` prints the names escaped; a whole restore gives them back as bytes,
+/// the hard link is still one file and the symbolic links' targets are right;
+/// the per-file check, which unescapes the table's path to name the file, passes.
+#[test]
+fn a_unit_of_names_that_are_not_utf8_is_listed_escaped_and_restores_byte_for_byte() {
+    let t = raw();
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let rows = list_rows(&h, &kb, UNIT_B);
+    for name in [
+        &b"caf\xe9.txt"[..],
+        b"dir\xe9",
+        b"dir\xe9/in\xff.bin",
+        b"hard\xe9-link",
+        b"lit\\xe9.txt",
+        b"sym\xe9-link",
+    ] {
+        let esc = escaped_bytes(name);
+        assert!(rows.iter().any(|r| r.3 == esc), "{esc:?} in {rows:?}");
+    }
+    // The two spellings are two names: the byte and the text.
+    assert_eq!(escaped_bytes(b"caf\xe9.txt"), "caf\\xe9.txt");
+    assert_eq!(escaped_bytes(b"lit\\xe9.txt"), "lit\\\\xe9.txt");
+    let o = h.run(&["--list", "--key", &kb, "--unit", UNIT_B]);
+    assert!(
+        o.stdout.contains("a backslash in a name is \\\\"),
+        "--list says how a path is typed: {}",
+        o.stdout
+    );
+    let dest = h.dest("whole");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists());
+    assert_raw_restored(t, &dest, &[]);
+    use std::os::unix::fs::MetadataExt;
+    let ino = |n: &[u8]| std::fs::metadata(dest.join(os(n))).unwrap().ino();
+    assert_eq!(
+        ino(b"caf\xe9.txt"),
+        ino(b"hard\xe9-link"),
+        "one file, two names"
+    );
+    assert_eq!(
+        std::fs::read_link(dest.join(os(b"sym\xe9-link"))).unwrap(),
+        std::path::PathBuf::from(os(b"caf\xe9.txt"))
+    );
+    assert_eq!(
+        std::fs::read_link(dest.join(os(b"to-\xfe\xfd-target"))).unwrap(),
+        std::path::PathBuf::from(os(b"\xff\xfegone"))
+    );
+    assert!(
+        o.stdout.contains("File check: all"),
+        "the per-file check ran over the names: {}",
+        o.stdout
+    );
+}
+
+/// `--path` takes the escaped form `--list` prints: the byte name, the folder,
+/// the name with the TEXT `\xe9`, and a UTF-8 name with a backslash (`\\`). The
+/// raw form of a backslash name is not a name in the table.
+#[test]
+fn path_takes_the_escaped_form_and_tells_the_byte_from_the_text() {
+    let t = raw();
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let dest = h.dest("paths");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        "caf\\xe9.txt",
+        "--path",
+        "dir\\xe9/in\\xff.bin",
+        "--path",
+        "lit\\\\xe9.txt",
+        "--path",
+        &escaped("odd\\back name.txt"),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let got = heir::tree_bytes(&dest);
+    let names: Vec<&[u8]> = got.keys().map(|k| k.as_slice()).collect();
+    assert_eq!(
+        names,
+        [
+            &b"caf\xe9.txt"[..],
+            b"dir\xe9/in\xff.bin",
+            b"lit\\xe9.txt",
+            b"odd\\back name.txt"
+        ],
+        "only the named files, by their bytes"
+    );
+    assert_raw_restored(
+        t,
+        &dest,
+        &[
+            b"hard\xe9-link",
+            b"dir\xe9/in\xff.bin",
+            b"caf\xe9.txt",
+            b"lit\\xe9.txt",
+        ],
+    );
+    // The text `\xe9` is not the byte 0xe9: naming the byte does not bring the
+    // file of that text, and a raw backslash is not the escaped one.
+    let none = h.dest("none");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&none),
+        "--unit",
+        UNIT_B,
+        "--path",
+        "lit\\xe9.txt",
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("are not in the file table"),
+        "{}",
+        o.stderr
+    );
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&none),
+        "--unit",
+        UNIT_B,
+        "--path",
+        "odd\\back name.txt",
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+}
+
+/// A damaged slice with a raw-named file in it: the per-file check names it
+/// escaped in the damaged-file list (one line, valid UTF-8), the list given to
+/// `--paths-from` on another copy restores it byte for byte, and a TAB, an LF
+/// or a raw name typed to `--path` is refused with the way to type it.
+#[test]
+fn the_damaged_file_list_round_trips_a_name_that_is_not_utf8() {
+    let t = &raw_copies()[0];
+    let t2 = &raw_copies()[1];
+    let h1 = Heir::of(t);
+    let kb = key(&h1, Who::TenantB);
+    let rows = list_rows(&h1, &kb, UNIT_B);
+    let (_, slice, _, _) = row_esc(&rows, "caf\\xe9.txt");
+    h1.flip(slice_pos(t, UNIT_B, *slice), 300);
+    let dest = h1.dest("first");
+    let o = h1.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let listed = damaged_list(&dest);
+    assert!(
+        listed.iter().any(|l| l == "caf\\xe9.txt"),
+        "the name is in the list, escaped: {listed:?}"
+    );
+    assert!(
+        std::fs::read_to_string(dest.join(".tapectl-damaged-files.txt")).is_ok(),
+        "the list is UTF-8 text"
+    );
+    let h2 = Heir::of(t2);
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        dest.join(".tapectl-damaged-files.txt").to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists());
+    assert_raw_restored(t, &dest, &[]);
+    assert_restored(t, UNIT_B, &dest);
+    // A real TAB in --path is refused with the way to write it.
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&h2.dest("tab")),
+        "--unit",
+        UNIT_B,
+        "--path",
+        "a\tb",
+    ]);
+    assert_eq!(o.code, 2, "{}", o.all());
+    assert!(o.stderr.contains("written \\t, \\n or \\r"), "{}", o.stderr);
+}
+
+/// The one unescape program, by itself, under every awk the host has: each case
+/// of the escape comes out as the bytes it stands for, a name that ends in a
+/// newline survives, and `printf %b`'s other escapes are NOT read.
+#[test]
+fn lint_the_unescape_awk_program_writes_the_same_bytes_under_every_awk() {
+    let script = String::from_utf8(tapectl::volume::heir::RESTORE_SH.as_bytes().to_vec()).unwrap();
+    let start = script.find("AWK_UNESC='").expect("the program") + "AWK_UNESC='".len();
+    let program = &script[start..start + script[start..].find("\n'\n").unwrap()];
+    assert!(program.contains("%c"), "the bytes are written by code");
+    let cases: [(&str, &[u8]); 10] = [
+        ("caf\\xe9.txt", b"caf\xe9.txt"),
+        ("a\\\\b\\\\xe9", b"a\\b\\xe9"),
+        ("tab\\tx\\nq\\r", b"tab\tx\nq\r"),
+        ("plain-\u{e9}", "plain-\u{e9}".as_bytes()),
+        ("\\xff\\xfe", b"\xff\xfe"),
+        ("bad\\q", b"bad\\q"),
+        ("end\\", b"end\\"),
+        ("\\x4", b"\\x4"),
+        ("\\c stops\\x41", b"\\c stopsA"),
+        ("", b""),
+    ];
+    for (name, body) in awks() {
+        let dir = tempfile::tempdir().unwrap();
+        let prog = dir.path().join("unesc.awk");
+        std::fs::write(&prog, program).unwrap();
+        let mut ran = 0;
+        for (text, want) in &cases {
+            use std::io::Write;
+            let tool = body.replace("\"$@\"", &format!("-f {} \"$@\"", prog.display()));
+            let sh = dir.path().join("run.sh");
+            std::fs::write(&sh, format!("#!/bin/sh\n{tool}")).unwrap();
+            let mut child = std::process::Command::new("sh")
+                .arg(&sh)
+                .env("LC_ALL", "C")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(out.stdout, *want, "{name}: {text:?}");
+            ran += 1;
+        }
+        assert_eq!(ran, cases.len(), "{name}");
+    }
 }

@@ -15,6 +15,7 @@ use tracing::info;
 use crate::db::files::FileKind;
 use crate::error::{Result, TapectlError};
 use crate::util::HashingReader;
+use crate::volume::index::on_disk;
 
 /// What [`validate_source`] establishes.
 #[derive(Debug)]
@@ -26,6 +27,7 @@ pub struct SourceValidation {
 /// One regular file of the snapshot, as the source walk found it.
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedFile {
+    /// In the escaped form (§1.5); [`on_disk`] gives the name's bytes.
     rel_path: String,
     expected_size: i64,
     /// `files.sha256` from an earlier stage of this snapshot, if any.
@@ -166,7 +168,7 @@ pub(crate) fn plan(
             continue;
         }
         if let Some((size, baseline)) = regular.remove(entry.path.as_str()) {
-            check_source_size(&base.join(&entry.path), &entry.path, size)?;
+            check_source_size(&base.join(on_disk(&entry.path)), &entry.path, size)?;
             files.push(PlannedFile {
                 rel_path: entry.path.clone(),
                 expected_size: size,
@@ -185,7 +187,7 @@ pub(crate) fn plan(
             continue;
         }
         if let Some((size, _)) = regular.remove(path.as_str()) {
-            check_source_size(&base.join(path), path, size)?;
+            check_source_size(&base.join(on_disk(path)), path, size)?;
             excluded_since.push(path);
         }
     }
@@ -390,7 +392,7 @@ pub(crate) fn hash_files(base: &Path, plan: &SourcePlan) -> Result<Hashed> {
         crate::signal::check(|| {
             format!("stopped while checking the source ({done} of {total} files hashed)")
         })?;
-        files.push(hash_one(&base.join(&planned.rel_path), planned)?);
+        files.push(hash_one(&base.join(on_disk(&planned.rel_path)), planned)?);
     }
     info!(files = files.len(), "source files hashed");
     Ok(Hashed { files })
@@ -412,7 +414,7 @@ pub(crate) fn recheck(base: &Path, hashed: &Hashed) -> Result<()> {
         crate::signal::check(|| {
             format!("stopped while re-checking the source ({done} of {total} files)")
         })?;
-        let full_path = base.join(&f.rel_path);
+        let full_path = base.join(on_disk(&f.rel_path));
         let meta = std::fs::symlink_metadata(&full_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 changed_while_staging(&f.rel_path, "it was removed after it was hashed")

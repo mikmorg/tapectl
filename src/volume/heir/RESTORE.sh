@@ -24,7 +24,13 @@
 #   RESTORE.sh --restore --key K --to DIR --unit U [--version N] --path P [--path P2 ...]
 #                                              only those files of one unit, by
 #                                              its file table: the slices that
-#                                              hold them are read, no others
+#                                              hold them are read, no others.
+#                                              P is written as --list prints it:
+#                                              escaped, so a backslash in a name
+#                                              is typed \\, a TAB \t, a newline
+#                                              \n, a carriage return \r, and a
+#                                              byte that is not UTF-8 \xHH (two
+#                                              lowercase hex digits)
 #   RESTORE.sh --restore --key K --to DIR --paths-from LIST
 #                                              the one repair: LIST is the
 #                                              .tapectl-damaged-files.txt of an
@@ -1181,6 +1187,8 @@ do_list() {
     say "Unit $(safe_str "$name")  version $ver  ($ns slice(s), $sb bytes of stream${comp:+, compressed with $comp})"
     r=$(range_of "$uuid" "$ver")
     [ -z "$r" ] || say "  PART: $(range_words "$r"). A file in a slice this tape does not hold is not on it."
+    say "  Paths are written escaped: a backslash in a name is \\\\, a TAB \\t, a newline \\n, a carriage"
+    say "  return \\r, and a byte that is not UTF-8 \\xHH. Give --path and --paths-from a path as it is printed here."
     say "  kind  slice  bytes  path"
     awk -F'\t' '/^#/ { next } { printf "  %s  %5s  %s  %s%s\n", $1, $2, $5, $7, ($1 == "h" ? "  -> " $8 : "") }' "$table"
   done <"$WORK/chosen.txt"
@@ -1681,24 +1689,46 @@ feed_from() { # <slice number>
   printf '%s\n' "$CUR" >"$WORK/feed.cur"
 }
 
-# Path of a table row's file as the stream names it: unescape the index's
-# four escapes (backslash, tab, newline, carriage return).
-unesc() { # <escaped text>; result in REPLY
-  local s=$1 out=""
-  while [[ $s == *\\* ]]; do
-    out+=${s%%\\*}
-    s=${s#*\\}
-    case ${s:0:1} in
-    t) out+=$'\t' ;;
-    n) out+=$'\n' ;;
-    r) out+=$'\r' ;;
-    \\) out+='\' ;;
-    *) out+='\'"${s:0:1}" ;;
-    esac
-    s=${s:1}
-  done
-  out+=$s
-  REPLY=$out
+# A path as the file table writes it (volume-format-v3.md 1.5) is escaped: a
+# backslash is \\, a TAB \t, a newline \n, a carriage return \r, and each byte
+# that is not part of a valid UTF-8 sequence \xHH (two lowercase hex digits). The
+# name on disk is the bytes. This ONE awk program reads the escaped text from its
+# standard input (never through -v, which would process the backslashes) and
+# writes the bytes, each by its code: not printf %b, which reads other escapes
+# (\c stops the output). Run under LC_ALL=C by every awk the script supports,
+# it writes a byte as a byte. A backslash that is not one of these escapes is
+# kept as it stands. A NUL byte is never written (a name has none).
+AWK_UNESC='
+BEGIN { hex = "0123456789abcdef" }
+{
+  s = $0
+  while ((p = index(s, "\\")) > 0) {
+    printf "%s", substr(s, 1, p - 1)
+    d = substr(s, p + 1, 1)
+    if (d == "t") { printf "\t"; s = substr(s, p + 2) }
+    else if (d == "n") { printf "\n"; s = substr(s, p + 2) }
+    else if (d == "r") { printf "\r"; s = substr(s, p + 2) }
+    else if (d == "\\") { printf "\\"; s = substr(s, p + 2) }
+    else if (d == "x" && substr(s, p + 2, 2) ~ /^[0-9a-f][0-9a-f]$/) {
+      v = (index(hex, substr(s, p + 2, 1)) - 1) * 16 + (index(hex, substr(s, p + 3, 1)) - 1)
+      if (v > 0) printf "%c", v
+      s = substr(s, p + 4)
+    }
+    else { printf "\\"; s = substr(s, p + 1) }
+  }
+  printf "%s", s
+}
+'
+
+# The name on disk of an escaped path: unesc <escaped text>; the result is in
+# REPLY. A sentinel byte is written after the bytes and taken off again, so a
+# name that ends in a newline survives the command substitution.
+unesc() {
+  REPLY=$(
+    printf '%s' "$1" | awk "$AWK_UNESC"
+    printf x
+  )
+  REPLY=${REPLY%x}
 }
 
 # The paths (escaped) of every member of a table that begins in the slices
@@ -2081,17 +2111,6 @@ continue_unit() { # <destination>
 
 # ---- named paths and the one repair (volume-format-v3.md 7.2 "One file", 1.7) ----
 
-# The index's escaping of a path, as the file table and the damaged-file list
-# write it: backslash, TAB, LF and CR, and nothing else. The result is REPLY.
-esc() { # <text>
-  local s=$1
-  s=${s//\\/\\\\}
-  s=${s//$'\t'/\\t}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  REPLY=$s
-}
-
 # The wanted members, in stream order: what to cut from which slices.
 M_START=() M_END=() M_SLICE=() M_LAST=() M_PATH=()
 NM=0
@@ -2271,11 +2290,12 @@ merge_damaged_list() { # <destination> <requested and brought paths file>
 # name. A hard link has no data of its own, so nothing is lost by it; the
 # per-file check that follows judges the result.
 make_links() { # <destination>
-  local dest=$1 kind p t
+  local dest=$1 kind p t pe te
   : >"$WORK/linked.paths"
   [ -s "$WORK/wanted.rows" ] || return 0
   while IFS=$'\t' read -r kind _ _ _ _ _ p t; do
     [ "$kind" = h ] || continue
+    pe=$p te=$t
     unesc "$p"
     p=$REPLY
     unesc "$t"
@@ -2283,9 +2303,8 @@ make_links() { # <destination>
     if [ -e "$dest/$p" ] || [ -L "$dest/$p" ] || [ ! -f "$dest/$t" ]; then continue; fi
     mkdir -p -- "$(dirname -- "$dest/$p")" 2>/dev/null || continue
     if ln -- "$dest/$t" "$dest/$p" 2>/dev/null; then
-      note "made the hard-linked name $(visible_text "$p") from its first name $(visible_text "$t") (its own member was not read)."
-      esc "$p"
-      printf '%s\n' "$REPLY" >>"$WORK/linked.paths"
+      note "made the hard-linked name $(visible_text "$pe") from its first name $(visible_text "$te") (its own member was not read)."
+      printf '%s\n' "$pe" >>"$WORK/linked.paths"
     fi
   done <"$WORK/wanted.rows"
 }
@@ -2312,7 +2331,7 @@ restore_paths() { # <destination> <how>
       unesc "$p"
       if [ -e "$dest/$REPLY" ] || [ -L "$dest/$REPLY" ]; then
         WANT_PATH="$p" awk -F'\t' '($7 "") == (ENVIRON["WANT_PATH"] "") && $1 == "d" { f = 1 } END { exit f ? 0 : 1 }' "$U_TABLE" ||
-          die "$(safe_str "$REPLY") is already in $(safe_str "$dest"). Give --overwrite to replace the named files (nothing has been read from a slice)."
+          die "$(visible_text "$p") is already in $(safe_str "$dest"). Give --overwrite to replace the named files (nothing has been read from a slice)."
       fi
     done <"$WORK/want.sorted"
   fi
@@ -2439,15 +2458,23 @@ restore_paths() { # <destination> <how>
 }
 
 # --restore --unit U --path P [--path P2 ...]
+# A path is given as --list prints it, and as the damaged-file list writes it:
+# escaped (volume-format-v3.md 1.5), so a backslash in a name is typed \\, a TAB
+# \t, a newline \n, a carriage return \r, and a byte that is not UTF-8 \xHH. It
+# is matched against the file table's own text, with no conversion.
 do_paths() {
   local p
   : >"$WORK/want.paths"
   for p in "${PATHS[@]}"; do
+    case $p in
+    *$'\t'* | *$'\n'* | *$'\r'*)
+      die_usage "--path takes a path as --list prints it: a TAB, a newline or a carriage return in a name is written \\t, \\n or \\r, and a backslash \\\\"
+      ;;
+    esac
     p=${p#./}
     while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p=${p%/}; done
     [ -n "$p" ] || p=.
-    esc "$p"
-    printf '%s\n' "$REPLY" >>"$WORK/want.paths"
+    printf '%s\n' "$p" >>"$WORK/want.paths"
   done
   unit_open "$(head -n 1 "$WORK/chosen.txt")"
   restore_paths "$TO" path
@@ -3168,7 +3195,7 @@ do_find() {
   say ""
   say "Paths containing '$(visible_text "$FIND_TEXT")' (unit, version, kind, size, path; kind is d directory,"
   say "f file, l symlink, s special). A TAB, newline or carriage return in a path is shown as"
-  say "\\t, \\n or \\r."
+  say "\\t, \\n or \\r, and a byte that is not UTF-8 as \\xHH."
   say ""
   cat "$WORK/find.out"
   say ""

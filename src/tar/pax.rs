@@ -77,7 +77,7 @@ fn one_record(data: &[u8]) -> Result<Split<'_>, String> {
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return Err(format!(
             "a record's length is not a decimal number: {:?}",
-            String::from_utf8_lossy(digits)
+            crate::volume::index::escape_bytes(digits)
         ));
     }
     let len: usize = std::str::from_utf8(digits)
@@ -133,7 +133,7 @@ pub fn acl_ids(text: &[u8]) -> Result<Vec<(IdKind, u32)>, String> {
         if entry.is_empty() {
             continue;
         }
-        let shown = || String::from_utf8_lossy(entry).into_owned();
+        let shown = || crate::volume::index::escape_bytes(entry).into_owned();
         let mut fields = entry.split(|b| *b == b':');
         let mut tag = fields.next().unwrap_or_default();
         if tag == b"default" || tag == b"d" {

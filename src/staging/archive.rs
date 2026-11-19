@@ -51,13 +51,18 @@ pub(crate) struct Scan {
 
 impl Scan {
     /// The paths, in the list's order, for `tar::write_list`.
-    pub(crate) fn paths(&self) -> Vec<&str> {
+    ///
+    /// Each is the name's own bytes (the entries hold the escaped form,
+    /// ADR-0012 item 297): tar is given what is on disk.
+    pub(crate) fn paths(&self) -> Vec<std::path::PathBuf> {
         self.entries
             .iter()
-            .map(|e| e.listed.path.as_str())
+            .map(|e| on_disk(&e.listed.path))
             .collect()
     }
 }
+
+pub(crate) use crate::volume::index::on_disk;
 
 /// Whether `path` has the extended attribute `name` (never following a
 /// symbolic link: tar archives the link itself).
@@ -128,7 +133,7 @@ pub(crate) fn scan(conn: &Connection, snapshot_id: i64, root: &Path, unit: &str)
             crate::signal::check(|| format!("stopped while looking at unit \"{unit}\"'s files"))?;
         }
         let is_dotfile = crate::unit::dotfile::is_unit_dotfile(&path);
-        let full = root.join(&path);
+        let full = root.join(on_disk(&path));
         let meta = match std::fs::symlink_metadata(&full) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_dotfile => continue,
@@ -199,7 +204,7 @@ pub(crate) fn recheck(
             })?;
         }
         let path = entry.listed.path.as_str();
-        let meta = std::fs::symlink_metadata(root.join(path)).map_err(|e| {
+        let meta = std::fs::symlink_metadata(root.join(on_disk(path))).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 changed_while_staging(path, "it was removed while tar read the unit")
             } else {
@@ -217,7 +222,7 @@ pub(crate) fn recheck(
             return Err(changed_while_staging(path, "it changed while tar read it"));
         }
         if entry.listed.kind == Kind::File && before.ctime_ns >= scan.started_ns - RACY_WINDOW_NS {
-            let (again, _) = hash_source_file(&root.join(path), path)?;
+            let (again, _) = hash_source_file(&root.join(on_disk(path)), path)?;
             let streamed = stream_sha
                 .get(path)
                 .map(|h| crate::db::files::sha256_to_hex(h));

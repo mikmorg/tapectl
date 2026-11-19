@@ -292,8 +292,9 @@ fn left_out_lines(rows: &[crate::db::snapshot_left_out::LeftOut]) -> String {
             format!("{why}, {}", crate::util::format_bytes_binary(row.bytes))
         };
         out.push_str(&format!(
+            // The stored form is the escaped one (§1.5; item 297): printed as it is.
             "\n  left out: {} ({what})",
-            crate::volume::index::escape(&row.path)
+            row.path
         ));
     }
     if rows.len() > LEFT_OUT_LINES {

@@ -90,7 +90,7 @@ mod tests {
         vec![
             row(IdKind::User, 0, Some("root")),
             row(IdKind::User, 4_294_967_294, None),
-            row(IdKind::Group, 0, Some("ro\tot")),
+            row(IdKind::Group, 0, Some("ro\\tot")),
             row(IdKind::Group, 1000, None),
         ]
     }

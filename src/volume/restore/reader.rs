@@ -308,7 +308,7 @@ impl<'j, 'a> Reading<'j, 'a> {
         if let Some(t) = self.tar.take() {
             self.runs.push(t.close(false));
         }
-        let at = self.job.dest.join(&m.path);
+        let at = self.job.dest.join(crate::volume::index::on_disk(&m.path));
         if let Ok(meta) = std::fs::symlink_metadata(&at) {
             if meta.is_file() {
                 if let Err(e) = std::fs::remove_file(&at) {
@@ -676,7 +676,7 @@ pub(super) fn disk_check(root: &Path, fed: &[&Row], lost: &mut BTreeMap<String, 
         let at: PathBuf = if m.path == "." {
             root.to_path_buf()
         } else {
-            root.join(&m.path)
+            root.join(crate::volume::index::on_disk(&m.path))
         };
         let Ok(meta) = std::fs::symlink_metadata(&at) else {
             lost.insert(m.path.clone(), "not restored".to_string());

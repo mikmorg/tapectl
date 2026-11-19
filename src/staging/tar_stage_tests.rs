@@ -63,28 +63,31 @@ mod tests {
         );
     }
 
-    /// #569: a file whose name is not valid UTF-8 cannot be carried yet (the
-    /// list given to tar is written from the catalog's text). It is refused
-    /// before anything is staged, by the snapshot that would record it, naming
-    /// the unit and the path.
+    /// #569, ADR-0012 item 297: a file whose name is not valid UTF-8 is
+    /// staged by its bytes. The snapshot records it escaped, tar is given its
+    /// bytes, the stream reader accepts the member, and the file table holds
+    /// the escaped path. (Layout 3 first refused such a unit by name.)
     #[test]
-    fn a_name_that_is_not_utf8_is_refused_naming_the_unit_and_the_path() {
+    fn a_name_that_is_not_utf8_is_staged_by_its_bytes() {
         let tmp = TempDir::new().unwrap();
-        let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
         fs::write(src.join("plain.txt"), b"plain").unwrap();
         let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
         fs::write(src.join(name), b"latin-1 name").unwrap();
 
-        let err = snapshot_create(&conn, "unit1", &config)
-            .expect_err("a name that is not UTF-8 is refused");
-        let msg = err.to_string();
-        assert!(msg.contains("unit \"unit1\""), "names the unit: {msg}");
-        assert!(msg.contains("caf\\xE9.txt"), "names the path: {msg}");
-        assert!(msg.contains("UTF-8"), "says why: {msg}");
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 0, "nothing was recorded");
+        let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
+        let id = stage_create(&conn, &paths, &config, snap_id, false)
+            .expect("a name that is not UTF-8 is staged");
+        let members: Vec<String> = crate::db::stage_files::load(&conn, id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert!(members.contains(&"plain.txt".to_string()), "{members:?}");
+        assert!(
+            members.contains(&"caf\\xe9.txt".to_string()),
+            "the member is the escaped path: {members:?}"
+        );
     }
 
     /// #562: `slice_size` is a multiple of 512 wherever it is set. A

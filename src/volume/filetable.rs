@@ -31,7 +31,7 @@ use std::ops::Range;
 
 use crate::db::files::{sha256_from_hex, sha256_to_hex};
 use crate::error::{Result, TapectlError};
-use crate::volume::index::{escape, unescape};
+use crate::volume::index::unescape;
 
 /// The table's first line.
 pub const HEADER: &str = "#tapectl-file-table 1";
@@ -95,8 +95,10 @@ impl Kind {
 }
 
 /// One member of a staging's stream, as the text and the catalog hold it.
-/// `path` and `link` are the paths themselves, unescaped: relative to the
-/// unit's root with no leading `./`, the root itself `.`.
+/// `path` and `link` are in the escaped form (§1.5; ADR-0012 item 297), the
+/// one the text and the catalog both hold: relative to the unit's root with
+/// no leading `./`, the root itself `.`. A name's bytes are
+/// `volume::index::unescape` of it, and only where it meets the disk or tar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub kind: Kind,
@@ -228,7 +230,8 @@ fn bad(what: &str, detail: impl std::fmt::Display) -> TapectlError {
 }
 
 /// Write a staging's table as the format's text, row by row: the two
-/// header lines, then each row, every path through `volume::index::escape`.
+/// header lines, then each row. A row's paths are held escaped already
+/// (§1.5), and one with a raw TAB, LF or CR is refused.
 /// Rows that break the [`Chain`], or end past `stream_bytes`, are refused
 /// before they are written. Returns the rows written.
 pub fn write<W: Write + ?Sized>(
@@ -245,6 +248,17 @@ pub fn write<W: Write + ?Sized>(
         chain
             .accept(&row)
             .map_err(|e| bad(&format!("row {n}"), e))?;
+        for text in [Some(row.path.as_str()), row.link.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if text.contains(['\t', '\n', '\r']) || unescape(text).is_err() {
+                return Err(bad(
+                    &format!("row {n}"),
+                    format!("{text:?} is not in the escaped form (§1.5)"),
+                ));
+            }
+        }
         if row.end > stream_bytes {
             return Err(bad(
                 &format!("row {n}"),
@@ -267,8 +281,8 @@ pub fn write<W: Write + ?Sized>(
             row.end,
             row.size,
             hash,
-            escape(&row.path),
-            escape(row.link.as_deref().unwrap_or("")),
+            row.path,
+            row.link.as_deref().unwrap_or(""),
         )?;
     }
     Ok(chain.rows())
@@ -343,8 +357,12 @@ impl<R: BufRead> Reader<R> {
             "-" => None,
             hex => Some(sha256_from_hex(hex).map_err(|e| e.to_string())?),
         };
-        let path = unescape(fields[6]).map_err(|e| format!("`path`: {e}"))?;
-        let link = unescape(fields[7]).map_err(|e| format!("`link target`: {e}"))?;
+        // Kept escaped: it is checked to be well escaped, and is the form the
+        // catalog holds.
+        unescape(fields[6]).map_err(|e| format!("`path`: {e}"))?;
+        unescape(fields[7]).map_err(|e| format!("`link target`: {e}"))?;
+        let path = fields[6].to_string();
+        let link = fields[7].to_string();
         let row = Row {
             kind,
             slice: number("slice", fields[1])?,
@@ -628,10 +646,12 @@ mod tests {
     fn the_text_round_trips_with_a_tab_a_newline_and_a_backslash() {
         let rows = laid_out(&[
             (Kind::Folder, ".", 512, None),
-            (Kind::File, "a\tb", 1024, None),
-            (Kind::File, "new\nline", 1024, None),
-            (Kind::File, "back\\slash\r", 1536, None),
-            (Kind::HardLink, "link\tto", 512, Some("a\tb")),
+            // Paths are held escaped (§1.5; item 297): these are the forms.
+            (Kind::File, "a\\tb", 1024, None),
+            (Kind::File, "new\\nline", 1024, None),
+            (Kind::File, "back\\\\slash\\r", 1536, None),
+            (Kind::File, "caf\\xe9.txt", 512, None),
+            (Kind::HardLink, "link\\tto", 512, Some("a\\tb")),
             (Kind::Symlink, "sym", 512, None),
             (Kind::Fifo, "p", 512, None),
             (Kind::CharDevice, "c", 512, None),
@@ -650,6 +670,7 @@ mod tests {
         assert!(text.contains("\tnew\\nline\t\n"), "{text}");
         assert!(text.contains("\tback\\\\slash\\r\t\n"), "{text}");
         assert!(text.contains("\tlink\\tto\ta\\tb\n"), "{text}");
+        assert!(text.contains("\tcaf\\xe9.txt\t\n"), "{text}");
         assert!(text.starts_with(&format!(
             "{HEADER}\n{STREAM_BYTES}{end}\nd\t1\t0\t512\t0\t-\t.\t\n"
         )));
@@ -700,8 +721,16 @@ mod tests {
                 "states a sha256",
             ),
             (
-                format!("{H}f\t1\t0\t1024\t5\t{HASH}\ta\\x\t\n"),
+                format!("{H}f\t1\t0\t1024\t5\t{HASH}\ta\\q\t\n"),
                 "unknown escape",
+            ),
+            (
+                format!("{H}f\t1\t0\t1024\t5\t{HASH}\ta\\x\t\n"),
+                "two lowercase hex digits",
+            ),
+            (
+                format!("{H}f\t1\t0\t1024\t5\t{HASH}\ta\\xE9\t\n"),
+                "two lowercase hex digits",
             ),
             (
                 format!("{H}f\t1\t0\t1024\t5\t{HASH}\ta\\\t\n"),
@@ -749,6 +778,21 @@ mod tests {
         ] {
             let e = refused(&text);
             assert!(e.contains(says), "{text:?}: {e}");
+        }
+    }
+
+    /// A row holds its path escaped: a raw TAB, LF or CR, or a text that is
+    /// not well escaped, would split a row or be read as another name.
+    #[test]
+    fn the_writer_refuses_a_path_that_is_not_escaped() {
+        for bad in ["a\tb", "a\nb", "a\rb", "a\\", "a\\q"] {
+            let rows = laid_out(&[(Kind::File, bad, 1024, None)]);
+            let mut out = Vec::new();
+            let e = write(&mut out, 1 << 20, rows.into_iter().map(Ok)).unwrap_err();
+            assert!(
+                e.to_string().contains("not in the escaped form"),
+                "{bad:?}: {e}"
+            );
         }
     }
 

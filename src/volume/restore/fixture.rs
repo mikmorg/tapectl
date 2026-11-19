@@ -64,6 +64,19 @@ pub(crate) enum Item {
     Symlink(String, String),
     /// A hard link: its path and the path of the file it is another name of.
     Hard(String, String),
+    /// The same four with names given as bytes, for a name that is not UTF-8
+    /// (ADR-0012 item 297, #569): Linux takes any byte but `/` and NUL.
+    FileB(Vec<u8>, Vec<u8>),
+    DirB(Vec<u8>),
+    /// A symbolic link: its path and its target, both bytes.
+    SymlinkB(Vec<u8>, Vec<u8>),
+    /// A hard link: its path and the path of the file it is another name of.
+    HardB(Vec<u8>, Vec<u8>),
+}
+
+/// `bytes` as a path.
+pub(crate) fn os(bytes: &[u8]) -> &std::ffi::OsStr {
+    std::os::unix::ffi::OsStrExt::from_bytes(bytes)
 }
 
 impl Item {
@@ -164,6 +177,22 @@ impl Home {
                     let at = dir.join(path);
                     fs::create_dir_all(at.parent().unwrap()).unwrap();
                     fs::hard_link(dir.join(target), at).unwrap();
+                }
+                Item::FileB(path, bytes) => {
+                    let at = dir.join(os(path));
+                    fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    fs::write(at, bytes).unwrap();
+                }
+                Item::DirB(path) => fs::create_dir_all(dir.join(os(path))).unwrap(),
+                Item::SymlinkB(path, target) => {
+                    let at = dir.join(os(path));
+                    fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(os(target), at).unwrap();
+                }
+                Item::HardB(path, target) => {
+                    let at = dir.join(os(path));
+                    fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    fs::hard_link(dir.join(os(target)), at).unwrap();
                 }
             }
         }
@@ -415,11 +444,10 @@ pub(crate) fn listing(root: &Path) -> BTreeMap<String, String> {
         };
         for e in entries.flatten() {
             let path = e.path();
-            let name = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
+            // The escaped form (§1.5): a name is bytes, never converted lossily.
+            let name =
+                crate::volume::index::escape_os(path.strip_prefix(root).unwrap().as_os_str())
+                    .into_owned();
             if name.starts_with(".tapectl-restore-tmp") {
                 continue;
             }
@@ -427,7 +455,10 @@ pub(crate) fn listing(root: &Path) -> BTreeMap<String, String> {
             if meta.is_symlink() {
                 out.insert(
                     name,
-                    format!("link {}", fs::read_link(&path).unwrap().display()),
+                    format!(
+                        "link {}",
+                        crate::volume::index::escape_os(fs::read_link(&path).unwrap().as_os_str())
+                    ),
                 );
             } else if meta.is_dir() {
                 out.insert(name.clone(), "dir".into());

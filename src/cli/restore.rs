@@ -373,8 +373,12 @@ impl From<&str> for UnitArg {
 pub struct UnitAndFile {
     /// Unit name. After --unit, the file's PATH instead
     #[arg(value_name = "UNIT", required_unless_present = "unit")]
-    first: Option<String>,
+    first: Option<std::ffi::OsString>,
     /// File path within the unit, relative to its root, as `catalog list` prints it.
+    ///
+    /// Typed as the shell has it: the name's own bytes, so a name that is not UTF-8
+    /// and one with a backslash are typed as they are. `catalog list` prints them
+    /// escaped (`\\` for a backslash, `\xHH` for a byte outside UTF-8).
     ///
     /// Checked against the catalog's file list for the version before the tape
     /// is touched; a directory is refused
@@ -383,28 +387,32 @@ pub struct UnitAndFile {
         required_unless_present_any = ["unit", "file"],
         conflicts_with_all = ["unit", "file"]
     )]
-    second: Option<String>,
+    second: Option<std::ffi::OsString>,
     /// The unit, as a flag: the same as UNIT
     #[arg(long = "unit", value_name = "UNIT")]
     unit: Option<String>,
     /// The file, as a flag: the same as PATH
     #[arg(long = "file", value_name = "PATH")]
-    file: Option<String>,
+    file: Option<std::ffi::OsString>,
 }
 
 impl UnitAndFile {
-    /// The unit named, however it was given.
+    /// The unit named, however it was given. A unit's name is UTF-8 text:
+    /// one that is not is "" here, and [`Self::resolve`] refuses it by name.
     pub fn name(&self) -> &str {
         self.unit
             .as_deref()
-            .or(self.first.as_deref())
-            .expect("clap requires UNIT or --unit")
+            .or(self.first.as_deref().and_then(|f| f.to_str()))
+            .unwrap_or("")
     }
 
     /// The unit and the file, however they were given. The two shapes clap
     /// cannot refuse on its own are refused here: `--unit` with no file, and
-    /// `--unit UNIT --file PATH` with a positional besides.
-    pub fn resolve(&self) -> Result<(&str, &str)> {
+    /// `--unit UNIT --file PATH` with a positional besides. The file is
+    /// returned in the escaped form (§1.5; ADR-0012 item 297): the operator
+    /// types a name's bytes, and the catalog and the file table spell them so.
+    pub fn resolve(&self) -> Result<(&str, String)> {
+        use crate::volume::index::escape_os;
         let file = match (&self.unit, &self.first, &self.second, &self.file) {
             (None, Some(_), Some(path), None) => path,
             (None, Some(_), None, Some(path)) => path,
@@ -418,8 +426,10 @@ impl UnitAndFile {
             }
             (Some(_), Some(extra), None, Some(path)) => {
                 return Err(TapectlError::Other(format!(
-                    "restore file: \"{extra}\" is one argument too many: --unit names the \
-                     unit and --file names \"{path}\""
+                    "restore file: \"{}\" is one argument too many: --unit names the \
+                     unit and --file names \"{}\"",
+                    escape_os(extra),
+                    escape_os(path)
                 )))
             }
             _ => {
@@ -430,7 +440,13 @@ impl UnitAndFile {
                 ))
             }
         };
-        Ok((self.name(), file.as_str()))
+        if self.unit.is_none() && self.first.as_deref().is_some_and(|f| f.to_str().is_none()) {
+            return Err(TapectlError::Other(format!(
+                "restore file: the unit name \"{}\" is not UTF-8; unit names are text",
+                escape_os(self.first.as_deref().expect("checked"))
+            )));
+        }
+        Ok((self.name(), escape_os(file).into_owned()))
     }
 }
 
@@ -606,7 +622,7 @@ pub fn run(
                     paths,
                     config,
                     unit,
-                    file,
+                    &file,
                     from,
                     to,
                     &device,
@@ -619,7 +635,7 @@ pub fn run(
                     paths,
                     config,
                     unit,
-                    file,
+                    &file,
                     to,
                     &device,
                     DEFAULT_BLOCK_SIZE,
@@ -1196,8 +1212,50 @@ mod tests {
             &["--file", "a/b.txt", "--unit", "photos"],
         ] {
             let target = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
-            assert_eq!(target.resolve().unwrap(), ("photos", "a/b.txt"), "{args:?}");
+            assert_eq!(
+                target.resolve().unwrap(),
+                ("photos", "a/b.txt".to_string()),
+                "{args:?}"
+            );
             assert_eq!(target.name(), "photos", "{args:?}");
+        }
+    }
+
+    /// ADR-0012 item 297 (#569): the operator types a name's bytes, and the
+    /// file is looked up by its escaped form. clap takes the bytes whole (a
+    /// `String` argument refused a name that is not UTF-8).
+    #[test]
+    fn restore_file_takes_the_typed_path_as_bytes_and_escapes_it() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let typed: &[(&[u8], &str)] = &[
+            (b"caf\xe9.txt", "caf\\xe9.txt"),
+            (b"back\\slash.txt", "back\\\\slash.txt"),
+            (b"plain/\xff", "plain/\\xff"),
+            (b"tab\there", "tab\\there"),
+        ];
+        for (bytes, want) in typed {
+            let file = OsString::from_vec(bytes.to_vec());
+            for shape in 0..3 {
+                let argv: Vec<OsString> = ["tapectl", "restore", "file"]
+                    .iter()
+                    .map(OsString::from)
+                    .chain(match shape {
+                        0 => vec!["photos".into(), file.clone()],
+                        1 => vec!["--unit".into(), "photos".into(), file.clone()],
+                        _ => vec!["photos".into(), "--file".into(), file.clone()],
+                    })
+                    .chain(["--to".into(), "/d".into()])
+                    .collect();
+                let target = match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+                    crate::cli::Commands::Restore {
+                        command: RestoreCommands::File { unit, .. },
+                    } => unit,
+                    other => panic!("not restore file: {other:?}"),
+                };
+                let (unit, file) = target.resolve().unwrap();
+                assert_eq!((unit, file.as_str()), ("photos", *want), "shape {shape}");
+            }
         }
     }
 

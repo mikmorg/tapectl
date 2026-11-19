@@ -49,7 +49,8 @@ impl IdKind {
     }
 }
 
-/// One id of a staging's stream and the name the host gave it. `None`: the
+/// One id of a staging's stream and the name the host gave it, in the escaped
+/// form of §1.5 (item 297), as the text and the catalog hold it. `None`: the
 /// host knew no name for it (never the empty string).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdRow {
@@ -134,7 +135,9 @@ impl<L: FnMut(IdKind, u32) -> Option<String>> Collector<L> {
     /// the first time only.
     pub fn see(&mut self, kind: IdKind, id: u32) {
         if let std::collections::btree_map::Entry::Vacant(slot) = self.seen.entry((kind, id)) {
-            let name = (self.lookup)(kind, id).filter(|n| !n.is_empty());
+            let name = (self.lookup)(kind, id)
+                .filter(|n| !n.is_empty())
+                .map(|n| escape(&n).into_owned());
             slot.insert(name);
         }
     }
@@ -167,8 +170,8 @@ fn in_order(before: Option<(IdKind, u32)>, row: &IdRow) -> std::result::Result<(
 }
 
 /// Write the map as the format's text: the header line, then one
-/// `<kind>\t<id>\t<name>` row for each id, the name through
-/// `volume::index::escape` and empty when the host knew none. Rows out of
+/// `<kind>\t<id>\t<name>` row for each id, the name as held (escaped,
+/// §1.5) and empty when the host knew none. Rows out of
 /// order are refused.
 pub fn write<'a, W: Write + ?Sized>(
     w: &mut W,
@@ -178,6 +181,16 @@ pub fn write<'a, W: Write + ?Sized>(
     let mut before = None;
     for (i, row) in rows.into_iter().enumerate() {
         in_order(before, row).map_err(|e| bad(&format!("row {}", i + 1), e))?;
+        if row
+            .name
+            .as_deref()
+            .is_some_and(|n| n.contains(['\t', '\n', '\r']) || unescape(n).is_err())
+        {
+            return Err(bad(
+                &format!("row {}", i + 1),
+                "a name is not in the escaped form (§1.5)",
+            ));
+        }
         if row.name.as_deref() == Some("") {
             return Err(bad(
                 &format!("row {}", i + 1),
@@ -189,7 +202,7 @@ pub fn write<'a, W: Write + ?Sized>(
             "{}\t{}\t{}",
             row.kind.letter(),
             row.id,
-            escape(row.name.as_deref().unwrap_or(""))
+            row.name.as_deref().unwrap_or("")
         )?;
         before = Some((row.kind, row.id));
     }
@@ -235,7 +248,8 @@ pub fn parse<R: BufRead>(mut r: R) -> Result<Vec<IdRow>> {
             .then(|| fields[1].parse().ok())
             .flatten()
             .ok_or_else(|| bad(&line, format!("not an id: {:?}", fields[1])))?;
-        let name = unescape(fields[2]).map_err(|e| bad(&line, e))?;
+        unescape(fields[2]).map_err(|e| bad(&line, e))?;
+        let name = fields[2].to_string();
         let row = IdRow {
             kind,
             id,
@@ -314,10 +328,11 @@ mod tests {
     fn the_text_round_trips_with_a_tab_a_newline_and_a_backslash() {
         let rows = vec![
             row(IdKind::User, 0, Some("root")),
-            row(IdKind::User, 1000, Some("a\tb")),
+            // Held escaped (§1.5; item 297), as the text writes it.
+            row(IdKind::User, 1000, Some("a\\tb")),
             row(IdKind::User, 4242, None),
-            row(IdKind::Group, 5, Some("new\nline")),
-            row(IdKind::Group, 4_294_967_294, Some("back\\slash")),
+            row(IdKind::Group, 5, Some("new\\nline")),
+            row(IdKind::Group, 4_294_967_294, Some("back\\\\slash\\xe9")),
         ];
         let mut out = Vec::new();
         write(&mut out, &rows).unwrap();
@@ -325,7 +340,7 @@ mod tests {
         assert_eq!(
             text,
             "#tapectl-id-map 1\nu\t0\troot\nu\t1000\ta\\tb\nu\t4242\t\n\
-             g\t5\tnew\\nline\ng\t4294967294\tback\\\\slash\n"
+             g\t5\tnew\\nline\ng\t4294967294\tback\\\\slash\\xe9\n"
         );
         assert_eq!(parse(text.as_bytes()).unwrap(), rows);
         assert_eq!(parse(format!("{HEADER}\n").as_bytes()).unwrap(), vec![]);

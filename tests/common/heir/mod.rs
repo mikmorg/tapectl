@@ -103,6 +103,10 @@ pub struct UnitTruth {
     pub name: String,
     pub tenant: &'static str,
     pub files: Vec<(String, Vec<u8>)>,
+    /// What a `raw_names` shape adds (ADR-0012 item 297, #569): regular files
+    /// named by bytes that are not UTF-8 (relative path bytes, content),
+    /// beside a hard link and a symbolic link to them that are in `links`.
+    pub raw_files: Vec<(Vec<u8>, Vec<u8>)>,
     /// How many slices its staging has.
     pub slices: usize,
 }
@@ -147,7 +151,24 @@ pub struct Shape {
     /// Write the units across cartridges as a real write plans them
     /// (`staged_build_units_spanning`, `allow_spanning` set on every unit).
     pub span: Option<Span>,
+    /// Add to each BIG unit files whose names are not UTF-8, a folder so
+    /// named, a hard link and a symbolic link whose target is such a name
+    /// (`UnitTruth::raw_files`; [`RAW_NAMES`]).
+    pub raw_names: bool,
 }
+
+/// The names a `raw_names` shape adds, as the bytes they are on disk: a
+/// Latin-1 file, a folder so named with a file in it, a hard link to the
+/// first file, and a symbolic link whose target is the first file's name.
+pub const RAW_NAMES: [&[u8]; 6] = [
+    b"caf\xe9.txt",
+    b"dir\xe9/in\xff.bin",
+    b"hard\xe9-link",
+    b"sym\xe9-link",
+    b"to-\xfe\xfd-target",
+    // UTF-8 text that LOOKS like a byte escape: a backslash, `x`, `e`, `9`.
+    b"lit\\xe9.txt",
+];
 
 /// A unit written across cartridges (T4.12): one tape for each entry of
 /// `warns`, each planned from what the earlier tapes' confirms recorded.
@@ -187,6 +208,7 @@ impl Shape {
             index_edit: None,
             no_index: false,
             span: None,
+            raw_names: false,
         }
     }
     /// One big unit of tenant A, compressed.
@@ -201,6 +223,7 @@ impl Shape {
             index_edit: None,
             no_index: false,
             span: None,
+            raw_names: false,
         }
     }
 }
@@ -300,7 +323,14 @@ fn secret_of(h: &Home, tenant: &str) -> String {
 }
 
 /// `unit init` of a made tree, then `snapshot create` and `stage create`.
-fn make_unit(h: &Home, name: &str, tenant: &'static str, big: bool, seed: u32) -> UnitTruth {
+fn make_unit(
+    h: &Home,
+    name: &str,
+    tenant: &'static str,
+    big: bool,
+    raw: bool,
+    seed: u32,
+) -> UnitTruth {
     let dir = h.sources.join(name);
     fs::create_dir_all(dir.join("inner")).unwrap();
     let mut files: Vec<(String, Vec<u8>)> = vec![
@@ -323,6 +353,25 @@ fn make_unit(h: &Home, name: &str, tenant: &'static str, big: bool, seed: u32) -
     for (path, bytes) in &files {
         fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
         fs::write(dir.join(path), bytes).unwrap();
+    }
+    let mut raw_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    if big && raw {
+        use std::os::unix::ffi::OsStrExt;
+        let os = std::ffi::OsStr::from_bytes;
+        let first = text(2_500, seed + 40);
+        let inner = noise(9_000, seed + 41);
+        fs::write(dir.join(os(RAW_NAMES[0])), &first).unwrap();
+        fs::create_dir_all(dir.join(os(RAW_NAMES[1])).parent().unwrap()).unwrap();
+        fs::write(dir.join(os(RAW_NAMES[1])), &inner).unwrap();
+        fs::hard_link(dir.join(os(RAW_NAMES[0])), dir.join(os(RAW_NAMES[2]))).unwrap();
+        std::os::unix::fs::symlink(os(RAW_NAMES[0]), dir.join(os(RAW_NAMES[3]))).unwrap();
+        std::os::unix::fs::symlink(os(b"\xff\xfegone"), dir.join(os(RAW_NAMES[4]))).unwrap();
+        let literal = text(1_200, seed + 42);
+        fs::write(dir.join(os(RAW_NAMES[5])), &literal).unwrap();
+        raw_files.push((RAW_NAMES[5].to_vec(), literal));
+        raw_files.push((RAW_NAMES[0].to_vec(), first.clone()));
+        raw_files.push((RAW_NAMES[1].to_vec(), inner));
+        raw_files.push((RAW_NAMES[2].to_vec(), first));
     }
     std::os::unix::fs::symlink(format!("{name}-small.txt"), dir.join("a-symlink")).unwrap();
     fs::hard_link(
@@ -365,6 +414,7 @@ fn make_unit(h: &Home, name: &str, tenant: &'static str, big: bool, seed: u32) -
         name: name.to_string(),
         tenant,
         files,
+        raw_files,
         slices: slices as usize,
     }
 }
@@ -628,7 +678,14 @@ impl Tape {
         };
         let mut units = Vec::new();
         for (i, (name, tenant, big)) in shape.units.iter().enumerate() {
-            units.push(make_unit(&h, name, tenant, *big, 1 + 7 * i as u32));
+            units.push(make_unit(
+                &h,
+                name,
+                tenant,
+                *big,
+                shape.raw_names,
+                1 + 7 * i as u32,
+            ));
         }
         let mut keys = BTreeMap::new();
         keys.insert(key_name(Who::TenantA), secret_of(&h, TENANT_A));
@@ -1420,14 +1477,38 @@ impl Heir {
     }
 }
 
-/// Every regular file under `dir` (relative path, bytes).
+/// Every regular file under `dir` (relative path, bytes). A name that is
+/// UTF-8 is its own key; one that is not is keyed by its escaped form
+/// (`volume::index::escape`), never a lossy conversion. [`tree_bytes`] has
+/// the exact names.
 pub fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    tree_bytes(dir)
+        .into_iter()
+        .map(|(name, bytes)| {
+            let key = match String::from_utf8(name) {
+                Ok(text) => text,
+                Err(e) => index::escape_bytes(e.as_bytes()).into_owned(),
+            };
+            (key, bytes)
+        })
+        .collect()
+}
+
+/// Every regular file under `dir`: its path's bytes relative to `dir`, and
+/// its content.
+pub fn tree_bytes(dir: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
     let mut out = BTreeMap::new();
-    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
         for e in fs::read_dir(dir).unwrap() {
             let e = e.unwrap();
             let p = e.path();
-            let name = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+            let name = p
+                .strip_prefix(base)
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+                .to_vec();
             let ft = e.file_type().unwrap();
             if ft.is_dir() {
                 walk(base, &p, out);

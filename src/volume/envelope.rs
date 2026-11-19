@@ -567,7 +567,7 @@ mod tests {
                 end: 2048,
                 size: 1000,
                 sha256: Some([7; 32]),
-                path: "a\tb".into(),
+                path: "a\\tb".into(),
                 link: None,
             },
         ];

@@ -272,7 +272,9 @@ pub(crate) fn matches_snapshot(
         let Some(expected) = sha256 else {
             continue; // never staged — no baseline to compare against.
         };
-        let full_path = unit_path.join(&stamp.path);
+        // A stamp's path is in the escaped form (§1.5; ADR-0012 item 297), the
+        // catalog's: the name on disk is its bytes.
+        let full_path = unit_path.join(crate::volume::index::on_disk(&stamp.path));
         let actual = match hash_source_file(&full_path, &stamp.path) {
             Ok((hex, _)) => hex,
             Err(e) => {

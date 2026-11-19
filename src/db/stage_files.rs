@@ -213,7 +213,7 @@ mod tests {
              INSERT INTO stage_sets (id, snapshot_id, slice_size) VALUES (7, 1, 4096);",
         )
         .unwrap();
-        crate::db::files::fixture::insert(&conn, 1, "a\tb", 5, "regular", None);
+        crate::db::files::fixture::insert(&conn, 1, "a\\tb", 5, "regular", None);
         (conn, 7)
     }
 
@@ -237,7 +237,7 @@ mod tests {
                 end: 2048,
                 size: 1000,
                 sha256: hash(1),
-                path: "a\tb".into(),
+                path: "a\\tb".into(),
                 link: None,
             },
             Row {
@@ -247,7 +247,7 @@ mod tests {
                 end: 2048 + 9000,
                 size: 8000,
                 sha256: hash(2),
-                path: "new\nline\\".into(),
+                path: "new\\nline\\\\".into(),
                 link: None,
             },
             Row {
@@ -258,7 +258,7 @@ mod tests {
                 size: 1000,
                 sha256: hash(1),
                 path: "again".into(),
-                link: Some("a\tb".into()),
+                link: Some("a\\tb".into()),
             },
         ]
     }

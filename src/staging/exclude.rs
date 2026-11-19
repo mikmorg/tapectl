@@ -46,6 +46,8 @@
 //!    pattern containing `/`, and a directory pattern whose name contains
 //!    `/` or is empty (`a/b/`, `/`).
 
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use glob::{MatchOptions, Pattern};
@@ -60,6 +62,15 @@ fn match_options() -> MatchOptions {
         case_sensitive: false,
         require_literal_separator: false,
         require_literal_leading_dot: false,
+    }
+}
+
+/// A name as a pattern reads it: itself when it is UTF-8, else its escaped
+/// form (item 297).
+fn match_text(name: &OsStr) -> Cow<'_, str> {
+    match name.to_str() {
+        Some(text) => Cow::Borrowed(text),
+        None => crate::volume::index::escape_os(name),
     }
 }
 
@@ -151,24 +162,20 @@ impl Excludes {
         self.names.is_empty() && self.dirs.is_empty()
     }
 
-    /// The UTF-8 components of `path` below the root. A path outside the
-    /// root is reduced to its leaf alone, so nothing above the root is ever
-    /// consulted. A non-UTF-8 component is skipped: it can match no
-    /// pattern, which fails safe toward archiving it.
-    fn components_below_root<'p>(&self, path: &'p Path) -> Vec<&'p str> {
+    /// The components of `path` below the root, as text a pattern is matched
+    /// against: a UTF-8 name as it is, a name that is not UTF-8 in its
+    /// escaped form (ADR-0012 item 297; `volume::index::escape_os`), so no
+    /// name is lost to a lossy conversion and a pattern such as `*.tmp` or
+    /// `caf*` still reads it. A path outside the root is reduced to its
+    /// leaf alone, so nothing above the root is ever consulted.
+    fn components_below_root<'p>(&self, path: &'p Path) -> Vec<Cow<'p, str>> {
         let rel = match path.strip_prefix(&self.root) {
             Ok(rel) => rel,
-            Err(_) => {
-                return path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .into_iter()
-                    .collect()
-            }
+            Err(_) => return path.file_name().map(match_text).into_iter().collect(),
         };
         rel.components()
             .filter_map(|c| match c {
-                Component::Normal(s) => s.to_str(),
+                Component::Normal(s) => Some(match_text(s)),
                 _ => None,
             })
             .collect()
