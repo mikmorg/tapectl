@@ -5408,3 +5408,77 @@ fn lint_the_unescape_awk_program_writes_the_same_bytes_under_every_awk() {
         assert_eq!(ran, cases.len(), "{name}");
     }
 }
+
+/// The per-file check names a damaged file whose name is not UTF-8 by its
+/// escaped form (the list's own, `--list`'s), and the run fails as it does for
+/// any damaged file. A tar stand-in overwrites the bytes of `dir\xe9/in\xff.bin`
+/// after the real tar ran (exit 0); the same run undamaged passes.
+#[test]
+fn the_file_check_names_a_damaged_non_utf8_file_by_its_escaped_name() {
+    let t = raw();
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    // Positive control: undamaged, the same run passes and writes no list.
+    let clean = h.dest("clean");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&clean),
+        "--unit",
+        UNIT_B,
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("File check: all"), "{}", o.stdout);
+    assert!(!clean.join(".tapectl-damaged-files.txt").exists());
+
+    let real = heir::host_tool("tar").unwrap();
+    h.put_tool(
+        "tar",
+        &format!(
+            r#"#!/bin/bash
+dest=""
+args=("$@")
+for ((i = 0; i < ${{#args[@]}}; i++)); do
+  if [ "${{args[$i]}}" = -C ]; then dest=${{args[$((i + 1))]}}; fi
+done
+"{real}" "$@"
+rc=$?
+if [ -n "$dest" ] && [ -f "$dest/"$'dir\xe9/in\xff.bin' ]; then
+  printf 'wrong bytes' > "$dest/"$'dir\xe9/in\xff.bin'
+fi
+exit $rc
+"#,
+            real = real.display()
+        ),
+    );
+    let dest = h.dest("damaged");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stdout.contains("RESTORE INCOMPLETE: 1 path(s)"),
+        "{}",
+        o.stdout
+    );
+    assert!(o.stdout.contains("File check: 1 of "), "{}", o.stdout);
+    // The stand-in did damage the file: the bytes on disk are the wrong ones.
+    assert_eq!(
+        std::fs::read(dest.join(os(b"dir\xe9/in\xff.bin"))).unwrap(),
+        b"wrong bytes"
+    );
+    assert_eq!(
+        damaged_list(&dest),
+        vec![escaped_bytes(b"dir\xe9/in\xff.bin")],
+        "named by its escaped form, never as raw bytes"
+    );
+    assert_eq!(escaped_bytes(b"dir\xe9/in\xff.bin"), "dir\\xe9/in\\xff.bin");
+}

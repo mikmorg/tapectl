@@ -153,3 +153,158 @@ fn restore_file_finds_a_name_by_its_escaped_form_and_places_its_bytes() {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("caf\\xe8.txt"), "{err}");
 }
+
+/// `catalog rebuild` of this unit on a fresh home (the heir's, with only the
+/// escrow secret): the rebuilt catalog holds exactly the escaped paths the
+/// original held, `restore unit` from it gives every name back byte for
+/// byte, and `restore file` finds `caf\xe9.txt` typed as bytes.
+///
+/// A second copy written from the rebuilt catalog is NOT reachable here: a
+/// rebuilt unit row has no source folder and no staging (`rebuild` inserts
+/// `units` with only uuid, name, tenant), so there is nothing to stage and
+/// write again; `unit init` of the source would mint a different unit, not a
+/// copy of this one.
+#[test]
+fn a_rebuilt_catalog_holds_the_same_escaped_paths_and_restores_every_name() {
+    use crate::crypto::keys::KeyFile;
+    use crate::progress::{self, Display};
+    use crate::tape::contact::{ContactSite, Medium, Operation};
+    use crate::volume::rebuild;
+
+    const LABEL: &str = "U8-REB";
+    let mut w = Home::new("64K", None, 1);
+    // The fixture keeps no escrow secret: register a recipient whose secret
+    // this test holds, before anything is staged to it.
+    w.conn
+        .execute("DELETE FROM encryption_keys WHERE is_escrow = 1", [])
+        .unwrap();
+    for entry in fs::read_dir(&w.paths.keys_dir).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().contains("-escrow") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    let escrow = crate::cli::key::create_escrow_recipient(&w.conn, &w.paths, None).unwrap();
+    w.unit(TENANT, UNIT, &items());
+    w.stage(UNIT);
+    w.volume(LABEL);
+    w.write(LABEL);
+    let original = unit_paths(&w.conn);
+    assert!(original.contains("caf\\xe9.txt"), "control: {original:?}");
+
+    // The heir's home: a fresh operator, the escrow public key only.
+    let dir = tempfile::TempDir::new().unwrap();
+    let paths = crate::config::TapectlPaths::new(dir.path().join(".tapectl"));
+    paths.ensure_dirs().unwrap();
+    fs::create_dir_all(&paths.logs_dir).unwrap();
+    let conn = crate::db::open(&paths.db_file).unwrap();
+    crate::tenant::add_tenant(&conn, &paths, "heir", Some("System operator"), true).unwrap();
+    crate::cli::key::adopt_escrow_recipient(&conn, &paths, &escrow.keypair.public_key).unwrap();
+    let keydir = tempfile::TempDir::new().unwrap();
+    let key = keydir.path().join("escrow.key");
+    fs::write(
+        &key,
+        format!(
+            "# created: 2026-10-19T00:00:00Z\n# public key: {}\n{}\n",
+            escrow.keypair.public_key, escrow.keypair.secret_key
+        ),
+    )
+    .unwrap();
+    let given = KeyFile::read_all(std::slice::from_ref(&key)).unwrap();
+
+    let mut tape = super::fixture::copy_of(&w.tapes[LABEL]);
+    let cfg = &w.config;
+    let session = progress::start_session(
+        Some(&paths.logs_dir),
+        "catalog rebuild",
+        Display::Off,
+        false,
+    );
+    let scratch = tempfile::TempDir::new().unwrap();
+    let report = rebuild::rebuild_from_store(
+        &conn,
+        &mut tape,
+        &KeyFile::all_identities(&given),
+        Some(LABEL),
+        "recovered",
+        Some("lto0"),
+        scratch.path(),
+        "memstore",
+        ContactSite::new(
+            cfg,
+            Operation::CatalogRebuild,
+            "memstore",
+            Medium::NoBackend,
+        ),
+    )
+    .expect("the escrow key rebuilds");
+    drop(session);
+    assert_eq!(report.units, 1, "{report:?}");
+
+    // (a) the same escaped paths, nothing more or less.
+    let rebuilt = unit_paths(&conn);
+    assert_eq!(rebuilt, original, "the rebuilt catalog's paths");
+
+    // (b) restore unit from the rebuilt catalog: byte for byte.
+    let options = RestoreOptions {
+        keys: given.clone(),
+        ..RestoreOptions::default()
+    };
+    let dest = tempfile::TempDir::new().unwrap();
+    let dest_dir = dest.path().to_string_lossy().into_owned();
+    super::restore_unit_from_store(
+        &conn,
+        &paths,
+        cfg,
+        UNIT,
+        LABEL,
+        1,
+        super::RestoreTarget::Unit {
+            dest_dir: &dest_dir,
+        },
+        &options,
+        &mut tape,
+        ContactSite::new(cfg, Operation::RestoreUnit, "memstore", Medium::NoBackend),
+    )
+    .expect("restore unit from the rebuilt catalog");
+    let got = listing(dest.path());
+    assert!(got.contains_key("caf\\xe9.txt"), "{:?}", got.keys());
+    assert_eq!(got, listing(&w.source(UNIT)), "every name, byte for byte");
+    assert_eq!(
+        fs::read(dest.path().join(os(b"d\xe9/in\xff.bin"))).unwrap(),
+        b"inside a folder"
+    );
+
+    // (c) restore file by the escaped name, placed under its bytes.
+    let one = tempfile::TempDir::new().unwrap();
+    let one_dir = one.path().to_string_lossy().into_owned();
+    super::restore_unit_from_store(
+        &conn,
+        &paths,
+        cfg,
+        UNIT,
+        LABEL,
+        1,
+        super::RestoreTarget::File {
+            file_path: "caf\\xe9.txt",
+            dest_dir: &one_dir,
+        },
+        &options,
+        &mut tape,
+        ContactSite::new(cfg, Operation::RestoreUnit, "memstore", Medium::NoBackend),
+    )
+    .expect("restore file from the rebuilt catalog");
+    assert_eq!(
+        fs::read(one.path().join(os(b"caf\xe9.txt"))).unwrap(),
+        b"latin one"
+    );
+}
+
+/// Every path the catalog holds for the unit (the escaped forms).
+fn unit_paths(conn: &rusqlite::Connection) -> std::collections::BTreeSet<String> {
+    conn.prepare("SELECT p.path FROM paths p JOIN units u ON u.id = p.unit_id WHERE u.name = ?1")
+        .unwrap()
+        .query_map([UNIT], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+}
