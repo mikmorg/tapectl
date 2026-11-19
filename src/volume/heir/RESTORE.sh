@@ -1668,13 +1668,13 @@ feed_from() { # <slice number>
           # The run's first slice is bad: the member never begins.
           for ((j = a + 1; j <= b; j++)); do
             mark_bad "$j" "part of the long member whose first slice is bad"
-            if grep -x "$a" "$WORK/absent.slices" >/dev/null 2>&1; then printf '%s\n' "$j" >>"$WORK/absent.slices"; fi
+            if [ -z "${SL_HERE[$j]:-}" ] && grep -x "$a" "$WORK/absent.slices" >/dev/null 2>&1; then printf '%s\n' "$j" >>"$WORK/absent.slices"; fi
           done
           k=$b
         else
           for ((j = k + 1; j <= b; j++)); do
             mark_bad "$j" "part of a long member with a bad piece"
-            if grep -x "$k" "$WORK/absent.slices" >/dev/null 2>&1; then printf '%s\n' "$j" >>"$WORK/absent.slices"; fi
+            if [ -z "${SL_HERE[$j]:-}" ] && grep -x "$k" "$WORK/absent.slices" >/dev/null 2>&1; then printf '%s\n' "$j" >>"$WORK/absent.slices"; fi
           done
           echo "resume $((b + 1)) $a" >"$WORK/feed.state"
           printf '%s\n' "$CUR" >"$WORK/feed.cur"
@@ -2083,8 +2083,7 @@ restore_one() { # <chosen row> <destination>
 # is never rewritten, and the list follows the merge rule of the repair.
 continue_unit() { # <destination>
   local dest=$1 k
-  note "$(safe_str "$dest") holds the damaged-file list of an earlier run of unit $(safe_str "$U_NAME") version $U_VER: this run adds to it. Only the files this tape holds whole that do not already pass the table's sha256 are restored; a file that passes is left alone."
-  GAVE_UP=1
+  note "$(safe_str "$dest") holds the damaged-file list of an earlier run of unit $(safe_str "$U_NAME") version $U_VER: this run adds to it. Only the files that do not already pass the table's sha256 are restored (the cartridge a file needs is asked for, as the repair asks); a file that passes is left alone."
   : >"$WORK/failed.paths"
   if [ "$NO_FILE_CHECK" = 0 ]; then
     file_check "$U_TABLE" "$dest" "$WORK/failed.paths"

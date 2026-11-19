@@ -4642,6 +4642,103 @@ fn a_start_on_the_second_tape_alone_restores_what_it_holds_whole_and_lists_the_r
     assert_eq!(a.ino(), b.ino(), "the two names are one file");
 }
 
+/// HEIR01 holds slices 1-3, HEIR02 slices 4-8: the file of slices 2 to 4 lies
+/// across the two cartridges, and its tail is in slice 4.
+fn span_long() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let t = span_series("none", 1, vec![Some(2), None], false);
+        assert_eq!(held(&t), [(1, 3), (4, 8)]);
+        t
+    })
+}
+
+/// A start on the later tape, answered "I do not have it" for slice 1: the
+/// closing line names only the slices this tape's MANIFEST gives no place
+/// (1-3). Slice 4 is here, and is left out for its own reason (the long
+/// member's first slice is bad), kept in the warning list and not in that line.
+#[test]
+fn a_start_on_the_later_tape_names_as_not_on_this_cartridge_only_the_slices_it_does_not_hold() {
+    let t = span_long();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(&restore_all(&ka, &dest), |_, _| Some("done".to_string()));
+    assert_eq!(o.code, 1, "{}", o.all());
+    let all = o.all();
+    assert!(
+        o.stdout.contains("NOT ON THIS CARTRIDGE: slices 1-3 of 8 of unit"),
+        "{all}"
+    );
+    assert!(!all.contains("slices 1-4 of 8"), "{all}");
+    assert!(
+        all.contains("slice 4: part of the long member whose first slice is bad"),
+        "{all}"
+    );
+    assert!(list_of(&dest).iter().any(|p| p == LARGE));
+    assert!(!dest.join(LARGE).exists());
+}
+
+/// The second run, on the first tape, into the same --to: the file whose tail
+/// is on the other cartridge is asked for through the one prompt, and the run
+/// completes the unit without rewriting a file that passes.
+#[test]
+fn a_second_run_asks_for_the_cartridge_a_file_across_the_cartridges_needs() {
+    use std::os::unix::fs::MetadataExt;
+    let t = span_long();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(&restore_all(&ka, &dest), |_, _| Some("done".to_string()));
+    assert_eq!(o.code, 1, "{}", o.all());
+    let before = std::fs::metadata(dest.join("notes.txt")).unwrap();
+    let before = (before.ino(), before.mtime(), before.mtime_nsec());
+    h.load("HEIR01");
+    let mut asked = Vec::new();
+    let o = h.run_prompted(&restore_all(&ka, &dest), |k, _| {
+        asked.push(k);
+        h.load("HEIR02");
+        Some(String::new())
+    });
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_eq!(asked, vec![1], "{}", o.all());
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.all());
+    assert_restored(&t[0], UNIT_A, &dest);
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists());
+    assert!(no_work_dir_in(&dest));
+    let after = std::fs::metadata(dest.join("notes.txt")).unwrap();
+    assert_eq!(
+        before,
+        (after.ino(), after.mtime(), after.mtime_nsec()),
+        "a file that passes is not rewritten"
+    );
+}
+
+/// The same second run, answered "I do not have it": the file stays listed,
+/// nothing partial is left, and the files the first run restored stay.
+#[test]
+fn a_second_run_answered_i_do_not_have_it_leaves_the_file_listed_and_no_partial() {
+    let t = span_long();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(&restore_all(&ka, &dest), |_, _| Some("done".to_string()));
+    assert_eq!(o.code, 1, "{}", o.all());
+    h.load("HEIR01");
+    let mut asked = 0;
+    let o = h.run_prompted(&restore_all(&ka, &dest), |_, _| {
+        asked += 1;
+        Some("done".to_string())
+    });
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert_eq!(asked, 1, "{}", o.all());
+    assert!(!dest.join(LARGE).exists(), "no partial file");
+    let list = list_of(&dest);
+    assert_eq!(list, vec![LARGE.to_string()], "{list:?}");
+    assert!(dest.join("notes.txt").exists());
+    assert!(no_work_dir_in(&dest));
+}
+
 /// The hard-linked name the first run listed (its first name is on the other
 /// tape) is restored by the repair once that tape is read: the list the first
 /// run wrote is the repair's input.
