@@ -690,17 +690,17 @@ heir restore-heir 0 --restore --unit "$UNIT_B" --key "$TENANT_KEY" --to "$WORK/r
 assert_identical "$SRC/b" "$WORK/restore-heir-b" heir-restore
 heir restore-heir-cut any --restore --unit "$UNIT_Z" --key "$TENANT_KEY" --to "$WORK/restore-heir-z"
 [ "$RC" != 0 ] || fail "RESTORE.sh restored the cut unit $UNIT_Z from a tape that does not hold it whole"
-# Layout 3's script restores what a short tape holds and says the rest is missing: "RESTORE
-# INCOMPLETE" with a list of the files left out (tests/heir_restore.rs::
-# a_whole_unit_restores_from_a_short_tape_and_a_partial_one_restores_what_it_holds), or, for a
-# unit no envelope on the tape lists, a refusal naming it.
-if grep -F "RESTORE INCOMPLETE" "$STEP_DIR/restore-heir-cut.out" "$STEP_DIR/restore-heir-cut.err" >/dev/null; then
-    [ -s "$WORK/restore-heir-z/.tapectl-damaged-files.txt" ] \
-        || fail "RESTORE.sh called the restore of $UNIT_Z incomplete but left no list of the files it left out"
-else
-    grep -F "is not in the envelope(s) your key opened" "$STEP_DIR/restore-heir-cut.out" "$STEP_DIR/restore-heir-cut.err" >/dev/null \
-        || fail "RESTORE.sh's refusal of $UNIT_Z is neither RESTORE INCOMPLETE nor 'not in the envelope(s) your key opened'"
-fi
+# Layout 3's script restores what a short tape holds and says the rest is missing: the cut unit
+# is in the tape's envelope, none of its slices is on the tape, so it names them NOT ON THIS
+# CARTRIDGE and ends RESTORE INCOMPLETE with the list of the files it left out (measured on
+# mhvtl 2026-11-19; tests/heir_restore.rs::
+# a_whole_unit_restores_from_a_short_tape_and_a_partial_one_restores_what_it_holds).
+grep -F "NOT ON THIS CARTRIDGE: slices " "$STEP_DIR/restore-heir-cut.out" "$STEP_DIR/restore-heir-cut.err" >/dev/null \
+    || fail "RESTORE.sh did not name the slices of $UNIT_Z this tape does not hold"
+grep -F "RESTORE INCOMPLETE" "$STEP_DIR/restore-heir-cut.out" "$STEP_DIR/restore-heir-cut.err" >/dev/null \
+    || fail "RESTORE.sh did not call the restore of $UNIT_Z incomplete"
+[ -s "$WORK/restore-heir-z/.tapectl-damaged-files.txt" ] \
+    || fail "RESTORE.sh called the restore of $UNIT_Z incomplete but left no list of the files it left out"
 run restore-tapectl-cut any tctl restore unit --unit "$UNIT_Z" --from "$LABEL1" --to "$WORK/restore-tapectl-z" --device "$TAPE_DEV"
 [ "$RC" != 0 ] || fail "tapectl restored the cut unit $UNIT_Z from $LABEL1"
 end_step
