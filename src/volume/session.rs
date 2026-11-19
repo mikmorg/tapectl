@@ -848,7 +848,7 @@ pub struct SealedSession {
 pub struct RangeUnit {
     /// The unit's name.
     pub unit: String,
-    /// The lowest slice number of the run (dar's slice number, 1-based).
+    /// The lowest slice number of the run (1-based).
     pub first_slice: i64,
     /// The highest slice number of the run.
     pub last_slice: i64,

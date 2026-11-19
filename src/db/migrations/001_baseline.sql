@@ -7,10 +7,9 @@
 -- is what a 1.9.2 catalog carries, with what Layout 3 adds as Stage 4 builds
 -- it (`volume-format-v3.md` Appendix A.2 and A.3): the file table
 -- (`stage_files`) and the id map (`stage_ids`), and the `tar_*` columns of
--- `stage_sets`, `tar_create_reports` and `restores` that D11 renames dar's
--- to. Until T4.15 removes dar, each `tar_*` column stands beside the `dar_*`
--- one it replaces (`restores.tar_*` are written by `volume::restore_record`,
--- whose test pins that table's columns). The relic row
+-- `stage_sets`, `tar_create_reports` and `restores` (D11; `restores.tar_*`
+-- are written by `volume::restore_record`, whose test pins that table's
+-- columns). The relic row
 -- `meta.schema_version` (written once by the first 1.x migration and never
 -- moved) is not written; `PRAGMA user_version`, which the migration runner
 -- keeps, is the schema's version.
@@ -99,7 +98,6 @@ CREATE TABLE archive_sets (
     verify_interval_days     INTEGER,
     preserve_xattrs          INTEGER,
     preserve_acls            INTEGER,
-    preserve_fsa             INTEGER,
     dirty_on_metadata_change INTEGER,
     created_at               TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at               TEXT NOT NULL DEFAULT (datetime('now')),
@@ -222,9 +220,8 @@ END;
 
 -- ---------------------------------------------------------------------------
 -- Staging: a stage set is one version staged once, its slices the encrypted
--- pieces waiting on the staging device; `dar_create_reports` (and, on the
--- tar payload, `tar_create_reports`) keeps what the archiver said about each
--- staging. `stage_files` and `stage_ids` are a staging's file table and id
+-- pieces waiting on the staging device; `tar_create_reports` keeps what
+-- the archiver said about each staging. `stage_files` and `stage_ids` are a staging's file table and id
 -- map (`volume-format-v3.md` §1.6, Appendix A.3; ADR-0012 items 265, 272,
 -- 277): they outlive the release of its slices and go only with its row.
 -- ---------------------------------------------------------------------------
@@ -234,17 +231,13 @@ CREATE TABLE stage_sets (
     snapshot_id          INTEGER NOT NULL REFERENCES snapshots(id),
     status               TEXT NOT NULL DEFAULT 'staging'
                          CHECK(status IN ('staging','staged','failed','cleaned')),
-    dar_version          TEXT,
     tar_version          TEXT,
-    dar_command          TEXT,
     tar_command          TEXT,
-    catalog_path         TEXT,
     slice_size           INTEGER NOT NULL,
     compression          TEXT,
     encrypted            INTEGER NOT NULL DEFAULT 1,
     key_fingerprints     TEXT,
     num_slices           INTEGER,
-    total_dar_size       INTEGER,
     -- The tar stream's length in bytes, its tail included (D11).
     stream_bytes         INTEGER,
     total_encrypted_size INTEGER,
@@ -279,22 +272,6 @@ CREATE TABLE stage_slices (
 );
 
 CREATE INDEX idx_stage_slices_stage_set ON stage_slices(stage_set_id);
-
-CREATE TABLE dar_create_reports (
-    id                INTEGER PRIMARY KEY,
-    captured_at       TEXT NOT NULL DEFAULT (datetime('now')),
-    stage_set_id      INTEGER REFERENCES stage_sets(id) ON DELETE SET NULL,
-    unit_name         TEXT,
-    snapshot_version  INTEGER,
-    outcome           TEXT NOT NULL,
-    dar_command       TEXT NOT NULL,
-    dar_exit_code     INTEGER,
-    dar_stderr        BLOB,
-    dar_version       TEXT,
-    tapectl_version   TEXT NOT NULL
-);
-
-CREATE INDEX idx_dar_create_reports_stage_set ON dar_create_reports(stage_set_id);
 
 CREATE TABLE tar_create_reports (
     id                INTEGER PRIMARY KEY,
@@ -835,19 +812,13 @@ CREATE TABLE restores (
     slices_read      INTEGER,
     bytes_restored   INTEGER,
     files_restored   INTEGER,
-    -- JSON array, program first: ["dar", "-x", "/dest/.tapectl-restore-tmp/restore", ...].
-    dar_argv         TEXT,
     -- The same, for the tar run that extracted the members (volume-format-v3.md
     -- §7.1): JSON array, program first. A restore that fed tar more than once
     -- (a long member's run cut short, item 264) records the last run.
     tar_argv         TEXT,
-    dar_exit_code    INTEGER,
     tar_exit_code    INTEGER,
-    dar_stdout       TEXT,
     tar_stdout       TEXT,
-    dar_stderr       TEXT,
     tar_stderr       TEXT,
-    dar_version      TEXT,
     tar_version      TEXT,
     tapectl_version  TEXT NOT NULL
 );

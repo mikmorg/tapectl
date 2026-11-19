@@ -39,7 +39,6 @@ pub mod tenant;
 pub mod unit;
 
 pub mod collection;
-pub mod dar;
 pub mod for_location;
 pub mod staging;
 pub mod tape;

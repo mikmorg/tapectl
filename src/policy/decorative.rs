@@ -24,10 +24,9 @@
 //! the delete list below. The audit's count of six also included
 //! `logging.level`/`logging.format` — issue #172 WIRES those two instead of
 //! deleting them. Issue #347 found four more parsed-but-inert keys and ran
-//! the same delete-or-wire decision on each: `preserve_xattrs` and
-//! `preserve_fsa` were WIRED (`dar::create`: `false` now drops extended
-//! attributes / filesystem attributes), `preserve_acls` stays the ratified
-//! visible no-op (`policy::subsumed`), and `dirty_on_metadata_change` — whose
+//! the same delete-or-wire decision on each: `preserve_xattrs` was
+//! WIRED (it gives tar `--xattrs`, and `preserve_acls` gives it `--acls`:
+//! independent knobs since 2.0.0, D11), and `dirty_on_metadata_change` — whose
 //! wiring belongs to dirty detection, not config — is the one reported here
 //! until it is wired or deleted.
 //!
@@ -196,7 +195,6 @@ mod tests {
             slice_size: None,
             preserve_xattrs: None,
             preserve_acls: None,
-            preserve_fsa: None,
             dirty_on_metadata_change: Some(true),
             allow_spanning: None,
             copies_at: None,

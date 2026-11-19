@@ -748,7 +748,7 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
 /// parse as whole JSON once something is staged -- the JSON arm never
 /// resolves an LTO backend (only the human "estimated tapes" line does,
 /// via `resolve_lto_backend`), so a fresh home with no `[[backends.lto]]`
-/// configured is fine here. Seeds one `staged` stage_set directly (no dar,
+/// configured is fine here. Seeds one `staged` stage_set directly (no tar,
 /// no encryption) since `volume plan` only ever reads the DB.
 #[test]
 fn volume_plan_json_parses_with_one_staged_unit() {

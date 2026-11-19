@@ -425,16 +425,6 @@ pub enum TapectlError {
     #[error("unit path does not exist: {0}")]
     UnitPathNotFound(String),
 
-    // dar
-    #[error("dar error: {0}")]
-    Dar(String),
-
-    #[error("dar not found at configured path: {0}")]
-    DarNotFound(String),
-
-    #[error("dar version {found} below minimum {minimum}")]
-    DarVersionTooOld { found: String, minimum: String },
-
     // tar, the Layout 3 writer (volume-format-v3.md §3.1)
     #[error("tar error: {0}")]
     Tar(String),

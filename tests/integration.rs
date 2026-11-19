@@ -27,8 +27,8 @@ fn setup() -> (TempDir, Connection, PathBuf) {
         &config_path,
         format!(
             r#"
-[dar]
-binary = "/usr/bin/dar"
+[tar]
+binary = "tar"
 
 [staging]
 directory = "{staging}"
@@ -40,7 +40,6 @@ checksum_mode = "mtime_size"
 encrypt = true
 preserve_xattrs = true
 preserve_acls = true
-preserve_fsa = true
 min_copies = 2
 min_locations = 2
 "#,
@@ -1902,7 +1901,7 @@ fn test_export_selects_single_stage_set() {
         .unwrap();
         let ss = conn.last_insert_rowid();
         for num in 1..=2i64 {
-            let fname = format!("{tag}_v{version}.{num}.dar.age");
+            let fname = format!("{tag}_v{version}.{num}.tar.age");
             let path = staging.join(&fname);
             let bytes = format!("{tag}-slice-{num}").into_bytes();
             std::fs::write(&path, &bytes).unwrap();
@@ -1954,7 +1953,7 @@ fn test_export_selects_single_stage_set() {
     let copied: Vec<String> = std::fs::read_dir(&dest)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .filter(|n| n.ends_with(".dar.age"))
+        .filter(|n| n.ends_with(".tar.age"))
         .collect();
     assert_eq!(copied.len(), 2);
     assert!(
@@ -1979,6 +1978,10 @@ fn test_export_selects_single_stage_set() {
 
     let recovery = std::fs::read_to_string(dest.join("RECOVERY.md")).unwrap();
     assert!(recovery.contains("sha256sum -c SHA256SUMS"));
+    assert!(
+        recovery.contains("tar -x") && !recovery.to_lowercase().contains("dar"),
+        "RECOVERY.md names tar, never dar: {recovery}"
+    );
     assert!(
         !recovery.contains("ARCHIVE_BASE"),
         "placeholder leaked into RECOVERY.md"
@@ -2071,7 +2074,7 @@ fn test_volume_write_refuses_over_capacity() {
     // A real slice file at its recorded size (sparse): `volume write`
     // refuses a staged set whose files are not on disk before anything
     // this test is about.
-    let slice = tmp.path().join("slice.dar.age");
+    let slice = tmp.path().join("slice.tar.age");
     std::fs::File::create(&slice)
         .unwrap()
         .set_len(5242880)
@@ -2227,7 +2230,7 @@ fn test_volume_write_refuses_above_the_fill_ceiling_and_the_override_lifts_it() 
     )
     .unwrap();
     let ss = conn.last_insert_rowid();
-    let slice = tmp.path().join("slice.dar.age");
+    let slice = tmp.path().join("slice.tar.age");
     std::fs::File::create(&slice)
         .unwrap()
         .set_len(5242880)
@@ -2447,7 +2450,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
     // A real slice file at its recorded size (sparse): `volume write`
     // refuses a staged set whose files are not on disk before anything
     // this test is about.
-    let slice = tmp.path().join("slice.dar.age");
+    let slice = tmp.path().join("slice.tar.age");
     std::fs::File::create(&slice).unwrap().set_len(110).unwrap();
     conn.execute(
         "INSERT INTO stage_slices
@@ -2525,7 +2528,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
 /// Trigger: `unit discover` against a `discovery.watch_roots` entry that
 /// does not exist on disk hits the pre-existing warn! in
 /// `src/unit/discovery.rs` ("watch root does not exist, skipping") with no
-/// dar/tape/staging setup required. Run with `--json`: the JSON branch of
+/// tar/tape/staging setup required. Run with `--json`: the JSON branch of
 /// `unit discover` (src/cli/unit.rs) deliberately omits `skipped_roots`, so
 /// stdout is clean of the warning text *by construction* — this test would
 /// catch a subscriber regression (e.g. dropping `.with_writer(stderr)`, or
@@ -2562,8 +2565,8 @@ fn test_tracing_warning_goes_to_stderr_not_stdout() {
         &config_path,
         format!(
             r#"
-[dar]
-binary = "/usr/bin/dar"
+[tar]
+binary = "tar"
 
 [staging]
 directory = "{staging_str}"
@@ -2575,7 +2578,6 @@ checksum_mode = "mtime_size"
 encrypt = true
 preserve_xattrs = true
 preserve_acls = true
-preserve_fsa = true
 min_copies = 2
 min_locations = 2
 

@@ -194,7 +194,7 @@ tapectl report reclaimable [OPTIONS]
 
 Stage attempts that failed, and the hours each lost
 
-Every `stage create` that ended without staging its unit, from the facts the catalog keeps: when it started, the last moment it recorded (its phases, dar's report, its source check), and the hours between, with the total. A failed stage restarts its unit from the beginning (ADR-0012 item 91), so this is the time it cost.
+Every `stage create` that ended without staging its unit, from the facts the catalog keeps: when it started, the last moment it recorded (its phases, tar's report, its source check), and the hours between, with the total. A failed stage restarts its unit from the beginning (ADR-0012 item 91), so this is the time it cost.
 
 ```text
 tapectl report failed-stages [OPTIONS]

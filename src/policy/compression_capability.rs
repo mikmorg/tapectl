@@ -1,14 +1,12 @@
 //! Advisory scan (issue #97): does an already-stored `archive_sets.compression`
-//! value match what the local `dar` binary can actually perform?
+//! value name one of the algorithms tapectl carries?
 //!
-//! Validation at `archive-set create/edit/sync` write time is only checked
-//! at the moment of writing (issue #97 wires that in `cli::archive_set`).
-//! Any row written *before* that guard existed — or written against a
-//! different dar binary than is installed now — keeps whatever value it
-//! has, and since issue #92 made `archive_sets.compression` reach the dar
-//! invocation directly, that stale value now reaches `dar -z` at write
-//! time. This scan surfaces such rows so an operator notices before the
-//! next archive attempt fails.
+//! tapectl compresses in-process, each slice alone, with gzip, xz or zstd
+//! (ADR-0012 items 285, 286), so whether a value can be performed no longer
+//! depends on the host: there is no probe of any installed tool. What is
+//! left is the closed set itself ([`crate::config::VALID_COMPRESSION_VALUES`]).
+//! Writing a row checks it (`cli::archive_set`), so this finds only a row some
+//! other path wrote, and says so before the next staging fails on it.
 //!
 //! Same shape as [`crate::policy::decorative`] / [`crate::policy::depth_check`]:
 //! advisory only, never rewrites the row, never changes `config check`'s
@@ -16,36 +14,19 @@
 
 use rusqlite::Connection;
 
-use crate::dar::version::{self, DarCapabilities};
+use crate::config::VALID_COMPRESSION_VALUES;
 
-/// One `archive_sets` row whose stored `compression` the local dar cannot
-/// perform.
+/// One `archive_sets` row whose stored `compression` is not a carried
+/// algorithm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedCompressionHit {
     pub archive_set_name: String,
     pub compression: String,
 }
 
-/// Scan every `archive_sets` row for a `compression` value unsupported by
-/// `dar_binary`. Fails open exactly like [`version::capabilities`]: if the
-/// capability probe itself cannot run (dar missing/unreadable — already
-/// reported separately by `config check`'s dar depth-check), this returns
-/// no hits rather than piling on a second error or falsely flagging every
-/// row.
-pub fn scan(conn: &Connection, dar_binary: &str) -> Vec<UnsupportedCompressionHit> {
-    let Ok(caps) = version::capabilities(dar_binary) else {
-        return Vec::new();
-    };
-    scan_with_capabilities(conn, &caps)
-}
-
-/// Same as [`scan`] but takes pre-probed capabilities, so callers that
-/// already ran the dar depth-check don't probe twice, and so this is
-/// unit-testable without a real dar binary.
-pub fn scan_with_capabilities(
-    conn: &Connection,
-    caps: &DarCapabilities,
-) -> Vec<UnsupportedCompressionHit> {
+/// Scan every `archive_sets` row for a `compression` value outside the
+/// carried set.
+pub fn scan(conn: &Connection) -> Vec<UnsupportedCompressionHit> {
     let mut hits = Vec::new();
 
     let mut stmt = match conn
@@ -62,9 +43,8 @@ pub fn scan_with_capabilities(
         return hits;
     };
 
-    for row in rows.flatten() {
-        let (name, compression) = row;
-        if !caps.supports(&compression) {
+    for (name, compression) in rows.flatten() {
+        if !VALID_COMPRESSION_VALUES.contains(&compression.as_str()) {
             hits.push(UnsupportedCompressionHit {
                 archive_set_name: name,
                 compression,
@@ -79,10 +59,11 @@ pub fn scan_with_capabilities(
 /// `config check` can never drift apart.
 pub fn describe(hit: &UnsupportedCompressionHit) -> String {
     format!(
-        "warning: archive set \"{}\" has compression \"{}\", which the local dar binary \
-         cannot perform — archiving with this set will fail until the value is changed \
-         or a dar build with that codec is installed",
-        hit.archive_set_name, hit.compression
+        "warning: archive set \"{}\" has compression \"{}\", which tapectl does not carry \
+         (it carries {}) — staging with this set will fail until the value is changed",
+        hit.archive_set_name,
+        hit.compression,
+        VALID_COMPRESSION_VALUES.join(", ")
     )
 }
 
@@ -90,28 +71,12 @@ pub fn describe(hit: &UnsupportedCompressionHit) -> String {
 mod tests {
     use super::*;
 
-    fn caps_without(missing: &[&str]) -> DarCapabilities {
-        let mut text = String::from(" Using libdar 6.7.1 built with compilation time options:\n");
-        for (label, alg) in [
-            ("gzip compression (libz)", "gzip"),
-            ("bzip2 compression (libbzip2)", "bzip2"),
-            ("lzo compression (liblzo2)", "lzo"),
-            ("xz compression (liblzma)", "xz"),
-            ("zstd compression (libzstd)", "zstd"),
-            ("lz4 compression (liblz4)", "lz4"),
-        ] {
-            let verdict = if missing.contains(&alg) { "NO" } else { "YES" };
-            text.push_str(&format!("   {label} : {verdict}\n"));
-        }
-        version::parse_capabilities(&text)
-    }
-
     fn fresh_conn() -> Connection {
         crate::db::open_memory().unwrap()
     }
 
     #[test]
-    fn flags_a_preexisting_row_with_unsupported_compression() {
+    fn flags_a_row_with_a_value_tapectl_does_not_carry() {
         let conn = fresh_conn();
         conn.execute(
             "INSERT INTO archive_sets (name, compression) VALUES ('cold', 'lzo')",
@@ -119,8 +84,7 @@ mod tests {
         )
         .unwrap();
 
-        let caps = caps_without(&["lzo"]);
-        let hits = scan_with_capabilities(&conn, &caps);
+        let hits = scan(&conn);
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].archive_set_name, "cold");
@@ -128,17 +92,16 @@ mod tests {
     }
 
     #[test]
-    fn supported_row_is_not_flagged() {
+    fn every_carried_value_is_not_flagged() {
         let conn = fresh_conn();
-        conn.execute(
-            "INSERT INTO archive_sets (name, compression) VALUES ('cold', 'gzip')",
-            [],
-        )
-        .unwrap();
-
-        let caps = caps_without(&["lzo"]);
-        let hits = scan_with_capabilities(&conn, &caps);
-        assert!(hits.is_empty());
+        for (i, alg) in VALID_COMPRESSION_VALUES.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO archive_sets (name, compression) VALUES (?1, ?2)",
+                rusqlite::params![format!("set{i}"), alg],
+            )
+            .unwrap();
+        }
+        assert!(scan(&conn).is_empty());
     }
 
     #[test]
@@ -146,14 +109,11 @@ mod tests {
         let conn = fresh_conn();
         conn.execute("INSERT INTO archive_sets (name) VALUES ('cold')", [])
             .unwrap();
-
-        let caps = caps_without(&["lzo", "zstd", "lz4", "xz", "gzip", "bzip2"]);
-        let hits = scan_with_capabilities(&conn, &caps);
-        assert!(hits.is_empty());
+        assert!(scan(&conn).is_empty());
     }
 
     #[test]
-    fn describe_names_the_set_and_the_codec() {
+    fn describe_names_the_set_the_value_and_the_carried_ones() {
         let hit = UnsupportedCompressionHit {
             archive_set_name: "cold".to_string(),
             compression: "lzo".to_string(),
@@ -161,5 +121,6 @@ mod tests {
         let line = describe(&hit);
         assert!(line.contains("cold"));
         assert!(line.contains("lzo"));
+        assert!(line.contains("gzip, xz, zstd"));
     }
 }

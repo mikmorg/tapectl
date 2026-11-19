@@ -601,7 +601,7 @@ mod tests {
             .enumerate()
             .map(|(i, &n)| {
                 let bytes: Vec<u8> = (0..n).map(|j| (j * 31 + i * 7 + j / 253) as u8).collect();
-                let path = dir.join(format!("slice-{i:03}.dar.age"));
+                let path = dir.join(format!("slice-{i:03}.tar.age"));
                 std::fs::write(&path, &bytes).unwrap();
                 (path, n as u64, Some(sha(&bytes)))
             })

@@ -1973,7 +1973,7 @@ fn run_batch(
     // and the batch index was bounds-checked — so a dry run has already
     // surfaced every reason this run would fail, and is not merely silent.
     // `execute_batch` below is where it stops being reversible: it stages
-    // the whole batch (dar + age, hours and a tape's worth of staging disk)
+    // the whole batch (tar + age, hours and a tape's worth of staging disk)
     // and then writes and SEALS a volume, which ADR-0003 makes immutable.
     // The cartridge is consumed; there is no undo. So the return goes here,
     // printing the plan the run would have executed: the budget line above,
@@ -2778,7 +2778,7 @@ mod checksum_mode_tests {
 /// `collection run --init` and `--move-to` (ADR-0012 item 210), the whole
 /// run on a medium in memory: everything real but the drive. The tenants and
 /// the escrow recipient are made as `init` and `tenant add` make them, the
-/// collection's units registered by `collection sync`, staged by the real dar
+/// collection's units registered by `collection sync`, staged by the real tar
 /// and age, the destination initialized by the real `volume init` and written
 /// by the real `volume write` over a [`MemStore`] (`MemDrive`, the
 /// [`collection::batch::RunDrive`] seam), and moved by `volume write
@@ -2834,7 +2834,6 @@ mod run_tests {
         let root = root.canonicalize().unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string();
         config.staging.directory = staging.to_string_lossy().into_owned();
         config.defaults.min_copies = min_copies;
         config.backends.lto.push(LtoBackendConfig {

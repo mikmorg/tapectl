@@ -798,7 +798,7 @@ fn riding_stage_set_ids(conn: &Connection) -> Result<Vec<i64>> {
 /// sole owner of "may this volume be written?" (the issue #96/#187
 /// derivation-discipline rule), and a bare existence check let a `sealed`,
 /// `retired`, `erased` or `quarantined` label pass, only for
-/// `batch::execute_batch` to stage the whole batch — hours of dar plus age,
+/// `batch::execute_batch` to stage the whole batch — hours of tar plus age,
 /// a tape's worth of staging disk — before `volume write` finally refused
 /// it. Both halves of `volume_write`'s own guard are applied here, in the
 /// same order (`volume::write::volume_write`, right after its own `SELECT
@@ -1002,7 +1002,7 @@ pub fn destination_budget_moving_to(
 /// destination-volume budget FIRST — before `batches_for_budget` ever runs
 /// `pending_units_for_collection`'s filesystem walk — so an unknown
 /// `--label` or an empty `--label` list fails immediately, long before
-/// `batch::execute_batch` stages a single unit (hours of dar + age, a
+/// `batch::execute_batch` stages a single unit (hours of tar + age, a
 /// tape's worth of staging disk).
 ///
 /// **More than one `--label` is refused HERE, before `destination_budget`

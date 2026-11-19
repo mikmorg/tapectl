@@ -448,7 +448,7 @@ unit_depth = 1
 
 /// Instance 1 of issue #230, and the worst of the four: `main.rs` never
 /// handed `cli::collection::run` the global flag, so `collection run
-/// --dry-run` staged an entire batch (dar + age, hours and a tape's worth of
+/// --dry-run` staged an entire batch (tar + age, hours and a tape's worth of
 /// staging disk) and then WROTE A REAL TAPE. ADR-0003 makes a sealed volume
 /// immutable, so the cartridge is consumed and nothing about it is
 /// reversible.
@@ -1774,7 +1774,7 @@ fn db_import_dry_run_does_not_overwrite() {
 /// 1.9.0): no destination directory, no MANIFEST.toml/SHA256SUMS/
 /// RECOVERY.md. The `stage_sets`/`stage_slices` chain is fabricated
 /// directly, the same way `restore_unit_dry_run_reports_a_preview_via_the_
-/// shared_arg_id` above fabricates its write-position chain — a real `dar`
+/// shared_arg_id` above fabricates its write-position chain — a real `tar`
 /// stage is not needed because the dry branch returns before the encrypted
 /// slice at `staging_path` is ever opened.
 #[test]
@@ -1819,7 +1819,7 @@ fn export_dry_run_creates_no_destination_directory() {
     // fail that copy with an unrelated I/O error instead of demonstrating
     // the actual defect (a real destination directory and its contents
     // getting written under `--dry-run`).
-    let slice_path = root.path().join("slice.1.dar.age");
+    let slice_path = root.path().join("slice.1.tar.age");
     std::fs::write(&slice_path, vec![0u8; 116]).unwrap();
     conn.execute(
         "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,

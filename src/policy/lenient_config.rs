@@ -57,7 +57,7 @@ pub struct LenientReport {
     pub problems: Vec<String>,
     /// A best-effort `Config`, built by stripping every unknown key this
     /// module found. Used to run the existing depth checks (staging, tape
-    /// devices, dar, decorative keys, …) even on a config with real
+    /// devices, tar, decorative keys, …) even on a config with real
     /// problems elsewhere. `None` only when nothing usable could be built —
     /// the file is not valid TOML at all, or a non-unknown-field structural
     /// error (a wrong-typed value, a missing required field) stopped the

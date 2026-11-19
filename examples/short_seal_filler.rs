@@ -16,8 +16,8 @@
 //! home2's staging area is smaller than one cartridge, so the run cannot
 //! stage 2.5 TB (item 115). Instead the filler unit is staged NORMALLY by
 //! `tapectl stage create` from a source a little larger than one slice, so its
-//! stage set is real in every respect (unit, snapshot, file rows, dar
-//! catalogue, recipients, escrow receipt) and its slice 1 is a full dar slice,
+//! stage set is real in every respect (unit, snapshot, file rows, file
+//! table, recipients, escrow receipt) and its slice 1 is a full tar slice,
 //! age-encrypted to the set's recipients. `fill` then gives that set N slice
 //! rows: slice 1 and N-1 copies of it, every one naming the same staged file
 //! with the same sizes and hashes, and the set's own later slices renumbered
@@ -39,7 +39,7 @@
 //!   real unit before `fill` runs.
 //!
 //! The filler is cut by the early warning and never restored: N copies of
-//! one dar slice are no archive. `staging clean --unit <filler> --force`
+//! one tar slice are no archive. `staging clean --unit <filler> --force`
 //! releases it afterwards (a missing path is skipped, so N rows naming one
 //! file are one unlink).
 //!
@@ -297,7 +297,7 @@ fn fill(raw: &[String]) -> Result<i32> {
     }
     if template.size_bytes != slice_size {
         bail!(
-            "slice 1 of {unit:?} is {} bytes of dar archive, not the set's full slice size \
+            "slice 1 of {unit:?} is {} bytes of tar stream, not the set's full slice size \
              {slice_size}: stage the filler from a source larger than one slice, so its slice 1 \
              is a full slice like every slice but the last of a real unit",
             template.size_bytes
@@ -483,7 +483,7 @@ fn fill(raw: &[String]) -> Result<i32> {
     tx.execute(
         "UPDATE stage_sets
          SET num_slices = (SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = ?1),
-             total_dar_size = (SELECT SUM(size_bytes) FROM stage_slices WHERE stage_set_id = ?1),
+             stream_bytes = (SELECT SUM(size_bytes) FROM stage_slices WHERE stage_set_id = ?1),
              total_encrypted_size =
                  (SELECT SUM(encrypted_bytes) FROM stage_slices WHERE stage_set_id = ?1),
              notes = CASE WHEN notes IS NULL OR notes = '' THEN ?2 ELSE notes || '; ' || ?2 END

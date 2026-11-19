@@ -45,28 +45,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: Install dar
-        # The ungated suite is NOT hermetic, despite what this file claimed
-        # until 2026-07-31. `staging::tests` and `cli::stage::tests` shell out
-        # to a real dar to build archives, and `tests/cli_smoke.rs` spawns
-        # `stage create`, which does the same. Without dar those tests fail,
-        # and they had been failing here for many commits while every local
-        # `cargo test` passed — this job was reporting red so consistently
-        # that its signal had stopped meaning anything.
+      - name: Install the test tools
+        # The ungated suite is NOT hermetic: staging runs the real GNU tar, and
+        # `tests/cli_smoke.rs` spawns `stage create`, which does the same.
+        # Without these tools those tests fail, and they had been failing here
+        # for many commits once while every local `cargo test` passed (issue
+        # #43): this job reported red so consistently that its signal had
+        # stopped meaning anything.
         #
-        # Installing dar is the honest fix: dar >= 2.6 is a documented hard
-        # dependency of the tool (CLAUDE.md, README), so a CI run without it
-        # is not testing the product as shipped. Ubuntu's `dar` package is
-        # 2.7.x, comfortably above the minimum enforced by src/dar/version.rs.
-        #
-        # Layout 3 (2.0.0, the plan's T4.0) adds what its tests run for real: `acl`
-        # (setfacl and getfacl, for the stream's ACL checks) and the decompressor of
-        # each algorithm Layout 3 carries (ADR-0012 item 285: gzip, xz, zstd), which
-        # read library-made slices back. dar stays until Stage 4's T4.15.
+        # Layout 3 (2.0.0) needs what its tests run for real: `acl` (setfacl
+        # and getfacl, for the stream's ACL checks) and the decompressor of
+        # each algorithm it carries (ADR-0012 item 285: gzip, xz, zstd), which
+        # read library-made slices back.
         run: |
           sudo apt-get update
-          sudo apt-get install -y dar acl attr gzip xz-utils zstd
-          dar --version | head -2
+          sudo apt-get install -y acl attr gzip xz-utils zstd
           getfacl --version | head -1
           gzip --version | head -1
           xz --version | head -1
@@ -82,8 +75,8 @@ jobs:
         # Debug profile on purpose — release builds are for publishing and the
         # perf suite only (house build rule). No $HOME dependence and no tape
         # devices: the mhvtl e2e and perf suites stay gated out (see the
-        # header). dar is the one external binary this suite genuinely needs,
-        # installed above. --no-fail-fast: cargo otherwise stops at the first
+        # header). The external tools this suite genuinely needs are
+        # installed above (tar is the runner's own). --no-fail-fast: cargo otherwise stops at the first
         # failing test binary, so a red lib binary hid every binary after it
         # (2026-10-21 to 10-24, when the runner moved to Ubuntu 26).
         run: cargo test --locked --no-fail-fast

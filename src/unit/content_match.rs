@@ -13,7 +13,7 @@
 //!
 //! **Home is `src/unit/`, not `src/collection/` or `src/staging/`,**
 //! because of the dependency direction: `collection` already legitimately
-//! depends on `staging` (dar/encryption plumbing) and on `unit`; `staging`
+//! depends on `staging` (tar/encryption plumbing) and on `unit`; `staging`
 //! already depends on `unit` (nesting checks). Putting the shared
 //! comparison in `collection` would force `staging::snapshot_create` to
 //! reach upward into it — a cycle. `unit` depends on neither, so both can

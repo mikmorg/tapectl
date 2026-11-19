@@ -111,7 +111,7 @@ fn an_ops_group_from_first_run_shares_the_logs_and_nothing_else() {
 
     // A long command's session log is written group-readable, and records
     // how it ended: a stage of a unit that does not exist opens its session
-    // and fails at once (no dar, no device).
+    // and fails at once (no tar, no device).
     let stage = tapectl(&home, &["stage", "create", "no-such-unit"]);
     assert!(!stage.status.success());
     let logs: Vec<_> = std::fs::read_dir(home.join("logs"))

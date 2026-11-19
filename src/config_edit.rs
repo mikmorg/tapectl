@@ -429,7 +429,6 @@ enum Shape {
 /// Every table of config.toml, by its dotted name, and how it is written.
 const TABLES: &[(&str, Shape)] = &[
     ("", Shape::Table),
-    ("dar", Shape::Table),
     ("tar", Shape::Table),
     ("backends", Shape::Table),
     ("backends.lto", Shape::List),
@@ -2243,7 +2242,7 @@ mod tests {
             "",
             &p(),
             &Edit::Set {
-                key: "dar.binary".into(),
+                key: "tar.binary".into(),
                 value: "\"3\"".into(),
             },
         )
@@ -2258,7 +2257,7 @@ mod tests {
             "",
             &p(),
             &Edit::Set {
-                key: "dar.binary".into(),
+                key: "tar.binary".into(),
                 value: "3".into(),
             },
         )
@@ -2447,10 +2446,10 @@ mod tests {
     #[test]
     fn whitespace_alone_is_not_carried() {
         let original =
-            "[defaults]\nslice_size = \"1G\"\n\n[staging]\njobs = 2\n\n[dar]\nbinary = \"dar\"\n";
+            "[defaults]\nslice_size = \"1G\"\n\n[staging]\njobs = 2\n\n[tar]\nbinary = \"tar\"\n";
         assert_eq!(
             remove(original, "staging"),
-            "[defaults]\nslice_size = \"1G\"\n\n[dar]\nbinary = \"dar\"\n"
+            "[defaults]\nslice_size = \"1G\"\n\n[tar]\nbinary = \"tar\"\n"
         );
     }
 

@@ -2708,8 +2708,8 @@ pub(crate) mod tests {
     /// The real offline decoder over every fixture's bytes reproduces the
     /// recorded decode exactly — proving the decode argv (`--pdt=1`
     /// especially) is the one the fixtures were made with. It touches no
-    /// device (`--in=FILE`). sg3-utils is not a test dependency (only dar is,
-    /// `tests/test_dependencies.rs`), so without `sg_logs` this says so and
+    /// device (`--in=FILE`). sg3-utils is not a test dependency (only tar and the
+    /// compressors are, `tests/test_dependencies.rs`), so without `sg_logs` this says so and
     /// returns.
     ///
     /// The recorded text is the oracle only for the decoder that made it:

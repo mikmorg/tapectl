@@ -514,7 +514,7 @@ pub struct IndexedUnit {
 pub struct RebuiltRange {
     pub unit: String,
     pub version: i64,
-    /// The lowest slice number of the run (dar's, 1-based).
+    /// The lowest slice number of the run (1-based).
     pub first_slice: i64,
     /// The highest slice number of the run.
     pub last_slice: i64,
@@ -1107,7 +1107,7 @@ fn rebuild_contacted(
         }
     }
 
-    // Issue #473's dar catalogues are not put back: no Layout 3 envelope
+    // Issue #473's catalogues (1.x's archives) are not put back: no Layout 3 envelope
     // carries one (`volume-format-v3.md` §9). The file table and id map a
     // rebuild restores come from the operator envelope's `catalog.db`
     // (§1.4), which is T4.9's to port.
@@ -2821,19 +2821,16 @@ fn ensure_stage_set(
         .and_then(|f| f.tar_version.clone())
         .or_else(|| unit.tar_version.clone());
     tx.execute(
-        "INSERT INTO stage_sets (snapshot_id, status, origin, dar_version, dar_command, slice_size,
-                                 num_slices, total_dar_size, total_encrypted_size, staged_at, notes,
+        "INSERT INTO stage_sets (snapshot_id, status, origin, slice_size,
+                                 num_slices, total_encrypted_size, staged_at, notes,
                                  key_fingerprints, stream_bytes, compression, compression_level,
                                  tar_version)
-         VALUES (?1, 'cleaned', 'rebuilt', ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8, ?9,
-                 ?10, ?11, ?12, ?13)",
+         VALUES (?1, 'cleaned', 'rebuilt', ?2, ?3, ?4, datetime('now'), ?5, ?6,
+                 ?7, ?8, ?9, ?10)",
         params![
             snapshot_id,
-            None::<String>,
-            None::<String>,
             slice_size,
             unit.slices.len() as i64,
-            unit.slices.iter().map(|s| s.size_bytes).sum::<i64>(),
             unit.slices.iter().map(|s| s.encrypted_bytes).sum::<i64>(),
             "rebuilt from the volume's envelope manifest; slices live on tape only",
             receipt,
@@ -3195,7 +3192,7 @@ fn ensure_files(
     // Generation 3 (tapectl 1.1.0 on) records each entry's kind and link
     // target, so the rebuilt rows keep them. Generations 1 and 2 record
     // only `is_directory` (#381): a symlink or special file on those tapes
-    // is rebuilt as regular — dar's catalogue still holds its real type.
+    // is rebuilt as regular — the file table still holds its real type.
     //
     // HAZARD for rows rebuilt from such a tape: a rebuilt row says `Regular`
     // for what may be a FIFO, a device or a symlink, so whatever trusts the

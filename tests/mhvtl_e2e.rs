@@ -130,16 +130,6 @@ fn tape_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-// Config::default() points at /opt/dar/bin/dar; on dev VMs dar lives in /usr/bin.
-fn find_dar() -> String {
-    for p in ["/opt/dar/bin/dar", "/usr/local/bin/dar", "/usr/bin/dar"] {
-        if Path::new(p).exists() {
-            return p.into();
-        }
-    }
-    "dar".into()
-}
-
 /// Ensure a GENERATION-MATCHED cartridge is loaded (issue #111).
 ///
 /// This used to issue a bare `mtx load 1` — whatever is in slot 1, which on a
@@ -234,10 +224,11 @@ fn setup_mhvtl(name: &str) -> Harness {
 
     let conn = db::open(&paths.db_file).unwrap();
 
-    let mut config = Config::default();
-    config.dar.binary = find_dar();
-    config.staging = StagingConfig {
-        directory: staging_dir.to_string_lossy().into_owned(),
+    let mut config = Config {
+        staging: StagingConfig {
+            directory: staging_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
         ..Default::default()
     };
     config.defaults.slice_size = "50M".into();
@@ -331,7 +322,7 @@ fn add_unit(
 /// Like `add_unit`, but also drops one distinctively-named file into the
 /// unit's source directory before staging. The v2 leak-scan leg (T9 leg 2,
 /// `volume-format-v2.md` sec 2's isolation invariant) needs a real source
-/// FILENAME to travel through dar's catalog so it can assert that filename
+/// FILENAME to travel through the file table so it can assert that filename
 /// never surfaces in plaintext — not just tenant/unit names. `.pdf` is
 /// deliberate: it must not collide with the default staging excludes
 /// (`*.nfo`, `*.tmp`, `Thumbs.db`, `.DS_Store`) or it would silently vanish
@@ -495,7 +486,7 @@ fn mhvtl_full_round_trip() {
 
     let dest = h.root.path().join("restored-alice");
     restore_to(&h, "alice-unit", label, &dest);
-    // dar is invoked with -R <unit_path>, so extracted files land directly in dest.
+    // The restore extracts relative to the destination, so files land directly in dest.
     assert!(
         diff_recursive(h.source(1), &dest),
         "restored content differs from source"
@@ -822,7 +813,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     let _g = tape_lock();
 
     // Use names/filenames with no plausible substring collision against the
-    // volume label, tapectl boilerplate, or dar/age headers. If any of these
+    // volume label, tapectl boilerplate, or tar/age headers. If any of these
     // strings (or an expected sha256_plain digest) show up in a plaintext
     // file on tape, isolation is broken.
     let label = "MHVTLI";
@@ -2075,7 +2066,7 @@ fn swap_cartridge(d: &MhvtlDevices, unload: &str, load: &str) {
 ///   the rows are completed/completed/cut/cut, and end of data is right
 ///   after the seal at K+1, which states it;
 /// - `volume verify` (full) passes, reading the seal at K+1;
-/// - RESTORE.sh with the real `mt`, `dd`, `age`, `dar` and `tar`: `--info`
+/// - RESTORE.sh with the real `mt`, `dd`, `age` and `tar`: `--info`
 ///   says SEALED and where the tape ended, `--verify` passes with NOT ON
 ///   TAPE for the files after K, a whole unit restores byte for byte, and
 ///   the cut unit is refused by name before any slice is read;
@@ -2443,7 +2434,7 @@ fn synthetic_unit(
         set_id,
         &[
             ("snapshot_id", Value::Integer(snapshot)),
-            ("total_dar_size", Value::Integer(size as i64)),
+            ("stream_bytes", Value::Integer(size as i64)),
             ("total_encrypted_size", Value::Integer(size as i64)),
         ],
     );

@@ -326,7 +326,7 @@ pub fn resolve_capacity(
 ///
 /// This is deliberately the sibling of [`crate::staging::parse_size_to_bytes`]
 /// (data sizes: `slice_size`, `large_file_warn_threshold`, `enospc_buffer` —
-/// binary, `K`=1024 etc., because dar and the block layer count bytes that
+/// binary, `K`=1024 etc., because tar and the block layer count bytes that
 /// way), not a replacement for it. ADR-0010's "Facts encoded" paragraph
 /// states native capacities as the marketed decimal figures, and
 /// [`Generation::native_capacity_bytes`] above encodes exactly that

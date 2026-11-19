@@ -17,8 +17,8 @@
 //!   the medium; `--prewrite-hash` adds one hash and one read of every staged
 //!   byte, before the write. The positive control: a write with
 //!   `--prewrite-hash` (1.0.3's default) is over the default write's budget.
-//! - **`stage create`** hashes the source once (beside dar, issue #364), and
-//!   dar's output once as plaintext and once as ciphertext. Nothing is read
+//! - **`stage create`** hashes the source once (beside tar, issue #364), and
+//!   tar's output once as plaintext and once as ciphertext. Nothing is read
 //!   back from staging.
 //!
 //! The counts are test-only (ADR-0012, 2026-10-12 item 45): nothing records
@@ -383,7 +383,7 @@ fn a_prewrite_hash_is_one_more_pass_and_over_the_default_budget() {
     }
 }
 
-/// `stage create`: the source hashed once, beside dar (#364), and dar's
+/// `stage create`: the source hashed once, beside tar (#364), and tar's
 /// output hashed once as plaintext and once as ciphertext; staging is
 /// written, never read back. A source written in the last two seconds costs
 /// one more pass of the files that recent (`validate::recheck`); this one
@@ -444,7 +444,7 @@ fn stage_create_hashes_source_plaintext_and_ciphertext_once_each() {
     )
     .unwrap();
     // A file changed within two seconds of its hash is hashed a second time
-    // after dar has read it (git's racy case, `validate::recheck`); a source
+    // after tar has read it (git's racy case, `validate::recheck`); a source
     // that has sat still is not. Production's sources have sat still.
     std::thread::sleep(std::time::Duration::from_millis(2_200));
     let snapshot = tapectl::staging::snapshot_create(&conn, "pass-stage", &config).unwrap();
@@ -463,7 +463,7 @@ fn stage_create_hashes_source_plaintext_and_ciphertext_once_each() {
         .unwrap();
     assert!(
         plain as u64 > source,
-        "positive control: dar's output holds the source ({plain} vs {source})"
+        "positive control: tar's output holds the source ({plain} vs {source})"
     );
     let layers = source + plain as u64 + cipher as u64;
     eprintln!("stage create: {spent:?}, source {source}, plain {plain}, cipher {cipher}");

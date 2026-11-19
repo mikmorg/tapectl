@@ -1,7 +1,7 @@
 //! Performance/scaling tests for the disk-side of the pipeline.
 //!
 //! Gated behind `TAPECTL_PERF_TESTS=1` — they do real work (thousands of
-//! files, hundreds of DB rows, dar + age encryption) and are too slow to
+//! files, hundreds of DB rows, tar + age encryption) and are too slow to
 //! run on every `cargo test` invocation. No tape hardware is required.
 //!
 //! Scenarios are scaled to a dev VM (≈100 GiB /scratch, no real drive): a
@@ -29,15 +29,6 @@ use tapectl::{db, staging, tenant, unit};
 
 fn perf_enabled() -> bool {
     std::env::var("TAPECTL_PERF_TESTS").is_ok()
-}
-
-fn find_dar() -> String {
-    for p in ["/opt/dar/bin/dar", "/usr/local/bin/dar", "/usr/bin/dar"] {
-        if Path::new(p).exists() {
-            return p.into();
-        }
-    }
-    "dar".into()
 }
 
 /// `TAPECTL_PERF_SCRATCH`, or the harness default: where every scenario's
@@ -103,10 +94,11 @@ fn setup(name: &str) -> PerfHarness {
     )
     .unwrap();
 
-    let mut config = Config::default();
-    config.dar.binary = find_dar();
-    config.staging = StagingConfig {
-        directory: staging_dir.to_string_lossy().into_owned(),
+    let mut config = Config {
+        staging: StagingConfig {
+            directory: staging_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
         ..Default::default()
     };
     config.defaults.slice_size = "200M".into();
@@ -143,7 +135,7 @@ fn report(scenario: &str, detail: &str, elapsed: Duration) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Many small files in one unit — stresses filesystem walk, per-file sha256,
-/// dar's file-count scaling, and the manifest-insert transaction path.
+/// tar's file-count scaling, and the manifest-insert transaction path.
 #[test]
 #[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
 fn perf_many_files_single_unit() {
@@ -188,7 +180,7 @@ fn perf_many_files_single_unit() {
     let t = Instant::now();
     staging::stage_create(&h.conn, &h.paths, &h.config, sid, true).unwrap();
     let stage_elapsed = t.elapsed();
-    report("many_files", "stage_create (dar + age)", stage_elapsed);
+    report("many_files", "stage_create (tar + age)", stage_elapsed);
 
     // Loose ceiling: if this ever takes more than 10 min on a dev VM,
     // something has broken catastrophically.
@@ -285,7 +277,7 @@ fn perf_many_units_audit() {
     );
 }
 
-/// One large file in a unit — stresses streaming sha256, dar single-slice
+/// One large file in a unit — stresses streaming sha256, tar single-slice
 /// path, and age encryption throughput.
 #[test]
 #[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
@@ -310,7 +302,7 @@ fn perf_large_single_file() {
     let path = dir.join("big.bin");
 
     let t = Instant::now();
-    // Write in 4 MB chunks with a rotating pattern so dar can't trivially
+    // Write in 4 MB chunks with a rotating pattern so tar can't trivially
     // compress it away even if compression is accidentally enabled.
     let chunk_size = 4 * 1024 * 1024;
     let total_bytes = size_mb * 1024 * 1024;
@@ -885,7 +877,7 @@ fn unit_of_files(n: usize) -> UnitCost {
 /// alike (an N+1 shows as 2N), scales linearly in
 /// time (a superlinear step, such as #413's, shows as ~100x for 10x the
 /// files), and the process stays under 512 MiB resident: the walk and the
-/// manifest stream, they do not hold the unit in memory. dar runs in its
+/// manifest stream, they do not hold the unit in memory. tar runs in its
 /// own process, so its memory is not in the figure.
 #[test]
 #[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
@@ -1191,7 +1183,7 @@ impl Xorshift {
 /// older generator left is rebuilt and not reused.
 const STAGE_FIXTURE_FORMAT: u32 = 1;
 /// Disk reads that are not the source: the test binary's own pages, the
-/// catalog, dar's and the helpers' libraries. About 45 MiB measured; this
+/// catalog, tar's and the helpers' libraries. About 45 MiB measured; this
 /// much is allowed on top of the ratio, so a small fixture is not mistaken
 /// for a second read.
 const STAGE_READ_SLACK: u64 = 128 << 20;
@@ -1333,7 +1325,7 @@ fn evict_from_page_cache(dir: &Path) {
 /// Bytes the kernel fetched from, and sent to, the block layer for this
 /// process (`/proc/self/io`: every thread of it) and, separately, for the
 /// children it has reaped (`RUSAGE_CHILDREN`'s `ru_inblock`/`ru_oublock`, in
-/// 512-byte blocks) — dar, here. Both are page-cache misses and writeback,
+/// 512-byte blocks) — tar, here. Both are page-cache misses and writeback,
 /// not `read(2)` calls: a read the cache answers does not count. Read twice
 /// and subtract; the suite runs with `--test-threads=1`, so no other
 /// scenario's children are reaped in between.
@@ -1399,16 +1391,16 @@ fn mib_per_s(bytes: u64, over: Duration) -> f64 {
 /// whole run and each step; every phase `stage create` records in
 /// `phase_timings` (the rows `volume info` and the stage report are made
 /// from, taken from the catalog and not timed here); how many bytes the
-/// whole run, dar included, read from disk, as a multiple of the source; and
+/// whole run, tar included, read from disk, as a multiple of the source; and
 /// how many it wrote. Only `archive` counts bytes, so only it has a rate
-/// (dar, the source hash and the age encryption run inside it, together).
+/// (tar, the source hash and the age encryption run inside it, together).
 ///
 /// Asserts only what holds on any machine: the stage succeeds, the
 /// `archive` phase was recorded, and the disk reads are at least half the
 /// source and at most one and a half times it plus [`STAGE_READ_SLACK`]. The
 /// upper bound is the one-read-per-byte promise of #370 and #441 with room
 /// for what is not the source (this test binary's own page-ins, the catalog;
-/// before #441 dar's `fadvise` made the second read come off the disk: 1.96x
+/// before #441 the archiver's `fadvise` made the second read come off the disk: 1.96x
 /// on a 2 GiB fixture); the lower bound is the positive control for the
 /// eviction: under half means the source came from the cache, or the scratch
 /// is a filesystem that reads no blocks, and every figure here would measure
@@ -1416,7 +1408,7 @@ fn mib_per_s(bytes: u64, over: Duration) -> f64 {
 ///
 /// Knobs: `TAPECTL_PERF_STAGE_MIB` (source size, 4096),
 /// `TAPECTL_PERF_STAGE_SMALL` (small files, 4000, in a quarter of it),
-/// `TAPECTL_PERF_STAGE_SLICE` (dar `-s`, 1G, the 1.1 default).
+/// `TAPECTL_PERF_STAGE_SLICE` (the slice size, 1G, the 1.1 default).
 #[test]
 #[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
 fn perf_staging_throughput_per_pass() {
@@ -1488,7 +1480,7 @@ fn perf_staging_throughput_per_pass() {
     let (slice_bytes, plain_bytes): (i64, i64) = h
         .conn
         .query_row(
-            "SELECT total_encrypted_size, total_dar_size FROM stage_sets WHERE id = ?1",
+            "SELECT total_encrypted_size, stream_bytes FROM stage_sets WHERE id = ?1",
             params![stage_set_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -1537,14 +1529,14 @@ fn perf_staging_throughput_per_pass() {
     let ratio = io.read() as f64 / source_bytes as f64;
     eprintln!(
         "[perf] stage_throughput read from disk {:.1} MiB = {ratio:.2}x the source \
-         (own {:.1} MiB, dar and other children {:.1} MiB)",
+         (own {:.1} MiB, tar and other children {:.1} MiB)",
         mib(io.read()),
         mib(io.own_read),
         mib(io.child_read),
     );
     eprintln!(
         "[perf] stage_throughput written {:.1} MiB (own {:.1}, children {:.1}); \
-         staged slices {:.1} MiB from a {:.1} MiB dar stream",
+         staged slices {:.1} MiB from a {:.1} MiB tar stream",
         mib(io.written()),
         mib(io.own_written),
         mib(io.child_written),

@@ -3071,20 +3071,20 @@ pub fn export_unit(
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
     // Select a SINGLE stage_set — the latest staged one for this unit — so the
-    // export never interleaves slices from two dar runs (H11). Two stage sets
+    // export never interleaves slices from two stagings (H11). Two stage sets
     // staged simultaneously (a re-stage, or two versions) would otherwise land
     // duplicate slice numbers in one directory and an heir following
     // RECOVERY.md would get an ambiguous, unrestorable set.
-    let (stage_set_id, snapshot_version): (i64, i64) = conn
+    let (stage_set_id, snapshot_version, compression): (i64, i64, Option<String>) = conn
         .query_row(
-            "SELECT ss.id, s.version
+            "SELECT ss.id, s.version, ss.compression
              FROM stage_sets ss
              JOIN snapshots s ON s.id = ss.snapshot_id
              WHERE s.unit_id = ?1 AND ss.status = 'staged'
              ORDER BY ss.created_at DESC, ss.id DESC
              LIMIT 1",
             params![unit.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| {
             TapectlError::Other(format!(
@@ -3141,7 +3141,7 @@ pub fn export_unit(
         let src_path = Path::new(src);
         let file_name = src_path
             .file_name()
-            .unwrap_or(std::ffi::OsStr::new("slice.dar.age"))
+            .unwrap_or(std::ffi::OsStr::new("slice.tar.age"))
             .to_string_lossy()
             .to_string();
         let dest_file = Path::new(dest_dir).join(&file_name);
@@ -3188,19 +3188,38 @@ pub fn export_unit(
     }
     fs::write(Path::new(dest_dir).join("SHA256SUMS"), &sums)?;
 
-    // Archive base = the common `base.N.dar` prefix of the exported slices
-    // (strip the `.N.dar.age` suffix), so RECOVERY.md can name the exact
-    // `dar -x` argument instead of an ARCHIVE_BASE placeholder.
+    // Archive base = the common `base.N.tar.age` prefix of the exported
+    // slices (strip the `.N.tar.age` suffix), so RECOVERY.md can name the
+    // exact files instead of a placeholder.
     let archive_base = manifest_entries
         .first()
         .map(|(_, f, _, _)| {
-            let stem = f.strip_suffix(".dar.age").unwrap_or(f);
+            let stem = f.strip_suffix(crate::staging::SLICE_SUFFIX).unwrap_or(f);
             stem.rsplit_once('.')
                 .map(|(b, _)| b)
                 .unwrap_or(stem)
                 .to_string()
         })
         .unwrap_or_else(|| "archive".to_string());
+    let last_slice = manifest_entries.len();
+
+    // Each slice is compressed alone, after the cut and before it is
+    // encrypted (ADR-0012 item 284), so it is decrypted, then decompressed
+    // by itself; the slices joined in order are the tar stream.
+    let (decompressor_need, decrypt_pipe) = match compression.as_deref() {
+        Some(alg @ ("gzip" | "xz" | "zstd")) => {
+            let tool = match alg {
+                "gzip" => "gzip",
+                "xz" => "xz",
+                _ => "zstd",
+            };
+            (
+                format!("- `{tool}` (each slice was compressed alone with {alg})\n"),
+                format!(" | {tool} -dc"),
+            )
+        }
+        _ => (String::new(), String::new()),
+    };
 
     // Write RECOVERY.md
     let recovery = format!(
@@ -3209,24 +3228,25 @@ pub fn export_unit(
          ## Snapshot version: {snapshot_version}\n\n\
          ### Prerequisites\n\n\
          - `age` CLI (https://github.com/FiloSottile/age)\n\
-         - `dar` >= 2.6\n\
+         - `tar` (GNU tar)\n\
+         {decompressor_need}\
          - The age secret key used to encrypt this data\n\n\
          ### Steps\n\n\
          1. Verify the encrypted slices against their checksums:\n\
          ```bash\n\
          sha256sum -c SHA256SUMS\n\
          ```\n\n\
-         2. Decrypt each slice:\n\
+         2. Decrypt each slice (the slices share the base name `{archive_base}`):\n\
          ```bash\n\
-         for f in *.dar.age; do\n\
-           age -d -i YOUR_KEY.age.key -o \"${{f%.age}}\" \"$f\"\n\
+         for f in *.tar.age; do\n\
+           age -d -i YOUR_KEY.age.key \"$f\"{decrypt_pipe} > \"${{f%.age}}\"\n\
          done\n\
          ```\n\n\
-         3. Extract with dar (the slices share the base name `{archive_base}`):\n\
+         3. Join the slices in order and extract the tar stream:\n\
          ```bash\n\
-         dar -x {archive_base} -R /destination/path -O -Q\n\
-         ```\n\
-         `-O` ignores stored ownership, needed when restoring as a non-root user.\n",
+         for n in $(seq 1 {last_slice}); do cat \"{archive_base}.$n.tar\"; done \\\n\
+           | tar -x -f - -C /destination/path\n\
+         ```\n",
     );
     fs::write(Path::new(dest_dir).join("RECOVERY.md"), &recovery)?;
 
@@ -5140,7 +5160,6 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string();
         config.staging.directory = staging.to_string_lossy().into_owned();
         config.backends.lto = vec![crate::config::LtoBackendConfig {
             name: "lto0".to_string(),
@@ -10991,7 +11010,7 @@ mod tests {
 
         let mut slice_files = Vec::new();
         for n in 1..=2i64 {
-            let f = dir.join(format!("{unit_name}-slice{n}.dar.age"));
+            let f = dir.join(format!("{unit_name}-slice{n}.tar.age"));
             fs::write(&f, b"ciphertext").unwrap();
             conn.execute(
                 "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,

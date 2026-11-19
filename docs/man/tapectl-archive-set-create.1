@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-archive\-set\-create \- Create a new archive set policy
 .SH SYNOPSIS
-\fBtapectl archive\-set create\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-compression\-level\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-checksum\-mode\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-\-slice\-size\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-\-preserve\-xattrs\fR] [\fB\-\-preserve\-acls\fR] [\fB\-\-preserve\-fsa\fR] [\fB\-\-dirty\-on\-metadata\-change\fR] [\fB\-\-allow\-spanning\fR] [\fB\-\-copies\-at\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl archive\-set create\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-compression\-level\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-checksum\-mode\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-\-slice\-size\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-\-preserve\-xattrs\fR] [\fB\-\-preserve\-acls\fR] [\fB\-\-dirty\-on\-metadata\-change\fR] [\fB\-\-allow\-spanning\fR] [\fB\-\-copies\-at\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Create a new archive set policy
 .SH OPTIONS
@@ -53,9 +53,6 @@ tar\*(Aqs \-\-xattrs; the raw POSIX ACL attribute is never among them.
 Keep POSIX ACLs (true/false)
 
 tar\*(Aqs \-\-acls: the text ACL record, every entry by number.
-.TP
-\fB\-\-preserve\-fsa\fR \fI<BOOL>\fR
-Keep filesystem attributes, chattr flags (true/false)
 .TP
 \fB\-\-dirty\-on\-metadata\-change\fR \fI<BOOL>\fR
 A metadata change makes a unit dirty (true/false)

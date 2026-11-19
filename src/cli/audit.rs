@@ -643,7 +643,7 @@ fn collect_findings(
 //     recipient list `escrow_coverage`/`encryption` flag) -> `read-slices`
 //     is never offered, because it reproduces the exact bytes the finding
 //     says are wrong; only a genuine `stage create <unit> --version <n>`
-//     (which re-runs dar against the unit's source path) produces new
+//     (which re-runs tar against the unit's source path) produces new
 //     ciphertext, preceded by `stage clean` when a live stage set would
 //     otherwise block it (`cli/stage.rs`'s re-stage arm refuses while any
 //     live slices exist for that version).

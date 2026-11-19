@@ -8,7 +8,7 @@
 //! through [`crate::config_edit`], which checks the edited file before it
 //! is written. Everything else here only reads.
 //!
-//! Every `config check` scan below (shadowing, subsumed, decorative keys,
+//! Every `config check` scan below (shadowing, decorative keys,
 //! unknown `[defaults]` keys, unsupported compression, and the
 //! tar/staging/tape depth checks) is ADVISORY — it advises, never rewrites
 //! operator-owned files, and never touches the exit code. That contract is load-bearing
@@ -281,29 +281,18 @@ fn run_check(
     // `[defaults]`-scoped wording.
     let unknown_key_hits = crate::policy::unknown_keys::scan(&toml_str);
 
-    // Advisory scan (issue #50/#92 precedent): a `preserve_acls` that
-    // disagrees with its layer's `preserve_xattrs` cannot take effect (dar
-    // has no independent ACL switch; ACLs ride EAs, issue #347).
-    let subsumed_hits = match loaded {
-        Some(cfg) if paths.db_file.exists() => crate::policy::subsumed::scan(cfg, conn),
-        Some(cfg) => crate::policy::subsumed::scan(cfg, &rusqlite::Connection::open_in_memory()?),
-        None => Vec::new(),
-    };
-
     // Decorative-key advisory (issue #62, #92/#50 precedent; populated by
-    // issue #347). Reads the `archive_sets` table too, like `subsumed`.
+    // issue #347). Reads the `archive_sets` table too.
     let decorative_hits = match loaded {
         Some(cfg) if paths.db_file.exists() => crate::policy::decorative::scan(cfg, conn),
         Some(cfg) => crate::policy::decorative::scan(cfg, &rusqlite::Connection::open_in_memory()?),
         None => Vec::new(),
     };
 
-    // Advisory scan (issue #97): a pre-existing archive_sets row whose
-    // compression the local dar cannot perform.
+    // Advisory scan (issue #97): an archive_sets row whose compression is
+    // not one of the algorithms tapectl carries.
     let unsupported_compression_hits = match loaded {
-        Some(cfg) if paths.db_file.exists() => {
-            crate::policy::compression_capability::scan(conn, &cfg.dar.binary)
-        }
+        Some(_) if paths.db_file.exists() => crate::policy::compression_capability::scan(conn),
         _ => Vec::new(),
     };
 
@@ -383,7 +372,6 @@ fn run_check(
         print_json(
             &report,
             &shadowing_hits,
-            &subsumed_hits,
             &decorative_hits,
             &unknown_key_hits,
             tar_check.as_ref(),
@@ -404,7 +392,6 @@ fn run_check(
             &report,
             &shadowing_hits,
             &unreadable_dotfiles,
-            &subsumed_hits,
             &decorative_hits,
             &unknown_key_hits,
             tar_check.as_ref(),
@@ -462,7 +449,6 @@ fn derived_sg_nodes(toml_str: &str, cfg: &crate::config::Config) -> Vec<(String,
 fn print_json(
     report: &crate::policy::lenient_config::LenientReport,
     shadowing_hits: &[crate::policy::shadowing::ShadowingDotfile],
-    subsumed_hits: &[crate::policy::subsumed::SubsumedAcls],
     decorative_hits: &[crate::policy::decorative::DecorativeHit],
     unknown_key_hits: &[crate::policy::unknown_keys::UnknownKeyHit],
     tar_check: Option<&crate::policy::depth_check::TarToolCheck>,
@@ -486,17 +472,6 @@ fn print_json(
                 "dotfile_path": h.dotfile_path.display().to_string(),
                 "checksum_mode_set": h.checksum_mode_set,
                 "compression_set": h.compression_set,
-            })
-        })
-        .collect();
-    let subsumed_json: Vec<_> = subsumed_hits
-        .iter()
-        .map(|h| {
-            serde_json::json!({
-                "source": h.source,
-                "field": "preserve_acls",
-                "value": h.preserve_acls,
-                "note": crate::policy::subsumed::describe(h),
             })
         })
         .collect();
@@ -606,7 +581,6 @@ fn print_json(
         "problems": report.problems,
         "slice_cap_problems": report.slice_cap_problems,
         "shadowing_dotfiles": shadowing_json,
-        "subsumed_policy_fields": subsumed_json,
         "decorative_keys": decorative_json,
         "unknown_keys": unknown_key_json,
         "tar": tar_json,
@@ -633,7 +607,6 @@ fn print_human(
     report: &crate::policy::lenient_config::LenientReport,
     shadowing_hits: &[crate::policy::shadowing::ShadowingDotfile],
     unreadable_dotfiles: &[crate::policy::shadowing::UnreadableDotfile],
-    subsumed_hits: &[crate::policy::subsumed::SubsumedAcls],
     decorative_hits: &[crate::policy::decorative::DecorativeHit],
     unknown_key_hits: &[crate::policy::unknown_keys::UnknownKeyHit],
     tar_check: Option<&crate::policy::depth_check::TarToolCheck>,
@@ -702,9 +675,6 @@ fn print_human(
             "  hint: an unrecognised key under [policy] is refused by name; \
              an ABSENT key is always fine and defers to the archive set or defaults"
         );
-    }
-    for hit in subsumed_hits {
-        println!("{}", crate::policy::subsumed::describe(hit));
     }
     match tar_check {
         Some(check) => println!("{}", crate::policy::depth_check::describe_tar(check)),

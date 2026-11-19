@@ -1365,7 +1365,6 @@ mod tests {
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         let mut config = config_with_staging_dir(&staging, 1);
-        config.dar.binary = "dar".to_string();
         config.defaults.compression = "gzip".to_string();
 
         let src = tmp.path().join("src");

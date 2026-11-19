@@ -254,7 +254,7 @@ mod tests {
             "s",
             "stage create",
             Subject::StageSet(ss),
-            &[timing("dar", 1500, Some(9), true)],
+            &[timing("tar", 1500, Some(9), true)],
         )
         .unwrap();
         assert_eq!(latest_for_stage_set(&conn, ss).unwrap().len(), 1);

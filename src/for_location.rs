@@ -2434,7 +2434,7 @@ mod tests {
         );
     }
 
-    /// A catalog on disk that [`stage`] runs against with dar (on `PATH`):
+    /// A catalog on disk that [`stage`] runs against with tar (on `PATH`):
     /// the operator `op`, the tenant `alice`, a registered escrow recipient,
     /// `home` and `offsite` (shelves), and the volume `L1` (initialized,
     /// 10 MiB) on [`Cat`]'s drive, staging at 1 MiB slices.
@@ -2454,7 +2454,6 @@ mod tests {
             let staging = tmp.path().join("staging");
             std::fs::create_dir_all(&staging).unwrap();
             let mut config = Cat::new().config;
-            config.dar.binary = "dar".into();
             config.staging.directory = staging.to_string_lossy().into_owned();
             config.defaults.slice_size = "1M".into();
             crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
@@ -2562,7 +2561,7 @@ mod tests {
         }
     }
 
-    /// Item 153, end to end with dar: `stage` snapshots a new unit and a
+    /// Item 153, end to end with tar: `stage` snapshots a new unit and a
     /// changed one and stages each, and the round trip holds: what it staged
     /// for X is exactly what `volume write --for-location X` takes, the
     /// changed unit's new version included although its old version has

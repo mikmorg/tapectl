@@ -11,7 +11,7 @@
 //!
 //! **One counter for the whole process, off until a test turns it on.**
 //! Production hashes on worker threads (the write pipeline's hash stage,
-//! staging's hash threads, the source hasher beside dar), so a per-thread
+//! staging's hash threads, the source hasher beside tar), so a per-thread
 //! count would miss most of it. A counted byte is one relaxed atomic add,
 //! and only while a [`Probe`] is alive; otherwise a relaxed load of a flag
 //! nobody writes. A probe holds a process-wide lock, so two budget tests in

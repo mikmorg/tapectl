@@ -41,7 +41,6 @@ pub const UNIT_FILES: [&str; 4] = [
 /// The tools tapectl and the tapes' RESTORE.sh run, each with its
 /// Debian/Ubuntu package.
 const TOOLS: &[(&str, &str)] = &[
-    ("dar", "dar"),
     ("sg_logs", "sg3-utils"),
     ("age", "age"),
     ("mt", "mt-st"),
@@ -1653,7 +1652,7 @@ mod tests {
             commands,
             [
                 "sudo usermod -aG tape alice",
-                "sudo apt install dar sg3-utils age mt-st tar",
+                "sudo apt install sg3-utils age mt-st tar",
                 "sudo loginctl enable-linger alice",
             ]
         );

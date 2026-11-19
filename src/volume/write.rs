@@ -15783,7 +15783,7 @@ mod tests {
     /// generates them (#491): the catalog's first stage set's version gets
     /// one more path, `bytes` long, which the tenant's envelope carries in
     /// `index/paths.tsv` and the operator's in `catalog.db` (Layout 3 has no
-    /// dar catalogue to grow them with, §9). Nothing when `bytes` is 0.
+    /// per-unit catalogue to grow them with, §9). Nothing when `bytes` is 0.
     fn grow_envelopes(conn: &Connection, _dir: &Path, bytes: usize) {
         if bytes == 0 {
             return;
@@ -15848,7 +15848,7 @@ mod tests {
 
         let (tenant_id, stage_set_id) = seed_escrow_check_fixture(&conn);
         let tmp = tempfile::TempDir::new().unwrap();
-        let slice = tmp.path().join("p.dar.age");
+        let slice = tmp.path().join("p.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -15890,7 +15890,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("p.dar.age") || err.to_lowercase().contains("missing"),
+            err.contains("p.tar.age") || err.to_lowercase().contains("missing"),
             "the staged-slice check refused: {err}"
         );
         std::fs::write(&slice, b"0123456789").unwrap();
@@ -16457,7 +16457,7 @@ mod tests {
     fn volume_write_refuses_a_partially_cleaned_stage_set_before_touching_the_device() {
         let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
         let dir = tempfile::TempDir::new().unwrap();
-        let present = dir.path().join("photos.1.dar.age");
+        let present = dir.path().join("photos.1.tar.age");
         std::fs::write(&present, b"ciphertext one").unwrap();
         conn.execute(
             "UPDATE stage_sets SET num_slices = 2 WHERE id = ?1",
@@ -16534,8 +16534,8 @@ mod tests {
     fn volume_write_refuses_a_stage_set_whose_slice_files_are_missing_or_short() {
         let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
         let dir = tempfile::TempDir::new().unwrap();
-        let gone = dir.path().join("photos.1.dar.age");
-        let short = dir.path().join("photos.2.dar.age");
+        let gone = dir.path().join("photos.1.tar.age");
+        let short = dir.path().join("photos.2.tar.age");
         std::fs::write(&short, b"short").unwrap();
         conn.execute(
             "UPDATE stage_sets SET num_slices = 2 WHERE id = ?1",
@@ -16580,7 +16580,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("not whole on disk"), "{msg}");
         assert!(
-            msg.contains("slice 1:") && msg.contains("photos.1.dar.age"),
+            msg.contains("slice 1:") && msg.contains("photos.1.tar.age"),
             "names the missing file: {msg}"
         );
         assert!(
@@ -17149,7 +17149,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // A real slice file at its recorded size: issue #402's on-disk
         // check runs before backend resolution.
-        let slice = tmp.path().join("x.dar.age");
+        let slice = tmp.path().join("x.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -17235,7 +17235,7 @@ mod tests {
         )
         .unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
-        let slice = tmp.path().join("x.dar.age");
+        let slice = tmp.path().join("x.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -17300,7 +17300,7 @@ mod tests {
         )
         .unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
-        let slice = tmp.path().join("x.dar.age");
+        let slice = tmp.path().join("x.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -17960,7 +17960,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // A real 10-byte slice file: issue #402's on-disk check runs before
         // the generation check this test is about.
-        let slice = tmp.path().join("tapectl-gencheck-slice.dar.age");
+        let slice = tmp.path().join("tapectl-gencheck-slice.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -18052,7 +18052,7 @@ mod tests {
                 (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
                  sha256_encrypted, staging_path)
              VALUES (?1, 1, 10, 10, 'p', 'e',
-                     '/nonexistent/tapectl-resume-gencheck-slice.dar.age')",
+                     '/nonexistent/tapectl-resume-gencheck-slice.tar.age')",
             params![stage_set_id],
         )
         .unwrap();
@@ -22457,7 +22457,7 @@ mod tests {
         ///
         /// The batch's staging loop is driven to its `(false, "staged")`
         /// no-op arm — an empty source directory matching a snapshot with no
-        /// file rows — so no `dar` runs and the loop reaches `volume_write`
+        /// file rows — so no `tar` runs and the loop reaches `volume_write`
         /// with the fixture's own staged data, exactly as a real run does
         /// once its units are already staged.
         #[test]
@@ -27613,7 +27613,7 @@ mod tests {
             }
 
             /// The body of the two tests above, with the envelopes grown by
-            /// a dar catalogue of `catalogue_bytes`.
+            /// a catalogue of `catalogue_bytes`.
             fn plans_past_the_ceiling_and_names_the_units(catalogue_bytes: usize) {
                 let mut f = fixture(WIDE_ABC, &["SE-P"]);
                 grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
@@ -27716,7 +27716,7 @@ mod tests {
             }
 
             /// The body of the two tests above, with the envelopes grown by
-            /// a dar catalogue of `catalogue_bytes`. The bound sits half a
+            /// a catalogue of `catalogue_bytes`. The bound sits half a
             /// slice past `b`'s end on the probe, more than the drift
             /// ([`wide_fixed`]) either side.
             fn refused_by_the_bound_not_trimmed(catalogue_bytes: usize) {
@@ -27762,7 +27762,7 @@ mod tests {
             }
 
             /// The body of the two tests above, with the envelopes grown by
-            /// a dar catalogue of `catalogue_bytes`. The fill budget sits half
+            /// a catalogue of `catalogue_bytes`. The fill budget sits half
             /// a slice past the probe's files ([`wide_fixed`]), which leaves
             /// the drift on both sides: the real files still fit under the
             /// ceiling (else the refusal is the capacity gate's, not this one)
@@ -28139,7 +28139,7 @@ mod tests {
                 }
 
                 /// The body of the two tests above, with the envelopes grown
-                /// by a dar catalogue of `catalogue_bytes`. Every figure is
+                /// by a catalogue of `catalogue_bytes`. Every figure is
                 /// placed from [`wide_fixed`], a slice or more from its edge.
                 fn span_past_the_ceiling_is_refused_naming_the_key(catalogue_bytes: usize) {
                     let mut f =
@@ -28341,7 +28341,7 @@ mod tests {
                 }
 
                 /// The body of the two tests above, with the envelopes grown
-                /// by a dar catalogue of `catalogue_bytes`. The fill budget
+                /// by a catalogue of `catalogue_bytes`. The fill budget
                 /// sits half a slice past `a` on the probe ([`wide_fixed`]):
                 /// `a` under it and `c` past it, whichever way the write's
                 /// own build drifts.
@@ -30934,7 +30934,7 @@ mod tests {
         }
 
         /// The body of the two tests above, with the envelopes grown by a
-        /// dar catalogue of `catalogue_bytes`.
+        /// catalogue of `catalogue_bytes`.
         fn refused_naming_the_numbers(catalogue_bytes: usize) {
             let f = fixture(&[3 * BS + 17, 5 * BS]);
             grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
@@ -31019,7 +31019,7 @@ mod tests {
         }
 
         /// The body of the two tests above, with the envelopes grown by a
-        /// dar catalogue of `catalogue_bytes`.
+        /// catalogue of `catalogue_bytes`.
         fn a_passing_rehearsal_bounds_the_real_write(catalogue_bytes: usize) {
             let f = fixture(&[2 * BS + 1, BS, 7 * BS - 3]);
             grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
@@ -31151,7 +31151,7 @@ mod tests {
         }
 
         /// The body of the two tests above, with the envelopes grown by a
-        /// dar catalogue of `catalogue_bytes`.
+        /// catalogue of `catalogue_bytes`.
         ///
         /// The one-byte edge is the rehearsal's rule on the probe's own
         /// numbers ([`CapacityNumbers::fits`]): every rehearsal builds

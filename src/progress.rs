@@ -6,7 +6,7 @@
 //! three parts that share one recorder:
 //!
 //! - **Phases.** A long operation names each stage of its work with
-//!   [`phase`] (`validate`, `dar`, `encrypt`, `write`, `confirm`, ...). A
+//!   [`phase`] (`validate`, `tar`, `encrypt`, `write`, `confirm`, ...). A
 //!   phase has a start, an end, a duration, optionally a byte total, and a
 //!   current item (the slice or unit being worked on). Every phase that ends
 //!   is kept as a [`PhaseTiming`], which the caller drains with [`drain`] to
@@ -949,7 +949,7 @@ impl Phase {
     }
 
     /// Let the ticker learn this phase's byte count by asking `f` — for work
-    /// done by a subprocess (dar), where no read passes through tapectl.
+    /// done by a subprocess (tar), where no read passes through tapectl.
     pub fn poll(&self, f: impl FnMut() -> Option<u64> + Send + 'static) {
         if let Some(r) = &self.rec {
             r.with_phase(self.id, |p| {
@@ -1758,7 +1758,7 @@ mod tests {
     #[test]
     fn a_polled_phase_takes_its_byte_count_from_the_poll() {
         let _s = start_capture();
-        let p = phase("dar", Some(100));
+        let p = phase("tar", Some(100));
         p.poll(|| Some(42));
         current().unwrap().tick(Instant::now());
         p.done();

@@ -314,17 +314,10 @@ mod tests {
                 expect("slices_read", "INTEGER", 0),
                 expect("bytes_restored", "INTEGER", 0),
                 expect("files_restored", "INTEGER", 0),
-                // Each tar_* column stands beside the column it replaces
-                // until T4.15 drops the old ones.
-                expect("dar_argv", "TEXT", 0),
                 expect("tar_argv", "TEXT", 0),
-                expect("dar_exit_code", "INTEGER", 0),
                 expect("tar_exit_code", "INTEGER", 0),
-                expect("dar_stdout", "TEXT", 0),
                 expect("tar_stdout", "TEXT", 0),
-                expect("dar_stderr", "TEXT", 0),
                 expect("tar_stderr", "TEXT", 0),
-                expect("dar_version", "TEXT", 0),
                 expect("tar_version", "TEXT", 0),
                 expect("tapectl_version", "TEXT", 1),
             ],

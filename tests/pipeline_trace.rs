@@ -54,7 +54,7 @@ fn staged(dir: &Path) -> Vec<(PathBuf, String)> {
     (0..FILES)
         .map(|i| {
             let bytes: Vec<u8> = (0..FILE_BYTES).map(|j| (j * 13 + i * 7) as u8).collect();
-            let path = dir.join(format!("slice-{i:03}.dar.age"));
+            let path = dir.join(format!("slice-{i:03}.tar.age"));
             std::fs::write(&path, &bytes).unwrap();
             let sha = format!("{:x}", sha2::Sha256::digest(&bytes));
             (path, sha)

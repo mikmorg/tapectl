@@ -9,8 +9,8 @@
 //! that converts between it and the text the rest of tapectl speaks (hex
 //! hashes, RFC 3339 mtimes, the walk's `file_type` names).
 //!
-//! dar's catalogue is the authority for permissions, owners, xattrs, ACLs,
-//! device numbers and hard links; none of them enter this database.
+//! The file table (`stage_files`) and the tar stream are the authority for
+//! permissions, owners, xattrs, ACLs, device numbers and hard links; none of them enter this database.
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{params, Connection};

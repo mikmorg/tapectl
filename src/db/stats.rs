@@ -149,7 +149,6 @@ pub fn table_sizes_by(conn: &Connection, method: SizeMethod) -> Result<TableSize
 /// 1), so a session written today can fall before the window.
 pub const JOURNALS: &[(&str, &str)] = &[
     ("cartridge_contacts", "opened_at"),
-    ("dar_create_reports", "captured_at"),
     ("events", "timestamp"),
     ("health_logs", "logged_at"),
     ("log_page_journal", "captured_at"),
@@ -158,6 +157,7 @@ pub const JOURNALS: &[(&str, &str)] = &[
     ("phase_timings", "started_at"),
     ("restores", "started_at"),
     ("st_stats_journal", "captured_at"),
+    ("tar_create_reports", "captured_at"),
     ("verification_results", "verified_at"),
     ("verification_sessions", "started_at"),
 ];

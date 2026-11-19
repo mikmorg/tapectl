@@ -136,7 +136,7 @@ pub enum ReportCommands {
     ///
     /// Every `stage create` that ended without staging its unit, from the
     /// facts the catalog keeps: when it started, the last moment it recorded
-    /// (its phases, dar's report, its source check), and the hours between,
+    /// (its phases, tar's report, its source check), and the hours between,
     /// with the total. A failed stage restarts its unit from the beginning
     /// (ADR-0012 item 91), so this is the time it cost.
     #[command(after_long_help = EXIT_REPORT)]
@@ -377,10 +377,10 @@ pub(crate) struct FailedStage {
     pub started: String,
     /// The last moment the catalog recorded of the attempt: the end of its
     /// last recorded phase (`phase_timings`, written as the attempt
-    /// unwinds, its failed phase included), dar's report (`dar_create_reports`,
-    /// written when dar ends), or its source check (`source_validated_at`),
+    /// unwinds, its failed phase included), tar's report (`tar_create_reports`,
+    /// written when tar ends), or its source check (`source_validated_at`),
     /// whichever is latest. `None` when it recorded none of them: a crash or
-    /// a power loss before dar ended leaves only the start.
+    /// a power loss before tar ended leaves only the start.
     pub failed: Option<String>,
     /// `failed` less `started`, in hours. `None` with `failed`.
     pub hours_lost: Option<f64>,
@@ -405,7 +405,7 @@ pub(crate) fn failed_stage_rows(conn: &Connection) -> Result<Vec<FailedStage>> {
                 (SELECT MAX(datetime(pt.started_at,
                                      '+' || (pt.duration_ms / 1000.0) || ' seconds'))
                    FROM phase_timings pt WHERE pt.stage_set_id = ss.id),
-                (SELECT MAX(dr.captured_at) FROM dar_create_reports dr
+                (SELECT MAX(dr.captured_at) FROM tar_create_reports dr
                   WHERE dr.stage_set_id = ss.id),
                 ss.source_validated_at
          FROM stage_sets ss
@@ -7979,14 +7979,14 @@ Read error counter page  [0x3]
             conn.execute(
                 "INSERT INTO phase_timings (session, operation, stage_set_id, seq, phase,
                                             started_at, duration_ms, outcome)
-                 VALUES ('s', 'stage create', ?1, ?2, 'dar', ?3, ?4, ?5)",
+                 VALUES ('s', 'stage create', ?1, ?2, 'tar', ?3, ?4, ?5)",
                 params![set, seq, started, ms, outcome],
             )
             .unwrap();
         }
 
         /// A failure recorded by its phases (2.5 hours), one released by
-        /// `stage clean` known by dar's report (1 hour), one that stopped
+        /// `stage clean` known by tar's report (1 hour), one that stopped
         /// before recording anything (unknown, not in the total). A staged
         /// set released later, one still staging and a rebuilt row are no
         /// failures.
@@ -8007,9 +8007,9 @@ Read error counter page  [0x3]
             phase(&conn, ids[0], 1, "2026-10-01 10:00:00", 3_600_000, "ok");
             phase(&conn, ids[0], 2, "2026-10-01 11:00:00", 5_400_000, "failed");
             conn.execute(
-                "INSERT INTO dar_create_reports (stage_set_id, captured_at, outcome, dar_command,
+                "INSERT INTO tar_create_reports (stage_set_id, captured_at, outcome, tar_command,
                                                  tapectl_version)
-                 VALUES (?1, '2026-10-02 10:00:00', 'files_changed', 'dar -c -', '1.7.0')",
+                 VALUES (?1, '2026-10-02 10:00:00', 'files_changed', 'tar -c', '1.7.0')",
                 params![ids[1]],
             )
             .unwrap();

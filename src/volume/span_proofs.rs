@@ -9,7 +9,7 @@
 //! recipient are made as `tapectl init` and `tenant add` make them; each unit
 //! is a folder of files registered by `unit init`, its policy edited in its
 //! dotfile as an operator edits it; `snapshot create` and `stage create` run
-//! the real dar and age. Each cartridge is registered and each volume made by
+//! the real tar and age. Each cartridge is registered and each volume made by
 //! the real `volume init` over a [`MemStore`], and each tape is written by the
 //! real `volume write` ([`write::volume_write_contacted`] with the store
 //! injected), followed by the release the CLI runs after it. The drive's
@@ -49,7 +49,7 @@ const OPERATOR: &str = "quince-operator-main";
 const TENANT_ONE: &str = "persimmon-tenant-one";
 const TENANT_TWO: &str = "persimmon-tenant-two";
 
-/// Deterministic incompressible bytes, so dar's output is the input's size.
+/// Deterministic incompressible bytes, so tar's output is the input's size.
 fn noise(len: usize, seed: u32) -> Vec<u8> {
     let mut x = seed.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9;
     (0..len)
@@ -206,7 +206,6 @@ impl Home {
         fs::create_dir_all(&sources).unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string();
         config.staging.directory = staging.to_string_lossy().into_owned();
         config.defaults.slice_size = slice_size.to_string();
         config.defaults.min_copies = min_copies;

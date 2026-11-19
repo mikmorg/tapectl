@@ -35,7 +35,6 @@ const DEFAULTS_FIELDS: &[&str] = &[
     "encrypt",
     "preserve_xattrs",
     "preserve_acls",
-    "preserve_fsa",
     "dirty_on_metadata_change",
     "global_excludes",
     "large_file_warn_threshold",

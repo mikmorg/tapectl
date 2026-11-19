@@ -875,7 +875,7 @@ fn dispatch(
                     serde_json::json!(report.unreadable_tenant_envelopes);
                 // ADR-0012 item 265 (#557): the file tables put back from the
                 // operator envelope's `catalog.db`, and the stage sets still
-                // without one. They replace #473's dar-catalogue pair.
+                // without one. They replace #473's catalogue pair.
                 obj["tables_restored"] = serde_json::json!(report.tables_restored);
                 obj["sets_without_table"] = serde_json::json!(report.sets_without_table);
                 // #418 R4: additive. The tapes this tape's cross-volume index

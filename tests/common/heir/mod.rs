@@ -939,7 +939,7 @@ echo $((pos + 1)) >"$T/pos"
 "#;
 
 /// Tools the script runs, taken from the host: a PATH of exactly these (and
-/// the three stand-ins) keeps a host's own `mt-st`, `age` or `dar` out of a
+/// the three stand-ins) keeps a host's own `mt-st` or `age` out of a
 /// run, and lets a test leave one out.
 const HOST_TOOLS: &[&str] = &[
     "env",

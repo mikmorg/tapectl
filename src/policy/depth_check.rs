@@ -3,7 +3,7 @@
 //! fails `config check`'s exit code, and it never opens a tape device (only
 //! `Path::exists` on the configured device paths).
 //!
-//! Following the [`crate::policy::subsumed`] pattern, I/O-performing `check_*`
+//! I/O-performing `check_*`
 //! functions are kept separate from pure `describe_*` functions so the text
 //! and `--json` arms of `config check` can never drift, and so the wording
 //! is unit-testable without touching a filesystem.
@@ -476,7 +476,7 @@ mod tests {
         assert!(line.contains("both present"));
     }
 
-    // -- check_dar / check_staging / scan_tape_devices: I/O, exercised with
+    // -- check_tar / check_staging / scan_tape_devices: I/O, exercised with
     // tempfiles/tempdirs rather than mocked, since Path::exists and
     // std::fs::write are the entire surface being tested.
 

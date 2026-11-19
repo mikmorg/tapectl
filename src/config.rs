@@ -99,12 +99,9 @@ pub fn default_home() -> PathBuf {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default)]
-    pub dar: DarConfig,
-
     /// GNU tar, the writer of Layout 3's data zone (`volume-format-v3.md`
-    /// §3.1; D11). `[dar]` is parsed until T4.15 removes it, and read by
-    /// nothing that stages.
+    /// §3.1; D11). A `[dar]` table is an unknown key, refused by name
+    /// (ADR-0012 item 258(d)).
     #[serde(default)]
     pub tar: TarConfig,
 
@@ -343,13 +340,6 @@ impl Default for TarConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DarConfig {
-    #[serde(default = "default_dar_binary")]
-    pub binary: String,
-}
-
 /// `device_sg` as written in the file: a string, never an empty one. Absence
 /// (the `default`) is the supported way to ask for the derived node
 /// (issue #431); an explicit `""` would be indistinguishable from it after
@@ -367,22 +357,6 @@ where
         ));
     }
     Ok(s)
-}
-
-fn default_dar_binary() -> String {
-    // Bare and PATH-resolved (issue #124) -- portable across distros that
-    // install dar to /usr/bin, /usr/local/bin, or elsewhere, and honored by
-    // `config check` (issue #119) exactly like the runtime honors it via
-    // `Command::new`.
-    "dar".to_string()
-}
-
-impl Default for DarConfig {
-    fn default() -> Self {
-        Self {
-            binary: default_dar_binary(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -590,7 +564,7 @@ const AGE_TAG_BYTES: u64 = 16;
 /// payload nonce. 4 KiB is room for a score of recipients.
 const AGE_HEADER_ALLOWANCE_BYTES: u64 = 4096;
 
-/// What one dar slice of `slice_size` bytes takes on the tape once age has
+/// What one slice of `slice_size` bytes takes on the tape once age has
 /// encrypted it and the writer has padded it to whole blocks.
 pub fn slice_bytes_on_tape(slice_size: u64) -> u64 {
     let chunks = slice_size.div_ceil(AGE_CHUNK_BYTES);
@@ -873,7 +847,6 @@ pub struct ArchiveSetConfig {
     pub slice_size: Option<String>,
     pub preserve_xattrs: Option<bool>,
     pub preserve_acls: Option<bool>,
-    pub preserve_fsa: Option<bool>,
     pub dirty_on_metadata_change: Option<bool>,
     /// #478 (ADR-0012 item 82): whether this set's units may span tapes.
     /// Absent means the set does not say, and `[defaults]` decides; `sync`
@@ -904,20 +877,12 @@ pub struct DefaultsConfig {
     pub checksum_mode: String,
     #[serde(default = "default_true")]
     pub encrypt: bool,
-    /// Archive extended attributes — and with them POSIX ACLs, which Linux
-    /// stores as extended attributes. `false` drops them all (dar `-u "*"`,
-    /// issue #347; it used to add `-am`, which never touched them).
+    /// Archive extended attributes: gives tar `--xattrs` (D11).
     #[serde(default = "default_true")]
     pub preserve_xattrs: bool,
-    /// No effect of its own: dar has no separate ACL switch, so ACLs follow
-    /// `preserve_xattrs` (issue #50). `config check` notes a value that
-    /// disagrees with it (`policy::subsumed`).
+    /// Archive POSIX ACLs: gives tar `--acls` (D11).
     #[serde(default = "default_true")]
     pub preserve_acls: bool,
-    /// Archive filesystem-specific attributes (Linux chattr flags). `false`
-    /// passes dar `--fsa-scope none` (issue #347).
-    #[serde(default = "default_true")]
-    pub preserve_fsa: bool,
     /// Resolved by the policy chain but read by nothing yet: dirty
     /// detection compares path, size and mtime only. `config check` notes
     /// `true` (`policy::decorative`, issue #347).
@@ -987,7 +952,7 @@ fn default_verify_interval_days() -> i64 {
 
 fn default_slice_size() -> String {
     // Ratified 2026-10-06 (ADR-0012, amendment 2026-10-06; was 10G from
-    // 2026-07-22, docs/design/v2-open-questions.md §1.3). dar -s is an exact
+    // 2026-07-22, docs/design/v2-open-questions.md §1.3). `slice_size` is an exact
     // per-slice cut and a per-unit max; 1G ≈ 2,300 slices per LTO-6 tape. A
     // slice is the unit that must still fit after the drive's early warning
     // once a short seal exists (#420), and the most a single-file restore or a
@@ -1024,7 +989,6 @@ impl Default for DefaultsConfig {
             encrypt: true,
             preserve_xattrs: true,
             preserve_acls: true,
-            preserve_fsa: true,
             dirty_on_metadata_change: false,
             // ADR-0012 item 252 (#542): no file is left out unless the
             // operator names the pattern. The old list (`*.nfo`, `Thumbs.db`,
@@ -1705,7 +1669,7 @@ impl Config {
     /// `[defaults].compression` / `.checksum_mode` used to accept any
     /// string even though the archive-set path already validates the same
     /// two fields (`cli::archive_set::validate_compression_capability`), so
-    /// a typo here surfaced as a raw `dar -zbanana` failure at stage time,
+    /// a typo here surfaced as a failure at stage time,
     /// hours later, or an opaque SQLite CHECK-constraint failure when a
     /// unit was finally written with a bad `checksum_mode`.
     ///
@@ -2212,16 +2176,11 @@ pub fn level_problem(compression: &str, level: Option<i64>) -> Option<String> {
     crate::staging::pack_level_problem(compression, level)
 }
 
-/// Compression algorithms `dar` accepts via `-z`. Moved here from
-/// `cli::archive_set` under issue #171 so `[defaults].compression` and an
-/// `[[archive_sets]]` entry's `compression` share one syntactic check —
-/// previously only the archive-set path validated this at all, so a typo in
-/// `[defaults]` surfaced as a raw `dar -zbanana` failure at stage time.
-/// Whether the LOCAL `dar` binary was actually compiled with a given codec
-/// is a separate, capability-probing question
-/// (`cli::archive_set::validate_compression_capability`), which wraps this.
-pub const VALID_COMPRESSION_VALUES: &[&str] =
-    &["none", "gzip", "bzip2", "lzo", "xz", "lzma", "zstd", "lz4"];
+/// The compression values: `none` and the three algorithms tapectl carries
+/// and compresses in-process (ADR-0012 items 285, 286; D11). One check for
+/// `[defaults].compression` and an `[[archive_sets]]` entry's `compression`
+/// (issue #171); there is no capability probe, because no host tool is asked.
+pub const VALID_COMPRESSION_VALUES: &[&str] = &["none", "gzip", "xz", "zstd"];
 
 pub fn validate_compression(value: &str) -> std::result::Result<(), String> {
     validate_closed_set("compression", value, VALID_COMPRESSION_VALUES)
@@ -2625,7 +2584,7 @@ impl TapectlPaths {
     /// (freshly created or pre-existing) to 0700.
     ///
     /// Issue #41: `~/.tapectl` holds the plaintext content-metadata index
-    /// (`tapectl.db`, stage reports, dar catalogs) the on-tape format works hard
+    /// (`tapectl.db`, stage reports, file tables) the on-tape format works hard
     /// to keep out of plaintext — leaving the directory tree at whatever
     /// the process umask hands out (0755 on a stock single-user box)
     /// contradicts that. Tightening runs every call, not just on first
@@ -2754,7 +2713,7 @@ mod tests {
     //! so it ends up whatever the process umask hands out — on a stock
     //! single-user box (umask 022) that's 0755 dirs / 0644 files, which
     //! leaves the plaintext content-metadata index (tapectl.db, stage reports,
-    //! dar catalogs) world-readable. These tests assert actual mode bits,
+    //! file tables) world-readable. These tests assert actual mode bits,
     //! never "does it not error", since that's exactly the class of test
     //! that would pass whether or not the fix is present.
     use super::*;
@@ -3217,6 +3176,44 @@ mod tests {
             ("[defaults]\nhash = \"sha256\"\n", "hash"),
         ] {
             assert_refused_as_unknown(body, key);
+        }
+    }
+
+    /// `[dar]` is gone with dar (D11, item 241): the table is an unknown key,
+    /// named in the refusal; `[tar]` is the one that takes a binary.
+    #[test]
+    fn the_dar_table_is_refused_as_unknown() {
+        assert_refused_as_unknown("[dar]\nbinary = \"dar\"\n", "dar");
+        assert_refused_as_unknown("[dar]\nbinary = \"/usr/bin/dar\"\n", "dar");
+        assert!(load_text("[tar]\nbinary = \"tar\"\n").is_ok());
+    }
+
+    /// `preserve_fsa` is gone (D11, item 253): refused by name in
+    /// `[defaults]` and in an `[[archive_sets]]` table, as any unknown key is.
+    /// `[staging] hash_threads` went earlier (D11) and stays refused.
+    #[test]
+    fn preserve_fsa_and_hash_threads_are_refused_as_unknown() {
+        assert_refused_as_unknown("[defaults]\npreserve_fsa = true\n", "preserve_fsa");
+        assert_refused_as_unknown(
+            "[[archive_sets]]\nname = \"a\"\npreserve_fsa = false\n",
+            "preserve_fsa",
+        );
+        assert_refused_as_unknown("[staging]\nhash_threads = 2\n", "hash_threads");
+    }
+
+    /// `compression` takes `none` and the three algorithms tapectl carries,
+    /// and nothing else (items 285, 286): the values dar alone could take are
+    /// refused at load, with no probe of any host tool.
+    #[test]
+    fn compression_takes_only_the_carried_algorithms() {
+        for ok in ["none", "gzip", "xz", "zstd"] {
+            let text = format!("[defaults]\ncompression = \"{ok}\"\n");
+            assert!(load_text(&text).is_ok(), "{ok}");
+        }
+        for bad in ["bzip2", "lzo", "lzma", "lz4"] {
+            let text = format!("[defaults]\ncompression = \"{bad}\"\n");
+            let msg = load_text(&text).unwrap_err();
+            assert!(msg.contains(bad), "{bad}: {msg}");
         }
     }
 
@@ -5029,7 +5026,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         std::fs::write(
             &path,
-            "[dar]\nbinary = \"dar\"\n\n\
+            "[tar]\nbinary = \"tar\"\n\n\
              [defaults]\nslice_size = \"1M\"\n\n\
              [compaction]\nutilization_threshold = 0.95\n\n\
              [[backends.lto]]\nname = \"lifecycle\"\ndevice_tape = \"/dev/null\"\n\

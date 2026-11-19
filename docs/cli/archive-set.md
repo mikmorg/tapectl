@@ -55,7 +55,6 @@ tapectl archive-set create [OPTIONS] <NAME>
 - `--preserve-acls <BOOL>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false)
   
     tar's --acls: the text ACL record, every entry by number.
-- `--preserve-fsa <BOOL>` *(one of `true`, `false`)* — Keep filesystem attributes, chattr flags (true/false)
 - `--dirty-on-metadata-change <BOOL>` *(one of `true`, `false`)* — A metadata change makes a unit dirty (true/false)
   
     Not read yet: dirty detection compares path, size and mtime only.
@@ -104,7 +103,6 @@ tapectl archive-set edit [OPTIONS] <NAME>
 - `--preserve-acls <BOOL>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false)
   
     tar's --acls: the text ACL record, every entry by number.
-- `--preserve-fsa <BOOL>` *(one of `true`, `false`)* — Keep filesystem attributes, chattr flags (true/false)
 - `--dirty-on-metadata-change <BOOL>` *(one of `true`, `false`)* — A metadata change makes a unit dirty (true/false)
   
     Not read yet: dirty detection compares path, size and mtime only.

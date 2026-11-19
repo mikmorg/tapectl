@@ -124,7 +124,7 @@ pub struct PendingScan {
 /// snapshot.
 ///
 /// **Issue #49:** this walk used to be deliberately unfiltered, on the
-/// reasoning that "excludes are a dar-time / archive-content concern
+/// reasoning that "excludes are a tar-time / archive-content concern
 /// applied later at stage create, and the `files` table this compares
 /// against is unfiltered too." That stopped being true once #49 wired
 /// `staging::walk_directory` (which populates `files`) through the shared

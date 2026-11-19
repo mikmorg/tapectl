@@ -15,7 +15,6 @@ pub mod evidence;
 pub mod lenient_config;
 pub mod reclaimable;
 pub mod shadowing;
-pub mod subsumed;
 pub mod tape_alerts;
 pub mod tenancy;
 pub mod unknown_keys;
@@ -38,7 +37,6 @@ pub struct ResolvedPolicy {
     pub verify_interval_days: Option<i64>,
     pub preserve_xattrs: bool,
     pub preserve_acls: bool,
-    pub preserve_fsa: bool,
     pub dirty_on_metadata_change: bool,
     /// ADR-0006: how many recorded WAREHOUSE deposits this unit should
     /// carry, on top of its tape copies. 0 (the default) means none are
@@ -169,7 +167,6 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         verify_interval_days: Some(defaults.verify_interval_days),
         preserve_xattrs: defaults.preserve_xattrs,
         preserve_acls: defaults.preserve_acls,
-        preserve_fsa: defaults.preserve_fsa,
         dirty_on_metadata_change: defaults.dirty_on_metadata_change,
         warehouse_copies: defaults.warehouse_copies,
         allow_spanning: defaults.allow_spanning,
@@ -198,7 +195,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             .query_row(
                 "SELECT min_copies, required_locations, encrypt, compression, checksum_mode,
                     slice_size, verify_interval_days, preserve_xattrs, preserve_acls,
-                    preserve_fsa, dirty_on_metadata_change, warehouse_copies, allow_spanning,
+                    dirty_on_metadata_change, warehouse_copies, allow_spanning,
                     copies_at, name, compression_level
              FROM archive_sets WHERE id = ?1",
                 params![as_id],
@@ -216,10 +213,9 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                         row.get::<_, Option<i64>>(9)?,
                         row.get::<_, Option<i64>>(10)?,
                         row.get::<_, Option<i64>>(11)?,
-                        row.get::<_, Option<i64>>(12)?,
-                        row.get::<_, Option<String>>(13)?,
-                        row.get::<_, String>(14)?,
-                        row.get::<_, Option<i64>>(15)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, Option<i64>>(14)?,
                     ))
                 },
             )
@@ -245,7 +241,6 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             verify_days,
             preserve_xattrs,
             preserve_acls,
-            preserve_fsa,
             dirty_on_meta,
             warehouse_copies,
             allow_spanning,
@@ -299,9 +294,6 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         }
         if let Some(v) = preserve_acls {
             policy.preserve_acls = v != 0;
-        }
-        if let Some(v) = preserve_fsa {
-            policy.preserve_fsa = v != 0;
         }
         if let Some(v) = dirty_on_meta {
             policy.dirty_on_metadata_change = v != 0;
@@ -441,7 +433,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
 
                 // Issue #213: `checksum_mode`/`compression` used to be
                 // assigned straight through with no validation, so a typo
-                // surfaced hours later as a raw `dar` failure (compression)
+                // surfaced hours later as a raw failure (compression)
                 // or an opaque SQLite CHECK-constraint rejection (checksum
                 // mode) at stage time. Closed-set-validated here, at the
                 // same boundary `config.toml`'s `[defaults]` and
@@ -1662,7 +1654,7 @@ slice_size = "500M"
     /// resolve time -- the same closed-set validation ADR-0012 already
     /// requires for `config.toml [defaults]` and `archive-set create/edit`
     /// -- rather than assigned straight through to surface hours later as a
-    /// raw `dar -z` failure mid-`stage create`.
+    /// raw failure mid-`stage create`.
     #[test]
     fn resolve_rejects_an_invalid_dotfile_compression_value() {
         let conn = fresh_conn();
@@ -1677,7 +1669,7 @@ slice_size = "500M"
 
         let err = resolve(&conn, &config, &unit).expect_err(
             "an invalid [policy] compression must be refused at resolve time (issue #213), \
-             not assigned straight through to surface later as a raw dar failure",
+             not assigned straight through to surface later as a raw failure",
         );
         assert!(err.to_string().contains("compression"), "got: {err}");
     }

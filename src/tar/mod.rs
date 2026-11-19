@@ -44,7 +44,7 @@ pub const REMOVED_ENV: [&str; 2] = ["TAR_OPTIONS", "POSIXLY_CORRECT"];
 /// [`REMOVED_ENV`] removed from its environment.
 ///
 /// The child asks the kernel for SIGKILL when the thread that spawned it
-/// goes (`PR_SET_PDEATHSIG`), as `dar::command` did (issue #404): a killed
+/// goes (`PR_SET_PDEATHSIG`), as the archiver's command did in 1.x (issue #404): a killed
 /// stage leaves no tar filling a pipe nobody reads. If tapectl died between
 /// the fork and the `prctl`, the child refuses to exec. `LC_ALL=C` keeps
 /// tar's messages in English and its name handling byte-wise. Every tar
