@@ -6986,7 +6986,7 @@ mod tests {
     /// (layout-session.md, `volumes.ended_after`), on the shared fixture.
     mod short_seal {
         use super::*;
-        use crate::volume::restore::short_tape::self;
+        use crate::volume::restore::short_tape;
 
         fn short_seal_warnings(conn: &Connection) -> Vec<AuditFinding> {
             let (violations, warnings) = collect_findings(conn, &Config::default(), None).unwrap();
