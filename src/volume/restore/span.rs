@@ -271,8 +271,6 @@ fn missing_refusal(
             "is given up (retired or erased)".to_string()
         } else if t.position_status == "pending" {
             "planned it, but its tape ended before it".to_string()
-        } else if t.write_status == "cut" {
-            "holds it in a write the end of its tape cut, which is never read".to_string()
         } else if t.write_status != "completed" && t.write_status != "range" {
             format!("holds it in a write that is {}", t.write_status)
         } else if t.position_status != "written" {

@@ -43,10 +43,8 @@ pub enum Standing {
 /// that (which `audit` names) sends no read past the seal of the other tape:
 /// tapectl takes `ended_after` from the catalog, which recorded the tape's
 /// seal when it sealed or was rebuilt (`volume-format-v2.md` §4.2 R1 and
-/// R5). A `cut` write's slices are never a source, even those at or before
-/// `ended_after`: §4.2 "Nothing of a cut unit counts on this tape, and no
-/// reader restores it from this tape, even though its slices at or before
-/// `ended_after` are present and hash correctly".
+/// R5). A set the tape was planned to take and did not has no write, so none
+/// of it is a source (ADR-0012 item 288).
 const ON_TAPE: &str = "(v.ended_after IS NULL OR CAST(wp.position AS INTEGER) <= v.ended_after)";
 
 /// The one test of "the volume `v` holds the slice `wp` of the write `w`",
@@ -543,8 +541,8 @@ mod tests {
                VALUES (3, 1, 2, 10, 20, 'p3', 'cccc');
              INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
                VALUES (4, 'V4', 'lto', 'p', 1000, 'sealed');
-             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, may_span)
-               VALUES (4, 1, 1, 4, 'range', 1);
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status)
+               VALUES (4, 1, 1, 4, 'range');
              INSERT INTO write_positions (write_id, stage_slice_id, position, status)
                VALUES (4, 3, '5', 'written');
              INSERT INTO write_positions (write_id, stage_slice_id, position, status)
@@ -641,7 +639,7 @@ mod tests {
         let conn = catalog();
         // Stage set 2's only holder becomes a range of it.
         conn.execute(
-            "UPDATE writes SET status = 'range', may_span = 1 WHERE id = 3",
+            "UPDATE writes SET status = 'range' WHERE id = 3",
             [],
         )
         .unwrap();

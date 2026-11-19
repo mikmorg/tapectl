@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection};
 use tracing::warn;
 
 use crate::config::Config;
@@ -69,31 +69,28 @@ pub enum CleanScope<'a> {
 /// enforces, as a reusable SQL boolean expression (issue #96's
 /// single-derivation rule, restated for issue #279): at least one `writes`
 /// row of the stage_set named by `id_expr` is `'completed'`, and every
-/// other is `'completed'` or `'cut'`. `id_expr` is the caller's own
+/// other is `'completed'`. `id_expr` is the caller's own
 /// qualified column or placeholder (`stage_sets.id`, `ss.id`, `?1`) so this
 /// drops into any query's WHERE clause without forcing a particular alias.
 ///
-/// **A `'cut'` row is no write** (1.6.0, issue #420; ADR-0012 item 112;
-/// `layout-session.md` "The short ending"). It is a stage set planned past
-/// where its tape sealed short: never a copy, and finished with, so it
-/// neither releases the staging nor holds it as an unfinished write would.
-/// A stage set whose only rows are `'cut'` therefore stays staged -- the
-/// next ordinary `volume write` writes it whole on another cartridge from
-/// exactly these slices -- and once one of its rows is `'completed'` it is
-/// released by the same rule as any other. Requiring a `'completed'` row
-/// (rather than any row) changes nothing for a set without `'cut'` rows:
-/// there, "every row completed" already implies one is.
+/// **A set the tape was planned to take and did not has no row** (ADR-0012
+/// item 288; before it a `'cut'` row said so): it stays staged -- the next
+/// ordinary `volume write` writes it from exactly these slices -- and once
+/// one of its rows is `'completed'` it is released by the same rule as any
+/// other. Requiring a `'completed'` row (rather than any row) changes nothing
+/// for a set whose every row is completed: there, "every row completed"
+/// already implies one is.
 ///
 /// `clean_staging`'s own non-force SQL below builds its query from this
 /// fragment. `cli::staging::staged_release_candidate_units` must state the
 /// same rule; this is `pub(crate)` so that query can be built from it too.
 /// [`release_blocker`] answers the same question per stage set, with the
-/// reason, and drops `'cut'` rows the same way.
+/// reason.
 ///
 /// **A `'range'` row is terminal** (1.7.0, issue #478; ADR-0012 items 121
 /// and 129; `layout-session.md` "Per-slice release"): like a `'completed'`
 /// row it never holds the staging as an unfinished write would
-/// ([`writes_finished_sql`]), and unlike a `'cut'` row its slices count.
+/// ([`writes_finished_sql`]), and its slices count.
 /// But a set holding one has its slices on different volumes, so it is never
 /// released whole here: it is released slice by slice
 /// ([`slice_release_candidate_predicate_sql`], [`release_covered_slices`]).
@@ -128,15 +125,14 @@ pub(crate) fn slice_release_candidate_predicate_sql(id_expr: &str) -> String {
 
 /// A SQL boolean: no `writes` row of the stage set `id_expr` holds its
 /// staging as an unfinished write would. `'completed'` and `'range'` rows
-/// are finished and count, a `'cut'` row is no write (ADR-0012 items 112,
-/// 121 and 129); every other status is a write that is live, resumable, or
+/// are finished and count (ADR-0012 items 121 and 129); every other status is a write that is live, resumable, or
 /// abandoned, which keeps the staging until `--force`.
 fn writes_finished_sql(id_expr: &str) -> String {
     format!(
         "NOT EXISTS (
              SELECT 1 FROM writes w
              WHERE w.stage_set_id = {id_expr}
-               AND w.status NOT IN ('completed', 'cut', 'range')
+               AND w.status NOT IN ('completed', 'range')
          )"
     )
 }
@@ -168,7 +164,7 @@ fn holds_a_range_sql(id_expr: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReleaseBlocker {
     /// Nothing blocks it: at least one `writes` row is `'completed'` or
-    /// `'range'` and every other is one of those or `'cut'`. A bare clean
+    /// `'range'` and every other is one of those. A bare clean
     /// releases it unless the unit is below its policy's `min_copies` -- or,
     /// for a set holding a range, releases each slice that has its copies
     /// ([`Self::SlicesShort`] names the ones that do not).
@@ -186,15 +182,6 @@ pub(crate) enum ReleaseBlocker {
     /// No `writes` row at all — staged and never written. A bare clean does
     /// not see it; only `--force` releases it.
     NeverWritten,
-    /// Only `'cut'` rows (1.6.0, issue #420; ADR-0012 item 112): the stage
-    /// set was planned onto `volume_label`, whose tape sealed short before
-    /// it, so it is written whole nowhere. A cut is no write: the next
-    /// ordinary `volume write` onto another cartridge writes the set whole
-    /// from these slices, and only then does a bare clean release them.
-    /// Until then, as for [`Self::NeverWritten`], only `--force` releases
-    /// them. `volume_label` is the volume that cut it (the latest, when
-    /// several did).
-    Cut { volume_label: Option<String> },
     /// A write session is live RIGHT NOW (`'planned'` or `'in_progress'`)
     /// and is reading these slices.
     WriteInFlight { volume_label: Option<String> },
@@ -227,14 +214,6 @@ pub(crate) enum ReleaseBlocker {
 /// an abandoned one: the worst thing to be wrong about is telling someone
 /// to delete slices something is still using.
 ///
-/// `'cut'` rows are dropped before any of that, as
-/// [`release_candidate_predicate_sql`] drops them: a cut is no write
-/// (ADR-0012 item 112), so it is never a blocker beside another row -- nor
-/// what the fall-through below would otherwise make of it, an abandoned
-/// session whose remedy is `--force`. Only a set with nothing but `'cut'`
-/// rows reads [`ReleaseBlocker::Cut`], so its refusal can name the volume
-/// that cut it and the write that finishes it.
-///
 /// A `'range'` row (1.7.0, issue #478; ADR-0012 items 121 and 129) is
 /// terminal, as [`release_candidate_predicate_sql`] reads it: beside
 /// `'completed'` rows, or alone, it blocks nothing. Whether the slices of a
@@ -242,24 +221,12 @@ pub(crate) enum ReleaseBlocker {
 /// function's to say ([`ReleaseBlocker::SlicesShort`]).
 pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<ReleaseBlocker> {
     let statuses: Vec<String> = conn
-        .prepare("SELECT status FROM writes WHERE stage_set_id = ?1 AND status <> 'cut'")?
+        .prepare("SELECT status FROM writes WHERE stage_set_id = ?1")?
         .query_map(params![stage_set_id], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if statuses.is_empty() {
-        let cut_on: Option<Option<String>> = conn
-            .query_row(
-                "SELECT v.label FROM writes w LEFT JOIN volumes v ON v.id = w.volume_id
-                 WHERE w.stage_set_id = ?1 AND w.status = 'cut'
-                 ORDER BY w.id DESC LIMIT 1",
-                params![stage_set_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        return Ok(match cut_on {
-            Some(volume_label) => ReleaseBlocker::Cut { volume_label },
-            None => ReleaseBlocker::NeverWritten,
-        });
+        return Ok(ReleaseBlocker::NeverWritten);
     }
     if statuses.iter().all(|s| s == "completed" || s == "range") {
         return Ok(ReleaseBlocker::None);
@@ -334,9 +301,8 @@ fn in_the_window() {}
 ///
 /// The `'staged'` default guard requires (a) at least one `writes` row for
 /// the stage_set is `'completed'` (it was actually written whole somewhere),
-/// AND (b) no `writes` row for it is anything other than `'completed'` or
-/// `'cut'` -- a `'cut'` row (1.6.0, issue #420) is no write, see
-/// [`release_candidate_predicate_sql`]. This is
+/// AND (b) no `writes` row for it is anything other than `'completed'`
+/// (see [`release_candidate_predicate_sql`]). This is
 /// stricter than "at least one completed write": a stage_set batched onto
 /// two cartridges (2 copies) with one sealed and the other still
 /// `'planned'`/`'in_progress'`/`'interrupted'` — or terminally `'aborted'`/
@@ -3173,7 +3139,7 @@ mod tests {
         conn.last_insert_rowid()
     }
 
-    /// A `range` write of `stage_set_id` (planned spannable) on a new sealed
+    /// A `range` write of `stage_set_id` on a new sealed
     /// volume `label`, holding the slices `written`, with every later slice
     /// planned and `pending` (the tape ended first): the row confirm leaves.
     fn seed_range_on(
@@ -3184,8 +3150,8 @@ mod tests {
     ) {
         let volume_id = sealed_volume(conn, label);
         conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-             SELECT id, snapshot_id, ?2, 'range', 1 FROM stage_sets WHERE id = ?1",
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT id, snapshot_id, ?2, 'range' FROM stage_sets WHERE id = ?1",
             params![stage_set_id, volume_id],
         )
         .unwrap();
@@ -3200,14 +3166,13 @@ mod tests {
         .unwrap();
     }
 
-    /// A `completed` write of the whole set on a new sealed volume `label`,
-    /// planned spannable or not.
-    fn seed_whole_on(conn: &Connection, stage_set_id: i64, label: &str, may_span: bool) {
+    /// A `completed` write of the whole set on a new sealed volume `label`.
+    fn seed_whole_on(conn: &Connection, stage_set_id: i64, label: &str) {
         let volume_id = sealed_volume(conn, label);
         conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-             SELECT id, snapshot_id, ?2, 'completed', ?3 FROM stage_sets WHERE id = ?1",
-            params![stage_set_id, volume_id, may_span],
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT id, snapshot_id, ?2, 'completed' FROM stage_sets WHERE id = ?1",
+            params![stage_set_id, volume_id],
         )
         .unwrap();
     }
@@ -3384,27 +3349,25 @@ mod tests {
     }
 
     /// A set with no `range` row has every slice on the same volumes: the
-    /// per-slice release never touches it, even one planned spannable that
-    /// reached its tape whole, and `clean_staging` releases it whole as in
-    /// 1.6.0, row for row: every path cleared, no `released_at` set.
+    /// per-slice release never touches it, even one that reached its tape
+    /// whole, and `clean_staging` releases it whole, row for row: every path
+    /// cleared, no `released_at` set.
     #[test]
-    fn a_set_with_no_range_row_is_released_whole_as_in_1_6_0() {
-        for may_span in [false, true] {
-            let (conn, set, files, dir) = seed_span(3);
-            let config = config_for(dir.path());
-            seed_whole_on(&conn, set, "V-W1", may_span);
+    fn a_set_with_no_range_row_is_released_whole() {
+        let (conn, set, files, dir) = seed_span(3);
+        let config = config_for(dir.path());
+        seed_whole_on(&conn, set, "V-W1");
 
-            let report = release_covered_slices(&conn, &config, set, 1).unwrap();
-            assert_eq!(report.files_removed, 0, "may_span={may_span}: {report:?}");
-            assert!(report.slices_released.is_empty() && report.slices_short.is_empty());
-            assert!(files.iter().all(|f| f.exists()));
+        let report = release_covered_slices(&conn, &config, set, 1).unwrap();
+        assert_eq!(report.files_removed, 0, "{report:?}");
+        assert!(report.slices_released.is_empty() && report.slices_short.is_empty());
+        assert!(files.iter().all(|f| f.exists()));
 
-            let report = clean_staging(&conn, &config, false, CleanScope::Whole).unwrap();
-            assert_eq!((report.sets_cleaned, report.files_removed), (1, 3));
-            assert!(report.slices_released.is_empty());
-            assert_eq!(slice_rows(&conn, set), [(false, false); 3]);
-            assert_eq!(set_status(&conn, set), "cleaned");
-        }
+        let report = clean_staging(&conn, &config, false, CleanScope::Whole).unwrap();
+        assert_eq!((report.sets_cleaned, report.files_removed), (1, 3));
+        assert!(report.slices_released.is_empty());
+        assert_eq!(slice_rows(&conn, set), [(false, false); 3]);
+        assert_eq!(set_status(&conn, set), "cleaned");
     }
 
     /// The whole-set release never takes a set holding a range, even one

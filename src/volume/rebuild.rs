@@ -49,11 +49,11 @@
 //! §1.2 rule 6, §5.2). The seal is located as the last file when the medium
 //! ends before File 0's pointer ([`locate_and_judge_seal`]). Its `ended_after`
 //! K is recorded on an inserted volume row, and every block is split by its
-//! positions and the seal (§5.3, ADR-0012 item 288; a block states no
-//! `may_span`): a staging with every slice at or before K is `completed`,
-//! one with some of them is a `range`, one with none is `cut`, positions
-//! after K are `pending`, and nothing after K is read. A full seal rebuilds
-//! as before.
+//! positions and the seal (§5.3, ADR-0012 item 288): a staging with every
+//! slice at or before K is `completed`, one with some of them is a `range`,
+//! one with none gets no `writes` row (it was planned and not written, and
+//! its slices stay staged), positions after K are `pending`, and nothing
+//! after K is read. A full seal rebuilds as before.
 //!
 //! **It inserts only what is missing, and never edits what it finds.** Run it
 //! over ten cartridges in any order, twice, and the result is the same
@@ -272,24 +272,24 @@ pub struct RebuildReport {
     /// for a full seal, and for an unsealed tape. An inserted row records it
     /// as `volumes.ended_after`.
     pub ended_after: Option<u64>,
-    /// Units, as `<unit> v<N>`, that the early end of the tape cut: a slice
-    /// of theirs is planned after [`Self::ended_after`]. Their writes are
-    /// `cut` (ADR-0012 item 112): never a copy, positions after the end not
-    /// `written`. A tape fact, listed whether or not this run inserted rows.
-    pub cut_units: Vec<String>,
-    /// The entries of [`Self::cut_units`] whose block states `may_span`
-    /// (#478): a spannable set the tape holds none of. Unlike a whole unit,
-    /// such a version restores from tapes whose ranges together hold every
-    /// slice, not only from a tape that holds it whole (ADR-0012 items 101
-    /// and 131).
-    pub cut_spanning_units: Vec<String>,
+    /// Units, as `<unit> v<N>`, the tape's plan listed and its early end
+    /// withdrew: every slice of theirs is planned after [`Self::ended_after`].
+    /// They get no `writes` row (ADR-0012 item 288): never a copy here. A tape
+    /// fact, listed whether or not this run inserted rows.
+    pub unwritten_units: Vec<String>,
+    /// The entries of [`Self::unwritten_units`] whose block gives some slice
+    /// no position on this tape (#478): a set the tape holds none of whose
+    /// other slices are planned on other tapes. Such a version restores from
+    /// tapes whose ranges together hold every slice (ADR-0012 items 101 and
+    /// 131).
+    pub unwritten_spanning_units: Vec<String>,
 
     // --- spanning (#478, ADR-0012 items 121, 128 and 130) -------------------
     //
-    // `volume-format-v2.md` §4.4: a block that states `may_span` splits three
-    // ways, as confirm splits the row (`layout-session.md`, "A write that may
-    // span"): `completed` when the tape holds every slice of the set,
-    // `range` when it holds some, `cut` when it holds none.
+    // `volume-format-v3.md` §5.3: a block splits three ways, as confirm
+    // splits the row (`layout-session.md`, "Confirm of a short ending"):
+    // `completed` when the tape holds every slice of the set, `range` when it
+    // holds some, and no row when it holds none.
     /// The spannable sets this tape holds as a range: some, not all, of the
     /// set's slices have a `tape_position` at or before `ended_after` (every
     /// planned position, on a full seal). Their writes are `range`: never a
@@ -1132,14 +1132,14 @@ fn rebuild_contacted(
     let attested = attest_escrow(conn, store, identities, &operator.manifest, &mut report);
 
     let tx = crate::db::busy::immediate_tx(conn)?;
-    // A `cut` set (#420) is not counted: it is no copy on this tape, and its
-    // slice header may lie past where the tape ended, so attestation from
-    // this tape is not the remedy for it.
+    // A set the tape did not take (#420, item 288) has no `writes` row and is
+    // not counted: it is no copy on this tape, and its slice header may lie
+    // past where the tape ended, so attestation from this tape is not the
+    // remedy for it.
     report.unknown_remaining = tx.query_row(
         "SELECT COUNT(*) FROM stage_sets ss
          JOIN writes w ON w.stage_set_id = ss.id
-         WHERE w.volume_id = ?1 AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL
-           AND w.status <> 'cut'",
+         WHERE w.volume_id = ?1 AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL",
         params![volume_id],
         |r| r.get(0),
     )?;
@@ -1297,7 +1297,7 @@ fn span_to_do(
     this_uuid: &str,
     report: &mut RebuildReport,
 ) {
-    for set in sets.iter().filter(|s| s.may_span) {
+    for set in sets.iter().filter(|s| s.in_part) {
         let copies = match crate::policy::coverage::slice_copies(conn, set.stage_set_id) {
             Ok(copies) => copies,
             Err(e) => {
@@ -2368,15 +2368,15 @@ fn insert_all(
         // Every block splits three ways, by its positions and the seal
         // (`volume-format-v3.md` §5.3, ADR-0012 items 130 and 288): `completed`
         // when the tape holds every slice of the staging, `range` when it
-        // holds some, `cut` when it holds none ([`tape_split`]).
+        // holds some, and no row when it holds none ([`tape_split`]).
         let written = tape_split(unit, sealed, ended_after);
         match written {
-            Written::Cut => {
-                let cut = format!("{} v{}", unit.name, unit.snapshot_version);
+            Written::Unwritten => {
+                let name = format!("{} v{}", unit.name, unit.snapshot_version);
                 if held_in_part(unit) {
-                    report.cut_spanning_units.push(cut.clone());
+                    report.unwritten_spanning_units.push(name.clone());
                 }
-                report.cut_units.push(cut);
+                report.unwritten_units.push(name);
             }
             Written::Range {
                 first_slice,
@@ -2400,10 +2400,15 @@ fn insert_all(
             slice_ids.push((slice, ensure_slice(tx, unit, slice, stage_set_id, report)?));
         }
 
-        let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, written, report)?;
-        for (slice, slice_id) in slice_ids {
-            let laid_down = sealed && slice_on_tape(slice, ended_after);
-            ensure_position(tx, write_id, slice_id, slice, laid_down, report)?;
+        // A staging the tape holds none of has no write on it, and so no
+        // positions: its slices stay staged for another tape (item 288).
+        if written != Written::Unwritten {
+            let write_id =
+                ensure_write(tx, stage_set_id, snapshot_id, volume_id, written, report)?;
+            for (slice, slice_id) in slice_ids {
+                let laid_down = sealed && slice_on_tape(slice, ended_after);
+                ensure_position(tx, write_id, slice_id, slice, laid_down, report)?;
+            }
         }
         // X24: after the positions, which are what the rule reads. The order
         // matters: the volume row is written at the top of this function, so
@@ -2432,7 +2437,7 @@ fn insert_all(
             unit_name: unit.name.clone(),
             unit_uuid: unit.uuid.clone(),
             version: unit.snapshot_version,
-            may_span: matches!(written, Written::Range { .. }) || held_in_part(unit),
+            in_part: matches!(written, Written::Range { .. }) || held_in_part(unit),
             num_slices: unit.slices.len() as i64,
             held_here: unit
                 .slices
@@ -2472,7 +2477,7 @@ struct RebuiltSet {
     /// This tape holds the staging in part: a `range`, or a block that gives
     /// some slice no position (#478, item 130). Only these sets have a
     /// to-do list of slices on other tapes ([`span_to_do`]).
-    may_span: bool,
+    in_part: bool,
     /// N: the slices the block lists.
     num_slices: i64,
     /// The slice numbers this tape holds, on a tape whose seal was read: the
@@ -2621,7 +2626,9 @@ fn ensure_snapshot(
     // only the positions inserted after this row can show. It is inserted
     // `staged`, as the writing catalog holds it before its tapes seal, and
     // [`promote_spanning_version`] makes it `current` when the rule holds.
-    let status = if held_in_part(unit) || matches!(written, Written::Range { .. }) {
+    let status = if held_in_part(unit)
+        || matches!(written, Written::Range { .. } | Written::Unwritten)
+    {
         "staged"
     } else {
         "current"
@@ -2912,8 +2919,8 @@ enum Written {
     /// interrupted.
     Range { first_slice: i64, last_slice: i64 },
     /// The tape is sealed and holds none of the staging's slices, all
-    /// planned after its end: `cut`.
-    Cut,
+    /// planned after its end: no `writes` row (item 288).
+    Unwritten,
     /// No seal marker sealed the tape (#458): `aborted`.
     Aborted,
 }
@@ -2928,8 +2935,8 @@ fn slice_on_tape(slice: &envelope::ManifestSlice, ended_after: Option<i64>) -> b
 }
 
 /// The row a sealed tape gives one manifest block (`volume-format-v3.md`
-/// §5.3, ADR-0012 item 288; `layout-session.md` "Confirm"): a block states no
-/// `may_span`, so every block is split by its positions and the seal alone.
+/// §5.3, ADR-0012 item 288; `layout-session.md` "Confirm"): every block is
+/// split by its positions and the seal alone.
 /// Of the staging's slices, those with a `tape_position` at or before the
 /// seal's `ended_after` (every planned position, on a full seal) are on the
 /// tape.
@@ -2938,10 +2945,9 @@ fn slice_on_tape(slice: &envelope::ManifestSlice, ended_after: Option<i64>) -> b
 /// - All N: `completed`, a copy of the version (a staging with no slices is
 ///   whole, as confirm's `span_split` reads one).
 /// - Some, not all: `range`, the run from the lowest to the highest of them.
-///   A unit the early warning interrupted is this, under item 288: the 1.6.0
-///   `cut` row, which passed over the slices before the end, is gone.
-/// - None: `cut`, the staging is not on this tape (§5.1); its positions lie
-///   after the end.
+///   A unit the early warning interrupted is this, under item 288.
+/// - None: [`Written::Unwritten`], the staging is not on this tape (§5.1);
+///   its positions lie after the end.
 fn tape_split(unit: &envelope::ManifestUnit, sealed: bool, ended_after: Option<i64>) -> Written {
     if !sealed {
         return Written::Aborted;
@@ -2960,7 +2966,7 @@ fn tape_split(unit: &envelope::ManifestUnit, sealed: bool, ended_after: Option<i
             first_slice,
             last_slice,
         },
-        _ => Written::Cut,
+        _ => Written::Unwritten,
     }
 }
 
@@ -2972,9 +2978,6 @@ fn ensure_write(
     written: Written,
     report: &mut RebuildReport,
 ) -> Result<i64> {
-    // `writes.may_span` stays until T5.1 removes it (item 288, D6): a block
-    // states none, so a `range` row sets it and every other row clears it.
-    let may_span = matches!(written, Written::Range { .. });
     if let Some(id) = existing_id(
         tx,
         "SELECT id FROM writes WHERE stage_set_id = ?1 AND volume_id = ?2",
@@ -2992,10 +2995,6 @@ fn ensure_write(
     // completion time. `docs/design/layout-session.md`: an aborted session's
     // tape "is not a copy".
     //
-    // #420 (ADR-0012 item 112): a unit the early end of a sealed tape cut is
-    // `cut`, as a passing short confirm records it: never a copy, and with
-    // no completion time either.
-    //
     // #478 (item 121): a range is terminal like a completed write and gets
     // its completion time as confirm gives it one. It is not a copy on its
     // own: its slices count one by one (item 127).
@@ -3010,11 +3009,9 @@ fn ensure_write(
              slices, not the whole set, so the write is not a copy on its own; never verified \
              by a read-back",
         ),
-        Written::Cut => (
-            "cut",
-            "rebuilt from the volume itself; the tape sealed short, ending before this unit's \
-             last slice, so the write is recorded as cut and is not a copy",
-        ),
+        Written::Unwritten => {
+            unreachable!("a staging the tape holds none of has no write row to insert")
+        }
         Written::Aborted => (
             "aborted",
             "rebuilt from the volume itself; the tape carries no valid seal marker, so the \
@@ -3023,17 +3020,10 @@ fn ensure_write(
     };
     tx.execute(
         "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified,
-                             completed_at, notes, may_span)
+                             completed_at, notes)
          VALUES (?1, ?2, ?3, ?4, 0,
-                 CASE WHEN ?4 IN ('completed', 'range') THEN datetime('now') END, ?5, ?6)",
-        params![
-            stage_set_id,
-            snapshot_id,
-            volume_id,
-            status,
-            notes,
-            may_span
-        ],
+                 CASE WHEN ?4 IN ('completed', 'range') THEN datetime('now') END, ?5)",
+        params![stage_set_id, snapshot_id, volume_id, status, notes],
     )?;
     report.writes += 1;
     Ok(tx.last_insert_rowid())
@@ -3280,15 +3270,18 @@ fn record_event(
     // asserted `sealed` says it read a seal; one that did not says so.
     let seal_clause = match &report.unsealed_reason {
         // #420: a short seal is a seal; the ledger says where the tape ended
-        // and which units it cut.
+        // and which units it took none of.
         None => match report.ended_after {
             None => String::new(),
             Some(k) => format!(
                 "; SEALED SHORT after file {k}{}{}",
-                if report.cut_units.is_empty() {
+                if report.unwritten_units.is_empty() {
                     String::new()
                 } else {
-                    format!(": cut (not a copy here) {}", report.cut_units.join(", "))
+                    format!(
+                        ": planned and not written (not a copy here) {}",
+                        report.unwritten_units.join(", ")
+                    )
                 },
                 if report.ended_after_recorded {
                     "; ended_after recorded on the existing volume row"
@@ -4019,7 +4012,7 @@ fn resolve_operator_identity(
 
 /// Whether a manifest block gives some of its staging's slices no
 /// `tape_position`: this tape's plan holds only a run of them. Layout 3 has
-/// no `may_span` key (`volume-format-v3.md` §1.9, item 288); a block is
+/// no spanning key (`volume-format-v3.md` §1.9, item 288); a block is
 /// split by [`tape_split`], and this only says the staging's other slices
 /// are planned on other tapes, for the report's to-do list ([`span_to_do`])
 /// and for a version that cannot be `current` until they are written.

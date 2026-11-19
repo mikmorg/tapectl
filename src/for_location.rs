@@ -22,9 +22,9 @@
 //! starts at slice 1 continues no range (item 93's tape 2 begins a copy of
 //! its own) and is judged by its need like any version.
 //!
-//! **The plan** (items 83, 95 and 152): the riding sets first, then the
-//! units to stage in priority order, whole units before units that may span
-//! (item 83), each next-fit (item 69): a unit is planned while
+//! **The plan** (items 122, 152, 288 and 289): the riding sets first, owed
+//! runs ahead of the queue (item 122), then the
+//! units to stage in priority order, each next-fit (item 69): a unit is planned while
 //! [`CapacityBudget::place`] puts every planned unit on this tape, and the
 //! first one it does not closes the tape; the rest wait for the next tape
 //! for X. The room is the volume's own (`collection::plan::destination_budget`):
@@ -589,13 +589,11 @@ fn padded_slices(
 type OwedRun = (i64, i64);
 
 /// How the write plans a staged set (`volume::write::find_staged_data` and
-/// its `plan_span_set`, mirrored from the catalog): a set whose unit allows
-/// spanning or that has a `range` row is planned as a span, its owed run
-/// ([`PlanClass::Owed`]) when it has a `range` row on a sealed volume and
-/// slices short of its copy floor, otherwise the whole set
-/// ([`PlanClass::Spannable`]); any other set is a whole unit of its slices
-/// still on disk. Returns the class, the owed run, and the block-padded
-/// bytes the tape plans.
+/// its `plan_span_set`, mirrored from the catalog; ADR-0012 items 122 and
+/// 288): its owed run ([`PlanClass::Owed`]) when it has a `range` row on a
+/// sealed volume and slices short of its copy floor, otherwise the whole set
+/// ([`PlanClass::Queued`]). Returns the class, the owed run, and the
+/// block-padded bytes the tape plans.
 fn staged_set_plan(
     conn: &Connection,
     config: &Config,
@@ -603,21 +601,13 @@ fn staged_set_plan(
     resolved: &ResolvedPolicy,
     stage_set_id: i64,
 ) -> Result<(PlanClass, Option<OwedRun>, u64)> {
-    let (has_range, sealed_range): (bool, bool) = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM writes WHERE stage_set_id = ?1 AND status = 'range'),
-                EXISTS(SELECT 1 FROM writes w JOIN volumes v ON v.id = w.volume_id
+    let sealed_range: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM writes w JOIN volumes v ON v.id = w.volume_id
                         WHERE w.stage_set_id = ?1 AND w.status = 'range'
                           AND v.status = 'sealed')",
         params![stage_set_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| r.get(0),
     )?;
-    if !(resolved.allow_spanning || has_range) {
-        return Ok((
-            PlanClass::Whole,
-            None,
-            padded_slices(conn, stage_set_id, true, None)?,
-        ));
-    }
     let floor = coverage::copy_floor(config, resolved.copy_floor_base(), &unit.status);
     let owed: Vec<i64> = if sealed_range {
         coverage::slice_copies(conn, stage_set_id)?
@@ -635,7 +625,7 @@ fn staged_set_plan(
             padded_slices(conn, stage_set_id, false, Some((first, last)))?,
         )),
         _ => Ok((
-            PlanClass::Spannable,
+            PlanClass::Queued,
             None,
             padded_slices(conn, stage_set_id, false, None)?,
         )),
@@ -945,11 +935,7 @@ fn judge_unit(
         return Ok(out);
     }
     let staged_snapshots: Vec<i64> = staged.iter().map(|s| s.snapshot_id).collect();
-    let class = if resolved.allow_spanning {
-        PlanClass::Spannable
-    } else {
-        PlanClass::Whole
-    };
+    let class = PlanClass::Queued;
     let judge = |copies: i64, here: i64| {
         NeedAt::judge(config, &resolved, &unit.status, location, copies, here)
     };
@@ -1107,21 +1093,20 @@ fn judge_unit(
 }
 
 /// Whether `placement` puts every unit on this tape: none deferred to a
-/// later tape and none refused.
+/// later tape.
 fn every_unit_on_this_tape(placement: &crate::volume::layout_model::Placement) -> bool {
     placement
         .placed
         .iter()
-        .all(|p| !matches!(p, Placed::Deferred | Placed::Refused))
+        .all(|p| !matches!(p, Placed::Deferred))
 }
 
-/// Where a class goes in the walk: owed runs, whole units, units that may
-/// span (items 83, 95 and 122).
+/// Where a class goes in the walk: owed runs, then the queue (items 122 and
+/// 288).
 fn class_rank(class: PlanClass) -> u8 {
     match class {
         PlanClass::Owed => 0,
-        PlanClass::Whole => 1,
-        PlanClass::Spannable => 2,
+        PlanClass::Queued => 1,
     }
 }
 
@@ -1131,7 +1116,7 @@ fn class_rank(class: PlanClass) -> u8 {
 ///
 /// `label` must be a write target, and its room is
 /// `collection::plan::destination_budget`'s: an empty volume's room under
-/// the fill ceiling (`unit_limit_bytes`) and its plan bound, with nothing
+/// the fill ceiling (`fill_bytes`) and its plan bound, with nothing
 /// subtracted for what is staged — the staged sets a write for X takes are
 /// planned here, and those it does not take do not ride. `device` names the
 /// drive whose fill ceiling and reserve apply (no drive is touched).
@@ -1146,7 +1131,7 @@ pub fn plan(
     let destination =
         crate::collection::plan::destination_budget(conn, config, device, &[label.to_string()])?;
     let room = BatchRoom {
-        fill: destination.unit_limit_bytes,
+        fill: destination.fill_bytes,
         bound: destination.plan_bound_bytes,
     };
 
@@ -1175,7 +1160,7 @@ pub fn plan(
     let staged_overflow: Vec<String> = riding
         .iter()
         .zip(&riding_placement.placed)
-        .filter(|(_, p)| matches!(p, Placed::Deferred | Placed::Refused))
+        .filter(|(_, p)| matches!(p, Placed::Deferred))
         .map(|(c, _)| c.name())
         .collect();
     let mut planned = riding;
@@ -1356,8 +1341,7 @@ fn bytes_text(bytes: u64) -> String {
 fn class_text(class: PlanClass) -> &'static str {
     match class {
         PlanClass::Owed => "owed",
-        PlanClass::Whole => "whole",
-        PlanClass::Spannable => "spannable",
+        PlanClass::Queued => "queued",
     }
 }
 
@@ -1403,8 +1387,7 @@ fn disposition_key(c: &Candidate, staged: Option<&Staged>) -> &'static str {
 fn candidate_line(c: &Candidate, location: &str, tail: &str) -> String {
     let class = match c.class {
         PlanClass::Owed => " (its owed run, first on the tape)",
-        PlanClass::Spannable => " (may span: last on the tape)",
-        PlanClass::Whole => "",
+        PlanClass::Queued => "",
     };
     format!(
         "  {}: {}; {}{class}{tail}",
@@ -1720,9 +1703,9 @@ mod tests {
         fn write(&self, set: i64, volume: i64, status: &str, first: i64, last: i64) {
             self.conn
                 .execute(
-                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                     SELECT id, snapshot_id, ?2, ?3, ?4 FROM stage_sets WHERE id = ?1",
-                    params![set, volume, status, i64::from(status == "range")],
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT id, snapshot_id, ?2, ?3 FROM stage_sets WHERE id = ?1",
+                    params![set, volume, status],
                 )
                 .unwrap();
             let write = self.conn.last_insert_rowid();

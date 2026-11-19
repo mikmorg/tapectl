@@ -430,11 +430,11 @@ const CHECKS: &[Check] = &[
         },
     },
     Check {
-        // #420 (layout-session.md, `volumes.ended_after`): the two
-        // invariants of a short-sealed volume's rows, and (#478, X27) the
-        // four of a `range` row. Umbrella name for one function
-        // (`short_seal_findings`) that emits `cut_without_ending`,
-        // `completed_past_ending`, `range_without_may_span`,
+        // #420 (layout-session.md, `volumes.ended_after`): the invariants of
+        // a short-sealed volume's rows, and (#478, X27; ADR-0012 item 288)
+        // those of a `range` row and of a `completed` one. Umbrella name for
+        // one function (`short_seal_findings`) that emits
+        // `completed_past_ending`, `completed_without_every_slice`,
         // `range_written_past_ending`, `range_not_one_run` or
         // `range_without_written_slice`, one finding per volume and kind.
         name: "short_seal",
@@ -2217,24 +2217,23 @@ fn check_tape_alert(ctx: &Ctx<'_>) -> Result<Findings> {
     })
 }
 
-// SHORT SEAL (#420; ADR-0012 item 112; layout-session.md, "volumes.ended_after").
+// SHORT SEAL (#420; ADR-0012 items 112 and 288; layout-session.md, "volumes.ended_after").
 //
-// The invariants `audit` checks of a tape that ended early, and of a range:
+// The invariants `audit` checks of a tape that ended early, of a `completed`
+// row and of a range:
 //
-// - `cut_without_ending`: a `cut` row exists only on a volume with
-//   `ended_after` set. A cut row elsewhere means the catalog does not record
-//   where that tape ended, so `volume verify` would look for its seal at the
-//   planned position.
 // - `completed_past_ending`: every `completed` row on a volume with
 //   `ended_after` set has all its slices at positions at or before it. One
 //   past it is a unit the tape does not hold whole counted as a copy.
+// - `completed_without_every_slice` (ADR-0012 item 288): a `completed` row
+//   holds a `written` position of every slice of its set, 1 to N. A
+//   `completed` row is a copy of the whole set, and one that lacks a slice
+//   counts copies that do not exist.
 //
 // From 1.7.0 (#478, coordinator fork X27; ADR-0012 items 121 and 122,
-// `volume-format-v2.md` §4.4), four of a `range` row:
+// `volume-format-v3.md` §5.3), three of a `range` row, which every unit's
+// write may now leave (item 288):
 //
-// - `range_without_may_span`: only a write planned as spannable is ever a
-//   range. Migration 039's row CHECK refuses the row, so it exists only where
-//   someone edited around the CHECK.
 // - `range_written_past_ending`: on a volume with `ended_after` set, a range's
 //   `written` positions are at or before it (confirm turns the ones after it
 //   `pending`). One past it is a slice the tape does not hold counted as a
@@ -2243,7 +2242,7 @@ fn check_tape_alert(ctx: &Ctx<'_>) -> Result<Findings> {
 //   slice order (item 122). A gap means the catalog does not say which slices
 //   the tape holds.
 // - `range_without_written_slice`: a range holds at least one slice; a write
-//   whose tape holds none of its set is `cut`.
+//   whose tape holds none of its set has no row at all.
 //
 // Confirm, `catalog rebuild` and the adoption of a lost write all keep every
 // one of them, so any finding is a catalog someone edited, or a bug. Warnings,
@@ -2272,12 +2271,7 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
         )
     };
     let mut stmt = conn.prepare(&format!(
-        "SELECT 'cut_without_ending', v.label, NULL, COUNT(*), NULL
-           FROM volumes v JOIN writes w ON w.volume_id = v.id
-          WHERE w.status = 'cut' AND v.ended_after IS NULL
-          GROUP BY v.id
-         UNION ALL
-         SELECT 'completed_past_ending', v.label, v.ended_after,
+        "SELECT 'completed_past_ending', v.label, v.ended_after,
                 COUNT(DISTINCT w.id), MAX(CAST(wp.position AS INTEGER))
            -- CROSS JOIN fixes the order (SQLite's rule): the short-sealed
            -- volumes first, their writes and positions by index, so no pass
@@ -2289,9 +2283,15 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
             AND CAST(wp.position AS INTEGER) > v.ended_after
           GROUP BY v.id
          UNION ALL
-         SELECT 'range_without_may_span', v.label, NULL, COUNT(*), NULL
+         SELECT 'completed_without_every_slice', v.label, NULL, COUNT(*), NULL
            FROM volumes v JOIN writes w ON w.volume_id = v.id
-          WHERE w.status = 'range' AND w.may_span = 0
+          WHERE w.status = 'completed'
+            AND EXISTS (SELECT 1 FROM stage_slices xs
+                         WHERE xs.stage_set_id = w.stage_set_id
+                           AND NOT EXISTS (SELECT 1 FROM write_positions xq
+                                            WHERE xq.write_id = w.id
+                                              AND xq.stage_slice_id = xs.id
+                                              AND xq.status = 'written'))
           GROUP BY v.id
          UNION ALL
          SELECT 'range_written_past_ending', v.label, v.ended_after,
@@ -2335,11 +2335,6 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
         .map(|(check, label, ended_after, writes, last)| {
             let writes = crate::render::plural(writes, "write", "writes");
             let message = match check.as_str() {
-                "cut_without_ending" => format!(
-                    "volume \"{label}\" has {writes} recorded `cut` but no \
-                     `ended_after`: a cut row exists only on a volume that sealed short, so this \
-                     catalog does not say where that tape ended"
-                ),
                 "completed_past_ending" => format!(
                     "volume \"{label}\" ended after tape file {}, but {writes} on it \
                      recorded `completed` have a slice past that (up to file {}): those units \
@@ -2347,10 +2342,10 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                     ended_after.unwrap_or_default(),
                     last.unwrap_or_default()
                 ),
-                "range_without_may_span" => format!(
-                    "volume \"{label}\" has {writes} recorded `range` with `may_span` \
-                     unset: only a write planned as spannable is ever a range, and the schema \
-                     refuses this row, so the catalog was edited around it"
+                "completed_without_every_slice" => format!(
+                    "volume \"{label}\" has {writes} recorded `completed` that lack a `written` \
+                     position of some slice of their set: a `completed` write is a copy of every \
+                     slice, 1 to N, so those units count copies that do not exist"
                 ),
                 "range_written_past_ending" => format!(
                     "volume \"{label}\" ended after tape file {}, but {writes} recorded `range` on \
@@ -2367,7 +2362,7 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                 _ => format!(
                     "volume \"{label}\" has {writes} recorded `range` with no slice \
                      `written`: a range is the slices the tape holds, and a write whose tape \
-                     holds none of its set is `cut`"
+                     holds none of its set has no row"
                 ),
             };
             AuditFinding {

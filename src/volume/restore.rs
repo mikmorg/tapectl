@@ -2588,12 +2588,10 @@ fn select(
     // Every (version, stage set) of this unit on this volume — newest
     // version first, later stage set first within one — whose write is a
     // copy here (`completed`, with written slices), a range of a version
-    // held across cartridges (#478, `range`, with written slices), or was
-    // cut by the early end of the tape (#420, `cut`). A cut version is
+    // held across cartridges (#478, `range`, with written slices). A range is
     // picked as RESTORE.sh picks it (the newest on the tape, or `--version`)
-    // and then refused by name: it is not on this tape whole
-    // (`volume-format-v2.md` §4.2 R4). A range is picked the same way and
-    // read across cartridges (§4.4).
+    // and read across cartridges (`volume-format-v3.md` §5.3). A set the tape
+    // was planned to take and did not (ADR-0012 item 288) has no row.
     let mut stmt = conn.prepare(
         "SELECT DISTINCT s.version, ss.id, w.status, v.ended_after
          FROM writes w
@@ -2601,10 +2599,9 @@ fn select(
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN volumes v ON v.id = w.volume_id
          WHERE s.unit_id = ?1 AND v.label = ?2
-           AND (w.status = 'cut'
-                OR (w.status IN ('completed', 'range')
-                    AND EXISTS (SELECT 1 FROM write_positions wp
-                                 WHERE wp.write_id = w.id AND wp.status = 'written')))
+           AND w.status IN ('completed', 'range')
+           AND EXISTS (SELECT 1 FROM write_positions wp
+                        WHERE wp.write_id = w.id AND wp.status = 'written')
          ORDER BY s.version DESC, ss.id DESC",
     )?;
     let candidates = stmt
@@ -2666,18 +2663,6 @@ fn select(
         )));
     };
     let (version, stage_set_id, ended_after) = (*version, *stage_set_id, *ended_after);
-    if status == "cut" {
-        return Err(cut_refusal(
-            conn,
-            unit_name,
-            unit.id,
-            volume_label,
-            version,
-            stage_set_id,
-            &versions_on_volume,
-        )?);
-    }
-
     let positions = get_write_positions(conn, stage_set_id, volume_label)?;
     // R3 (`volume-format-v2.md` §4.2): nothing past where the tape ended is
     // read. A completed write holds every slice at or before it by
@@ -2739,155 +2724,62 @@ fn slice_one_holder(conn: &Connection, stage_set_id: i64) -> Result<Option<Strin
     })
 }
 
-/// `volumes.ended_after` of `volume_label`: where its tape ended, when it
-/// sealed short (#420). `None` for a full seal and for an unknown label.
-fn ended_after_of(conn: &Connection, volume_label: &str) -> Result<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT ended_after FROM volumes WHERE label = ?1",
-            params![volume_label],
-            |r| r.get::<_, Option<i64>>(0),
-        )
-        .optional()?
-        .flatten())
-}
-
-/// The refusal for a version the early end of `volume_label`'s tape cut
-/// (#420; `volume-format-v2.md` §4.2 R4: name it, never restore it from this
-/// tape, say where its copies are). Where: a volume in service that holds
-/// the same version whole, from the catalog
-/// ([`crate::policy::coverage::in_service_copy_of_version_excluding`], this
-/// volume excluded), or, when none does, that it is still to be written.
-fn cut_refusal(
-    conn: &Connection,
-    unit_name: &str,
-    unit_id: i64,
-    volume_label: &str,
-    version: i64,
-    stage_set_id: i64,
-    whole_here: &[i64],
-) -> Result<TapectlError> {
-    let volume_id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM volumes WHERE label = ?1",
-            params![volume_label],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let ended_after = ended_after_of(conn, volume_label)?;
-    let last: Option<i64> = conn.query_row(
-        "SELECT MAX(CAST(wp.position AS INTEGER)) FROM write_positions wp
-           JOIN writes w ON w.id = wp.write_id
-          WHERE w.stage_set_id = ?1 AND w.volume_id = ?2",
-        params![stage_set_id, volume_id],
-        |r| r.get(0),
-    )?;
-    let holder = crate::policy::coverage::in_service_copy_of_version_excluding(
-        conn, unit_id, version, volume_id,
-    )?;
-    let ended = match (ended_after, last) {
-        (Some(k), Some(last)) => format!(
-            "the tape ended early, after tape file {k} (its seal says so), and the slices of \
-             this version run to tape file {last}"
-        ),
-        (Some(k), None) => format!("the tape ended early, after tape file {k}"),
-        _ => "the tape ended early".to_string(),
-    };
-    let elsewhere = match holder {
-        Some(label) => format!(
-            "volume \"{label}\" holds it whole: `tapectl restore unit --unit {unit_name} --from \
-             {label} --version {version} --to <DIR>`"
-        ),
-        None => "no volume this catalog knows holds it whole yet: it is written whole by an \
-                 ordinary `tapectl volume write` onto another cartridge while it is still \
-                 staged, or `tapectl catalog rebuild --from-volume` of the tape that holds it \
-                 brings that tape into the catalog"
-            .to_string(),
-    };
-    let older = if whole_here.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " Version(s) {} of it are whole on \"{volume_label}\": pass one with --version.",
-            whole_here
-                .iter()
-                .map(i64::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    Ok(TapectlError::Other(format!(
-        "unit \"{unit_name}\" version {version} is not on volume \"{volume_label}\" whole: \
-         {ended}. It was cut by the end of the tape and is never restored from it \
-         (volume-format-v2.md §4.2); {elsewhere}.{older} Nothing was read from tape."
-    )))
-}
-
 /// One unit a volume does not hold whole though its tape carries some of it:
-/// one the early end of the tape cut (#420), or one of which the tape holds
-/// only a range, a version held across cartridges (#478). What `restore
-/// volume` names instead of restoring it.
+/// one of which the tape holds only a range, a version held across
+/// cartridges (#478; ADR-0012 item 288: any unit the early end of the tape
+/// interrupted). What `restore volume` names instead of restoring it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CutUnit {
+pub struct RangeUnit {
     pub unit_name: String,
     pub version: i64,
     /// A volume in service that holds this version whole, if the catalog
     /// knows one.
     pub whole_on: Option<String>,
-    /// For a range (#478): the first and last slice of the version this tape
-    /// holds. `None` for a unit the end of the tape cut.
-    pub range: Option<(i64, i64)>,
-    /// For a range: a live volume holding the version's slice 1, where a
-    /// restore across cartridges starts (`volume-format-v2.md` §4.4), this
-    /// one included. `None` for a cut unit, or when no live volume holds it.
+    /// The first and last slice of the version this tape holds.
+    pub range: (i64, i64),
+    /// A live volume holding the version's slice 1, where a restore across
+    /// cartridges starts (`volume-format-v3.md` §5.3), this one included.
+    /// `None` when no live volume holds it.
     pub starts_on: Option<String>,
 }
 
-impl CutUnit {
-    /// `"bravo" v1, whole on "L6-0002"`, or where none is known, that it is
-    /// still to be written; for a range, the slices this tape holds and where
-    /// the version is whole or starts.
+impl RangeUnit {
+    /// `"bravo" v1, slices 1-2 of it on this tape, whole on "L6-0002"`: the
+    /// slices this tape holds and where the version is whole or starts.
     pub fn describe(&self) -> String {
-        let whole = match &self.whole_on {
-            Some(label) => format!("whole on \"{label}\""),
-            None => "whole on no volume this catalog knows yet".to_string(),
-        };
-        match self.range {
-            None => format!("\"{}\" v{}, {whole}", self.unit_name, self.version),
-            Some((first, last)) => format!(
-                "\"{}\" v{}, {} of it on this tape, {}",
-                self.unit_name,
-                self.version,
-                span::slices_phrase(first, last),
-                match (&self.whole_on, &self.starts_on) {
-                    (Some(_), _) => whole,
-                    (None, Some(label)) =>
-                        format!("held across cartridges from its slice 1 on \"{label}\""),
-                    (None, None) => "and its slice 1 is on no live volume".to_string(),
-                }
-            ),
-        }
+        let (first, last) = self.range;
+        format!(
+            "\"{}\" v{}, {} of it on this tape, {}",
+            self.unit_name,
+            self.version,
+            span::slices_phrase(first, last),
+            match (&self.whole_on, &self.starts_on) {
+                (Some(label), _) => format!("whole on \"{label}\""),
+                (None, Some(label)) =>
+                    format!("held across cartridges from its slice 1 on \"{label}\""),
+                (None, None) => "and its slice 1 is on no live volume".to_string(),
+            }
+        )
     }
 
     /// The volume `restore unit --from` reads this version from: a whole
-    /// copy, or for a range the holder of its slice 1.
+    /// copy, or the holder of its slice 1.
     pub fn restore_from(&self) -> Option<&str> {
         self.whole_on.as_deref().or(self.starts_on.as_deref())
     }
 }
 
-/// Every unit version recorded `cut` on `volume_label` (#420), or held
-/// there only as a range of a version held across cartridges (#478), in the
-/// order it was planned on the tape, each with a volume that holds it whole
-/// when the catalog knows one, and for a range the slices this tape holds
-/// and the live holder of its slice 1. Empty for a tape that sealed full
-/// with nothing of a span on it. `restore volume` names these: the tape does
-/// not hold them whole, so they are not in [`units_on_volume`]'s set
-/// (`volume-format-v2.md` §4.2, "`restore volume` names the cut units", and
-/// §4.4, ADR-0012 item 89).
-pub fn cut_units_on_volume(conn: &Connection, volume_label: &str) -> Result<Vec<CutUnit>> {
+/// Every unit version held on `volume_label` only as a range of a version
+/// held across cartridges (#478), in the order it was planned on the tape,
+/// each with a volume that holds it whole when the catalog knows one, the
+/// slices this tape holds and the live holder of its slice 1. Empty for a
+/// tape that sealed full with nothing of a span on it. `restore volume`
+/// names these: the tape does not hold them whole, so they are not in
+/// [`units_on_volume`]'s set (`volume-format-v3.md` §5.3, ADR-0012 items 89
+/// and 288).
+pub fn ranges_on_volume(conn: &Connection, volume_label: &str) -> Result<Vec<RangeUnit>> {
     let mut stmt = conn.prepare(
-        "SELECT u.id, u.name, s.version, v.id, w.status = 'range', ss.id,
+        "SELECT u.id, u.name, s.version, v.id, ss.id,
                 (SELECT MIN(CAST(wp.position AS INTEGER)) FROM write_positions wp
                   WHERE wp.write_id = w.id) AS first,
                 (SELECT MIN(sl.slice_number) FROM write_positions wp
@@ -2902,10 +2794,10 @@ pub fn cut_units_on_volume(conn: &Connection, volume_label: &str) -> Result<Vec<
          JOIN units u ON u.id = s.unit_id
          JOIN volumes v ON v.id = w.volume_id
          WHERE v.label = ?1
-           AND w.status = 'cut'
+           AND w.status = 'range'
          ORDER BY first, u.name, s.version",
     )?;
-    type Row = (i64, String, i64, i64, bool, i64, Option<i64>, Option<i64>);
+    type Row = (i64, String, i64, i64, i64, Option<i64>, Option<i64>);
     let rows = stmt
         .query_map(params![volume_label], |r| {
             Ok((
@@ -2913,32 +2805,31 @@ pub fn cut_units_on_volume(conn: &Connection, volume_label: &str) -> Result<Vec<
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
-                r.get::<_, bool>(4)?,
-                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(6)?,
                 r.get::<_, Option<i64>>(7)?,
-                r.get::<_, Option<i64>>(8)?,
             ))
         })?
         .collect::<std::result::Result<Vec<Row>, _>>()?;
     rows.into_iter()
+        .filter_map(
+            |(unit_id, unit_name, version, volume_id, stage_set_id, first, last)| {
+                let (first, last) = (first?, last?);
+                Some((unit_id, unit_name, version, volume_id, stage_set_id, first, last))
+            },
+        )
         .map(
-            |(unit_id, unit_name, version, volume_id, range, stage_set_id, first, last)| {
+            |(unit_id, unit_name, version, volume_id, stage_set_id, first, last)| {
                 let whole_on = crate::policy::coverage::in_service_copy_of_version_excluding(
                     conn,
                     unit_id,
                     version,
                     Some(volume_id),
                 )?;
-                let (range, starts_on) = match (range, first, last) {
-                    (true, Some(first), Some(last)) => {
-                        (Some((first, last)), slice_one_holder(conn, stage_set_id)?)
-                    }
-                    _ => (None, None),
-                };
-                Ok(CutUnit {
+                Ok(RangeUnit {
                     whole_on,
-                    range,
-                    starts_on,
+                    range: (first, last),
+                    starts_on: slice_one_holder(conn, stage_set_id)?,
                     unit_name,
                     version,
                 })
@@ -2988,40 +2879,19 @@ pub fn units_on_volume(conn: &Connection, volume_label: &str) -> Result<Vec<Stri
         .query_map(params![volume_label], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if names.is_empty() {
-        // #420: a tape that ended inside its first unit holds none whole.
-        // #478: nor does a tape that holds only ranges of versions held
-        // across cartridges.
-        let cut = cut_units_on_volume(conn, volume_label)?;
-        let list = |units: &[&CutUnit]| {
-            units
+        // #478 (ADR-0012 item 288): a tape that ended inside its first unit
+        // holds none whole, only a range of it.
+        let ranges = ranges_on_volume(conn, volume_label)?;
+        if !ranges.is_empty() {
+            let list = ranges
                 .iter()
                 .map(|c| c.describe())
                 .collect::<Vec<_>>()
-                .join("; ")
-        };
-        let (ranges, cuts): (Vec<&CutUnit>, Vec<&CutUnit>) =
-            cut.iter().partition(|c| c.range.is_some());
-        if !cut.is_empty() && ranges.is_empty() {
-            return Err(TapectlError::Other(format!(
-                "volume \"{volume_label}\" holds no unit whole: its tape ended early, and every \
-                 unit on it was cut by the end of the tape ({}). Nothing was read from tape.",
-                list(&cuts)
-            )));
-        }
-        if !ranges.is_empty() {
-            let cut_part = if cuts.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; its tape ended early, and the end of the tape cut the others ({})",
-                    list(&cuts)
-                )
-            };
+                .join("; ");
             return Err(TapectlError::Other(format!(
                 "volume \"{volume_label}\" holds no unit whole: it holds only a range of \
-                 versions held across cartridges ({}), each restored across cartridges with \
-                 `tapectl restore unit`{cut_part}. Nothing was read from tape.",
-                list(&ranges)
+                 versions held across cartridges ({list}), each restored across cartridges \
+                 with `tapectl restore unit`. Nothing was read from tape."
             )));
         }
         return Err(TapectlError::Other(format!(

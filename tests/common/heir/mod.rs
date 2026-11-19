@@ -149,7 +149,7 @@ pub struct Shape {
     /// Build the tape with no cross-volume index at all.
     pub no_index: bool,
     /// Write the units across cartridges as a real write plans them
-    /// (`staged_build_units_spanning`, `allow_spanning` set on every unit).
+    /// (`staged_build_units_spanning`).
     pub span: Option<Span>,
     /// Add to each BIG unit files whose names are not UTF-8, a folder so
     /// named, a hard link and a symbolic link whose target is such a name
@@ -267,8 +267,6 @@ struct Home {
     paths: TapectlPaths,
     config: Config,
     sources: PathBuf,
-    /// Units may span (`allow_spanning`).
-    span: bool,
 }
 
 /// What writing a tape needs besides the catalog.
@@ -393,12 +391,6 @@ fn make_unit(
         None,
     )
     .unwrap();
-    if h.span {
-        let dotfile = dir.join(".tapectl-unit.toml");
-        let mut d = tapectl::unit::dotfile::read_dotfile(&dotfile).unwrap();
-        d.allow_spanning = Some(true);
-        tapectl::unit::dotfile::write_dotfile(&dotfile, &d).unwrap();
-    }
     let snapshot = tapectl::staging::snapshot_create(&h.conn, name, &h.config).unwrap();
     let stage_set_id = tapectl::staging::stage_create(&h.conn, &h.paths, &h.config, snapshot, true)
         .unwrap_or_else(|e| panic!("stage create {name}: {e}"));
@@ -674,7 +666,6 @@ impl Tape {
             paths,
             config,
             sources,
-            span: shape.span.is_some(),
         };
         let mut units = Vec::new();
         for (i, (name, tenant, big)) in shape.units.iter().enumerate() {

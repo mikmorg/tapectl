@@ -550,7 +550,7 @@ mod tests {
             let (conn, unit_id, ss_id) =
                 setup("sealed", Some(r#"["age1escrowescrowescrow"]"#), "staged", 1);
             conn.execute(
-                "UPDATE writes SET status = 'range', may_span = 1 WHERE stage_set_id = ?1",
+                "UPDATE writes SET status = 'range' WHERE stage_set_id = ?1",
                 params![ss_id],
             )
             .unwrap();

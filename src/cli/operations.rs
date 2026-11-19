@@ -11134,7 +11134,7 @@ mod tests {
         let volume_id = insert_volume(&conn, "VOL-RANGE");
         let (write_id, _) = insert_write(&conn, snap_id, volume_id, "planned", None);
         conn.execute(
-            "UPDATE writes SET status = 'range', may_span = 1 WHERE id = ?1",
+            "UPDATE writes SET status = 'range' WHERE id = ?1",
             params![write_id],
         )
         .unwrap();

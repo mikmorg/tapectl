@@ -1191,13 +1191,12 @@ mod tests {
     /// The live `writes.status` vocabulary, pinned to the schema rather than
     /// to a schema file's text (`live_status_check`'s reason).
     #[test]
-    fn the_live_write_status_check_is_the_eight_states() {
+    fn the_live_write_status_check_is_the_seven_states() {
         assert_eq!(
             live_status_check("writes"),
             [
                 "aborted",
                 "completed",
-                "cut",
                 "failed",
                 "in_progress",
                 "interrupted",

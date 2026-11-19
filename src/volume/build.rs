@@ -31,7 +31,7 @@ use super::index::{self, IndexFiles};
 use super::layout::{self, FrontIndexFile, IdThunkV2Params};
 use super::layout_model::{
     CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, LayoutError, Placement,
-    PlanClass, PlanSplit, SliceCheck, ZoneKind,
+    PlanClass, SliceCheck, ZoneKind,
 };
 
 // ── Plain-data inputs ──
@@ -697,14 +697,13 @@ pub fn build_with_plan_bound(
 
     entries.sort_by_key(|e| e.position);
 
-    // The span's tail (ADR-0012 item 123, `CapacityBudget::span_tail_from`):
-    // the last unit, when it may span, is the one unit the capacity gate lets
-    // pass the plan bound. The plan order puts the tail last
-    // (`CapacityBudget::place`), and a whole unit last is never a tail.
+    // The plan's tail (ADR-0012 items 123 and 289,
+    // `CapacityBudget::span_tail_from`): the last unit is the one unit the
+    // capacity gate lets pass the plan bound. The plan order puts the tail
+    // last (`CapacityBudget::place`).
     let span_tail_from = inputs
         .units
         .last()
-        .filter(|u| u.span.is_some())
         .and_then(|u| u.slices.first())
         .map(|s| slice_positions[&s.slice_id]);
 
@@ -791,28 +790,12 @@ impl BuiltLayout {
         }
     }
 
-    /// How `units` — the ones this Layout was built from, in the order
-    /// given to [`build`] — sit against its budget (ADR-0012 item 113,
-    /// [`Layout::split_units`]): `units[split.past_ceiling()]` are planned
-    /// past the fill ceiling ("the tape may end before them"), and a split
-    /// that does not [`PlanSplit::fits`] is a Layout `validate` refuses.
-    pub fn split(&self, units: &[BuildUnit]) -> PlanSplit {
-        self.layout.split_units(&unit_slice_ids(units))
-    }
-
-    /// The data slices of the units planned past the fill ceiling, in
-    /// position order ([`Layout::entries_past_ceiling`]).
-    pub fn entries_past_ceiling(&self, units: &[BuildUnit]) -> Vec<&LayoutEntry> {
-        self.layout.entries_past_ceiling(&unit_slice_ids(units))
-    }
-
-    /// Where `units` sit in a span tape's plan order (`layout-session.md`
-    /// "Spanning"; [`CapacityBudget::place`], [`Layout::place_units`]), each
+    /// Where `units` sit in a tape's plan order (`layout-session.md` "The
+    /// plan order"; [`CapacityBudget::place`], [`Layout::place_units`]), each
     /// with its [`PlanClass`] from the caller: `classes[i]` is `units[i]`'s.
     /// The class is the caller's to give because only the catalog knows it:
-    /// an owed run and a fresh spannable set can be the same slices (item
-    /// 93's second tape owes the whole set), and a [`BuildUnit`] says only
-    /// that a unit may span. The placement describes this Layout when it was
+    /// an owed run and a queued set can be the same slices (item 93's second
+    /// tape owes the whole set). The placement describes this Layout when it was
     /// built from the units in [`Placement::order`], with none deferred.
     pub fn place(&self, units: &[BuildUnit], classes: &[PlanClass]) -> Placement {
         self.layout.place_units(&unit_slice_ids(units), classes)
@@ -820,7 +803,7 @@ impl BuiltLayout {
 }
 
 /// Each unit's slices as `stage_slice_id`s, in the units' order — the unit
-/// boundaries [`Layout::split_units`] needs and a Layout does not carry.
+/// boundaries [`Layout::place_units`] needs and a Layout does not carry.
 pub fn unit_slice_ids(units: &[BuildUnit]) -> Vec<Vec<i64>> {
     units
         .iter()

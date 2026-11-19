@@ -30,7 +30,7 @@ use super::format;
 use super::layout;
 use super::layout_model::{
     CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, Placed, Placement,
-    PlanClass, PlanItem, PlanSplit, SliceCheck, ZoneKind,
+    PlanClass, PlanItem, SliceCheck, ZoneKind,
 };
 use super::loaded;
 use super::session::{
@@ -1432,7 +1432,7 @@ pub(crate) fn volume_write_contacted<'c>(
     // The write's staged-data facts, from the catalog and the disk alone
     // (issues #402, #445): shared with `volume write --init`, which asks
     // them BEFORE it initialises a cartridge ([`write_catalog_preflight_in`]).
-    let batch = checked_staged_units(conn, scope.spanning(config), scope.only())?;
+    let batch = checked_staged_units(conn, config, scope.only())?;
     // Issue #201: say what is about to happen before anything below touches
     // a backend, a MAM, or the drive. See `announce_staged_selection`'s doc
     // comment for why this is stderr and why it changes no selection logic.
@@ -1482,7 +1482,14 @@ pub(crate) fn volume_write_contacted<'c>(
     // consulted for it again. Reading `backends.lto[].nominal_capacity` here
     // is exactly how issue #141 planned an LTO-5 cartridge as 2.5 TB.
     let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
-    let budget = write_budget(backend, nominal_capacity)?;
+    let mut budget = write_budget(backend, nominal_capacity)?;
+    if !scope.may_plan_past_the_ceiling() {
+        // A rewrite plans under the fill ceiling and never past it (item
+        // 142's reason stands: it may hold a unit's only copy): its plan
+        // stops at the last slice that fits, and what the tape does not
+        // take stays staged and held (item 289, D20).
+        budget.plan_bound_bytes = None;
+    }
     // ADR-0012 item 86 (X19): a run that continues a span goes only onto the
     // generation of the range it continues. From the catalog alone, before
     // the drive is touched.
@@ -1590,7 +1597,6 @@ pub(crate) fn volume_write_contacted<'c>(
             nominal_capacity,
             budget,
             batch,
-            stage_set_ids,
             session,
         },
         &det,
@@ -1737,100 +1743,53 @@ fn write_budget(
     })
 }
 
-/// The refusal of a plan that commits nothing (ADR-0012 item 113, the
-/// coordinator's ruling): every staged unit is planned past the fill
-/// ceiling, so the tape may end before any of them. `None` when at least one
-/// unit is committed, or there is nothing to plan. Mostly unreachable: `stage
-/// create` refuses a unit above an empty tape's fill ceiling.
-fn past_ceiling_refusal(label: &str, split: &PlanSplit, units: &[BuildUnit]) -> Option<String> {
-    (split.committed == 0 && split.units > 0).then(|| commits_nothing(label, units))
-}
-
-/// [`past_ceiling_refusal`] of a span tape's plan, read from its placement
-/// (`layout-session.md` "The plan order"): refused when no unit is committed
-/// and no unit that may span is planned. A unit that may span is never a
-/// plan that commits nothing: the slices before the drive's early warning
-/// stay on the tape as a range of it (ADR-0012 items 84 and 123), which is
-/// how item 94's set larger than one tape is planned on a tape of its own.
-fn placed_past_ceiling_refusal(
-    label: &str,
-    plan: &SpanPlan,
-    units: &[BuildUnit],
-) -> Option<String> {
-    let placed = &plan.placement.placed;
-    let committed = placed.contains(&Placed::Committed);
-    let span_planned = units
-        .iter()
-        .zip(placed)
-        .any(|(u, p)| u.span.is_some() && matches!(p, Placed::PastCeiling | Placed::Tail));
-    (!units.is_empty() && !committed && !span_planned).then(|| commits_nothing(label, units))
-}
-
-/// The words of [`past_ceiling_refusal`].
+/// The refusal of a plan that puts nothing on the tape (ADR-0012 items 113
+/// and 289): on a drive that declares no `post_warning_bytes` the plan stops
+/// at the fill ceiling, and not even the first slice of the first set fits
+/// under it once the volume's own files are counted. Mostly unreachable:
+/// `stage create` and the capacity gate see a slice larger than a tape first.
 fn commits_nothing(label: &str, units: &[BuildUnit]) -> String {
     format!(
-        "volume \"{label}\": no staged unit fits within the fill ceiling, so this write would \
-         commit nothing: every one of {} is planned past it, and the tape may end before \
-         any of them (ADR-0012 item 113). Nothing was written and no session was recorded. \
-         A unit must fit under the ceiling of the cartridge it is written to",
-        unit_names(units)
+        "volume \"{label}\": no staged slice fits within the fill ceiling of this cartridge \
+         once the volume's own files are counted, so this write would put nothing on it: \
+         {} wait{}. Nothing was written and no session was recorded. A slice must fit under \
+         the ceiling of the cartridge it is written to (ADR-0012 items 113 and 289)",
+        unit_names(units),
+        if units.len() == 1 { "s" } else { "" },
     )
 }
 
-/// The units a write plans past the fill ceiling, named before the tape
-/// moves (ADR-0012 item 113): "the tape may end before them". `None` when
-/// none is, as on every write whose drive declares no `post_warning_bytes`.
-fn past_ceiling_notice(label: &str, split: &PlanSplit, units: &[BuildUnit]) -> Option<String> {
-    past_ceiling_sentence(label, &units[split.past_ceiling()])
-}
-
-/// The words of [`past_ceiling_notice`], for whole units `past`.
-fn past_ceiling_sentence<'u>(
-    label: &str,
-    past: impl IntoIterator<Item = &'u BuildUnit>,
-) -> Option<String> {
-    let past: Vec<&BuildUnit> = past.into_iter().collect();
-    (!past.is_empty()).then(|| {
-        format!(
-            "volume \"{label}\": {} planned past the fill ceiling; the tape may end before them. \
-             The drive declares post_warning_bytes, so the plan reaches toward the cartridge's \
-             nominal capacity (ADR-0012 item 113): a unit the tape ends before is cut, stays \
-             staged, and is written whole onto another cartridge by the next `tapectl volume \
-             write`",
-            unit_names(past)
-        )
-    })
-}
-
-/// What a span tape's plan says before the tape moves (`layout-session.md`
-/// "The plan order"), from the built Layout's own placement: the whole units
-/// planned past the fill ceiling ([`past_ceiling_notice`]'s words), each unit
-/// that may span and is planned past the ceiling (the early warning, not the
-/// plan, ends it on this tape: items 84 and 123), and the units that wait
-/// for the next tape.
+/// What a tape's plan says before the tape moves (`layout-session.md` "The
+/// plan order"), from the built Layout's own placement: the units planned
+/// past the fill ceiling (the early warning, not the plan, ends them on this
+/// tape: items 288 and 289), the unit a drive with no `post_warning_bytes`
+/// plans only up to the fill ceiling, and the units that wait for the next
+/// tape.
 fn span_plan_notices(label: &str, plan: &SpanPlan, units: &[BuildUnit]) -> Vec<String> {
-    let placed = |want: fn(&BuildUnit, Placed) -> bool| -> Vec<&BuildUnit> {
-        units
-            .iter()
-            .zip(&plan.placement.placed)
-            .filter(|(u, p)| want(u, **p))
-            .map(|(u, _)| u)
-            .collect()
-    };
-    let whole_past = placed(|u, p| u.span.is_none() && p == Placed::PastCeiling);
-    let spans_past =
-        placed(|u, p| u.span.is_some() && matches!(p, Placed::PastCeiling | Placed::Tail));
-    let mut notices: Vec<String> = past_ceiling_sentence(label, whole_past)
-        .into_iter()
+    let past: Vec<&BuildUnit> = units
+        .iter()
+        .zip(&plan.placement.placed)
+        .filter(|(_, p)| matches!(p, Placed::PastCeiling | Placed::Tail))
+        .map(|(u, _)| u)
         .collect();
-    if !spans_past.is_empty() {
+    let mut notices = Vec::new();
+    if !past.is_empty() {
         notices.push(format!(
-            "volume \"{label}\": {} may span, and the plan takes it past the fill ceiling to its \
-             end: the drive's early warning, not the plan, ends it on this tape (ADR-0012 items \
-             84 and 123). The slices written before the warning stay here as a range of it, and \
-             an ordinary `tapectl volume write` onto another cartridge of the same generation \
-             continues it",
-            unit_names(spans_past)
+            "volume \"{label}\": {} planned past the fill ceiling, to its end: the drive's \
+             early warning, not the plan, ends it on this tape (ADR-0012 items 288 and 289). \
+             The slices written before the warning stay here as a range of it, and an ordinary \
+             `tapectl volume write` onto another cartridge of the same generation continues it",
+            unit_names(past)
+        ));
+    }
+    for cut in &plan.stops_short {
+        notices.push(format!(
+            "volume \"{label}\": {} is planned only up to the fill ceiling, {}: the drive \
+             declares no post_warning_bytes, so the plan ends at the last slice that fits \
+             (ADR-0012 item 289). The rest stays staged, and an ordinary `tapectl volume write` \
+             onto another cartridge of the same generation continues it",
+            cut.unit,
+            slice_run(cut.first, cut.last),
         ));
     }
     if let Some(waiting) = waiting_notice(label, &plan.deferred) {
@@ -1839,18 +1798,20 @@ fn span_plan_notices(label: &str, plan: &SpanPlan, units: &[BuildUnit]) -> Vec<S
     notices
 }
 
-/// The units a span tape's plan left for a later tape, named (ADR-0012
-/// items 83, 94 and 95; X12, X13): not on this tape, still staged, and
-/// written by the next `volume write` onto another cartridge. `None` when
-/// none waits.
+/// The units a tape's plan left for a later tape, named (ADR-0012 items 288
+/// and 289): not on this tape, still staged, and written by the next `volume
+/// write` onto another cartridge. `None` when none waits.
 fn waiting_notice(label: &str, deferred: &[BuildUnit]) -> Option<String> {
     (!deferred.is_empty()).then(|| {
+        let one = deferred.len() == 1;
         format!(
-            "volume \"{label}\": {} waits for the next tape: the plan holds a unit that may span \
-             and gives it the room these would take, so they are not on this tape and stay staged \
-             (ADR-0012 items 83, 94 and 95). The next `tapectl volume write` onto another \
-             cartridge writes them",
-            unit_names(deferred)
+            "volume \"{label}\": {} planned and not written: the plan ends before {}, so {} not \
+             on this tape and stay staged (ADR-0012 items 288 and 289). The next `tapectl volume \
+             write` onto another cartridge writes {}",
+            unit_names(deferred),
+            if one { "it" } else { "them" },
+            if one { "it is" } else { "they are" },
+            if one { "it" } else { "them" },
         )
     })
 }
@@ -1864,51 +1825,38 @@ fn unit_names<'u>(units: impl IntoIterator<Item = &'u BuildUnit>) -> String {
         .join(", ")
 }
 
-/// What the plan of a span tape decided (`layout-session.md` "The plan
-/// order"; ADR-0012 items 83, 94, 95, 122 and 123): the built Layout's own
-/// placement of its units, the authority every notice reads, and the units
-/// the plan left for a later tape.
+/// A set a plan with no bound ends inside: its slices `first` to `last`
+/// (of the run this tape would take) are planned, and the rest of the run is
+/// not.
+struct StopsShort {
+    unit: String,
+    first: i64,
+    last: i64,
+}
+
+/// What the plan of a tape decided (`layout-session.md` "The plan order";
+/// ADR-0012 items 122, 288 and 289): the built Layout's own placement of its
+/// units, the authority every notice reads, and the units the plan left for a
+/// later tape.
 struct SpanPlan {
-    /// [`build::BuiltLayout::place`] of the built units: none deferred or
-    /// refused, in the built order.
+    /// [`build::BuiltLayout::place`] of the built units: none deferred, in
+    /// the built order.
     placement: Placement,
-    /// The units not on this tape, in the order the plan took them: whole
-    /// units an owed run or a spannable set leaves no room for, and sets
-    /// queued after the span's tail (X12, X13). They stay staged.
+    /// The units not on this tape, in the order the plan took them: sets
+    /// queued after the plan's tail, and a tail on a drive with no plan
+    /// bound that not even its first slice fits. They stay staged.
     deferred: Vec<BuildUnit>,
+    /// The set a plan with no `post_warning_bytes` ended inside, at the
+    /// last of its slices that fits the fill ceiling.
+    stops_short: Vec<StopsShort>,
 }
 
-/// Where a class goes in the plan order: owed runs, whole units, spannable
-/// sets ([`CapacityBudget::place`]).
-fn plan_rank(class: PlanClass) -> u8 {
-    match class {
-        PlanClass::Owed => 0,
-        PlanClass::Whole => 1,
-        PlanClass::Spannable => 2,
-    }
-}
-
-/// The order a span tape's plan takes `units` in, as indices: grouped by
-/// class as [`CapacityBudget::place`] groups them (owed runs, whole units,
-/// spannable sets), the caller's order within each, except that a spannable
-/// set larger than one tape (its slices, block-padded, more than `room`: the
-/// plan bound less the volume's own files) goes ahead of those that fit, so
-/// item 94's early start is not deferred behind a fitting set's tail (X13,
-/// the coordinator's ruling). `room` `None` (no plan bound) groups only.
-fn take_in_plan_order(
-    units: &[BuildUnit],
-    classes: &[PlanClass],
-    room: Option<u64>,
-    block_size: u64,
-) -> Vec<usize> {
-    let larger_than_tape = |u: &BuildUnit| {
-        room.is_some_and(|room| room > 0 && padded_slice_bytes(u, block_size) > room)
-    };
-    let mut order: Vec<usize> = (0..units.len()).collect();
-    order.sort_by_key(|&i| {
-        let first = classes[i] == PlanClass::Spannable && larger_than_tape(&units[i]);
-        (plan_rank(classes[i]), !first)
-    });
+/// The order a tape's plan takes a batch in, as indices: owed runs first,
+/// then the queue, the caller's order within each ([`CapacityBudget::place`]).
+fn take_in_plan_order(classes: &[PlanClass]) -> Vec<usize> {
+    let rank = |class: PlanClass| u8::from(class != PlanClass::Owed);
+    let mut order: Vec<usize> = (0..classes.len()).collect();
+    order.sort_by_key(|&i| rank(classes[i]));
     order
 }
 
@@ -1922,12 +1870,12 @@ fn padded_slice_bytes(unit: &BuildUnit, block_size: u64) -> u64 {
         .sum()
 }
 
-/// What `volume plan` shows of a write's plan when a staged set may span
-/// (#478): one write of everything staged, planned as `volume write` plans
-/// it ([`find_staged_data`], [`take_in_plan_order`],
-/// [`CapacityBudget::place`]) on the slices' sizes alone, the volume's own
-/// files not counted, as `volume plan`'s other figures are estimates.
-/// `units[i]` and `classes[i]` are the placement's caller's units.
+/// What `volume plan` shows of a write's plan (#478): one write of
+/// everything staged, planned as `volume write` plans it
+/// ([`find_staged_data`], [`take_in_plan_order`], [`CapacityBudget::place`])
+/// on the slices' sizes alone, the volume's own files not counted, as
+/// `volume plan`'s other figures are estimates. `units[i]` and `classes[i]`
+/// are the placement's caller's units.
 pub(crate) struct PlanPreview {
     pub units: Vec<BuildUnit>,
     pub classes: Vec<PlanClass>,
@@ -1935,10 +1883,9 @@ pub(crate) struct PlanPreview {
 }
 
 /// [`PlanPreview`] of everything staged against a fill budget of
-/// `available_bytes` and the plan bound `plan_bound_bytes`; `None` when no
-/// staged set may span, so the plan is 1.6.0's. A refusal the plan of a span
-/// raises from the catalog (a released slice it would plan, a policy that
-/// cannot be resolved) is the `Err`.
+/// `available_bytes` and the plan bound `plan_bound_bytes`; `None` when
+/// nothing is staged. A refusal the plan raises from the catalog (a released
+/// slice it would plan, a policy that cannot be resolved) is the `Err`.
 pub(crate) fn plan_preview(
     conn: &Connection,
     config: &Config,
@@ -1946,11 +1893,11 @@ pub(crate) fn plan_preview(
     plan_bound_bytes: Option<u64>,
     block_size: u64,
 ) -> Result<Option<PlanPreview>> {
-    let batch = find_staged_data(conn, Spanning::ByPolicy(config), None)?;
-    if !batch.spans() {
+    let batch = find_staged_data(conn, config, None)?;
+    if batch.is_empty() {
         return Ok(None);
     }
-    let order = take_in_plan_order(&batch.units, &batch.classes, plan_bound_bytes, block_size);
+    let order = take_in_plan_order(&batch.classes);
     let units: Vec<BuildUnit> = order.iter().map(|&i| batch.units[i].clone()).collect();
     let classes: Vec<PlanClass> = order.iter().map(|&i| batch.classes[i]).collect();
     let items: Vec<PlanItem> = units
@@ -1975,25 +1922,22 @@ pub(crate) fn plan_preview(
     }))
 }
 
-/// [`build_write_layout`] for a batch that holds a set whose write may span
-/// (`layout-session.md` "The plan order"). The plan order is decided BEFORE
-/// the build, because a deferred unit must not reach the envelopes, the
-/// on-tape `catalog.db`, the index or `plan()`'s rows, and the build reads
-/// it back:
+/// The one planner of a write (`layout-session.md` "The plan order"; ADR-0012
+/// items 122, 288 and 289, D20). The plan order is decided BEFORE the build,
+/// because a deferred unit must not reach the envelopes, the on-tape
+/// `catalog.db`, the index or `plan()`'s rows, and the build reads it back:
 ///
-/// 1. A probe build of every candidate, grouped by class (owed runs, whole
-///    units, spannable sets; the caller's order within each), gives the
-///    volume's own files: an upper bound on the plan's content, since leaving
-///    a unit out only shrinks what the envelopes hold (the coordinator's
-///    ruling). Not on their bytes to the block: a build of fewer units can
-///    land up to one block per file above the probe (#491, step 4).
-/// 2. Spannable sets larger than one tape (more than the plan bound less
-///    those files) are taken ahead of those that fit, so item 94's early
-///    start is not deferred behind a fitting set's tail (X13).
-/// 3. [`CapacityBudget::place`] on those sizes. A refusal (item 123's
-///    `post_warning_bytes`, or whole units the plan cannot hold) is the
-///    pre-write validation's refusal, before any byte is written.
-/// 4. The units it places, in its order, deferred ones dropped, are built
+/// 1. A probe build of every candidate, owed runs first and the caller's
+///    order within each class, gives the volume's own files: an upper bound
+///    on the plan's content, since leaving a unit out only shrinks what the
+///    envelopes hold (the coordinator's ruling). Not on their bytes to the
+///    block: a build of fewer units can land up to one block per file above
+///    the probe (#491, step 4).
+/// 2. [`CapacityBudget::place`] on those sizes. On a drive with no plan
+///    bound the set that carries the plan past the fill ceiling is planned
+///    as the longest prefix of its slices that fits ([`Placement::tail_room`],
+///    less the drift a rebuild allows), and deferred when not even one does.
+/// 3. The units it places, in its order, deferred ones dropped, are built
 ///    (the probe stands when that is what it built), and the built Layout's
 ///    placement is read back ([`read_back_span_plan`]): it must place every
 ///    unit as the plan did, on the built bytes or, when those exceed the
@@ -2010,16 +1954,13 @@ fn build_span_layout(
     operator_public_keys: Vec<String>,
     escrow_public_key: Option<String>,
     session_dir: &Path,
-    fill_ceiling: f64,
-    nominal_capacity: i64,
 ) -> Result<(build::BuiltLayout, BuildInputs, SpanPlan)> {
     let label = w.label;
     let block_size = w.block_size;
-    let bound = w.plan_bound_bytes;
     let StagedBatch { units, classes } = batch;
 
-    // 1. The probe, grouped by class (the caller's order within each).
-    let grouped = take_in_plan_order(&units, &classes, None, block_size);
+    // 1. The probe, owed runs first (the caller's order within each class).
+    let grouped = take_in_plan_order(&classes);
     let probe_classes: Vec<PlanClass> = grouped.iter().map(|&i| classes[i]).collect();
     let probe_units: Vec<BuildUnit> = grouped.iter().map(|&i| units[i].clone()).collect();
     let probe_ids: Vec<i64> = probe_units.iter().map(|u| u.stage_set_id).collect();
@@ -2034,51 +1975,67 @@ fn build_span_layout(
         escrow_public_key.clone(),
         session_dir,
     )?;
-
-    // 2. Larger-than-tape spannable sets first (X13).
     let fixed = probe.layout.fixed_on_tape_bytes();
-    let room = bound.map(|b| b.saturating_sub(fixed));
-    let taken = take_in_plan_order(&probe_inputs.units, &probe_classes, room, block_size);
-    let ordered: Vec<BuildUnit> = taken
-        .iter()
-        .map(|&i| probe_inputs.units[i].clone())
-        .collect();
-    let ordered_classes: Vec<PlanClass> = taken.iter().map(|&i| probe_classes[i]).collect();
 
-    // 3. The plan order.
-    let planned = probe.place(&ordered, &ordered_classes);
-    if !planned.is_ok() {
-        let _ = fs::remove_dir_all(session_dir);
-        let note = crate::volume::layout_model::capacity_refusal_note(
-            &planned.errors,
-            fill_ceiling,
-            nominal_capacity as u64,
-        );
-        return Err(TapectlError::Other(format!(
-            "volume \"{label}\" failed pre-write validation: {}",
-            planned
-                .errors
-                .iter()
-                .map(|e| e.to_string())
-                .chain(note)
-                .collect::<Vec<_>>()
-                .join("; ")
-        )));
-    }
-    let final_units: Vec<BuildUnit> = planned.order.iter().map(|&i| ordered[i].clone()).collect();
-    let final_classes: Vec<PlanClass> = planned.order.iter().map(|&i| ordered_classes[i]).collect();
-    let deferred: Vec<BuildUnit> = planned
+    // 2. The plan order.
+    let ordered = probe_inputs.units.clone();
+    let planned = probe.place(&ordered, &probe_classes);
+    let mut final_units: Vec<BuildUnit> =
+        planned.order.iter().map(|&i| ordered[i].clone()).collect();
+    let mut final_classes: Vec<PlanClass> =
+        planned.order.iter().map(|&i| probe_classes[i]).collect();
+    let mut deferred: Vec<BuildUnit> = planned
         .deferred()
         .iter()
         .map(|&i| ordered[i].clone())
         .collect();
+    let mut stops_short = Vec::new();
+    if let (Some(room), Some(last)) = (planned.tail_room, final_units.last_mut()) {
+        // No plan bound: the tail is planned up to the fill ceiling. Its
+        // slices are a prefix of the run it would take, short of the room by
+        // what a rebuild of the files may drift.
+        let drift = capacity_numbers(&probe.layout).map_or(0, |n| n.margin);
+        let mut room = room.saturating_sub(drift);
+        let all = last.slices.len();
+        let mut keep = 0;
+        for slice in &last.slices {
+            let bytes = crate::volume::layout_model::pad_to_blocks(
+                slice.encrypted_bytes.max(0) as u64,
+                block_size,
+            );
+            if bytes > room {
+                break;
+            }
+            room -= bytes;
+            keep += 1;
+        }
+        if keep < all {
+            let first = last.slices.first().map_or(0, |s| s.slice_number);
+            if keep == 0 {
+                let dropped = final_units.pop().expect("the tail was just read");
+                final_classes.pop();
+                deferred.insert(0, dropped);
+            } else {
+                last.slices.truncate(keep);
+                stops_short.push(StopsShort {
+                    unit: format!("\"{}\" v{}", last.unit_name, last.snapshot_version),
+                    first,
+                    last: last.slices.last().map_or(first, |s| s.slice_number),
+                });
+            }
+        }
+    }
+    if final_units.is_empty() {
+        let _ = fs::remove_dir_all(session_dir);
+        return Err(TapectlError::Other(commits_nothing(label, &deferred)));
+    }
 
-    // 4. The build, and its read-back.
+    // 3. The build, and its read-back.
     let probe_stands = final_units.len() == probe_inputs.units.len()
         && final_units
             .iter()
             .zip(&probe_inputs.units)
-            .all(|(a, b)| a.stage_set_id == b.stage_set_id);
+            .all(|(a, b)| a.stage_set_id == b.stage_set_id && a.slices.len() == b.slices.len());
     let (built, inputs) = if probe_stands {
         (probe, probe_inputs)
     } else {
@@ -2103,8 +2060,8 @@ fn build_span_layout(
             return Err(TapectlError::Other(format!(
                 "volume \"{label}\": internal error: the built Layout does not place its units \
                  as the plan made before the build did ({why}). Nothing was written and no \
-                 session was recorded. Report this: the plan order of a tape that holds a unit \
-                 that may span disagrees with itself"
+                 session was recorded. Report this: the plan order of a tape disagrees with \
+                 itself"
             )));
         }
     };
@@ -2114,6 +2071,7 @@ fn build_span_layout(
         SpanPlan {
             placement,
             deferred,
+            stops_short,
         },
     ))
 }
@@ -2371,36 +2329,27 @@ fn read_back_span_plan(
 }
 
 /// `Ok` when `placement` places every one of `units` in their order, none
-/// deferred or refused; otherwise how it does not, in the words of
+/// deferred; otherwise how it does not, in the words of
 /// [`build_span_layout`]'s refusal.
 fn placement_is_the_plan(
     placement: &Placement,
     units: &[BuildUnit],
 ) -> std::result::Result<(), String> {
     let in_order: Vec<usize> = (0..units.len()).collect();
-    let disagrees: Vec<&BuildUnit> = units
+    let deferred: Vec<&BuildUnit> = units
         .iter()
         .zip(&placement.placed)
-        .filter(|(_, p)| matches!(p, Placed::Deferred | Placed::Refused))
+        .filter(|(_, p)| matches!(p, Placed::Deferred))
         .map(|(u, _)| u)
         .collect();
-    if placement.is_ok() && placement.order == in_order && disagrees.is_empty() {
+    if placement.order == in_order && deferred.is_empty() {
         return Ok(());
     }
-    Err(format!(
-        "{}; {}",
-        if disagrees.is_empty() {
-            "a unit moved".to_string()
-        } else {
-            format!("{} no longer fit", unit_names(disagrees.iter().copied()))
-        },
-        placement
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; "),
-    ))
+    Err(if deferred.is_empty() {
+        "a unit moved".to_string()
+    } else {
+        format!("{} no longer fit", unit_names(deferred.iter().copied()))
+    })
 }
 
 /// `slices 1-2`, or `slice 3` for a run of one: a range as a message names it.
@@ -2413,9 +2362,9 @@ pub(crate) fn slice_run(first: i64, last: i64) -> String {
 }
 
 /// The run of each unit's slices this tape's plan holds, as the index's
-/// `this-tape` rows state it (`volume-format-v2.md` §1.5; ADR-0012 item
-/// 126): a whole unit is its whole set, and a unit whose write may span is
-/// the run [`BuildUnit::slices`] plans, by slice number.
+/// `this-tape` rows state it (`volume-format-v3.md` §1.5; ADR-0012 item
+/// 126): the run [`BuildUnit::slices`] plans, by slice number; a unit built
+/// without its span (a test's) is its whole set.
 fn index_runs(units: &[BuildUnit]) -> Vec<coverage::IndexRun> {
     units
         .iter()
@@ -2462,7 +2411,7 @@ impl CapacityNumbers {
     /// reserve against the budget.
     ///
     /// The fill ceiling's figures, never a plan bound (ADR-0012 item 113): a
-    /// rewrite may hold a unit's only copy, and a cut there leaves it none.
+    /// rewrite may hold a unit's only copy.
     pub fn fits(&self) -> bool {
         self.staged + self.generated + self.margin + self.reserve <= self.available
     }
@@ -2477,8 +2426,8 @@ impl CapacityNumbers {
              envelopes with the catalogues, the cross-volume index and catalog.db, their \
              backups, the seal, block padding) take {}, plus {} of margin for what only the \
              real volume decides and {} of end-of-tape reserve: {} in all, against the {} the \
-             cartridge may take ({}% of its {} capacity). A unit is never split, so there is \
-             no smaller write of this data; compact onto a larger generation, or raise the \
+             cartridge may take ({}% of its {} capacity). A rewrite writes what it staged \
+             onto one cartridge, so there is no smaller write of this data; compact onto a larger generation, or raise the \
              ceiling with --fill-ceiling if you know the cartridge takes it",
             fmt(self.staged as i64),
             fmt(self.generated as i64),
@@ -2575,9 +2524,9 @@ pub(crate) fn rehearse_write_capacity(
         enospc_buffer,
         ..
     } = write_budget(backend, volume.capacity_bytes)?;
-    // A rewrite never spans (ADR-0012 item 142): its rehearsal plans the
-    // batch as its write will, every set whole.
-    let units = checked_staged_units(conn, Spanning::Never, only)?.units;
+    // A rewrite plans under the fill ceiling (ADR-0012 item 142): its
+    // rehearsal refuses a batch that does not fit it whole, before the erase.
+    let units = checked_staged_units(conn, config, only)?.units;
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let SessionKeys {
         keys,
@@ -2604,8 +2553,7 @@ pub(crate) fn rehearse_write_capacity(
             usable_bytes,
             enospc_buffer,
             // Never past the fill ceiling (ADR-0012 item 113, the
-            // coordinator's ruling): the rewrite may hold a unit's only copy,
-            // and a cut there would leave it with none.
+            // coordinator's ruling): the rewrite may hold a unit's only copy.
             plan_bound_bytes: None,
             nominal_capacity: volume.capacity_bytes,
             mam_capacity: 0,
@@ -2664,7 +2612,6 @@ struct StagedWrite<'a> {
     budget: WriteBudget,
     /// The staged batch, each set with its plan class (#478).
     batch: StagedBatch,
-    stage_set_ids: Vec<i64>,
     session: SessionKeys,
 }
 
@@ -2710,7 +2657,6 @@ fn volume_write_in_contact<'c>(
                 post_warning_bytes,
             },
         batch,
-        stage_set_ids,
         session:
             SessionKeys {
                 keys,
@@ -2805,9 +2751,9 @@ fn volume_write_in_contact<'c>(
 
     // The Layout is built by `build_write_layout`, the one place a write's
     // Layout is made -- `volume rewrite`'s capacity rehearsal (issue #483)
-    // calls the same function before it erases anything. A batch holding a
-    // set whose write may span is planned first (#478, `build_span_layout`);
-    // any other is built as it was in 1.6.0.
+    // calls the same function before it erases anything. Every write is
+    // planned first by `build_span_layout`, the one planner (ADR-0012 items
+    // 288 and 289).
     let phase = progress::phase("build", None);
     let write_build = WriteBuild {
         label,
@@ -2827,34 +2773,16 @@ fn volume_write_in_contact<'c>(
         mam_loads: mam.load_count.unwrap_or(0),
         cartridge_identity,
     };
-    let (built, inputs, span_plan) = if batch.spans() {
-        let (built, inputs, plan) = build_span_layout(
-            conn,
-            paths,
-            write_build,
-            batch,
-            tenants,
-            operator_public_keys,
-            escrow_public_key,
-            &session_dir,
-            backend.fill_ceiling,
-            nominal_capacity,
-        )?;
-        (built, inputs, Some(plan))
-    } else {
-        let (built, inputs) = build_write_layout(
-            conn,
-            paths,
-            write_build,
-            batch.units,
-            &stage_set_ids,
-            tenants,
-            operator_public_keys,
-            escrow_public_key,
-            &session_dir,
-        )?;
-        (built, inputs, None)
-    };
+    let (built, inputs, span_plan) = build_span_layout(
+        conn,
+        paths,
+        write_build,
+        batch,
+        tenants,
+        operator_public_keys,
+        escrow_public_key,
+        &session_dir,
+    )?;
     phase.done();
     // ADR-0012 item 215: what this write asks for once its tape is sealed,
     // into the session directory `build` just made, beside its frozen
@@ -2923,37 +2851,13 @@ fn volume_write_in_contact<'c>(
         }
     }
 
-    // ADR-0012 item 113: with the drive's plan bound, the units after the
-    // prefix that fits the fill ceiling are planned past it. The pre-flight
-    // above refused a plan beyond the bound (`PlanBoundExceeded`), never
-    // trimming it; here a plan whose every unit is past the ceiling is
-    // refused too (a tape that can only end cut is not a plan), and the
-    // units past it are named before the tape moves. Without a bound the
-    // split is the whole plan, committed, and this says nothing.
-    //
-    // #478: a span tape's plan is read from its own placement instead
-    // (`build_span_layout`'s read-back): the same refusal, and the notices
-    // name the whole units past the ceiling, the units that may span past it
-    // (the early warning ends them here), and the units that wait for the
-    // next tape.
-    match &span_plan {
-        None => {
-            let split = built.split(&inputs.units);
-            if let Some(refusal) = past_ceiling_refusal(label, &split, &inputs.units) {
-                return Err(TapectlError::Other(refusal));
-            }
-            if let Some(notice) = past_ceiling_notice(label, &split, &inputs.units) {
-                eprintln!("{notice}");
-            }
-        }
-        Some(plan) => {
-            if let Some(refusal) = placed_past_ceiling_refusal(label, plan, &inputs.units) {
-                return Err(TapectlError::Other(refusal));
-            }
-            for notice in span_plan_notices(label, plan, &inputs.units) {
-                eprintln!("{notice}");
-            }
-        }
+    // ADR-0012 items 113, 288 and 289: the plan is read from its own
+    // placement (`build_span_layout`'s read-back). The notices name the sets
+    // planned past the fill ceiling (the early warning ends them here), the
+    // set a drive with no `post_warning_bytes` plans only up to the ceiling,
+    // and the sets that wait for the next tape.
+    for notice in span_plan_notices(label, &span_plan, &inputs.units) {
+        eprintln!("{notice}");
     }
 
     // The tape device opens HERE and not a line earlier (the pre-flight
@@ -3078,12 +2982,9 @@ fn volume_write_in_contact<'c>(
         Some(config.defaults.verify_interval_days),
     )?;
     // #478: the units the plan left for a later tape, named once the write
-    // is done as the cut units are (`layout-session.md` "The plan order"):
-    // still staged, and written by the next `volume write`.
-    if let Some(waiting) = span_plan
-        .as_ref()
-        .and_then(|plan| waiting_notice(label, &plan.deferred))
-    {
+    // is done (`layout-session.md` "The plan order"): still staged, and
+    // written by the next `volume write`.
+    if let Some(waiting) = waiting_notice(label, &span_plan.deferred) {
         eprintln!("{waiting}");
     }
     Ok(layout_snapshot)
@@ -4518,7 +4419,7 @@ fn write_aborted(conn: &Connection, volume_id: i64, label: &str, reason: &str) -
 /// `in_progress` or `interrupted`, the set [`precontact_refusal`] calls one
 /// write session: the volume's session lock is held, and a write refuses
 /// while another session on the volume is unresolved, so there is no other.
-/// No `cut` row exists before a confirm, and `completed` ones are never
+/// No `range` row exists before a confirm, and `completed` ones are never
 /// touched. The same rows `session::mark_writes` would move, for the one
 /// path where `ReadyToSeal::seal` has consumed the session's own ids.
 fn abort_unsealed_session(
@@ -4923,7 +4824,8 @@ fn finish_confirm(
             }
             // #420 (`layout-session.md`, "After a short seal"): a short seal
             // is a success and exits 0; the operator is told where the tape
-            // ended, which units it cut, and what writes them. On stderr,
+            // ended, which units it holds as a range or planned and did not
+            // write, and what continues them. On stderr,
             // like every other line this layer prints, so `--json` stdout
             // stays one document.
             if let Some(report) = sealed.short_ending_report() {
@@ -5684,8 +5586,8 @@ fn full_seal_range_report(sealed: &session::SealedSession) -> Option<String> {
 
 /// The `write_completed` event's `details` (#420, #478; `layout-session.md`
 /// "Confirm of a short ending"): [`session::SealedSession::write_completed_details`],
-/// which names the short ending and the cut units and, from 1.7.0, the range
-/// units with their slice runs. `None` on a full seal with no range, whose
+/// which names the short ending and the units planned and not written, and
+/// the range units with their slice runs. `None` on a full seal with no range, whose
 /// event is what it was before 1.6.0. Shared with the adoption of a lost write
 /// (`adopt_lost::record_adoption`), which writes the same event.
 pub(crate) fn write_completed_details(sealed: &session::SealedSession) -> Option<String> {
@@ -5701,9 +5603,6 @@ pub(crate) fn write_completed_details(sealed: &session::SealedSession) -> Option
 pub struct RecordedEnding {
     /// `volumes.ended_after`: the short seal's K, `None` on a full seal.
     pub ended_after: Option<i64>,
-    /// The units whose `writes` rows on the volume are `cut`, in plan order
-    /// (the order the session inserted its rows): empty on a full seal.
-    pub cut_units: Vec<String>,
     /// The units whose `writes` rows on the volume are `range`, in plan
     /// order, with their runs ([`recorded_ranges`]).
     pub range_units: Vec<RecordedRange>,
@@ -5736,21 +5635,8 @@ pub fn recorded_ending(conn: &Connection, label: &str) -> Result<RecordedEnding>
         )
         .optional()?
         .flatten();
-    let cut_units = conn
-        .prepare(
-            "SELECT u.name FROM writes w
-             JOIN volumes v ON v.id = w.volume_id
-             JOIN stage_sets ss ON ss.id = w.stage_set_id
-             JOIN snapshots s ON s.id = ss.snapshot_id
-             JOIN units u ON u.id = s.unit_id
-             WHERE v.label = ?1 AND w.status = 'cut'
-             ORDER BY w.id",
-        )?
-        .query_map(params![label], |r| r.get(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(RecordedEnding {
         ended_after,
-        cut_units,
         range_units: recorded_ranges(conn, label)?,
         deferred_units: waiting_units(conn, label)?,
         keep_together: keep_together(conn, label)?,
@@ -5831,16 +5717,16 @@ pub fn copy_summary(conn: &Connection, label: &str) -> Result<CopySummary> {
 }
 
 /// The units a write of the volume labelled `label` was planned to carry:
-/// those with a `completed`, `range` or `cut` write on it, in id order. The
-/// cut ones are still owed a copy, so the next command a write ends with
-/// judges them too (ADR-0012 item 216).
+/// those with a `completed` or `range` write on it, in id order. A range is
+/// still owed the rest of its slices, so the next command a write ends with
+/// judges it too (ADR-0012 item 216).
 pub fn units_planned_onto(conn: &Connection, label: &str) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT sn.unit_id FROM writes w
            JOIN volumes v ON v.id = w.volume_id
            JOIN stage_sets ss ON ss.id = w.stage_set_id
            JOIN snapshots sn ON sn.id = ss.snapshot_id
-          WHERE v.label = ?1 AND w.status IN ('completed', 'range', 'cut')
+          WHERE v.label = ?1 AND w.status IN ('completed', 'range')
           ORDER BY sn.unit_id",
     )?;
     let ids = stmt
@@ -8123,11 +8009,6 @@ fn read_slices_contacted(
     // wanted — a `reclaimable` or `purged` one is the operator's "drop this
     // when the volume is compacted", and reading it back to write it again
     // would undo that.
-    //
-    // #420: never a `cut` write's (`volume-format-v2.md` §4.2: no reader
-    // restores a cut unit from the tape that cut it). Its slices before the
-    // short seal are on the tape and recorded `written`, but they are part
-    // of a unit, and staging them would promote a set that is not whole.
     let mut stmt = conn.prepare(
         "SELECT wp.position, wp.sha256_on_volume,
                 ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id,
@@ -8138,7 +8019,6 @@ fn read_slices_contacted(
          JOIN stage_sets sts ON sts.id = w.stage_set_id
          JOIN snapshots sn ON sn.id = sts.snapshot_id
          WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'
-           AND w.status <> 'cut'
            AND CASE WHEN ?3 IS NULL THEN sn.status NOT IN ('reclaimable', 'purged')
                     ELSE sn.version = ?3 END
          ORDER BY CAST(wp.position AS INTEGER)",
@@ -8151,33 +8031,6 @@ fn read_slices_contacted(
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if source_slices.is_empty() {
-        // #420: a unit the tape's short seal cut is named as cut, with where
-        // the tape ended: its slices are not on this tape whole.
-        let cut: Option<Option<i64>> = conn
-            .query_row(
-                "SELECT v.ended_after FROM writes w
-                 JOIN volumes v ON v.id = w.volume_id
-                 JOIN stage_sets sts ON sts.id = w.stage_set_id
-                 JOIN snapshots sn ON sn.id = sts.snapshot_id
-                 WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND w.status = 'cut'
-                   AND (?3 IS NULL OR sn.version = ?3)
-                 LIMIT 1",
-                params![from_vol_id, unit.id, version],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(ended_after) = cut {
-            return Err(TapectlError::Other(format!(
-                "unit \"{unit_name}\"{} is not on volume \"{from_label}\" whole: the tape sealed \
-                 short{} and the unit was cut (volume-format-v2.md §4.2), so no slice of it is \
-                 read from this tape. It is still staged, or written whole on another \
-                 cartridge: `tapectl unit info {unit_name}` says where",
-                version.map(|v| format!(" version {v}")).unwrap_or_default(),
-                ended_after
-                    .map(|k| format!(" after tape file {k}"))
-                    .unwrap_or_default(),
-            )));
-        }
         let message = match version {
             Some(v) => {
                 format!("no slices for unit \"{unit_name}\" version {v} on volume \"{from_label}\"")
@@ -8190,8 +8043,7 @@ fn read_slices_contacted(
                      JOIN writes w ON w.id = wp.write_id
                      JOIN stage_sets sts ON sts.id = w.stage_set_id
                      JOIN snapshots sn ON sn.id = sts.snapshot_id
-                     WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'
-                       AND w.status <> 'cut'",
+                     WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'",
                     params![from_vol_id, unit.id],
                     |row| row.get(0),
                 )?;
@@ -9257,13 +9109,13 @@ impl VerifyReport {
 /// init` (issue #445).
 fn checked_staged_units(
     conn: &Connection,
-    spanning: Spanning<'_>,
+    config: &Config,
     only: Option<&[i64]>,
 ) -> Result<StagedBatch> {
-    let batch = find_staged_data(conn, spanning, only)?;
     // Issue #402: every staged set whole, on disk, before anything below
     // touches a backend, a MAM or the drive.
     check_staged_slices(conn, only)?;
+    let batch = find_staged_data(conn, config, only)?;
     // Item 265 (#557): every unit's file table in the catalog, before
     // anything below touches a backend, a MAM or the drive.
     #[cfg(test)]
@@ -9340,10 +9192,9 @@ pub(crate) fn write_catalog_preflight(
 /// anything: the write that follows the erase must not be able to refuse for
 /// a reason the catalog and the disk already knew.
 ///
-/// The batch is planned as the write plans it ([`StagedScope::spanning`]), so
-/// a refusal the plan of a span raises from the catalog alone (a released
-/// slice the tape would plan, a unit whose policy cannot be resolved) is
-/// raised here too. Item 86's generation refusal needs the volume, which
+/// The batch is planned as the write plans it ([`find_staged_data`]), so a
+/// refusal the plan raises from the catalog alone (a released slice the tape
+/// would plan, a unit whose policy cannot be resolved) is raised here too. Item 86's generation refusal needs the volume, which
 /// does not exist yet: the write raises it.
 pub(crate) fn write_catalog_preflight_in(
     conn: &Connection,
@@ -9352,7 +9203,7 @@ pub(crate) fn write_catalog_preflight_in(
     allow_missing_escrow: bool,
     scope: &StagedScope,
 ) -> Result<()> {
-    let batch = checked_staged_units(conn, scope.spanning(config), scope.only())?;
+    let batch = checked_staged_units(conn, config, scope.only())?;
     let stage_set_ids = batch.stage_set_ids();
     let session = assemble_keys_for_units(conn, &batch.units, &stage_set_ids)?;
     // The write's `validate` also checks keys, escrow and per-set escrow
@@ -9386,29 +9237,14 @@ pub(crate) fn write_catalog_preflight_in(
     Ok(())
 }
 
-/// Whether a write may plan a staged set to span cartridges (#478;
-/// `layout-session.md` "Spanning", "The frozen flag").
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Spanning<'a> {
-    /// By each unit's resolved policy (`allow_spanning`: dotfile, archive
-    /// set, `[defaults]`), and always for a stage set that already has a
-    /// `range` row, whatever the key now says, so a span in progress can
-    /// always finish (ADR-0012 item 121, X17).
-    ByPolicy(&'a Config),
-    /// Never: `volume rewrite` plans every write with `may_span` unset, so a
-    /// spannable unit it carries is planned whole and is cut, as in 1.6.0, if
-    /// the early warning comes (ADR-0012 item 142, X20).
-    Never,
-}
-
-/// Which staged sets a write takes ([`volume_write_scoped`]), and with them
-/// whether it may plan a set to span ([`Spanning`]).
+/// Which staged sets a write takes ([`volume_write_scoped`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagedScope {
-    /// Every `staged` set: an ordinary `volume write`, spanning by policy.
+    /// Every `staged` set: an ordinary `volume write`.
     Every,
     /// `volume rewrite`'s own stage sets (issue #483), and nothing else that
-    /// happens to be staged. A rewrite never spans (ADR-0012 item 142).
+    /// happens to be staged. A rewrite plans under the fill ceiling and never
+    /// past it (ADR-0012 items 142 and 289).
     Rewrite(Vec<i64>),
     /// `volume write --for-location X` (#493, ADR-0012 item 151): the staged
     /// sets that still have need at X, chosen by `for_location`. Planned by
@@ -9426,12 +9262,11 @@ impl StagedScope {
         }
     }
 
-    /// The write's spanning rule: by policy, except for a rewrite.
-    pub(crate) fn spanning<'c>(&self, config: &'c Config) -> Spanning<'c> {
-        match self {
-            StagedScope::Rewrite(_) => Spanning::Never,
-            StagedScope::Every | StagedScope::ForLocation(_) => Spanning::ByPolicy(config),
-        }
+    /// Whether the write's plan may reach past the fill ceiling to the
+    /// cartridge's nominal capacity (D20): every write but a rewrite's, which
+    /// may hold a unit's only copy (ADR-0012 item 142).
+    pub(crate) fn may_plan_past_the_ceiling(&self) -> bool {
+        !matches!(self, StagedScope::Rewrite(_))
     }
 }
 
@@ -9548,12 +9383,6 @@ pub(crate) struct StagedBatch {
 }
 
 impl StagedBatch {
-    /// The batch holds a set whose write may span: the write is planned by
-    /// [`CapacityBudget::place`] rather than 1.6.0's split.
-    fn spans(&self) -> bool {
-        self.units.iter().any(|u| u.span.is_some())
-    }
-
     fn is_empty(&self) -> bool {
         self.units.is_empty()
     }
@@ -9564,16 +9393,15 @@ impl StagedBatch {
     }
 }
 
-/// One `stage_slices` row of a set whose write may span.
+/// One `stage_slices` row of a staged set.
 struct SpanRow {
     slice: SpanSlice,
     staging_path: Option<String>,
 }
 
-/// How a set whose write may span is planned on this tape (`layout-session.md`
-/// "What the plan works from" and "The plan order"; ADR-0012 items 122 and
-/// 127; X16-X18): every slice of the set is in its span, and the slices this
-/// tape plans are
+/// How a stage set is planned on a tape (`layout-session.md` "What the plan
+/// works from" and "The plan order"; ADR-0012 items 122, 127 and 288; X16-X18):
+/// every slice of the set is in its span, and the slices this tape plans are
 ///
 /// - **an owed run** ([`PlanClass::Owed`]) when the set has a `range` row on
 ///   a sealed volume and slices still owed (a slice is owed while its copies,
@@ -9581,10 +9409,9 @@ struct SpanRow {
 ///   lowest owed slice to the highest, inclusive, so a slice between them
 ///   that is not owed is written too (a volume holds one unbroken run of a
 ///   set, item 122);
-/// - otherwise **the whole set** ([`PlanClass::Spannable`]): a set with no
+/// - otherwise **the whole set** ([`PlanClass::Queued`]): a set with no
 ///   range yet, and a set whose every slice already meets the floor (kept
-///   staged, say by `--keep-staging`), which a write copies again as 1.6.0
-///   copies a kept whole unit again.
+///   staged, say by `--keep-staging`), which a write copies again.
 ///
 /// A slice this tape plans whose staged file was released is refused, never
 /// skipped (X18), naming `volume read-slices --from` (#402's shape).
@@ -9638,7 +9465,7 @@ fn plan_span_set(
     };
     let (class, run) = match (owed.iter().min(), owed.iter().max()) {
         (Some(&first), Some(&last)) => (PlanClass::Owed, Some((first, last))),
-        _ => (PlanClass::Spannable, None),
+        _ => (PlanClass::Queued, None),
     };
     let in_run = |n: i64| run.is_none_or(|(first, last)| (first..=last).contains(&n));
 
@@ -9708,8 +9535,8 @@ fn released_slice_refusal(
         }
     };
     Ok(format!(
-        "refusing to write: \"{}\" v{version} (stage set {stage_set_id}) may span, and this \
-         tape plans its slice {}, whose staged file was released from staging. A range is one \
+        "refusing to write: \"{}\" v{version} (stage set {stage_set_id}) is planned on this \
+         tape with its slice {}, whose staged file was released from staging. A range is one \
          unbroken run of a unit's slices, so the slice is never skipped. Nothing was written \
          and the drive was not touched. Stage it again, then write: {remedy}",
         unit.name, slice.slice_number
@@ -9719,22 +9546,21 @@ fn released_slice_refusal(
 /// Gather the staged batch as `BuildUnit`s, ready for `build::build`, each
 /// with its [`PlanClass`]. `ORDER BY u.name` stays — the alphabetical
 /// (next-fit) ordering ruled in sheet §7 (`docs/design/v2-open-questions.md`);
-/// `build()` never reorders its input, and the plan order of a span tape
+/// `build()` never reorders its input, and the plan order of a tape
 /// (`CapacityBudget::place`) groups the units by class in this order.
 ///
-/// A unit that may not span is today's: its staged slices, the block
-/// 1.6.0 wrote, [`PlanClass::Whole`]. A set whose write may span
-/// ([`Spanning`]) gets every slice of it in [`BuildUnit::span`] and the
-/// slices this tape plans in [`BuildUnit::slices`] ([`plan_span_set`]).
-/// Deciding that resolves each unit's policy, and a unit whose policy cannot
-/// be resolved refuses the write by name (issue #105's rule).
+/// Every set gets every slice of it in [`BuildUnit::span`] and the slices
+/// this tape plans in [`BuildUnit::slices`] ([`plan_span_set`]; ADR-0012 item
+/// 288: every set may continue on the next cartridge). Deciding that
+/// resolves each unit's policy (its copy floor), and a unit whose policy
+/// cannot be resolved refuses the write by name (issue #105's rule).
 ///
 /// `only` narrows the selection to those stage sets (`volume rewrite`, issue
 /// #483); `None` is every `staged` set. The order is the query's own either
 /// way: a scope drops sets from the list, it never reorders it.
 fn find_staged_data(
     conn: &Connection,
-    spanning: Spanning<'_>,
+    config: &Config,
     only: Option<&[i64]>,
 ) -> Result<StagedBatch> {
     let mut stmt = conn.prepare(
@@ -9784,65 +9610,17 @@ fn find_staged_data(
         // §3.5: only a compressed staging names its algorithm.
         let compression = compression.filter(|c| c != "none");
         let stream_bytes = stream_bytes.unwrap_or(0);
-        if let Spanning::ByPolicy(config) = spanning {
-            let unit = queries::get_unit_by_uuid(conn, &uuid)?
-                .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
-            let policy = crate::policy::resolve(conn, config, &unit)?;
-            let has_range: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM writes WHERE stage_set_id = ?1 AND status = 'range')",
-                params![ss_id],
-                |r| r.get(0),
-            )?;
-            if policy.allow_spanning || has_range {
-                let (slices, span, class) = plan_span_set(
-                    conn,
-                    config,
-                    ss_id,
-                    &unit,
-                    policy.copy_floor_base(),
-                    snap_ver,
-                )?;
-                if !slices.is_empty() {
-                    batch.units.push(BuildUnit {
-                        stage_set_id: ss_id,
-                        snapshot_id: snap_id,
-                        unit_name: name,
-                        unit_uuid: uuid,
-                        tenant_id,
-                        tar_version,
-                        stream_bytes,
-                        compression,
-                        snapshot_version: snap_ver,
-                        slices,
-                        span: Some(span),
-                    });
-                    batch.classes.push(class);
-                }
-                continue;
-            }
-        }
-        let mut slice_stmt = conn.prepare(
-            "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted,
-                    staging_path, continues
-             FROM stage_slices WHERE stage_set_id = ?1 AND staging_path IS NOT NULL
-             ORDER BY slice_number",
+        let unit = queries::get_unit_by_uuid(conn, &uuid)?
+            .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
+        let policy = crate::policy::resolve(conn, config, &unit)?;
+        let (slices, span, class) = plan_span_set(
+            conn,
+            config,
+            ss_id,
+            &unit,
+            policy.copy_floor_base(),
+            snap_ver,
         )?;
-        let slices: Vec<BuildSlice> = slice_stmt
-            .query_map(params![ss_id], |row| {
-                let staging_path: String = row.get(6)?;
-                Ok(BuildSlice {
-                    slice_id: row.get(0)?,
-                    slice_number: row.get(1)?,
-                    size_bytes: row.get(2)?,
-                    encrypted_bytes: row.get(3)?,
-                    sha256_plain: row.get(4)?,
-                    sha256_encrypted: row.get(5)?,
-                    staging_path: PathBuf::from(staging_path),
-                    continues: row.get(7)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
         if !slices.is_empty() {
             batch.units.push(BuildUnit {
                 stage_set_id: ss_id,
@@ -9855,9 +9633,9 @@ fn find_staged_data(
                 compression,
                 snapshot_version: snap_ver,
                 slices,
-                span: None,
+                span: Some(span),
             });
-            batch.classes.push(PlanClass::Whole);
+            batch.classes.push(class);
         }
     }
     Ok(batch)
@@ -9988,24 +9766,24 @@ fn announce_staged_selection(label: &str, units: &[BuildUnit]) {
     eprint!("{}", render_staged_selection(label, units));
 }
 
-/// The units `volume write` would put on a tape (every whole staged set, in
-/// its order, each refused as the write refuses it before contact: #402's
-/// check and item 265's), as `build` takes them. Public for the keyless
-/// acceptance suite (`tests/format_v3.rs`), which builds a tape from the
-/// real staging as `volume write` does: with these, [`generate_tables`],
-/// the index and the on-tape `catalog.db`.
+/// The units `volume write` would put on a tape (every staged set, in its
+/// order, each refused as the write refuses it before contact: #402's check
+/// and item 265's), as `build` takes them, planned as a write plans a batch
+/// under the default configuration. Public for the keyless acceptance suite
+/// (`tests/format_v3.rs`), which builds a tape from the real staging as
+/// `volume write` does: with these, [`generate_tables`], the index and the
+/// on-tape `catalog.db`.
 pub fn staged_build_units(conn: &Connection) -> Result<Vec<BuildUnit>> {
-    Ok(checked_staged_units(conn, Spanning::Never, None)?.units)
+    Ok(checked_staged_units(conn, &Config::default(), None)?.units)
 }
 
-/// The units `volume write` would put on a tape when it plans spanning as a
-/// real write does (`Spanning::ByPolicy`): a set that may span gets the run
+/// The units `volume write` would put on a tape under `config`, as a real
+/// write plans them: a set that has a range on an earlier tape gets the run
 /// of slices it still owes, from the `range` rows earlier tapes' confirms
 /// recorded. Public for the heir's suite (`tests/heir_restore.rs`), which
-/// writes a unit across cartridges with tapectl's own planner (T4.12). Until
-/// T5.1 a set spans only where its policy allows it (`allow_spanning`).
+/// writes a unit across cartridges with tapectl's own planner (T4.12).
 pub fn staged_build_units_spanning(conn: &Connection, config: &Config) -> Result<Vec<BuildUnit>> {
-    Ok(checked_staged_units(conn, Spanning::ByPolicy(config), None)?.units)
+    Ok(checked_staged_units(conn, config, None)?.units)
 }
 
 /// Refuse the write, by name, when a selected unit's file table is not in
@@ -10407,8 +10185,8 @@ mod tests {
                      JOIN units u ON u.id = s.unit_id,
                      (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3) n
                      WHERE u.name = 'spanner';
-                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                     SELECT ss.id, ss.snapshot_id, v.id, 'range', 1
+                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT ss.id, ss.snapshot_id, v.id, 'range'
                      FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
                      JOIN units u ON u.id = s.unit_id, volumes v
                      WHERE u.name = 'spanner' AND v.label = 'L6-SRC';
@@ -20792,7 +20570,7 @@ mod tests {
         /// in it, its slice 1 at file 4 written.
         fn range_fixture(label: &str) -> (Connection, i64, crate::tape::fake::FakeTape) {
             let (conn, volume_id, fake) = loaded_fixture(label);
-            conn.execute("UPDATE writes SET status = 'range', may_span = 1", [])
+            conn.execute("UPDATE writes SET status = 'range'", [])
                 .unwrap();
             (conn, volume_id, fake)
         }

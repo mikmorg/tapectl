@@ -102,7 +102,6 @@ CREATE TABLE archive_sets (
     created_at               TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at               TEXT NOT NULL DEFAULT (datetime('now')),
     warehouse_copies         INTEGER,
-    allow_spanning           INTEGER,
     copies_at                TEXT,
     -- The level `compression` is packed at (item 287; D15): NULL for the
     -- algorithm's own default.
@@ -468,16 +467,14 @@ CREATE TABLE writes (
     status              TEXT NOT NULL DEFAULT 'planned'
                         CHECK(status IN ('planned','in_progress','completed',
                                          'failed','aborted','interrupted',
-                                         'cut','range')),
+                                         'range')),
     write_verified      INTEGER NOT NULL DEFAULT 0,
     started_at          TEXT,
     completed_at        TEXT,
     notes               TEXT,
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
     session_dir         TEXT,
-    may_span            INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(stage_set_id, volume_id),
-    CHECK(status <> 'range' OR may_span = 1)
+    UNIQUE(stage_set_id, volume_id)
 );
 
 CREATE INDEX idx_writes_stage_set ON writes(stage_set_id);

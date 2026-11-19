@@ -385,8 +385,7 @@ impl ValidatedLayout {
     }
 }
 
-/// `plan`'s rows: one `writes` row per unit, `may_span` set for a unit whose
-/// write may span ([`BuildUnit::span`]), and one `write_positions` row
+/// `plan`'s rows: one `writes` row per unit and one `write_positions` row
 /// per slice entry, on `tx`. Returns the `(write_id, snapshot_id)` pairs and
 /// the `stage_slice_id -> write_id` map the session carries.
 #[allow(clippy::type_complexity)]
@@ -400,21 +399,10 @@ fn insert_plan_rows(
     let mut write_ids = Vec::with_capacity(units.len());
     let mut slice_write_id = HashMap::new();
     for u in units {
-        // `writes.may_span` (ADR-0012 item 121, migration 039): whether this
-        // write may span is frozen here, from the unit's span, which is what
-        // `build` fenced File 0 and the seal placeholder with (item 124).
-        // Everything after the plan reads the row, never the policy again.
         tx.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir,
-                                 may_span)
-             VALUES (?1, ?2, ?3, 'planned', ?4, ?5)",
-            params![
-                u.stage_set_id,
-                u.snapshot_id,
-                volume_id,
-                session_dir,
-                u.span.is_some()
-            ],
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+             VALUES (?1, ?2, ?3, 'planned', ?4)",
+            params![u.stage_set_id, u.snapshot_id, volume_id, session_dir],
         )?;
         let write_id = tx.last_insert_rowid();
         write_ids.push((write_id, u.snapshot_id));
@@ -828,17 +816,18 @@ pub struct SealedSession {
     pub label: String,
     /// How the tape ended (#420).
     pub ending: Ending,
-    /// The units whose rows the pass made `cut`, by name, in plan order:
-    /// on a short seal, the unit the early warning interrupted and every unit
-    /// planned after it (`layout-session.md`, "Confirm of a short ending").
-    /// Empty on a full seal.
-    pub cut_units: Vec<String>,
+    /// The units planned and not written, by name, in plan order: on a short
+    /// seal, every unit planned after the one the early warning interrupted,
+    /// none of whose slices reached the tape (item 288:
+    /// their rows are deleted, and their slices stay staged). Empty on a full
+    /// seal.
+    pub unwritten_units: Vec<String>,
     /// The units whose rows the pass made `range`, in plan order, each with
-    /// the slices this tape holds (#478, ADR-0012 item 121;
-    /// `layout-session.md`, "A write that may span"): a write that may span
-    /// with some, not all, of its stage set's slices on this tape. On a short
-    /// seal the unit the early warning ended inside; on either ending a run
-    /// that continues a span. Empty when no write of the session may span.
+    /// the slices this tape holds (#478, ADR-0012 items 121 and 288;
+    /// `layout-session.md`, "Confirm of a short ending"): a unit with some,
+    /// not all, of its stage set's slices on this tape. On a short seal the
+    /// unit the early warning ended inside; on either ending a run that
+    /// continues one.
     pub range_units: Vec<RangeUnit>,
 }
 
@@ -870,44 +859,45 @@ impl RangeUnit {
 
 impl SealedSession {
     /// What the operator is told after a short seal (`layout-session.md`,
-    /// "After a short seal"): where the tape ended, the cut units, and the
-    /// command that writes them; from 1.7.0 also each unit the tape ended in
-    /// as a range, with the slices it holds, and what continues it. `None`
-    /// on a full seal. A short seal is a success: the command exits 0.
+    /// "After a short seal"): where the tape ended, each unit it holds as a
+    /// range with the slices it holds, each unit planned and not written, and
+    /// the command that continues them (ADR-0012 item 288). `None` on a full
+    /// seal. A short seal is a success: the command exits 0.
     pub fn short_ending_report(&self) -> Option<String> {
         let Ending::Short { ended_after } = self.ending else {
             return None;
         };
-        let units = if self.cut_units.is_empty() {
-            "none".to_string()
-        } else {
-            self.cut_units.join(", ")
-        };
         let mut report = format!(
             "volume \"{label}\" sealed short: the drive's early warning came in tape file \
              {ended_after}, so the tape ends after it. Every unit wholly before it is on this \
-             tape and counts as a copy. Cut (not on this tape, still staged): {units}. Write \
-             them whole onto another cartridge with an ordinary `tapectl volume write <label>` \
-             (`--init` initialises a new one).",
+             tape and counts as a copy.",
             label = self.label,
         );
         if !self.range_units.is_empty() {
             let ranges: Vec<String> = self.range_units.iter().map(RangeUnit::describe).collect();
             report.push_str(&format!(
-                " Held here as a range, the rest of each still staged: {}. An ordinary \
-                 `tapectl volume write <label>` onto another cartridge of the same generation \
-                 continues it.",
+                " Held here as a range, the rest of each still staged: {}.",
                 ranges.join(", ")
             ));
         }
+        if !self.unwritten_units.is_empty() {
+            report.push_str(&format!(
+                " Planned and not written (still staged): {}.",
+                self.unwritten_units.join(", ")
+            ));
+        }
+        report.push_str(
+            " An ordinary `tapectl volume write <label>` onto another cartridge of the same \
+             generation continues them (`--init` initialises a new one).",
+        );
         Some(report)
     }
 
     /// The `write_completed` event's `details` (#420, #478;
     /// `layout-session.md` "Confirm of a short ending": the event names the
-    /// short ending and the cut units, and from 1.7.0 the range units with
-    /// their slice runs). A short seal: `{"ending": "short", "ended_after":
-    /// K, "cut_units": [..]}`, with `"range_units": [{"unit", "first_slice",
+    /// short ending and the units planned and not written, and the range
+    /// units with their slice runs). A short seal: `{"ending": "short",
+    /// "ended_after": K, "unwritten_units": [..]}`, with `"range_units": [{"unit", "first_slice",
     /// "last_slice"}, ..]` after it when the tape holds a range. A full seal
     /// with a range: `{"ending": "full", "range_units": [..]}`. `None` on a
     /// full seal with no range, whose event is what it was before 1.6.0; a
@@ -929,7 +919,7 @@ impl SealedSession {
             Ending::Short { ended_after } => serde_json::json!({
                 "ending": "short",
                 "ended_after": ended_after,
-                "cut_units": self.cut_units,
+                "unwritten_units": self.unwritten_units,
             }),
             Ending::Full if self.range_units.is_empty() => return None,
             Ending::Full => serde_json::json!({ "ending": "full" }),
@@ -3720,8 +3710,9 @@ impl SealedPending {
     /// Integrity -> 'full', Navigable -> 'quick', ADR-0001), then three
     /// outcomes, not two (ADR-0012's 2026-09-18 amendment, issues
     /// #260/#267): pass => ONE transaction flipping `writes` 'completed'
-    /// (on a short seal 'cut' for a set not wholly on the tape, #420; for a
-    /// write that may span 'range' when some of its set is here, #478),
+    /// ('range' when some, not all, of its set is here, #478 and ADR-0012
+    /// item 288; a set none of which is on the tape, planned and not written,
+    /// has no row after it),
     /// `snapshots` 'current' (a range's only by ADR-0012 item 128),
     /// `volumes` 'sealed'; a mismatch that
     /// `Evidence::proves_medium_bad` => `volumes.observed_condition`
@@ -3792,18 +3783,15 @@ impl SealedPending {
         // `aborted` for a session `adopt_aborted` picked up (#280). The seal
         // transaction below completes a row only if it still reads the same,
         // so an abort that landed during the readback is reported, never
-        // overwritten. Read with it, from the same row: `may_span`, frozen
-        // when the write was planned (ADR-0012 item 121), which decides how
-        // the pass splits the row. A rehydrated session reads it here as a
-        // fresh one does, and never resolves the policy again.
-        let entry_statuses: Vec<(String, bool)> = self
+        // overwritten.
+        let entry_statuses: Vec<String> = self
             .write_ids
             .iter()
             .map(|(write_id, _)| {
                 conn.query_row(
-                    "SELECT status, may_span FROM writes WHERE id = ?1",
+                    "SELECT status FROM writes WHERE id = ?1",
                     params![write_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| r.get(0),
                 )
             })
             .collect::<rusqlite::Result<_>>()?;
@@ -3906,21 +3894,16 @@ impl SealedPending {
                 Ending::Short { ended_after } => ended_after,
                 Ending::Full => planned_seal_position(&self.built.layout)?.saturating_sub(1),
             };
-            let (promoted, cut_units, range_units) =
+            let (promoted, unwritten_units, range_units) =
                 busy::retry(BusyPolicy::DEFAULT, "the seal", || {
                     let tx = busy::immediate_tx(conn)?;
-                    // #420 (`layout-session.md`, "Confirm of a short ending"): on
-                    // a short seal a stage set is on this tape only when every
-                    // slice of it is at or before `ended_after`; every other set
-                    // of the session is `cut` — the one the warning interrupted
-                    // and every one planned after it. `cut` is written here and
-                    // nowhere else in the session.
-                    //
-                    // #478 (ADR-0012 item 121, "A write that may span"): a row
-                    // whose `may_span` is set splits three ways instead, on either
-                    // ending ([`span_split`]): `completed` when the whole set is
-                    // here, `range` when some of it is, `cut` when none is. `range`
-                    // too is written here and nowhere else.
+                    // #478 and ADR-0012 items 121 and 288 (`layout-session.md`,
+                    // "Confirm of a short ending"): every row of the session
+                    // splits three ways, on either ending ([`span_split`]):
+                    // `completed` when the whole set is here, `range` when some
+                    // of it is, and when none is, the row and its positions are
+                    // deleted: the plan listed the set and the seal withdrew
+                    // it. `range` is written here and nowhere else.
                     let unit_name = |snapshot_id: i64| -> Result<String> {
                         Ok(tx
                             .query_row(
@@ -3933,28 +3916,13 @@ impl SealedPending {
                             .unwrap_or_else(|| format!("snapshot {snapshot_id}")))
                     };
                     let mut whole_snapshots: Vec<i64> = Vec::with_capacity(self.write_ids.len());
-                    let mut cut_units: Vec<String> = Vec::new();
+                    let mut unwritten_units: Vec<String> = Vec::new();
                     let mut range_units: Vec<RangeUnit> = Vec::new();
                     let mut range_writes: Vec<(i64, i64)> = Vec::new();
-                    for ((write_id, snapshot_id), (entered, may_span)) in
+                    for ((write_id, snapshot_id), entered) in
                         self.write_ids.iter().zip(&entry_statuses)
                     {
-                        let split = if *may_span {
-                            span_split(&tx, *write_id, counted_through)?
-                        } else {
-                            let whole = match self.ending {
-                                Ending::Full => true,
-                                Ending::Short { ended_after } => {
-                                    last_slice_position(&tx, *write_id)?
-                                        .is_none_or(|last| last <= i64::from(ended_after))
-                                }
-                            };
-                            if whole {
-                                Split::Completed
-                            } else {
-                                Split::Cut
-                            }
-                        };
+                        let split = span_split(&tx, *write_id, counted_through)?;
                         // ADR-0012 2026-10-06 item 24: `write_verified` means
                         // fully read back — an Integrity confirm, never a quick one.
                         // A range is terminal like a completed write (item 121),
@@ -3987,10 +3955,26 @@ impl SealedPending {
                                 params![write_id, entered, tier == Tier::Integrity],
                             )?
                         }
-                        Split::Cut => tx.execute(
-                            "UPDATE writes SET status = 'cut' WHERE id = ?1 AND status = ?2",
-                            params![write_id, entered],
-                        )?,
+                        Split::Unwritten => {
+                            // Nothing of the set counts on this tape: the row
+                            // and its positions go, and the set's slices stay
+                            // staged for the next write (item 288).
+                            let row = tx.query_row(
+                                "SELECT status FROM writes WHERE id = ?1",
+                                params![write_id],
+                                |r| r.get::<_, String>(0),
+                            )
+                            .optional()?;
+                            if row.as_deref() == Some(entered.as_str()) {
+                                tx.execute(
+                                    "DELETE FROM write_positions WHERE write_id = ?1",
+                                    params![write_id],
+                                )?;
+                                tx.execute("DELETE FROM writes WHERE id = ?1", params![write_id])?
+                            } else {
+                                0
+                            }
+                        }
                     };
                         if completed > 0 {
                             match split {
@@ -4006,7 +3990,9 @@ impl SealedPending {
                                     });
                                     range_writes.push((*write_id, *snapshot_id));
                                 }
-                                Split::Cut => cut_units.push(unit_name(*snapshot_id)?),
+                                Split::Unwritten => {
+                                    unwritten_units.push(unit_name(*snapshot_id)?)
+                                }
                             }
                         }
                         if completed == 0 {
@@ -4060,8 +4046,8 @@ impl SealedPending {
                     // rather than guessing, and so nothing is logged when the
                     // guard matches no row.
                     // Only a set this tape holds whole, or a range that makes its
-                    // set whole on sealed volumes, promotes its snapshot: a cut
-                    // one's version is not written yet (#420).
+                    // set whole on sealed volumes, promotes its snapshot: a set
+                    // not written has no copy yet (#420).
                     let mut promoted: Vec<(i64, String, String, i64)> = Vec::new();
                     for snapshot_id in &whole_snapshots {
                         let before: Option<(String, String, i64)> = tx
@@ -4125,7 +4111,7 @@ impl SealedPending {
                         )));
                     }
                     tx.commit()?;
-                    Ok((promoted, cut_units, range_units))
+                    Ok((promoted, unwritten_units, range_units))
                 })?;
 
             // Audit rows are emitted AFTER the commit, deliberately, and a
@@ -4163,7 +4149,7 @@ impl SealedPending {
                 volume_id: self.volume_id,
                 label: self.built.layout.label.clone(),
                 ending: self.ending,
-                cut_units,
+                unwritten_units,
                 range_units,
             };
             if let Some(report) = sealed.short_ending_report() {
@@ -4912,8 +4898,8 @@ fn record_quarantine(
 /// a 5-second lock wait would leave the rows claiming a state the tape is
 /// not in. Idempotent, so safe to retry.
 ///
-/// Never a `cut` or `range` row, and never TO either (#420, ADR-0012 items
-/// 112 and 121): both are terminal and are written only inside a passing
+/// Never a `range` row, and never TO one (ADR-0012 items 121 and 288): it is
+/// terminal and written only inside a passing
 /// confirm's transaction, so an Inconclusive confirm's `interrupted` (or any
 /// later mark) leaves them as they are.
 ///
@@ -4935,14 +4921,14 @@ fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Res
 /// commits ([`record_quarantine`]'s).
 fn mark_writes_on(tx: &Connection, write_ids: &[(i64, i64)], status: &str) -> Result<()> {
     debug_assert!(
-        status != "cut" && status != "range",
-        "cut and range are written only by a passing confirm"
+        status != "range",
+        "range is written only by a passing confirm"
     );
     for (write_id, _) in write_ids {
-        // `cut` (#420) and `range` (#478, ADR-0012 item 121) are terminal
-        // outcomes of a passing confirm: nothing after it moves them.
+        // `range` (#478, ADR-0012 item 121) is a terminal outcome of a
+        // passing confirm: nothing after it moves it.
         tx.execute(
-            "UPDATE writes SET status = ?1 WHERE id = ?2 AND status NOT IN ('cut', 'range')",
+            "UPDATE writes SET status = ?1 WHERE id = ?2 AND status <> 'range'",
             params![status, write_id],
         )?;
     }
@@ -5017,38 +5003,26 @@ fn planned_seal_position(layout: &super::layout_model::Layout) -> Result<u32> {
         .ok_or_else(|| TapectlError::Other("layout has no seal_marker entry".into()))
 }
 
-/// The Layout position of the last slice of `write_id`'s stage set, from its
-/// `write_positions` rows (`plan` inserts one per slice, at its Layout
-/// position). `None` for a set with no slice.
-fn last_slice_position(conn: &Connection, write_id: i64) -> Result<Option<i64>> {
-    Ok(conn.query_row(
-        "SELECT MAX(CAST(position AS INTEGER)) FROM write_positions WHERE write_id = ?1",
-        params![write_id],
-        |r| r.get(0),
-    )?)
-}
-
 /// What a passing confirm records for one `writes` row (#420, #478).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Split {
     /// The tape holds the stage set whole: a copy of it.
     Completed,
     /// The tape holds some, not all, of the set's slices: the run from
-    /// `first_slice` to `last_slice` (ADR-0012 item 121; only a write that
-    /// may span).
+    /// `first_slice` to `last_slice` (ADR-0012 items 121 and 288).
     Range { first_slice: i64, last_slice: i64 },
-    /// Nothing of the set counts on this tape.
-    Cut,
+    /// Nothing of the set counts on this tape: planned and not written.
+    Unwritten,
 }
 
-/// The three-way split of a write that may span (#478; ADR-0012 items 121
-/// and 128, `layout-session.md` "A write that may span",
-/// `volume-format-v2.md` §4.4): of every slice of `write_id`'s stage set, 1
+/// The three-way split of every row of a write (#478; ADR-0012 items 121,
+/// 128 and 288, `layout-session.md` "Confirm of a short ending",
+/// `volume-format-v3.md` §5.3): of every slice of `write_id`'s stage set, 1
 /// to N, those `written` on this volume at a position at or before
 /// `ended_after` (K on a short seal, M-1 on a full one). All N: `completed`
 /// (item 93's middle tape). At least one: `range`, the run from the lowest
-/// to the highest of them. None: `cut`. A set with no slice rows has every
-/// slice here, as the 1.6.0 rule reads it.
+/// to the highest of them. None: [`Split::Unwritten`]. A set with no slice
+/// rows has every slice here.
 pub(crate) fn span_split(conn: &Connection, write_id: i64, ended_after: u32) -> Result<Split> {
     let (slices, held, first, last): (i64, i64, Option<i64>, Option<i64>) = conn.query_row(
         "SELECT COUNT(DISTINCT sl.id), COUNT(DISTINCT wp.stage_slice_id),
@@ -5069,7 +5043,7 @@ pub(crate) fn span_split(conn: &Connection, write_id: i64, ended_after: u32) -> 
             first_slice,
             last_slice,
         },
-        _ => Split::Cut,
+        _ => Split::Unwritten,
     })
 }
 

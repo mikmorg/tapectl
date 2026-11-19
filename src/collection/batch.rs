@@ -24,8 +24,9 @@ use crate::staging::clean::CleanReport;
 pub use crate::staging::release::CopyProgress;
 use crate::staging::release::ReleaseOutcome;
 use crate::staging::view::SourceView;
+use crate::volume::layout_model::{PlanClass, PlanItem};
 
-use super::selector::Batch;
+use super::selector::{Batch, BatchRoom, PendingUnit};
 
 /// Which copies of a `collection run` its confirm reads back in full
 /// (ADR-0012 2026-10-07 item 31). The default confirm is quick (the front
@@ -65,6 +66,10 @@ pub struct BatchExecutionReport {
     /// deliberate no-op in the loop above and must not be counted as
     /// "staged" here.
     pub units_staged: usize,
+    /// The units, by name, that the run staged in rounds after the batch the
+    /// selector chose, because the staged ones packed smaller than their
+    /// estimate and the plan did not yet pass its bound (ADR-0012 item 289).
+    pub rounds_staged: Vec<String>,
     pub copies_written: usize,
     /// The whole-set release of the batch's covered units (ADR-0012 item
     /// 217, per unit): `Some` when it ran — over every unit of the batch
@@ -221,6 +226,53 @@ pub fn execute_batch(
     )
 }
 
+/// What `collection run` may add to a batch after staging it (ADR-0012 item
+/// 289, "the batch after staging"): the selector works from sizes estimated
+/// before staging, and the write's plan from the staged sizes, so a batch of
+/// units that pack would end by its plan short of the warning. After the
+/// batch is staged the run asks the plan, and while the plan has no set that
+/// passes its bound and a pending unit remains it stages the next one and
+/// asks again.
+#[derive(Debug, Clone, Copy)]
+pub struct Rounds<'a> {
+    /// The destination's whole room, with nothing subtracted for what is
+    /// staged ([`super::plan::DestinationBudget::fill_bytes`] and its plan
+    /// bound): the plan is asked of the staged bytes themselves.
+    pub room: BatchRoom,
+    /// The pending units after this batch, in the selector's order.
+    pub following: &'a [PendingUnit],
+}
+
+/// [`execute_batch_rounds`] with no rounds: the batch the selector chose
+/// and nothing more.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_batch_with(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    lib: &CollectionConfig,
+    batch: &Batch,
+    copy_labels: &[String],
+    drive: &dyn RunDrive,
+    confirm: RunConfirm,
+    move_to: Option<&str>,
+    assume_yes: bool,
+) -> Result<BatchExecutionReport> {
+    execute_batch_rounds(
+        conn,
+        paths,
+        config,
+        lib,
+        batch,
+        copy_labels,
+        drive,
+        confirm,
+        move_to,
+        assume_yes,
+        None,
+    )
+}
+
 /// Execute one batch: stage every unit once, write one session per
 /// destination label, move the tape when `--move-to` asks, then release
 /// staging.
@@ -306,7 +358,7 @@ pub fn execute_batch(
 /// asked per copy ([`RunConfirm::full_for_copy`]; ADR-0012, 2026-10-06 item
 /// 1 and 2026-10-07 item 31).
 #[allow(clippy::too_many_arguments)]
-pub fn execute_batch_with(
+pub fn execute_batch_rounds(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
@@ -317,6 +369,7 @@ pub fn execute_batch_with(
     confirm: RunConfirm,
     move_to: Option<&str>,
     assume_yes: bool,
+    rounds: Option<Rounds<'_>>,
 ) -> Result<BatchExecutionReport> {
     if batch.units.is_empty() {
         return Err(TapectlError::Other(
@@ -335,7 +388,54 @@ pub fn execute_batch_with(
     // batch's own (name-ordered) sequence — from a snapshot of the root when
     // the collection has a `snapshot_command` (see [`stage_batch`]), released
     // before any tape is touched.
-    let staged = stage_batch(conn, paths, config, lib, batch, assume_yes)?;
+    let mut staged = stage_batch(conn, paths, config, lib, batch, assume_yes)?;
+
+    // ADR-0012 item 289: the plan is asked of the staged bytes, and while it
+    // has no set that passes its bound and a pending unit remains, the next
+    // unit is staged and the plan asked again. The run then writes once.
+    let mut rounds_staged: Vec<String> = Vec::new();
+    if let Some(rounds) = rounds {
+        let budget = rounds.room.budget();
+        for next in rounds.following {
+            let total = super::plan::already_staged_on_tape_bytes(conn)?;
+            let plan = budget.place(
+                0,
+                &[PlanItem {
+                    class: PlanClass::Queued,
+                    bytes: total,
+                }],
+            );
+            if plan.tail().is_some() {
+                break;
+            }
+            let one = Batch {
+                units: vec![next.clone()],
+                total_bytes: next.size_bytes,
+                padded_bytes: next.size_bytes,
+            };
+            let more = stage_batch(conn, paths, config, lib, &one, assume_yes)?;
+            if more.units_staged > 0 {
+                rounds_staged.push(next.name.clone());
+            }
+            staged.units_staged += more.units_staged;
+            staged.snapshot_path = staged.snapshot_path.or(more.snapshot_path);
+            staged.release_warning = staged.release_warning.or(more.release_warning);
+        }
+    }
+    let released_batch = if rounds_staged.is_empty() {
+        batch.clone()
+    } else {
+        let mut all = batch.clone();
+        all.units.extend(
+            rounds
+                .map(|r| r.following)
+                .unwrap_or_default()
+                .iter()
+                .filter(|u| rounds_staged.contains(&u.name))
+                .cloned(),
+        );
+        all
+    };
 
     // Session per copy — sequential, abort-on-first-failure (see doc
     // comment above). Never forced: each `label` is "already `volume
@@ -367,10 +467,12 @@ pub fn execute_batch_with(
     // Release staging only when this batch's copy just sealed is enough —
     // see `release_if_covered`'s own doc comment for the gate and the #248
     // scoping it applies.
-    let (released, release_warning) = release_after_copies(conn, config, batch, copy_labels);
+    let (released, release_warning) =
+        release_after_copies(conn, config, &released_batch, copy_labels);
 
     Ok(BatchExecutionReport {
         units_staged: staged.units_staged,
+        rounds_staged,
         copies_written: copy_labels.len(),
         cleaned: released.cleaned,
         released_units: released.released_units,

@@ -196,7 +196,6 @@ mod tests {
             preserve_xattrs: None,
             preserve_acls: None,
             dirty_on_metadata_change: Some(true),
-            allow_spanning: None,
             copies_at: None,
         });
         let conn = crate::db::open_memory().unwrap();

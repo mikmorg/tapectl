@@ -4,7 +4,7 @@
 //!
 //! `clean_staging` stays policy-free (ADR-0012's #244 amendment): it knows
 //! which stage sets are safe to delete (a completed write, and every other
-//! row completed or `cut`), not which are *worth* deleting. This module is
+//! row completed), not which are *worth* deleting. This module is
 //! the gate in front of it. Two
 //! callers share it: `collection run`'s batch (via
 //! `collection::batch::release_if_covered`) and `volume write` / `volume
@@ -26,12 +26,11 @@
 //! all-or-nothing rule wrote two covered units a third time, held back by a
 //! third unit that was short.
 //!
-//! A `cut` write (1.6.0, issue #420; ADR-0012 item 112) is no write here: a
-//! stage set planned past where its tape sealed short. It never counts as a
-//! copy (`copy_count_expr` counts only `completed` writes), so a cut unit is
-//! short and keeps its staging; and it never holds the staging either
-//! (`clean_staging`'s guard skips it), so once the version has a `completed`
-//! write elsewhere it is released by the same rule as any other.
+//! A stage set the tape was planned to take and did not (ADR-0012 item 288)
+//! has no row. It never counts as a copy (`copy_count_expr` counts only
+//! `completed` writes), so its unit is short and keeps its staging; and once
+//! the version has a `completed` write elsewhere it is released by the same
+//! rule as any other.
 //!
 //! A stage set that holds a `range` (1.7.0, issue #478; ADR-0012 items 85,
 //! 121 and 129) is released slice by slice instead, each slice once its
@@ -156,8 +155,8 @@ pub struct ReleaseOutcome {
 ///
 /// The release itself is `clean_staging(force = false, CleanScope::Units)`
 /// over the covered units, so its own guard still applies and is what keeps
-/// a set that has no completed write — or any write that is neither
-/// `completed` nor `cut` — staged. This function adds the policy question
+/// a set that has no completed write — or any write that is not
+/// `completed` (or a `range`) — staged. This function adds the policy question
 /// that guard cannot answer (issue #229's second half): after one copy of a
 /// unit whose floor is 2, the guard passes vacuously (one `writes` row,
 /// `completed`) and would release the only cheap route to the second copy.
@@ -552,7 +551,7 @@ pub fn under_copied_units(
 /// or `volume resume` of that volume has just put on tape, and so the units
 /// [`release_if_covered`] must judge together. A `range` write (1.7.0, issue
 /// #478; ADR-0012 item 121) put some of its set's slices on the tape, and
-/// those slices may now have their copies (item 129). A `cut` one put none.
+/// those slices may now have their copies (item 129).
 ///
 /// This is a lookup, not a decision: it says which units the gate looks at
 /// and which stage sets `clean_staging` is allowed to consider, never
@@ -772,8 +771,8 @@ pub(crate) mod fixtures {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-             SELECT ?1, ?2, id, 'range', 1 FROM volumes WHERE label = ?3",
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT ?1, ?2, id, 'range' FROM volumes WHERE label = ?3",
             params![staged.stage_set_id, staged.snapshot_id, label],
         )
         .unwrap();
@@ -1464,40 +1463,31 @@ mod tests {
         );
     }
 
-    /// A set with no `range` row releases exactly as in 1.6.0, whether or
-    /// not its write was planned spannable: whole, every path cleared, no
+    /// A set with no `range` row releases whole: every path cleared, no
     /// `released_at` set, nothing in `slices`.
     #[test]
-    fn a_set_with_no_range_row_releases_exactly_as_in_1_6_0() {
-        for may_span in [0, 1] {
-            let conn = db::open_memory().unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let config = config(dir.path(), 1);
-            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
-            let (s, files) = staged_span(&conn, alpha, 1, "current", dir.path(), 3);
-            add_write(&conn, &s, "V-ONE", "sealed", "completed");
-            conn.execute("UPDATE writes SET may_span = ?1", params![may_span])
-                .unwrap();
+    fn a_set_with_no_range_row_releases_whole() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 1);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let (s, files) = staged_span(&conn, alpha, 1, "current", dir.path(), 3);
+        add_write(&conn, &s, "V-ONE", "sealed", "completed");
 
-            let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
-            let cleaned = out.cleaned.expect("released");
-            assert_eq!(
-                (cleaned.sets_cleaned, cleaned.files_removed),
-                (1, 3),
-                "may_span={may_span}"
-            );
-            assert!(out.slices.slices_released.is_empty() && out.slices.files_removed == 0);
-            assert_eq!(files_exist(&files), [false; 3]);
-            let (paths, released): (i64, i64) = conn
-                .query_row(
-                    "SELECT COUNT(staging_path), COUNT(released_at) FROM stage_slices",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!((paths, released), (0, 0), "may_span={may_span}");
-            assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
-        }
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+        let cleaned = out.cleaned.expect("released");
+        assert_eq!((cleaned.sets_cleaned, cleaned.files_removed), (1, 3));
+        assert!(out.slices.slices_released.is_empty() && out.slices.files_removed == 0);
+        assert_eq!(files_exist(&files), [false; 3]);
+        let (paths, released): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(staging_path), COUNT(released_at) FROM stage_slices",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((paths, released), (0, 0));
+        assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
     }
 
     /// `unit_ids_written_to` counts a `range` write as a write to the tape,

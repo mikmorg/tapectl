@@ -1054,7 +1054,6 @@ mod tests {
                 compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec!["*.tmp".into(), "Thumbs.db".into()],
             },
@@ -1136,7 +1135,6 @@ mod tests {
                 compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec![".cache/".into()],
             },
@@ -1181,15 +1179,14 @@ mod tests {
         );
     }
 
-    /// #478 (ADR-0012 item 82): the dotfile model gained `allow_spanning`,
-    /// and an existing unit's dotfile that does not set it keeps its
+    /// An existing unit's dotfile keeps its
     /// fingerprint across the rewrite every unit command does (`unit tag`,
     /// `unit rename`, `tenant reassign`: `read_dotfile` then
     /// `write_dotfile`): the same walk, the same paths and sizes, and the
     /// dotfile's own bytes unchanged. (Its mtime moves with any rewrite; the
     /// dotfile is not content either way, ADR-0012 item 24.)
     #[test]
-    fn an_unset_allow_spanning_leaves_an_existing_dotfiles_fingerprint_unchanged() {
+    fn a_rewrite_leaves_an_existing_dotfiles_fingerprint_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(".tapectl-unit.toml");
         let existing = "[unit]\nuuid = \"u-1\"\nname = \"fixture\"\n\
@@ -1205,7 +1202,6 @@ mod tests {
         let before = sized(walk_fingerprint(tmp.path(), &[]).unwrap());
 
         let df = crate::unit::dotfile::read_dotfile(&path).unwrap();
-        assert!(df.allow_spanning.is_none());
         crate::unit::dotfile::write_dotfile(&path, &df).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
@@ -1292,7 +1288,6 @@ mod tests {
                 compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec!["*.tmp".into()],
             },

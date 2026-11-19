@@ -227,379 +227,94 @@ pub struct CapacityBudget {
     pub span_tail_from: Option<i32>,
 }
 
-/// How a plan's units sit against its [`CapacityBudget`] (ADR-0012 item
-/// 113), as counts over the caller's unit order: `units[..committed]` are
-/// the committed plan, `units[committed..planned]` are planned past the fill
-/// ceiling, and `units[planned..]` reach beyond the plan bound (without one,
-/// beyond the fill ceiling) and cannot be on this plan. A unit is never
-/// split: one that crosses the fill ceiling is wholly past it, and one that
-/// crosses the bound is wholly beyond it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlanSplit {
-    pub committed: usize,
-    pub planned: usize,
-    pub units: usize,
-}
-
-impl PlanSplit {
-    /// The units planned past the fill ceiling: "the tape may end before
-    /// them". Always empty without a plan bound.
-    pub fn past_ceiling(&self) -> std::ops::Range<usize> {
-        self.committed..self.planned
-    }
-
-    /// The units no plan within this budget can hold: a Layout holding any
-    /// of them fails [`Layout::validate`].
-    pub fn beyond_bound(&self) -> std::ops::Range<usize> {
-        self.planned..self.units
-    }
-
-    /// Every unit fits the plan.
-    pub fn fits(&self) -> bool {
-        self.planned == self.units
-    }
-}
-
 impl CapacityBudget {
-    /// Split units, in the caller's order, at the fill ceiling and at the
-    /// plan bound ([`PlanSplit`]). `fixed_bytes` is every file of the plan
-    /// that is not a data slice, block-padded (Files 0-3, the envelopes and
-    /// their backups, the seal); `unit_bytes` is each unit's slices,
-    /// block-padded. A unit is committed while the plan's end through it
-    /// plus the reserve fits the fill budget; after the first unit that does
-    /// not, every later unit is past the ceiling even if a smaller one would
-    /// fit (whole units in the caller's order, never reordered). A unit is
-    /// planned while the plan's end through it stays within the bound.
-    ///
-    /// Every unit here is a whole unit: this is [`Self::place`] of
-    /// [`PlanClass::Whole`] items, which keeps 1.6.0's split exactly.
-    pub fn split(&self, fixed_bytes: u64, unit_bytes: &[u64]) -> PlanSplit {
-        let (committed, planned) = self.whole_run(fixed_bytes, unit_bytes.iter().copied(), true);
-        PlanSplit {
-            committed,
-            planned,
-            units: unit_bytes.len(),
-        }
-    }
-
-    /// 1.6.0's rule for whole units in the caller's order from `start` (the
-    /// plan's end before them): how many are committed under the fill
-    /// ceiling, and how many are planned in all. Past the ceiling a unit is
-    /// planned only when `past_ceiling` allows it and the plan bound holds
-    /// it (items 99 and 113); the first unit not planned ends the run.
-    fn whole_run(
-        &self,
-        start: u64,
-        unit_bytes: impl IntoIterator<Item = u64>,
-        past_ceiling: bool,
-    ) -> (usize, usize) {
-        let mut end = start;
-        let mut committed = 0;
-        let mut planned = 0;
-        let mut ceiling_crossed = false;
-        for bytes in unit_bytes {
-            end = end.saturating_add(bytes);
-            if !ceiling_crossed && end.saturating_add(self.reserve_bytes) <= self.available_bytes {
-                committed += 1;
-                planned += 1;
-                continue;
-            }
-            ceiling_crossed = true;
-            match self.plan_bound_bytes {
-                Some(bound) if past_ceiling && end <= bound => planned += 1,
-                _ => break,
-            }
-        }
-        (committed, planned)
-    }
-
-    /// Where a spannable unit (an owed run or a fresh set) whose slices end
-    /// the plan at `end` sits: under the fill ceiling, past it within the
-    /// plan bound, or across the bound, planned to its end (item 123). `None`
-    /// when it passes the fill ceiling on a drive with no plan bound: the
-    /// write is refused, naming `post_warning_bytes` (item 123).
-    fn span_placed(&self, end: u64) -> Option<Placed> {
+    /// Where a set whose slices end the plan at `end` sits: under the fill
+    /// ceiling, past it within the plan bound, or across the bound or the
+    /// ceiling, which makes it the plan's [`Placed::Tail`] (items 123, 288
+    /// and 289).
+    fn placed_at(&self, end: u64) -> Placed {
         if end.saturating_add(self.reserve_bytes) <= self.available_bytes {
-            return Some(Placed::Committed);
+            return Placed::Committed;
         }
         match self.plan_bound_bytes {
-            None => None,
-            Some(bound) if end <= bound => Some(Placed::PastCeiling),
-            Some(_) => Some(Placed::Tail),
+            Some(bound) if end <= bound => Placed::PastCeiling,
+            _ => Placed::Tail,
         }
     }
 
-    /// The plan order of one tape (`layout-session.md` "Spanning"; ADR-0012
-    /// items 83, 94, 95, 99, 113, 122, 123 and 147), on block-padded sizes
-    /// alone. `fixed_bytes` is as for [`Self::split`]; `items` are the units
-    /// in the caller's order, each with its [`PlanClass`]. The plan is, in
-    /// order:
+    /// The plan order of one tape (`layout-session.md` "The plan order";
+    /// ADR-0012 items 122, 123, 288 and 289, D20), on block-padded sizes
+    /// alone. `fixed_bytes` is every file of the plan that is not a data
+    /// slice, block-padded (Files 0-3, the envelopes and their backups, the
+    /// seal); `items` are the stage sets in the caller's order, each with
+    /// its [`PlanClass`]. The plan is, in order:
     ///
-    /// 1. **Owed runs**, in the caller's order (item 122).
-    /// 2. **Whole units**, in the caller's order and never reordered, by
-    ///    1.6.0's rule: committed up to the fill ceiling and, when no
-    ///    spannable set is queued, planned past it within item 113's bound
-    ///    (items 83, 95 and 99: with one queued, whole units stop at the
-    ///    ceiling and the room past it is the set's).
-    /// 3. **Spannable sets**, in the caller's order, last (items 83 and 95).
-    ///    The first one that crosses the plan bound is the [`Placed::Tail`],
-    ///    planned to its end, and nothing is planned after it (item 123,
-    ///    X13). A set larger than one tape (more than the bound less
-    ///    `fixed_bytes`: the early warning estimated at the nominal capacity,
-    ///    X11) starts right after the owed runs instead (items 94 and 147),
-    ///    and every whole unit is deferred. They fill in after its tail on
-    ///    its last tape, where the set's owed run comes first and whole units
-    ///    follow within item 113's bound (item 123). No later start is
-    ///    computed: 1.7.0 started such a set as late as it could while
-    ///    touching the fewest tapes, which by X11's estimate ended it at its
-    ///    last tape's bound and left no slack for an early warning (#492).
+    /// 1. **Owed runs**, in the caller's order (item 122): a set in
+    ///    progress lays its owed slices first, as one unbroken run in slice
+    ///    order.
+    /// 2. **The queue**, in the caller's order. There is no second class and
+    ///    nothing is deferred behind another set.
     ///
-    /// An owed run may be the tail too: one that crosses the bound is
-    /// planned to its end, and everything after it is deferred.
-    ///
-    /// **Deferred and refused** (X12, as the coordinator amended it on
-    /// 2026-10-23). The baseline is 1.6.0's plan of the whole units alone. A
-    /// whole unit it cannot hold is [`Placed::Refused`] as in 1.6.0
-    /// ([`LayoutError::PlanBoundExceeded`] with a bound,
-    /// [`LayoutError::CapacityExceeded`] without one): nothing displaced it,
-    /// so the plan is never trimmed for it. A whole unit the baseline holds
-    /// but an owed run or a spannable set pushes out is [`Placed::Deferred`]:
-    /// it is not on this tape and waits, staged, for a later one. That covers
-    /// a set larger than one tape starting right after the owed runs (items
-    /// 94 and 147) and a queued set that fits one tape taking the room past
-    /// the ceiling (items 83 and 95).
-    /// A spannable unit that passes the fill ceiling on a drive with no plan
-    /// bound is refused by [`LayoutError::SpanNeedsPostWarningBytes`].
-    ///
-    /// Every unit [`PlanClass::Whole`] gives exactly [`Self::split`].
+    /// **The bound** (D20, item 289). On a drive that declares
+    /// `post_warning_bytes` ([`Self::plan_bound_bytes`]) sets are added
+    /// while the plan's end is at or below the cartridge's nominal capacity;
+    /// the one that carries the plan past it is the [`Placed::Tail`],
+    /// planned to its end, and no set is planned after it (the early warning
+    /// ends it on the tape). An owed run is held to the same rule. On a
+    /// drive without the key, sets are added while the plan's end is at or
+    /// below the fill ceiling (with the reserve); the set that carries it
+    /// past is the [`Placed::Tail`] again, and the plan ends at the last
+    /// slice of it that fits, a prefix of its slices that the caller finds
+    /// from [`Placement::tail_room`]. Nothing is refused for the missing
+    /// key.
     pub fn place(&self, fixed_bytes: u64, items: &[PlanItem]) -> Placement {
-        let of = |class: PlanClass| -> Vec<usize> {
-            (0..items.len())
-                .filter(|&i| items[i].class == class)
-                .collect()
-        };
-        let (owed, whole, spannable) = (
-            of(PlanClass::Owed),
-            of(PlanClass::Whole),
-            of(PlanClass::Spannable),
-        );
-        let bytes = |ids: &[usize]| -> u64 { ids.iter().map(|&i| items[i].bytes).sum() };
-        let sizes = |ids: &[usize]| -> Vec<u64> { ids.iter().map(|&i| items[i].bytes).collect() };
+        let owed = (0..items.len()).filter(|&i| items[i].class == PlanClass::Owed);
+        let queued = (0..items.len()).filter(|&i| items[i].class == PlanClass::Queued);
         let mut placed = vec![Placed::Deferred; items.len()];
-        let mut errors = Vec::new();
-
-        // X12's baseline: 1.6.0's plan of the whole units alone. What it
-        // cannot hold is refused whatever else is queued.
-        let (_, held) = self.whole_run(fixed_bytes, sizes(&whole), true);
-        if held < whole.len() {
-            for &i in &whole[held..] {
-                placed[i] = Placed::Refused;
-            }
-            let needed = fixed_bytes.saturating_add(bytes(&whole));
-            errors.push(match self.plan_bound_bytes {
-                Some(bound) => LayoutError::PlanBoundExceeded { needed, bound },
-                None => LayoutError::CapacityExceeded {
-                    needed,
-                    reserve: self.reserve_bytes,
-                    available: self.available_bytes,
-                },
-            });
-        }
-        let held_whole = &whole[..held];
-
-        // 1. Owed runs, from the plan's fixed files.
-        let mut end = fixed_bytes;
         let mut order = Vec::new();
-        let mut tail = None;
-        let mut refused_span = false;
-        for &i in &owed {
-            if tail.is_some() || refused_span {
-                continue;
-            }
+        let mut tail_room = None;
+        let mut end = fixed_bytes;
+        for i in owed.chain(queued) {
+            let before = end;
             end = end.saturating_add(items[i].bytes);
-            placed[i] = self.place_span(end, &mut errors, &mut refused_span);
+            let at = self.placed_at(end);
+            placed[i] = at;
             order.push(i);
-            if placed[i] == Placed::Tail {
-                tail = Some(i);
+            if at == Placed::Tail {
+                if self.plan_bound_bytes.is_none() {
+                    tail_room = Some(
+                        self.available_bytes
+                            .saturating_sub(self.reserve_bytes)
+                            .saturating_sub(before),
+                    );
+                }
+                break;
             }
         }
-        let owed_end = end;
-        let open = tail.is_none() && !refused_span;
-
-        // 2. Whole units after them, stopped at the fill ceiling when a
-        // spannable set is queued (item 83). Nothing is planned after a tail.
-        let (committed, mut kept) = if open {
-            self.whole_run(owed_end, sizes(held_whole), spannable.is_empty())
-        } else {
-            (0, 0)
-        };
-
-        // 3. Spannable sets. A tail larger than one tape starts right after
-        // the owed runs instead (items 94 and 147): every whole unit waits,
-        // to fill in after its tail on its last tape.
-        let mut spans = self.place_spans(
-            &spannable,
-            items,
-            owed_end.saturating_add(bytes(&held_whole[..kept])),
-            !open,
-        );
-        if let Some(t) = spans.tail {
-            if kept > 0 && self.larger_than_one_tape(fixed_bytes, items[t].bytes) {
-                kept = 0;
-                spans = self.place_spans(&spannable, items, owed_end, false);
-            }
-        }
-        // What the baseline holds and this plan does not, an owed run or a
-        // spannable set pushed out: deferred (X12).
-        for (n, &i) in held_whole.iter().enumerate() {
-            placed[i] = if n < committed.min(kept) {
-                Placed::Committed
-            } else if n < kept {
-                Placed::PastCeiling
-            } else {
-                Placed::Deferred
-            };
-        }
-        order.extend(&held_whole[..kept]);
-        for (i, p) in spans.placed {
-            placed[i] = p;
-            if p != Placed::Deferred && p != Placed::Refused {
-                order.push(i);
-            }
-        }
-        errors.extend(spans.errors);
         Placement {
             order,
             placed,
-            errors,
+            tail_room,
         }
-    }
-
-    /// X11's room per tape for a span: the plan bound less `fixed_bytes`,
-    /// the early warning estimated at the nominal capacity. `None` without
-    /// a bound (nothing spans, item 123) or with no room under it.
-    fn span_room(&self, fixed_bytes: u64) -> Option<u64> {
-        self.plan_bound_bytes
-            .map(|bound| bound.saturating_sub(fixed_bytes))
-            .filter(|&room| room > 0)
-    }
-
-    /// A spannable set of `bytes` is larger than one tape by X11's estimate
-    /// (item 94): [`Self::place`] starts it right after the owed runs (item
-    /// 147).
-    fn larger_than_one_tape(&self, fixed_bytes: u64, bytes: u64) -> bool {
-        self.span_room(fixed_bytes).is_some_and(|room| bytes > room)
-    }
-
-    /// Item 147's last tape, by X11's estimate: when `placement`'s tail is a
-    /// spannable set larger than one tape, the bytes of it left for its last
-    /// tape. There its owed run comes first and the whole units it displaced
-    /// follow within item 113's bound (item 123). Its first tape is taken to
-    /// hold the plan bound less where it starts there, and each later tape
-    /// the bound less `fixed_bytes`, as [`Self::place`] decides it is larger
-    /// than one tape. `None` for any other placement: no tail, an owed run
-    /// as the tail, or a set that fits one tape (item 95).
-    pub fn span_last_run(
-        &self,
-        fixed_bytes: u64,
-        items: &[PlanItem],
-        placement: &Placement,
-    ) -> Option<u64> {
-        let t = placement.tail()?;
-        let (bound, room) = (self.plan_bound_bytes?, self.span_room(fixed_bytes)?);
-        let set = items[t].bytes;
-        if items[t].class != PlanClass::Spannable || set <= room {
-            return None;
-        }
-        let start = placement
-            .order
-            .iter()
-            .take_while(|&&i| i != t)
-            .fold(fixed_bytes, |end, &i| end.saturating_add(items[i].bytes));
-        let rest = set.saturating_sub(bound.saturating_sub(start));
-        let later_tapes = rest.div_ceil(room).max(1);
-        Some(rest - (later_tapes - 1) * room)
-    }
-
-    /// One spannable unit ending the plan at `end` ([`Self::span_placed`]);
-    /// a refusal is recorded once, for the first unit that needs the key.
-    fn place_span(&self, end: u64, errors: &mut Vec<LayoutError>, refused: &mut bool) -> Placed {
-        match self.span_placed(end) {
-            Some(p) => p,
-            None => {
-                errors.push(LayoutError::SpanNeedsPostWarningBytes {
-                    needed: end,
-                    reserve: self.reserve_bytes,
-                    available: self.available_bytes,
-                });
-                *refused = true;
-                Placed::Refused
-            }
-        }
-    }
-
-    /// Step 3 of [`Self::place`]: the spannable sets in the caller's order
-    /// from `start`. After the tail, or when nothing may follow what came
-    /// before (`closed`), every set is deferred (X13); after a refusal, every
-    /// set is refused with it.
-    fn place_spans(
-        &self,
-        spannable: &[usize],
-        items: &[PlanItem],
-        start: u64,
-        closed: bool,
-    ) -> SpanRun {
-        let mut run = SpanRun {
-            placed: Vec::with_capacity(spannable.len()),
-            tail: None,
-            errors: Vec::new(),
-        };
-        let mut end = start;
-        let mut refused = false;
-        for &i in spannable {
-            let p = if closed || run.tail.is_some() {
-                Placed::Deferred
-            } else if refused {
-                Placed::Refused
-            } else {
-                end = end.saturating_add(items[i].bytes);
-                self.place_span(end, &mut run.errors, &mut refused)
-            };
-            if p == Placed::Tail {
-                run.tail = Some(i);
-            }
-            run.placed.push((i, p));
-        }
-        run
     }
 }
 
-/// What [`CapacityBudget::place`]'s step 3 decided.
-struct SpanRun {
-    placed: Vec<(usize, Placed)>,
-    tail: Option<usize>,
-    errors: Vec<LayoutError>,
-}
-
-/// What a unit is to the plan order (`layout-session.md` "Spanning";
-/// ADR-0012 items 83, 94, 95 and 122). The caller knows which a unit is: the
-/// catalog's rows say whether a spannable set already has a range, and a
-/// Layout knows neither.
+/// What a stage set is to the plan order (`layout-session.md` "The plan
+/// order"; ADR-0012 items 122 and 288). The caller knows which a set is: the
+/// catalog's rows say whether it has a range on a sealed volume and slices
+/// still owed, and a Layout knows neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanClass {
-    /// A span in progress: a spannable set with a `range` row on a sealed
-    /// volume and slices still owed. Its owed run, from its lowest owed
-    /// slice to its highest, goes first (item 122).
+    /// A span in progress: a set with a `range` row on a sealed volume and
+    /// slices still owed. Its owed run, from its lowest owed slice to its
+    /// highest, goes first (item 122).
     Owed,
-    /// A unit that may not span, as in 1.6.0 (items 99 and 113).
-    Whole,
-    /// A spannable set with no range yet: last (items 83 and 95), or right
-    /// after the owed runs when it is larger than one tape (items 94 and
-    /// 147).
-    Spannable,
+    /// Every other set the write takes, with its whole slice list, in the
+    /// order the write takes them (item 288: no set is whole or cut).
+    Queued,
 }
 
-/// One unit of a plan for [`CapacityBudget::place`].
+/// One set of a plan for [`CapacityBudget::place`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanItem {
     pub class: PlanClass,
@@ -607,56 +322,52 @@ pub struct PlanItem {
     pub bytes: u64,
 }
 
-/// Where [`CapacityBudget::place`] put one unit.
+/// Where [`CapacityBudget::place`] put one set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placed {
     /// Within the fill ceiling, with the reserve: the committed plan.
     Committed,
-    /// Past the fill ceiling and within the plan bound (item 113): the tape
-    /// may end before it.
+    /// Past the fill ceiling and within the plan bound (item 113): the
+    /// early warning, not the plan, may end the tape inside it.
     PastCeiling,
-    /// The span's tail: the spannable unit that crosses the plan bound,
-    /// planned to its end; the early warning ends its range (items 84 and
-    /// 123). At most one, and the last unit of the plan.
+    /// The set that carries the plan past its bound (items 123 and 289):
+    /// with the key, planned to its end, and the early warning ends its
+    /// range; without it, planned up to the fill ceiling
+    /// ([`Placement::tail_room`]). At most one, and the last of the plan.
     Tail,
-    /// Not on this tape: a whole unit an owed run or a spannable set pushes
-    /// out (items 83, 94, 95 and 147; X12 as amended), or a unit queued after
-    /// the tail (X13). It stays staged and waits for a later tape.
+    /// Not on this tape: queued after the tail. It stays staged and waits
+    /// for a later tape.
     Deferred,
-    /// The plan cannot hold it, and is refused ([`Placement::errors`]).
-    Refused,
 }
 
 /// The plan order of one tape ([`CapacityBudget::place`]).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Placement {
-    /// The units this tape plans, as indices into the caller's units, in
-    /// tape order: owed runs, whole units, spannable sets. No deferred or
-    /// refused unit is in it.
+    /// The sets this tape plans, as indices into the caller's items, in
+    /// tape order: owed runs, then the queue. No deferred set is in it.
     pub order: Vec<usize>,
-    /// Where each unit went, by the caller's index.
+    /// Where each set went, by the caller's index.
     pub placed: Vec<Placed>,
-    /// Why this plan cannot be written; empty when it can.
-    pub errors: Vec<LayoutError>,
+    /// On a drive with no plan bound: the bytes, block-padded, that the
+    /// tail's slices may take before the fill ceiling (less the reserve). The
+    /// tail is planned as the longest prefix of its slices that fits in it,
+    /// and is deferred when not even the first does. `None` with a bound, and
+    /// when there is no tail.
+    pub tail_room: Option<u64>,
 }
 
 impl Placement {
-    /// The plan can be written: nothing refused.
-    pub fn is_ok(&self) -> bool {
-        self.errors.is_empty()
-    }
-
-    /// The unit planned past the bound to its end, if any (item 123).
+    /// The set planned past the bound to its end, if any (item 123).
     pub fn tail(&self) -> Option<usize> {
         self.placed.iter().position(|&p| p == Placed::Tail)
     }
 
-    /// The units left for a later tape, in the caller's order (X12, X13).
+    /// The sets left for a later tape, in the caller's order.
     pub fn deferred(&self) -> Vec<usize> {
         self.with(Placed::Deferred)
     }
 
-    /// The units placed `p`, in the caller's order.
+    /// The sets placed `p`, in the caller's order.
     pub fn with(&self, p: Placed) -> Vec<usize> {
         (0..self.placed.len())
             .filter(|&i| self.placed[i] == p)
@@ -770,9 +481,8 @@ pub fn capacity_refusal_note(
         .then(|| {
             format!(
                 "the fill ceiling is {}% of this volume's {} capacity (ADR-0012). Write less \
-                 to this volume — a unit that does not allow spanning (allow_spanning) is never \
-                 split — or, if you know this cartridge can take it, raise the ceiling for this \
-                 write with --fill-ceiling",
+                 to this volume, or, if you know this cartridge can take it, raise the ceiling \
+                 for this write with --fill-ceiling",
                 fill_ceiling_percent(fill_ceiling),
                 crate::util::format_bytes_decimal(
                     i64::try_from(capacity_bytes).unwrap_or(i64::MAX)
@@ -826,38 +536,13 @@ pub enum LayoutError {
     #[error(
         "capacity exceeded: the layout needs {needed} bytes on tape, {over} bytes ({over_h}) \
          over the {bound} bytes of this volume's nominal capacity, the most a plan may reach \
-         past the fill ceiling (ADR-0012 item 113). A unit that does not allow spanning \
-         (allow_spanning) is never split: write fewer units to this volume",
+         past the fill ceiling (ADR-0012 item 113)",
         over = needed.saturating_sub(*bound),
         over_h = crate::util::format_bytes_binary(
             i64::try_from(needed.saturating_sub(*bound)).unwrap_or(i64::MAX)
         ),
     )]
     PlanBoundExceeded { needed: u64, bound: u64 },
-    /// ADR-0012 item 123 (`volume-format-v2.md` §4.3; `layout-session.md`
-    /// "Spanning", Refusals): a unit that allows spanning would pass the fill
-    /// ceiling on a drive that declares no `post_warning_bytes`. A spannable
-    /// set is planned past the ceiling, to the drive's early warning, only
-    /// with that key; without it the write is refused, naming the key. Not
-    /// [`Self::CapacityExceeded`]: the remedy is the drive's key, which
-    /// [`capacity_refusal_note`] does not name.
-    #[error(
-        "capacity exceeded: a unit that allows spanning would pass the fill ceiling: the layout \
-         needs {needed} bytes on tape plus a {reserve}-byte end-of-tape reserve, {over} bytes \
-         ({over_h}) over the {available} bytes this volume may be filled to. A unit that allows \
-         spanning is planned past the fill ceiling, to the drive's early warning, only when the \
-         drive declares post_warning_bytes in its [[backends.lto]] entry of config.toml \
-         (ADR-0012 item 123)",
-        over = (needed + reserve).saturating_sub(*available),
-        over_h = crate::util::format_bytes_binary(
-            i64::try_from((needed + reserve).saturating_sub(*available)).unwrap_or(i64::MAX)
-        ),
-    )]
-    SpanNeedsPostWarningBytes {
-        needed: u64,
-        reserve: u64,
-        available: u64,
-    },
     #[error("staged slice file missing: {0}")]
     SliceFileMissing(PathBuf),
     #[error("staged slice size mismatch for {path}: recorded {expected} bytes, on-disk {actual}")]
@@ -1051,15 +736,15 @@ impl Layout {
         self.capacity_errors_with_tail(available_bytes, self.budget.span_tail_from)
     }
 
-    /// [`Self::capacity_errors_against`] for a plan whose last unit is a
-    /// span's tail ([`Placed::Tail`], ADR-0012 item 123): `tail_from` is the
+    /// [`Self::capacity_errors_against`] for a plan whose last unit is the
+    /// plan's tail ([`Placed::Tail`], ADR-0012 items 123 and 289): `tail_from` is the
     /// position of the tail's first slice, and every slice from there to the
     /// seal is the tail. Only the tail may pass the plan bound: the rest of
     /// the plan, the seal included, must end within it, which puts the
     /// tail's start before the bound (it crosses the bound, it does not lie
     /// beyond it). Today's committed gate still applies (the files that are
     /// not slices, plus the reserve, within the fill budget). Without a plan
-    /// bound a tail is refused by name ([`LayoutError::SpanNeedsPostWarningBytes`]).
+    /// bound there is no tail: the plan fits the fill budget or is refused.
     /// `None`, or a position after every slice, is 1.6.0's gate exactly.
     /// [`Self::capacity_errors_against`] passes the budget's own
     /// [`CapacityBudget::span_tail_from`].
@@ -1075,26 +760,17 @@ impl Layout {
         if needed + reserve <= available_bytes {
             return Vec::new();
         }
+        // Without a plan bound the plan stops at the fill ceiling, a tail
+        // trimmed to the slices that fit it (item 289, D20): nothing passes.
+        let Some(bound) = self.budget.plan_bound_bytes else {
+            return vec![LayoutError::CapacityExceeded {
+                needed,
+                reserve,
+                available: available_bytes,
+            }];
+        };
         let tail = tail_from.map_or(0, |from| self.slice_bytes_from(from));
         let before_tail = needed - tail;
-        let Some(bound) = self.budget.plan_bound_bytes else {
-            let mut errs = Vec::new();
-            if tail == 0 || before_tail + reserve > available_bytes {
-                errs.push(LayoutError::CapacityExceeded {
-                    needed: before_tail,
-                    reserve,
-                    available: available_bytes,
-                });
-            }
-            if tail > 0 {
-                errs.push(LayoutError::SpanNeedsPostWarningBytes {
-                    needed,
-                    reserve,
-                    available: available_bytes,
-                });
-            }
-            return errs;
-        };
         let mut errs = Vec::new();
         let fixed = self.fixed_on_tape_bytes();
         if fixed + reserve > available_bytes {
@@ -1134,16 +810,7 @@ impl Layout {
             .sum()
     }
 
-    /// Split units, each given as its slices' `stage_slice_id`s in the
-    /// caller's order, against this Layout's budget (ADR-0012 item 113;
-    /// [`CapacityBudget::split`]). A slice id the Layout does not hold, or an
-    /// unsized slice, counts nothing.
-    pub fn split_units(&self, unit_slice_ids: &[Vec<i64>]) -> PlanSplit {
-        self.budget
-            .split(self.fixed_on_tape_bytes(), &self.unit_bytes(unit_slice_ids))
-    }
-
-    /// [`CapacityBudget::place`] of units given as for [`Self::split_units`],
+    /// [`CapacityBudget::place`] of units given as each one's slices' `stage_slice_id`s in the caller's order,
     /// each with its [`PlanClass`] (`classes[i]` is `unit_slice_ids[i]`'s),
     /// against this Layout's budget and its files that are not slices. The
     /// placement is of these sizes in the plan order, whatever order the
@@ -1176,27 +843,6 @@ impl Layout {
             .iter()
             .map(|ids| ids.iter().filter_map(|id| padded.get(id)).sum())
             .collect()
-    }
-
-    /// The data slices of the units planned past the fill ceiling, in
-    /// position order (ADR-0012 item 113): the entries of which the session
-    /// and the operator text say "planned past the fill ceiling; the tape
-    /// may end before them". Empty without a plan bound, and when every
-    /// unit is committed. Units as in [`Self::split_units`].
-    pub fn entries_past_ceiling(&self, unit_slice_ids: &[Vec<i64>]) -> Vec<&LayoutEntry> {
-        let split = self.split_units(unit_slice_ids);
-        let ids: HashSet<i64> = unit_slice_ids[split.past_ceiling()]
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
-        let mut past: Vec<&LayoutEntry> = self
-            .entries
-            .iter()
-            .filter(|e| matches!(e.kind, ZoneKind::Slice { stage_slice_id } if ids.contains(&stage_slice_id)))
-            .collect();
-        past.sort_by_key(|e| e.position);
-        past
     }
 
     fn check_staged_slices(&self, slice_check: SliceCheck, errs: &mut Vec<LayoutError>) {

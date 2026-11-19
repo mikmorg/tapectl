@@ -3480,17 +3480,16 @@ mod tests {
                       (3, 1, 3, 10, 20, 'p3', 'e3'), (4, 1, 4, 10, 20, 'p4', 'e4');
              INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
                VALUES (1, 'V1', 'lto', 'p', 1000, 'sealed'), (2, 'V2', 'lto', 'p', 1000, 'sealed'),
-                      (3, 'V3', 'lto', 'p', 1000, 'sealed'), (4, 'V4', 'lto', 'p', 1000, 'sealed');
-             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, may_span)
-               VALUES (1, 1, 1, 1, 'range', 1), (2, 1, 1, 2, 'completed', 1),
-                      (3, 1, 1, 3, 'range', 1), (4, 1, 1, 4, 'cut', 1);
+                      (3, 'V3', 'lto', 'p', 1000, 'sealed');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status)
+               VALUES (1, 1, 1, 1, 'range'), (2, 1, 1, 2, 'completed'),
+                      (3, 1, 1, 3, 'range');
              INSERT INTO write_positions (write_id, stage_slice_id, position, status)
                VALUES (1, 1, '10', 'written'), (1, 2, '11', 'written'),
                       (1, 3, '12', 'pending'), (1, 4, '13', 'pending'),
                       (2, 1, '8', 'written'), (2, 2, '9', 'written'),
                       (2, 3, '10', 'written'), (2, 4, '11', 'written'),
-                      (3, 3, '4', 'written'), (3, 4, '5', 'written'),
-                      (4, 1, '20', 'pending');",
+                      (3, 3, '4', 'written'), (3, 4, '5', 'written');",
         )
         .unwrap();
         let mut stmt = conn.prepare(sql).expect("the query runs on this schema");

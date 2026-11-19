@@ -158,15 +158,6 @@ fn write_warned(h: &mut Home, label: &str, warn: Warn) {
     crate::cli::volume::release_staging_after_write(&h.conn, &h.config, label, false);
 }
 
-/// The unit's own policy lets it span (the operator's edit of its dotfile,
-/// made before the first snapshot).
-fn let_it_span(h: &Home, unit: &str) {
-    let dotfile = h.source(unit).join(".tapectl-unit.toml");
-    let mut d = crate::unit::dotfile::read_dotfile(&dotfile).unwrap();
-    d.allow_spanning = Some(true);
-    crate::unit::dotfile::write_dotfile(&dotfile, &d).unwrap();
-}
-
 // ── the units and the tapes ──
 
 /// What the unit holds: files of about 40 KB (one to a slice at 64K), a long
@@ -183,7 +174,6 @@ fn tree() -> Vec<Item> {
 fn staged(labels: &[&str], items: &[Item], min_copies: i32) -> Home {
     let mut h = Home::new("64K", None, min_copies);
     h.unit(TENANT, UNIT, items);
-    let_it_span(&h, UNIT);
     h.stage(UNIT);
     for label in labels {
         h.volume(label);
@@ -1053,7 +1043,6 @@ fn restore_volume_restores_the_whole_units_and_the_unit_held_across_cartridges()
     let mut h = Home::new("64K", None, 1);
     h.unit(TENANT, OTHER, &files("o", 2, 30_000, 5));
     h.unit(TENANT, UNIT, &tree());
-    let_it_span(&h, UNIT);
     h.stage(OTHER);
     h.stage(UNIT);
     h.volume(A);

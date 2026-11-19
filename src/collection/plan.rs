@@ -66,41 +66,25 @@ const BLOCK_SIZE: u64 = 512 * 1024;
 /// dropped — every caller of this function (`plan_for_collection`,
 /// `plan_for_run`) must keep reporting it and exit non-zero.
 ///
-/// `limit` says where `packing` came from, for the refusal of a unit too big
-/// for one tape (issues #391, #395: the refusal names the overage and the
-/// per-generation limit, ADR-0012 2026-10-06 items 16 and 17).
-///
-/// `packing` (ADR-0012 item 113): without a plan bound, batches are packed
-/// against the room under the fill ceiling, exactly as before 1.6.0. With one
-/// (the drive declares `post_warning_bytes`), they are packed against the room
-/// to the plan bound — the cartridge's whole nominal capacity — in the same
-/// next-fit order, so the units after the ceiling are whole units appended in
-/// order ([`placement`] names them); and a unit must still fit under
-/// the fill ceiling of an empty tape alone, which is `stage create`'s own
-/// limit, so a batch never holds a unit `stage create` would refuse.
-///
-/// **Spanning** (1.7.0, #478; ADR-0012 items 82, 83, 85, 94, 95 and 123).
-/// Every pending unit's policy is resolved, for `allow_spanning`; a unit
-/// whose own dotfile `[policy]` cannot be resolved is refused, as
-/// `--policy-aware` refuses it. The units that allow spanning are packed by
-/// [`selector::plan_batches_spanning`]: not held to one tape (nor to the
-/// empty tape's fill ceiling above), last in their batch, and refused only
-/// when larger than the staging area (`stage create`'s rule, over
-/// `staging::staging_total_bytes`) or, on a drive with no plan bound, when
-/// over the fill ceiling (item 123). With no unit that allows spanning the
-/// plan is 1.6.0's.
+/// `packing` (ADR-0012 items 113, 288 and 289, D19): batches are packed
+/// against the plan's bound, the cartridge's whole nominal capacity when the
+/// drive declares `post_warning_bytes` and the fill ceiling when it does not,
+/// in next-fit order. A unit is added while the plan's end is at or below the
+/// bound, and the unit that carries the plan past it is the batch's last
+/// ([`selector::plan_batches`]). No unit is held to one tape: every unit
+/// continues on the next cartridge at the early warning. The one limit is the
+/// staging area (`stage create`'s rule, item 85, over
+/// `staging::staging_total_bytes`): a unit larger than it is refused by name.
 ///
 /// `staged` (issue #475): the destination budget, when the caller has one
 /// (`collection run`). Staged data that will ride along to the tape comes out
-/// of `packing` before packing, so a unit too big for what is LEFT, though it
-/// fits an empty tape, is refused as that — staged data to write first — and
-/// not as a unit that "can never be batched".
+/// of `packing` before packing.
 ///
 /// `policy_aware` (ADR-0012 2026-10-07 item 26, issue #144): order the
 /// selection so the units whose audit findings a write would resolve —
 /// [`coverage::Shortfall`], the audit's own `copy_count` and
 /// `location_presence` predicates — are packed first
-/// (`selector::plan_batches_prioritised`). A never-archived unit always
+/// (`selector::plan_batches`' `prioritised`). A never-archived unit always
 /// falls short; a changed unit whose current version already meets its
 /// policy does not, and waits behind the ones that do. A unit whose own
 /// dotfile `[policy]` cannot be resolved for that ranking is refused, not
@@ -110,8 +94,6 @@ fn batches_for_budget(
     config: &Config,
     lib: &CollectionConfig,
     packing: &Packing,
-    limit: &str,
-    staged: Option<&DestinationBudget>,
     policy_aware: bool,
 ) -> Result<Packed> {
     let mut scan = super::fingerprint::pending_units_for_collection(
@@ -121,15 +103,13 @@ fn batches_for_budget(
     )?;
 
     // Each pending unit's policy is resolved here, which the scan above
-    // never did (it reads only `[excludes]`): for `allow_spanning` (#478)
-    // and, with `--policy-aware`, for the ranking. A unit whose OWN dotfile
-    // fails to resolve — an invalid `[policy]` value — is refused here like
-    // any other dotfile fault (ADR-0012 2026-09-22: it refuses that unit,
-    // not the collection) and left out of every batch. Only the dotfile
-    // layer: a `[defaults]` or archive-set fault is not one unit's, and
-    // still aborts the plan.
+    // never did (it reads only `[excludes]`), for the ranking `--policy-aware`
+    // asks. A unit whose OWN dotfile fails to resolve — an invalid `[policy]`
+    // value — is refused here like any other dotfile fault (ADR-0012
+    // 2026-09-22: it refuses that unit, not the collection) and left out of
+    // every batch. Only the dotfile layer: a `[defaults]` or archive-set fault
+    // is not one unit's, and still aborts the plan.
     let mut prioritised = HashSet::new();
-    let mut spannable = HashSet::new();
     let mut kept = Vec::with_capacity(scan.pending.len());
     for p in std::mem::take(&mut scan.pending) {
         let resolved = match crate::policy::resolve(conn, config, &p.unit) {
@@ -152,9 +132,6 @@ fn batches_for_budget(
             }
             Err(e) => return Err(e),
         };
-        if resolved.allow_spanning {
-            spannable.insert(p.unit.name.clone());
-        }
         if policy_aware
             && coverage::shortfall(conn, config, p.unit.id, &p.unit.status, &resolved)?.any()
         {
@@ -170,57 +147,27 @@ fn batches_for_budget(
         })
         .collect();
     let first = policy_aware.then_some(&prioritised);
-
-    if let Some(past) = &packing.past_ceiling {
-        // ADR-0012 item 113: a unit alone must fit under an empty tape's
-        // fill ceiling, the limit `stage create` refuses at. The selector
-        // run at that figure is the refusal (in the selector's own order
-        // and words); its batches are not used. A unit that allows spanning
-        // is not held to it (item 94).
-        let whole: Vec<selector::PendingUnit> = synthetic
-            .iter()
-            .filter(|u| !spannable.contains(&u.name))
-            .cloned()
-            .collect();
-        let alone = match first {
-            Some(first) => {
-                selector::plan_batches_prioritised(whole, first, past.unit_limit, BLOCK_SIZE)
-            }
-            None => selector::plan_batches(whole, past.unit_limit, BLOCK_SIZE),
-        };
-        if let Err(oversized) = alone {
-            return Err(TapectlError::Other(oversized_refusal(
-                &lib.name,
-                &oversized,
-                &past.unit_limit_describe,
-                None,
-            )));
-        }
-    }
     let room = BatchRoom {
         fill: packing.fill,
-        bound: packing.past_ceiling.as_ref().map(|past| past.room),
+        bound: packing.bound,
     };
-    let spanning = selector::Spanning {
-        staging_total: if spannable.is_empty() {
-            None
-        } else {
-            staging_total(config)
-        },
-        units: spannable,
-    };
-    let batches = selector::plan_batches_spanning(synthetic, first, &spanning, room, BLOCK_SIZE)
-        .map_err(|refused| selector_refusal(&lib.name, config, &refused, limit, staged))?;
+    let batches = selector::plan_batches(
+        synthetic,
+        first,
+        staging_total(config),
+        room,
+        BLOCK_SIZE,
+    )
+    .map_err(|larger| staging_refusal(&lib.name, config, &larger))?;
     Ok(Packed {
         batches,
         refused: scan.refused,
-        spannable: spanning.units,
         room,
     })
 }
 
-/// The staging filesystem's total size, which a unit that allows spanning
-/// must fit (ADR-0012 items 85 and 94, ruling X14): `stage create`'s figure
+/// The staging filesystem's total size, which a unit must fit (ADR-0012
+/// items 85 and 288, ruling X14): `stage create`'s figure
 /// (`staging::staging_total_bytes`). One that cannot be read is said on
 /// stderr and refuses nothing, as there.
 fn staging_total(config: &Config) -> Option<u64> {
@@ -230,7 +177,7 @@ fn staging_total(config: &Config) -> Option<u64> {
         Err(e) => {
             crate::progress::stderr_println(&format!(
                 "warning: could not read the size of staging directory {} ({e}); planning the \
-                 units that allow spanning without checking that they fit the staging area",
+                 units without checking that they fit the staging area",
                 dir.display()
             ));
             None
@@ -247,9 +194,6 @@ pub struct Packed {
     /// Units refused for their own dotfile (issue #285), its `[policy]`
     /// included: never in a batch.
     pub refused: Vec<RefusedUnit>,
-    /// The pending units that allow spanning (ADR-0012 item 82), by name.
-    /// Empty when none does, and then the batches are 1.6.0's.
-    pub spannable: HashSet<String>,
     /// What each batch was packed against.
     pub room: BatchRoom,
 }
@@ -257,138 +201,96 @@ pub struct Packed {
 impl Packed {
     /// Where the units of `batch` sit on its tape ([`placement`]).
     pub fn placement(&self, batch: &Batch) -> BatchPlacement {
-        placement(batch, self.room, &self.spannable)
+        placement(batch, self.room)
     }
 }
 
-/// What [`batches_for_budget`] packs one batch against (ADR-0012 item 113).
+/// What [`batches_for_budget`] packs one batch against (ADR-0012 items 113
+/// and 289).
 #[derive(Debug, Clone)]
 struct Packing {
-    /// The room under the fill ceiling: what a batch is packed against
-    /// without a plan bound, exactly as before 1.6.0.
+    /// The room under the fill ceiling: the bound of a batch without a plan
+    /// bound.
     fill: u64,
-    /// With a plan bound (the drive declares `post_warning_bytes`).
-    past_ceiling: Option<PastCeilingPacking>,
+    /// With a plan bound (the drive declares `post_warning_bytes`): the room
+    /// to it.
+    bound: Option<u64>,
 }
 
 impl Packing {
     /// Packing with no plan bound: `fill` is all a batch may take.
     #[cfg(test)]
     fn under_ceiling(fill: u64) -> Self {
-        Packing {
-            fill,
-            past_ceiling: None,
-        }
+        Packing { fill, bound: None }
     }
 }
 
-#[derive(Debug, Clone)]
-struct PastCeilingPacking {
-    /// The room to the plan bound: what a batch is packed against.
-    room: u64,
-    /// The most one unit may be: an empty tape's room under the fill ceiling.
-    unit_limit: u64,
-    /// Where `unit_limit` came from, for the refusal of a unit above it.
-    unit_limit_describe: String,
-}
-
 /// Where the units of one batch sit on its tape: the per-tape plan order
-/// ([`CapacityBudget::place`], `layout-session.md` "Spanning"), over the room
-/// the batch was packed against, by unit name in the batch's order. Empty
-/// when the batch fits under the fill ceiling, as every batch does without a
-/// plan bound.
+/// ([`CapacityBudget::place`], `layout-session.md` "The plan order"), over
+/// the room the batch was packed against, by unit name in the batch's order.
+/// Empty when the batch fits under the fill ceiling.
 ///
 /// [`CapacityBudget::place`]: crate::volume::layout_model::CapacityBudget::place
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BatchPlacement {
-    /// Units that may not span planned past the fill ceiling (ADR-0012 item
-    /// 113): the tape may end before them, and one it ends before is cut and
-    /// stays staged for the next cartridge.
+    /// Units planned past the fill ceiling within the plan bound (ADR-0012
+    /// item 113): last on the tape, and if the tape ends inside one it
+    /// continues on the next cartridge (items 288 and 289).
     pub past_ceiling: Vec<String>,
-    /// Units that allow spanning planned past the fill ceiling within the
-    /// plan bound (items 83 and 95): last on the tape, and if the tape ends
-    /// inside one it continues on the next cartridge.
-    pub may_span: Vec<String>,
-    /// The unit that allows spanning and crosses the plan bound (items 84,
-    /// 94 and 123): last on its batch's tape, cut by the drive's early
-    /// warning, and continued on the next cartridge. One larger than one
-    /// tape starts its batch's first tape instead (item 147).
-    pub spans: Option<String>,
-    /// The whole units the unit that spans displaces when it is larger than
-    /// one tape (items 94 and 147): written after its tail on its last tape,
-    /// in the batch's order ([`selector::after_the_tail`]). Those past that
-    /// tape's fill ceiling are in `past_ceiling` too. Empty otherwise.
-    pub after_tail: Vec<String>,
+    /// The unit that carries the plan past its bound (items 123, 288 and
+    /// 289): the batch's last. With the drive's `post_warning_bytes` it is
+    /// planned to its end and the drive's early warning ends the tape inside
+    /// it; without the key the plan stops at the last of its slices that fits
+    /// the fill ceiling. Either way the rest of it continues on the next
+    /// cartridge. `None` when the batch fits.
+    pub continues: Option<String>,
 }
 
-/// [`BatchPlacement`] of `batch`, packed against `room`, whose units named
-/// in `spannable` allow spanning. With none, its `past_ceiling` is every unit
-/// after the first whose running block-padded total passes `room.fill` (the
-/// batch's room under the ceiling: [`TapeBudget::bytes`] for `collection
-/// plan`, [`DestinationBudget::bytes`] for `collection run`), in the batch's
-/// order — whole units, never reordered, as 1.6.0 names them. When a unit
-/// larger than one tape spans, the whole units it displaces are placed on
-/// its last tape after its tail, as the selector packed them (item 147).
-pub fn placement(batch: &Batch, room: BatchRoom, spannable: &HashSet<String>) -> BatchPlacement {
+/// [`BatchPlacement`] of `batch`, packed against `room`. With none past the
+/// fill ceiling both are empty: `past_ceiling` is every unit after the first
+/// whose running block-padded total passes `room.fill` (the batch's room
+/// under the ceiling: [`TapeBudget::bytes`] for `collection plan`,
+/// [`DestinationBudget::bytes`] for `collection run`), in the batch's order.
+pub fn placement(batch: &Batch, room: BatchRoom) -> BatchPlacement {
     let items: Vec<PlanItem> = batch
         .units
         .iter()
         .map(|u| PlanItem {
-            class: if spannable.contains(&u.name) {
-                PlanClass::Spannable
-            } else {
-                PlanClass::Whole
-            },
+            class: PlanClass::Queued,
             bytes: pad_to_blocks(u.size_bytes, BLOCK_SIZE),
         })
         .collect();
-    let budget = room.budget();
-    let first = budget.place(0, &items);
-    let mut placed = first.placed.clone();
-    let mut after_tail = vec![false; items.len()];
-    for (i, last) in selector::after_the_tail(&budget, &items, &first).unwrap_or_default() {
-        placed[i] = last;
-        after_tail[i] = true;
-    }
+    let placed = room.budget().place(0, &items).placed;
     let mut out = BatchPlacement::default();
-    for (((unit, item), at), after) in batch.units.iter().zip(&items).zip(&placed).zip(after_tail) {
-        if after {
-            out.after_tail.push(unit.name.clone());
-        }
-        match (item.class, at) {
-            (PlanClass::Whole, Placed::PastCeiling) => out.past_ceiling.push(unit.name.clone()),
-            (PlanClass::Spannable, Placed::PastCeiling) => out.may_span.push(unit.name.clone()),
-            (PlanClass::Spannable, Placed::Tail) => out.spans = Some(unit.name.clone()),
+    for (unit, at) in batch.units.iter().zip(&placed) {
+        match at {
+            Placed::PastCeiling => out.past_ceiling.push(unit.name.clone()),
+            Placed::Tail => out.continues = Some(unit.name.clone()),
             _ => {}
         }
     }
     out
 }
 
-/// The refusal for everything [`selector::plan_batches_spanning`] refused:
-/// the units too big for one tape ([`oversized_refusal`]), then the units
-/// that allow spanning and are larger than the staging area, in
-/// `stage create`'s words (ADR-0012 items 85 and 94).
-fn selector_refusal(
+/// The refusal for the units [`selector::plan_batches`] found larger than
+/// the staging area, in `stage create`'s words (ADR-0012 items 85 and 288).
+fn staging_refusal(
     collection: &str,
     config: &Config,
-    refused: &selector::Refused,
-    limit: &str,
-    staged: Option<&DestinationBudget>,
+    larger: &[selector::LargerThanStaging],
 ) -> TapectlError {
     let bin = |b: u64| crate::util::format_bytes_binary(i64::try_from(b).unwrap_or(i64::MAX));
-    let larger = refused
-        .larger_than_staging
+    let units = larger
         .iter()
         .map(|u| {
             format!(
-                "unit \"{}\" allows spanning (allow_spanning) and is {} bytes ({}), larger than \
-                 the staging area: the filesystem of staging directory {} is {} bytes ({}) in \
-                 all. A unit that spans cartridges is staged whole before its first tape is \
-                 written, and its slices are released only as each tape gives them their copies \
-                 (ADR-0012 items 85 and 94), so it cannot be staged here and can never be \
-                 batched. It can be once the staging area is larger than the unit: grow that \
-                 filesystem, or point `[staging] directory` in config.toml at a larger one.",
+                "unit \"{}\" is {} bytes ({}), larger than the staging area: the filesystem \
+                 of staging directory {} is {} bytes ({}) in all. A unit is staged whole \
+                 before its first tape is written, and its slices are released only as each \
+                 tape gives them their copies (ADR-0012 items 85 and 129), so it cannot be \
+                 staged here and can never be batched. It can be once the staging area is \
+                 larger than the unit: grow that filesystem, or point `[staging] directory` \
+                 in config.toml at a larger one.",
                 u.name,
                 u.size_bytes,
                 bin(u.size_bytes),
@@ -399,93 +301,7 @@ fn selector_refusal(
         })
         .collect::<Vec<_>>()
         .join(" ");
-    TapectlError::Other(match (refused.oversized.is_empty(), larger.is_empty()) {
-        (false, true) => oversized_refusal(collection, &refused.oversized, limit, staged),
-        (false, false) => format!(
-            "{}. Also, {larger}",
-            oversized_refusal(collection, &refused.oversized, limit, staged)
-        ),
-        (true, _) => format!("collection \"{collection}\": {larger}"),
-    })
-}
-
-/// The refusal for units the selector found too big for the budget it was
-/// given (issues #391, #395, #475).
-///
-/// A unit larger than the whole tape can never be batched unless it allows
-/// spanning: a unit that does not is never split across tapes (ADR-0012
-/// items 17 and 82), and `--fill-ceiling` raises the ceiling only up to the
-/// whole cartridge. But `collection run`'s budget is what is
-/// LEFT after the staged data that will ride along (issue #232 item 1), and
-/// when that data fills the destination the budget saturates to zero and
-/// every unit reads as oversized. A unit that fits `budget + staged` does
-/// fit an empty tape; the true statement is that the staged data has to be
-/// written first, so that is what is said (issue #475).
-fn oversized_refusal(
-    collection: &str,
-    oversized: &[selector::OversizedUnit],
-    limit: &str,
-    staged: Option<&DestinationBudget>,
-) -> String {
-    let dec = |b: u64| crate::util::format_bytes_decimal(i64::try_from(b).unwrap_or(i64::MAX));
-    let (blocked, never): (Vec<&selector::OversizedUnit>, Vec<&selector::OversizedUnit>) =
-        match staged {
-            Some(b) if b.already_staged_bytes > 0 => oversized.iter().partition(|o| {
-                o.padded_bytes <= o.budget_bytes.saturating_add(b.already_staged_bytes)
-            }),
-            _ => (Vec::new(), oversized.iter().collect()),
-        };
-    let never_batched = |units: &[&selector::OversizedUnit]| {
-        format!(
-            "{} the per-tape budget and can never be \
-             batched (a unit that does not allow spanning is never split across tapes; \
-             ADR-0012): {}. The limit: {limit}. To let a unit span cartridges, set \
-             `allow_spanning = true` in the [policy] of its .tapectl-unit.toml, in its archive \
-             set or in [defaults]; a span is written only by a drive whose `[[backends.lto]]` \
-             entry declares `post_warning_bytes`. `--fill-ceiling` raises the ceiling only up \
-             to the whole cartridge",
-            match units.len() {
-                1 => "1 unit exceeds".to_string(),
-                n => format!("{n} units exceed"),
-            },
-            units
-                .iter()
-                .map(|o| o.to_string())
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
-    };
-    let Some(b) = staged.filter(|_| !blocked.is_empty()) else {
-        return format!("collection \"{collection}\": {}", never_batched(&never));
-    };
-    let mut msg = format!(
-        "collection \"{collection}\": {}; write it first (`tapectl volume write {}`), then run \
-         the collection again onto an empty initialised volume. {} an empty tape but not \
-         beside the staged data: {}. The limit: {limit}",
-        if b.packing_bytes() == 0 {
-            "staged data already fills this tape".to_string()
-        } else {
-            format!(
-                "staged data already takes {} of this tape, leaving {}",
-                dec(b.already_staged_bytes),
-                dec(b.packing_bytes())
-            )
-        },
-        b.binding_label,
-        match blocked.len() {
-            1 => "1 pending unit fits".to_string(),
-            n => format!("{n} pending units fit"),
-        },
-        blocked
-            .iter()
-            .map(|o| format!("\"{}\" ({})", o.name, dec(o.padded_bytes)))
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    if !never.is_empty() {
-        msg.push_str(&format!(". Also, {}", never_batched(&never)));
-    }
-    msg
+    TapectlError::Other(format!("collection \"{collection}\": {units}"))
 }
 
 /// Compute one collection's batches against its resolved LTO backend
@@ -542,22 +358,10 @@ pub fn plan_for_collection_with_budget(
     // fill ceiling to the whole nominal capacity; without it, as before.
     let packing = Packing {
         fill: tape.bytes,
-        past_ceiling: tape.plan_bound_bytes.map(|bound| PastCeilingPacking {
-            room: bound,
-            unit_limit: tape.bytes,
-            unit_limit_describe: tape.describe(),
-        }),
+        bound: tape.plan_bound_bytes,
     };
 
-    let packed = batches_for_budget(
-        conn,
-        config,
-        lib,
-        &packing,
-        &tape.describe_packing(),
-        None,
-        policy_aware,
-    )?;
+    let packed = batches_for_budget(conn, config, lib, &packing, policy_aware)?;
     Ok((packed, tape))
 }
 
@@ -637,9 +441,10 @@ pub struct DestinationBudget {
     /// ([`Self::packing_bytes`]); `None` stops it at [`Self::bytes`].
     pub plan_bound_bytes: Option<u64>,
     /// An empty volume's room under the fill ceiling (its capacity at the
-    /// fill ceiling, less the reserve): the most one unit may be when a batch
-    /// reaches past the ceiling, `stage create`'s own limit.
-    pub unit_limit_bytes: u64,
+    /// fill ceiling, less the reserve), with nothing subtracted for what is
+    /// staged: what the plan of one write is judged against, the room
+    /// `collection run`'s rounds (item 289) and `stage for-location` read.
+    pub fill_bytes: u64,
     /// Copy-distinctness warnings (issue #144): a destination at a location
     /// where a stage set riding along already has a copy, one rendered
     /// [`coverage::Distinctness::warning`] per such label. Advisory
@@ -680,32 +485,14 @@ impl DestinationBudget {
             Some(_) => format!(
                 "{under_ceiling}; a batch may reach past the fill ceiling to {} ({} bytes), its \
                  whole nominal capacity less the {} already staged, because the drive declares \
-                 post_warning_bytes: the units planned past the ceiling are on the tape only if \
-                 it reaches them before its early warning (ADR-0012 item 113)",
+                 post_warning_bytes: the unit that carries it past that continues on the next \
+                 cartridge, where the tape's early warning ends it (ADR-0012 items 113, 288 \
+                 and 289)",
                 dec(self.packing_bytes()),
                 self.packing_bytes(),
                 bin(self.already_staged_bytes),
             ),
         }
-    }
-
-    /// Where [`Self::unit_limit_bytes`] came from, for the refusal of a unit
-    /// above it when a batch reaches past the fill ceiling.
-    fn describe_unit_limit(&self) -> String {
-        format!(
-            "volume \"{}\" takes {} ({} bytes) for one unit: its {} capacity at the {}% fill \
-             ceiling, less the {} end-of-tape reserve. A batch may reach past the ceiling \
-             (the drive declares post_warning_bytes, ADR-0012 item 113), but a unit alone \
-             must fit under it, as `stage create` requires",
-            self.binding_label,
-            crate::util::format_bytes_decimal(
-                i64::try_from(self.unit_limit_bytes).unwrap_or(i64::MAX)
-            ),
-            self.unit_limit_bytes,
-            crate::util::format_bytes_decimal(self.binding_capacity_bytes.max(0)),
-            crate::volume::layout_model::fill_ceiling_percent(self.fill_ceiling),
-            crate::util::format_bytes_binary(i64::try_from(self.reserve_bytes).unwrap_or(i64::MAX)),
-        )
     }
 }
 
@@ -729,7 +516,7 @@ impl DestinationBudget {
 /// from the database ahead of a `BuiltLayout` existing at all, since a
 /// second retained batch's `Layout` is never built until its own `volume
 /// write` runs.
-fn already_staged_on_tape_bytes(conn: &Connection) -> Result<u64> {
+pub(super) fn already_staged_on_tape_bytes(conn: &Connection) -> Result<u64> {
     // Padding is applied per-slice, not to the aggregate sum: summing first
     // and padding once would round a batch of small slices up only a single
     // time instead of once per slice, understating the total in a way
@@ -993,7 +780,7 @@ pub fn destination_budget_moving_to(
         reserve_bytes: enospc_buffer,
         already_staged_bytes: already_staged,
         plan_bound_bytes,
-        unit_limit_bytes: usable.saturating_sub(enospc_buffer),
+        fill_bytes: usable.saturating_sub(enospc_buffer),
         warnings,
     })
 }
@@ -1076,24 +863,12 @@ pub fn plan_for_run_moving_to(
         }
     }
     let budget = destination_budget_moving_to(conn, config, device, labels, moved_to)?;
-    // ADR-0012 item 113, as in `plan_for_collection_with_budget`.
+    // ADR-0012 items 113 and 289, as in `plan_for_collection_with_budget`.
     let packing = Packing {
         fill: budget.bytes,
-        past_ceiling: budget.plan_bound_bytes.map(|_| PastCeilingPacking {
-            room: budget.packing_bytes(),
-            unit_limit: budget.unit_limit_bytes,
-            unit_limit_describe: budget.describe_unit_limit(),
-        }),
+        bound: budget.plan_bound_bytes.map(|_| budget.packing_bytes()),
     };
-    let packed = batches_for_budget(
-        conn,
-        config,
-        lib,
-        &packing,
-        &budget.describe(),
-        Some(&budget),
-        policy_aware,
-    )?;
+    let packed = batches_for_budget(conn, config, lib, &packing, policy_aware)?;
     Ok((packed, budget))
 }
 

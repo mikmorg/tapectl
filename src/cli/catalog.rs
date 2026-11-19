@@ -855,11 +855,14 @@ fn dispatch(
                     serde_json::json!(report.volume_inserted && report.unsealed_reason.is_some());
                 obj["found_volume_status"] = serde_json::json!(report.found_volume_status);
                 // #420: additive. Where a short tape ended, the units it
-                // cut, and what was recorded of the ending on a found row.
+                // took none of (planned and not written: no row), and what
+                // was recorded of the ending on a found row.
                 obj["ended_after"] = serde_json::json!(report.ended_after);
-                obj["cut_units"] = serde_json::json!(report.cut_units);
-                // #478: additive. The cut units above that may span.
-                obj["cut_spanning_units"] = serde_json::json!(report.cut_spanning_units);
+                obj["unwritten_units"] = serde_json::json!(report.unwritten_units);
+                // #478: additive. The units above whose other slices are
+                // planned on other tapes.
+                obj["unwritten_spanning_units"] =
+                    serde_json::json!(report.unwritten_spanning_units);
                 obj["ended_after_recorded"] = serde_json::json!(report.ended_after_recorded);
                 obj["volume_ended_after_mismatch"] =
                     serde_json::json!(report.volume_ended_after_mismatch);
@@ -1394,32 +1397,33 @@ fn short_tape_lines(report: &RebuildReport) -> Vec<String> {
              after tape file {k}, and every file its plan lists after that is not on it \
              (volume-format-v2.md §4.2)"
         ));
-        // #478: a cut spannable unit is said apart from a cut whole unit.
-        // Its version restores from tapes whose ranges together hold every
-        // slice, in slice order, as well as from a whole copy (ADR-0012 items
-        // 101 and 131; volume-format-v2.md §4.4).
+        // #478: a unit whose other slices are planned on other tapes is said
+        // apart from one this tape was to hold whole. Its version restores
+        // from tapes whose ranges together hold every slice, in slice order,
+        // as well as from a whole copy (ADR-0012 items 101 and 131).
         let whole: Vec<&str> = report
-            .cut_units
+            .unwritten_units
             .iter()
-            .filter(|u| !report.cut_spanning_units.contains(u))
+            .filter(|u| !report.unwritten_spanning_units.contains(u))
             .map(String::as_str)
             .collect();
         if !whole.is_empty() {
             lines.push(format!(
-                "    cut by the early end, recorded \"cut\" and NOT a copy on this tape: {}. \
-                 Each is restorable only from another tape that holds it whole; `tapectl \
-                 catalog locate <UNIT>` names the ones this catalog knows",
+                "    planned and not written (the early end took none of it), recorded with no \
+                 write and NOT a copy on this tape: {}. Each is restorable only from another \
+                 tape that holds it whole; `tapectl catalog locate <UNIT>` names the ones this \
+                 catalog knows",
                 whole.join(", ")
             ));
         }
-        if !report.cut_spanning_units.is_empty() {
+        if !report.unwritten_spanning_units.is_empty() {
             lines.push(format!(
-                "    spanning units cut by the early end, none of their slices on this tape, \
-                 recorded \"cut\" and NOT a copy on this tape: {}. Each is restorable from \
-                 another tape that holds it whole, or from tapes whose ranges together hold \
-                 every slice, read in slice order (volume-format-v2.md §4.4); `tapectl catalog \
-                 locate <UNIT>` names the holders this catalog knows",
-                report.cut_spanning_units.join(", ")
+                "    units whose other slices are planned on other tapes, none of their slices \
+                 on this tape, recorded with no write and NOT a copy on this tape: {}. Each is \
+                 restorable from another tape that holds it whole, or from tapes whose ranges \
+                 together hold every slice, read in slice order; `tapectl catalog locate <UNIT>` \
+                 names the holders this catalog knows",
+                report.unwritten_spanning_units.join(", ")
             ));
         }
         if report.ended_after_recorded {
@@ -2696,9 +2700,9 @@ mod tests {
             .unwrap();
             let volume = conn.last_insert_rowid();
             conn.execute(
-                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span,
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status,
                                      completed_at)
-                 VALUES (?1, ?2, ?3, ?4, 1, '2026-10-21T00:00:00Z')",
+                 VALUES (?1, ?2, ?3, ?4, '2026-10-21T00:00:00Z')",
                 params![set, snap, volume, status],
             )
             .unwrap();

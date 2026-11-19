@@ -944,15 +944,12 @@ fn snapshot_to_stage(
                         // set, whose ciphertext cannot continue the ranges
                         // already sealed. So `--force` costs more here than
                         // for an abandoned session (a re-confirmation, and
-                        // its remedy text recommends --force) or a cut set
-                        // (written nowhere, nothing on tape to orphan), and
+                        // its remedy text recommends --force) or a set
+                        // written nowhere (nothing on tape to orphan), and
                         // it outranks both; a live or resumable session
                         // still outranks it, being in use now or next.
                         staging::clean::ReleaseBlocker::SlicesShort { .. } => 4,
                         staging::clean::ReleaseBlocker::Abandoned { .. } => 3,
-                        // #420: never written whole, as `NeverWritten`, but
-                        // it names the volume that cut it.
-                        staging::clean::ReleaseBlocker::Cut { .. } => 2,
                         staging::clean::ReleaseBlocker::NeverWritten => 1,
                         staging::clean::ReleaseBlocker::None => 0,
                     };
@@ -980,25 +977,6 @@ fn snapshot_to_stage(
                          --unit {name} --version {v}` would leave it untouched — \
                          pass --force to release it"
                     ),
-                    // #420 (ADR-0012 item 112): a short seal cut it. The
-                    // slices are the input to the write that puts it on
-                    // tape whole, which is an ordinary `volume write` onto
-                    // another cartridge.
-                    staging::clean::ReleaseBlocker::Cut { volume_label } => {
-                        let on = match volume_label {
-                            Some(l) => format!("volume \"{l}\""),
-                            None => "its volume".to_string(),
-                        };
-                        format!(
-                            "{head}, and it is written whole nowhere: {on} sealed short before \
-                             it, so it was cut there and is not a copy. Write it whole onto \
-                             another cartridge with `tapectl volume write <LABEL>` (`--init` \
-                             initialises a new one); these slices are what that write \
-                             reads. `tapectl stage clean --unit {name} --version {v}` \
-                             leaves it untouched until then — pass --force only to give the \
-                             version up"
-                        )
-                    }
                     // #478 (ADR-0012 items 85 and 129): a span in
                     // progress. Its released slices are on tape; the short
                     // ones continue it, and are released one by one as
@@ -1851,7 +1829,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE writes SET status = 'range', may_span = 1 WHERE stage_set_id = ?1",
+            "UPDATE writes SET status = 'range' WHERE stage_set_id = ?1",
             params![stage_set_id],
         )
         .unwrap();

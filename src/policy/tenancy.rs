@@ -362,8 +362,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-             VALUES (last_insert_rowid(), ?1, ?2, 'range', 1)",
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (last_insert_rowid(), ?1, ?2, 'range')",
             params![snap, vol],
         )
         .unwrap();
@@ -419,7 +419,6 @@ mod tests {
             compression_level: None,
             slice_size: None,
             warehouse_copies: None,
-            allow_spanning: None,
             copies_at: None,
             exclude_patterns: vec![],
         };

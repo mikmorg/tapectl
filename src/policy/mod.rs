@@ -42,12 +42,6 @@ pub struct ResolvedPolicy {
     /// carry, on top of its tape copies. 0 (the default) means none are
     /// expected and `audit` says nothing about warehouses for this unit.
     pub warehouse_copies: i64,
-    /// #478 (ADR-0012 item 82): whether the unit may span tapes by its
-    /// slices. Off unless a layer turns it on (`[defaults]` is false when
-    /// the key is absent). Read at use, like every field here: a write that
-    /// may span must freeze it when it is planned (`writes.may_span`, item
-    /// 121), because the dotfile can change while a span is in progress.
-    pub allow_spanning: bool,
     /// #493 (ADR-0012 items 148, 149, 155, 156): how many copies the unit
     /// should hold at each named location. Empty when no layer sets a
     /// target: the unit then behaves exactly as before 1.7.x.
@@ -57,7 +51,7 @@ pub struct ResolvedPolicy {
     /// `[defaults] copies_at`. Maps never merge across layers: a dotfile that
     /// names only `offsite` drops a `home` its archive set named. An empty
     /// map is a setting too (an explicit "no targets" that hides the layers
-    /// below), as `allow_spanning = false` is a choice and not silence.
+    /// below).
     ///
     /// **An archive set's `required_locations` counts as `{name = 1}` at that
     /// set's layer** (item 156), with the set's own `copies_at` laid over it
@@ -169,7 +163,6 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         preserve_acls: defaults.preserve_acls,
         dirty_on_metadata_change: defaults.dirty_on_metadata_change,
         warehouse_copies: defaults.warehouse_copies,
-        allow_spanning: defaults.allow_spanning,
         copies_at: defaults.copies_at.clone(),
     };
     // Which layer set `policy.copies_at`, and the names in it that a
@@ -195,7 +188,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             .query_row(
                 "SELECT min_copies, required_locations, encrypt, compression, checksum_mode,
                     slice_size, verify_interval_days, preserve_xattrs, preserve_acls,
-                    dirty_on_metadata_change, warehouse_copies, allow_spanning,
+                    dirty_on_metadata_change, warehouse_copies,
                     copies_at, name, compression_level
              FROM archive_sets WHERE id = ?1",
                 params![as_id],
@@ -212,10 +205,9 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                         row.get::<_, Option<i64>>(8)?,
                         row.get::<_, Option<i64>>(9)?,
                         row.get::<_, Option<i64>>(10)?,
-                        row.get::<_, Option<i64>>(11)?,
-                        row.get::<_, Option<String>>(12)?,
-                        row.get::<_, String>(13)?,
-                        row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, Option<i64>>(13)?,
                     ))
                 },
             )
@@ -243,7 +235,6 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             preserve_acls,
             dirty_on_meta,
             warehouse_copies,
-            allow_spanning,
             copies_at_json,
             set_name,
             compression_level,
@@ -300,10 +291,6 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         }
         if let Some(v) = warehouse_copies {
             policy.warehouse_copies = v;
-        }
-        // NULL defers to `[defaults]` (migration 039), never reads as "off".
-        if let Some(v) = allow_spanning {
-            policy.allow_spanning = v != 0;
         }
         // #493: the set's map is its `required_locations` at one copy each,
         // with its own `copies_at` (migration 040; NULL defers) laid over
@@ -503,11 +490,6 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                 // silently outrank the archive set).
                 if let Some(v) = section.warehouse_copies {
                     policy.warehouse_copies = v;
-                }
-                // #478: absent defers to the archive set; `false` is a
-                // choice, and outranks a set that allows spanning.
-                if let Some(v) = section.allow_spanning {
-                    policy.allow_spanning = v;
                 }
                 // #493 (items 155, 156): present, the dotfile's map replaces
                 // the lower layers' whole; absent, they stand.
@@ -745,7 +727,7 @@ pub fn volume_verify_interval_days(
            JOIN snapshots s ON s.id = w.snapshot_id
            JOIN units u ON u.id = s.unit_id
            LEFT JOIN archive_sets a ON a.id = u.archive_set_id
-          WHERE w.volume_id = ?1 AND w.status <> 'cut'",
+          WHERE w.volume_id = ?1",
         params![volume_id, default_days],
         |r| r.get(0),
     )?)
@@ -1018,107 +1000,6 @@ slice_size = "500M"
         let unit = make_unit(Some(as_id), Some(tmp.path().to_str().unwrap().to_string()));
         let p = resolve(&conn, &config, &unit).unwrap();
         assert_eq!(p.warehouse_copies, 4);
-    }
-
-    /// #478 (ADR-0012 item 82): `allow_spanning` resolves dotfile, then
-    /// archive set, then `[defaults]`, off by default, and each layer speaks
-    /// only when it was set: a NULL archive-set column defers, and so does
-    /// a dotfile without the key.
-    #[test]
-    fn allow_spanning_resolves_dotfile_over_archive_set_over_defaults() {
-        let conn = fresh_conn();
-        let dotfile = |text: &str| {
-            let tmp = TempDir::new().unwrap();
-            std::fs::write(tmp.path().join(".tapectl-unit.toml"), text).unwrap();
-            tmp
-        };
-        let resolved = |config: &Config, set: Option<i64>, dir: Option<&TempDir>| {
-            let path = dir.map(|d| d.path().to_str().unwrap().to_string());
-            resolve(&conn, config, &make_unit(set, path))
-                .unwrap()
-                .allow_spanning
-        };
-        conn.execute(
-            "INSERT INTO archive_sets (name, allow_spanning) VALUES ('whole', 0)",
-            [],
-        )
-        .unwrap();
-        let whole = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO archive_sets (name, allow_spanning) VALUES ('span', 1)",
-            [],
-        )
-        .unwrap();
-        let span = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO archive_sets (name, min_copies) VALUES ('silent', 3)",
-            [],
-        )
-        .unwrap();
-        let silent = conn.last_insert_rowid();
-        let off = Config::default();
-        let mut on = Config::default();
-        on.defaults.allow_spanning = true;
-
-        // Off when nothing sets it.
-        assert!(!resolved(&off, None, None), "default off");
-        assert!(
-            !resolved(&off, Some(silent), None),
-            "a NULL column is not on"
-        );
-        // `[defaults]` alone, and through a set that does not say.
-        assert!(resolved(&on, None, None), "defaults alone");
-        assert!(
-            resolved(&on, Some(silent), None),
-            "a NULL archive-set column defers to [defaults], never reads as off"
-        );
-        // The archive set over `[defaults]`, either way.
-        assert!(resolved(&off, Some(span), None), "set on over defaults off");
-        assert!(
-            !resolved(&on, Some(whole), None),
-            "set off over defaults on"
-        );
-        // The dotfile over the archive set over `[defaults]`, either way.
-        let span_here = dotfile("[policy]\nallow_spanning = true\n");
-        let whole_here = dotfile("[policy]\nallow_spanning = false\n");
-        let says_nothing = dotfile("[policy]\nslice_size = \"500M\"\n");
-        assert!(
-            resolved(&off, Some(whole), Some(&span_here)),
-            "dotfile true over set false over defaults false"
-        );
-        assert!(
-            !resolved(&on, Some(span), Some(&whole_here)),
-            "dotfile false over set true over defaults true"
-        );
-        assert!(
-            resolved(&off, Some(span), Some(&says_nothing)),
-            "a dotfile without the key defers to the set"
-        );
-        assert!(
-            resolved(&on, Some(silent), Some(&says_nothing)),
-            "...and through a silent set to [defaults]"
-        );
-    }
-
-    /// #478: a misspelled spanning key in a dotfile makes the unit's policy
-    /// unresolvable, naming the key, rather than reading as "not set"
-    /// (issue #211's rule).
-    #[test]
-    fn resolve_refuses_a_misspelled_allow_spanning_in_a_dotfile() {
-        let conn = fresh_conn();
-        let config = Config::default();
-        for bad in ["allow_span", "allowSpanning"] {
-            let tmp = TempDir::new().unwrap();
-            std::fs::write(
-                tmp.path().join(".tapectl-unit.toml"),
-                format!("[policy]\n{bad} = true\n"),
-            )
-            .unwrap();
-            let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
-            let msg = resolve(&conn, &config, &unit).unwrap_err().to_string();
-            assert!(msg.contains(bad), "{bad}: {msg}");
-            assert!(msg.contains(".tapectl-unit.toml"), "{bad}: {msg}");
-        }
     }
 
     /// A map of location to count, for the `copies_at` tests.

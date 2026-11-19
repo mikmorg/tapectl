@@ -139,16 +139,16 @@ pub enum VolumeCommands {
     /// the first one that fails: an init that refuses writes nothing, and
     /// nothing moves unless the write sealed and confirmed.
     ///
-    /// A unit that allows spanning (`allow_spanning`, ADR-0012 item 82) may
-    /// have its slices on more than one tape. The write lays out first the
-    /// slices still owed of a span in progress, then whole units, then units
-    /// that may span, last; the drive's early warning, not the plan, ends
-    /// such a unit on the tape (items 84, 122 and 123), which needs the
-    /// drive's `post_warning_bytes`. The write names each unit the tape holds
-    /// as a range of slices, the whole units it leaves for the next tape
-    /// (still staged), and, once a range completes a copy across tapes, the
-    /// tapes to keep together (item 134). A span continues only onto a
-    /// cartridge of the generation it began on (item 86).
+    /// Every unit may have its slices on more than one tape (ADR-0012 items
+    /// 288 and 289). The write lays out first the slices still owed of a span
+    /// in progress, then the queue in order, to the drive's early warning,
+    /// which ends the tape inside the last unit it takes (with the drive's
+    /// `post_warning_bytes`; without it the plan ends at the last slice that
+    /// fits the fill ceiling). The write names each unit the tape holds as a
+    /// range of slices, the units it leaves for the next tape (still
+    /// staged), and, once a range completes a copy across tapes, the tapes
+    /// to keep together (item 134). A span continues only onto a cartridge
+    /// of the generation it began on (item 86).
     ///
     /// Exit status (every command that writes a tape shares it):
     /// 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was
@@ -616,9 +616,8 @@ pub enum VolumeCommands {
 
     /// Show bin-packing plan for pending staged data
     ///
-    /// When a staged unit may span (`allow_spanning`), it also shows the
-    /// order one write of everything staged takes (owed runs of a span in
-    /// progress, whole units, units that may span), the slices each plans,
+    /// It also shows the order one write of everything staged takes (owed
+    /// runs of a span in progress, then the queue), the slices each plans,
     /// where each sits against the fill ceiling, and the units that would
     /// wait for the next tape. An estimate: the volume's own files are not
     /// counted.
@@ -2367,18 +2366,16 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
             // (issue #482): what the init decided about the medium.
             "medium": done.initialized.as_ref().map(|i| i.medium.to_json()),
             "loaded": done.loaded,
-            // #420, additive: how the tape ended. `"full"` with no cut unit,
-            // or `"short"` with the `ended_after` its seal states and the
-            // units it cut (still staged; the next `volume write` onto
-            // another cartridge writes them whole).
+            // #420, additive: how the tape ended. `"full"`, or `"short"`
+            // with the `ended_after` its seal states.
             "ending": done.ending.kind(),
             "ended_after": done.ending.ended_after,
-            "cut_units": done.ending.cut_units,
-            // #478, additive, empty when nothing may span: the units this
-            // tape holds as a range with their slice runs, the staged units
-            // it did not take (they wait for the next tape), and the tapes
-            // that make up each whole copy across tapes a range here
-            // completes (ADR-0012 item 134).
+            // #478, additive: the units this tape holds as a range with
+            // their slice runs, the staged units it did not take (planned
+            // and not written, or left for the next tape: they stay staged
+            // and wait for it), and the tapes that make up each whole copy
+            // across tapes a range here completes (ADR-0012 items 134 and
+            // 288).
             "range_units": done.ending.range_units,
             "deferred_units": done.ending.deferred_units,
             "keep_together": done.ending.keep_together,
@@ -3446,14 +3443,7 @@ pub fn run(
                         // ADR-0012 item 113: only when the drive declares
                         // `post_warning_bytes`; every line above is unchanged.
                         let tape = backend.planning_tape_budget(generation.as_deref())?;
-                        let mut in_write_order: Vec<(String, i64, u64)> = rows
-                            .iter()
-                            .map(|(name, ver, _, size)| {
-                                (name.clone(), *ver, size.unwrap_or(0) as u64)
-                            })
-                            .collect();
-                        in_write_order.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-                        for line in plan_bound_lines(&tape, &in_write_order) {
+                        for line in plan_bound_lines(&tape) {
                             println!("{line}");
                         }
                     }
@@ -4769,9 +4759,6 @@ struct VolumeInfo {
     /// the tape ends after this file. `None` on a full seal and on a volume
     /// not sealed.
     ended_after: Option<i64>,
-    /// The units this volume cut (`writes.status = 'cut'`): planned, past
-    /// the drive's early warning, so not on this tape and never a copy here.
-    cut_units: Vec<String>,
     /// The units this volume holds as a range (#478, `writes.status =
     /// 'range'`), each with the run of its slices written here: not a copy
     /// on its own (ADR-0012 item 127). Empty when it holds none.
@@ -4923,18 +4910,6 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         rusqlite::params![vol_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
-    let cut_units: Vec<String> = conn
-        .prepare(
-            "SELECT DISTINCT u.name
-             FROM writes w
-             JOIN stage_sets ss ON ss.id = w.stage_set_id
-             JOIN snapshots s ON s.id = ss.snapshot_id
-             JOIN units u ON u.id = s.unit_id
-             WHERE w.volume_id = ?1 AND w.status = 'cut'
-             ORDER BY u.name",
-        )?
-        .query_map(rusqlite::params![vol_id], |r| r.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
     let range_units = write::recorded_ranges(conn, label)?;
 
     // Units carried: one row per unit, aggregated across every completed
@@ -5092,7 +5067,6 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         write_lbp,
         write_lbp_note,
         ended_after,
-        cut_units,
         range_units,
         notes,
         unit_count,
@@ -5260,26 +5234,17 @@ const WRITE_CHECK_NOT_RECORDED: &str =
     "not recorded (written before tapectl 1.7.2, or rebuilt from tape, which does not say)";
 
 /// `volume info`'s ending line (#490): on a tape that sealed short, where it
-/// ended and the units it cut. `None` for any other volume.
-fn render_ending_line(
-    ended_after: Option<i64>,
-    cut_units: &[String],
-    whole_units: i64,
-) -> Option<String> {
+/// ended. `None` for any other volume. The units the plan listed and the seal
+/// withdrew leave no row (ADR-0012 item 288); the ranges are the next line.
+fn render_ending_line(ended_after: Option<i64>, whole_units: i64) -> Option<String> {
     let k = ended_after?;
-    let cut = if cut_units.is_empty() {
-        "none".to_string()
-    } else {
-        cut_units.join(", ")
-    };
     let none_whole = if whole_units == 0 {
         "; no unit is wholly on this tape"
     } else {
         ""
     };
     Some(format!(
-        "  Ended short: after tape file {k}, at the drive's early warning{none_whole}\n  \
-         Cut (not on this tape): {cut}"
+        "  Ended short: after tape file {k}, at the drive's early warning{none_whole}"
     ))
 }
 
@@ -5377,7 +5342,7 @@ fn print_volume_info(info: &VolumeInfo) {
     );
     println!("{}", render_sealed_line(info.sealed_at.as_deref()));
     println!("{}", info.write_check_line());
-    if let Some(ending) = render_ending_line(info.ended_after, &info.cut_units, info.unit_count) {
+    if let Some(ending) = render_ending_line(info.ended_after, info.unit_count) {
         println!("{ending}");
     }
     if let Some(ranges) = render_range_line(&info.range_units) {
@@ -5680,51 +5645,23 @@ fn verify_mismatches_json(report: &write::VerifyReport) -> Vec<serde_json::Value
         .collect()
 }
 
-/// `volume plan`'s lines for the plan bound (ADR-0012 item 113): none when
-/// the drive declares no `post_warning_bytes` (the plan stops at the fill
-/// ceiling, as before 1.6.0); otherwise how far a write may plan past the
-/// ceiling, and which staged units one write would plan past it. `units` are
-/// `(name, version, encrypted bytes)` in the order a write takes them (by
-/// unit name). An estimate, as the tape count above it is: each unit is
-/// block-padded whole, and the volume's own files are not counted.
-fn plan_bound_lines(tape: &crate::config::TapeBudget, units: &[(String, i64, u64)]) -> Vec<String> {
+/// `volume plan`'s line for the plan bound (ADR-0012 items 113, 288 and
+/// 289): none when the drive declares no `post_warning_bytes` (the plan stops
+/// at the fill ceiling, at the last slice that fits); otherwise how far a
+/// write may plan past the ceiling. The units a write plans there are the
+/// plan order's below ([`plan_span_lines`]).
+fn plan_bound_lines(tape: &crate::config::TapeBudget) -> Vec<String> {
     let Some(bound) = tape.plan_bound_bytes else {
         return Vec::new();
     };
     let dec = |b: u64| crate::util::format_bytes_decimal(i64::try_from(b).unwrap_or(i64::MAX));
-    let mut lines = vec![format!(
-        "past the fill ceiling: a write may plan whole units up to {} ({bound} bytes), the \
-         cartridge's nominal capacity, because the drive declares post_warning_bytes (ADR-0012 \
-         item 113); the tape may end before a unit planned past the ceiling, which is then cut \
-         and written whole onto the next cartridge",
+    vec![format!(
+        "past the fill ceiling: a write may plan up to {} ({bound} bytes), the cartridge's \
+         nominal capacity, because the drive declares post_warning_bytes (ADR-0012 items 113 \
+         and 289); the set that carries the plan past the ceiling is planned to its end, the \
+         tape may end inside it, and the rest of it continues on the next cartridge",
         dec(bound)
-    )];
-    let padded: Vec<u64> = units
-        .iter()
-        .map(|(_, _, bytes)| {
-            crate::volume::layout_model::pad_to_blocks(*bytes, DEFAULT_BLOCK_SIZE as u64)
-        })
-        .collect();
-    let split = crate::volume::layout_model::CapacityBudget {
-        available_bytes: tape.bytes,
-        reserve_bytes: 0,
-        plan_bound_bytes: Some(bound),
-        span_tail_from: None,
-    }
-    .split(0, &padded);
-    let past = &units[split.past_ceiling()];
-    if !past.is_empty() {
-        lines.push(format!(
-            "planned past the fill ceiling of {} by one write of everything staged (the tape may \
-             end before them): {}",
-            dec(tape.bytes),
-            past.iter()
-                .map(|(name, ver, _)| format!("{name} v{ver}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    lines
+    )]
 }
 
 /// The plan order `volume plan` shows when a staged unit may span (#478,
@@ -5763,8 +5700,7 @@ fn plan_span_unit(preview: &write::PlanPreview, i: usize) -> (String, &'static s
     let last = u.slices.last().map_or(0, |s| s.slice_number);
     let class = match preview.classes[i] {
         PlanClass::Owed => "owed run",
-        PlanClass::Spannable => "may span",
-        PlanClass::Whole => "whole",
+        PlanClass::Queued => "queued",
     };
     (
         format!("{} v{}", u.unit_name, u.snapshot_version),
@@ -5775,51 +5711,47 @@ fn plan_span_unit(preview: &write::PlanPreview, i: usize) -> (String, &'static s
 }
 
 /// What a placement means, in `volume plan`'s words.
-fn placed_words(placed: crate::volume::layout_model::Placed, may_span: bool) -> &'static str {
+fn placed_words(placed: crate::volume::layout_model::Placed) -> &'static str {
     use crate::volume::layout_model::Placed;
-    match (placed, may_span) {
-        (Placed::Committed, _) => "under the fill ceiling",
-        (Placed::PastCeiling, true) => "past the fill ceiling; the tape may end inside it",
-        (Placed::PastCeiling, false) => "past the fill ceiling; the tape may end before it",
-        (Placed::Tail, _) => {
-            "past the cartridge's nominal capacity, to its end; the drive's early warning ends \
-             it on the tape"
+    match placed {
+        Placed::Committed => "under the fill ceiling",
+        Placed::PastCeiling => "past the fill ceiling; the tape may end inside it",
+        Placed::Tail => {
+            "the last of the plan: to its end past the cartridge's nominal capacity, or, on a \
+             drive with no post_warning_bytes, up to the fill ceiling; the rest of it \
+             continues on the next cartridge"
         }
-        (Placed::Deferred, _) => "waits for the next tape",
-        (Placed::Refused, _) => "refused",
+        Placed::Deferred => "waits for the next tape",
     }
 }
 
-/// `volume plan`'s lines for a write whose batch holds a unit that may span
-/// (#478): the units in the order one write of everything staged takes
-/// them, each with the slices it plans and where the plan puts it, the
-/// units that wait for the next tape, and what it refuses. An estimate, as
-/// the tape count above it is.
+/// `volume plan`'s lines for the plan of a write (#478; ADR-0012 items 288
+/// and 289): the units in the order one write of everything staged takes
+/// them, each with the slices it plans and where the plan puts it, and the
+/// units that wait for the next tape. An estimate, as the tape count above
+/// it is.
 fn plan_span_lines(span: &std::result::Result<write::PlanPreview, String>) -> Vec<String> {
     let preview = match span {
         Ok(preview) => preview,
         Err(refusal) => {
             return vec![format!(
-                "spanning: a write of everything staged would refuse: {refusal}"
+                "plan order: a write of everything staged would refuse: {refusal}"
             )]
         }
     };
     let mut lines = vec![
-        "spanning: one write of everything staged plans these, in this order (an estimate: each \
-         unit's slices block-padded, the volume's own files not counted; a unit that may span \
-         is ended on the tape by the drive's early warning, ADR-0012 items 83, 94 and 123):"
+        "plan order: one write of everything staged plans these, in this order (an estimate: \
+         each unit's slices block-padded, the volume's own files not counted; every unit \
+         continues on the next cartridge where the drive's early warning ends the tape, \
+         ADR-0012 items 288 and 289):"
             .to_string(),
     ];
     for &i in &preview.placement.order {
         let (name, class, first, last) = plan_span_unit(preview, i);
-        let what = if class == "whole" {
-            class.to_string()
-        } else {
-            format!("{class}, {}", write::slice_run(first, last))
-        };
         lines.push(format!(
-            "  {name}: {what}, {}",
-            placed_words(preview.placement.placed[i], class != "whole")
+            "  {name}: {class}, {}, {}",
+            write::slice_run(first, last),
+            placed_words(preview.placement.placed[i])
         ));
     }
     let deferred = preview.placement.deferred();
@@ -5833,15 +5765,12 @@ fn plan_span_lines(span: &std::result::Result<write::PlanPreview, String>) -> Ve
                 .join(", ")
         ));
     }
-    for e in &preview.placement.errors {
-        lines.push(format!("  refused: {e}"));
-    }
     lines
 }
 
 /// `volume plan --json`'s `spanning` object (#478): `{"units": [{"unit",
 /// "version", "class", "first_slice", "last_slice", "placed"}], "deferred":
-/// [..], "refused": [..]}` in the plan's order, or `{"refusal": ".."}`.
+/// [..]}` in the plan's order, or `{"refusal": ".."}`.
 fn plan_span_json(span: &std::result::Result<write::PlanPreview, String>) -> serde_json::Value {
     use crate::volume::layout_model::Placed;
     let preview = match span {
@@ -5862,19 +5791,12 @@ fn plan_span_json(span: &std::result::Result<write::PlanPreview, String>) -> ser
                 Placed::PastCeiling => "past_ceiling",
                 Placed::Tail => "tail",
                 Placed::Deferred => "deferred",
-                Placed::Refused => "refused",
             },
         })
     };
     serde_json::json!({
         "units": preview.placement.order.iter().map(|&i| unit(i)).collect::<Vec<_>>(),
         "deferred": preview.placement.deferred().into_iter().map(unit).collect::<Vec<_>>(),
-        "refused": preview
-            .placement
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>(),
     })
 }
 
@@ -6302,8 +6224,8 @@ mod tests {
                                            encrypted_bytes, sha256_plain, sha256_encrypted)
                      SELECT ss.id, n.n, 10, 10, 'p' || n.n, 'e' || n.n
                      FROM stage_sets ss, (SELECT 1 AS n UNION SELECT 2 UNION SELECT 3) n;
-                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                     SELECT ss.id, ss.snapshot_id, v.id, 'range', 1 FROM stage_sets ss, volumes v;
+                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT ss.id, ss.snapshot_id, v.id, 'range' FROM stage_sets ss, volumes v;
                  INSERT INTO write_positions (write_id, stage_slice_id, position, status)
                      SELECT w.id, sl.id, CAST(7 + sl.slice_number AS TEXT),
                             CASE WHEN sl.slice_number <= 2 THEN 'written' ELSE 'pending' END

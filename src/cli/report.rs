@@ -5973,8 +5973,8 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                 SELECT last_insert_rowid(), ?1, id, 'range', 1 FROM volumes WHERE label = 'SPAN01'",
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 SELECT last_insert_rowid(), ?1, id, 'range' FROM volumes WHERE label = 'SPAN01'",
                 params![snap],
             )
             .unwrap();

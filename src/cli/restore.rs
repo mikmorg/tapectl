@@ -142,10 +142,9 @@ pub enum RestoreCommands {
         to: String,
         /// A unit to restore; repeat for several.
         ///
-        /// Without it, every unit the volume holds whole: on a tape that ended
-        /// early (a short seal), the units the end cut are named, with a volume
-        /// that holds each whole, and left out; so is a unit of which the tape
-        /// holds only a range (a version held across cartridges), with the
+        /// Without it, every unit the volume holds whole: a unit of which the
+        /// tape holds only a range (a version held across cartridges, such as
+        /// the one a short seal ended inside) is named and left out, with the
         /// `restore unit` that reads it. A unit named that the tape does not
         /// hold whole is refused before the drive is opened
         #[arg(long = "unit", value_name = "NAME")]
@@ -736,27 +735,24 @@ pub fn run(
                 }
             };
 
-            // #420 (`volume-format-v2.md` §4.2): with no unit named, the set
-            // is every unit the volume holds whole; a tape that ended early
-            // also names the units it cut, and where each is whole. A unit
-            // named that the tape cut was refused, by name, before the drive.
-            // #478 (§4.4, ADR-0012 item 89): the same for a unit of which the
-            // tape holds only a range, with where its restore starts.
-            let cut = if units.is_empty() {
-                volume::restore::cut_units_on_volume(conn, &report.volume_label)?
+            // #478 (`volume-format-v3.md` §5.3, ADR-0012 items 89 and 288):
+            // with no unit named, the set is every unit the volume holds
+            // whole; a unit of which the tape holds only a range is named,
+            // with where its restore starts.
+            let ranges = if units.is_empty() {
+                volume::restore::ranges_on_volume(conn, &report.volume_label)?
             } else {
                 Vec::new()
             };
             if json_output {
                 let mut obj = units_report_json(&report);
-                obj["cut"] = cut_units_json(&cut);
-                obj["ranges"] = range_units_json(&cut);
+                obj["ranges"] = range_units_json(&ranges);
                 crate::render::print_json(&obj);
             } else {
                 for line in units_report_lines(&report) {
                     println!("{line}");
                 }
-                for line in cut_units_lines(&cut, &report.volume_label) {
+                for line in range_units_lines(&ranges, &report.volume_label) {
                     println!("{line}");
                 }
             }
@@ -1061,13 +1057,12 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
     lines
 }
 
-/// The units the early end of `label`'s tape cut (#420), and those of which
-/// it holds only a range of a version held across cartridges (#478), one
-/// line each, for `restore volume` with no unit named: not restored, and not
-/// a failure — the tape does not hold them whole by design
-/// (`volume-format-v2.md` §4.2 and §4.4, ADR-0012 item 89).
-pub(crate) fn cut_units_lines(cut: &[volume::restore::CutUnit], label: &str) -> Vec<String> {
-    let how = |c: &volume::restore::CutUnit| match c.restore_from() {
+/// The units of which `label`'s tape holds only a range of a version held
+/// across cartridges (#478; ADR-0012 items 89 and 288), one line each, for
+/// `restore volume` with no unit named: not restored, and not a failure —
+/// the tape does not hold them whole by design (`volume-format-v3.md` §5.3).
+pub(crate) fn range_units_lines(ranges: &[volume::restore::RangeUnit], label: &str) -> Vec<String> {
+    let how = |c: &volume::restore::RangeUnit| match c.restore_from() {
         Some(from) => format!(
             "; restore it with `tapectl restore unit --unit {} --from {from} --version {} --to \
              <DIR>`",
@@ -1075,69 +1070,41 @@ pub(crate) fn cut_units_lines(cut: &[volume::restore::CutUnit], label: &str) -> 
         ),
         None => String::new(),
     };
-    let mut lines: Vec<String> = cut
+    let mut lines: Vec<String> = ranges
         .iter()
-        .map(|c| match c.range {
-            None => format!(
-                "not on this tape whole: {} — cut by the early end of \"{label}\"'s tape{}",
-                c.describe(),
-                how(c)
-            ),
-            Some(_) => format!(
+        .map(|c| {
+            format!(
                 "not on this tape whole: {} — a range of a version held across cartridges, read \
                  with its other slices in slice order{}",
                 c.describe(),
                 how(c)
-            ),
+            )
         })
         .collect();
-    let cuts = cut.iter().filter(|c| c.range.is_none()).count();
-    let ranges = cut.len() - cuts;
-    if cuts > 0 {
-        lines.push(format!(
-            "{} left out: \"{label}\" ended early and does not hold them whole",
-            crate::render::plural(cuts as i64, "unit", "units")
-        ));
-    }
-    if ranges > 0 {
+    if !ranges.is_empty() {
         lines.push(format!(
             "{} held across cartridges left out: \"{label}\" holds only a range of each, \
              and `restore volume` restores the units a tape holds whole",
-            crate::render::plural(ranges as i64, "unit", "units")
+            crate::render::plural(ranges.len() as i64, "unit", "units")
         ));
     }
     lines
 }
 
-/// `restore volume --json`'s `cut`: the units the end of the tape cut.
-fn cut_units_json(cut: &[volume::restore::CutUnit]) -> serde_json::Value {
-    cut.iter()
-        .filter(|c| c.range.is_none())
+/// `restore volume --json`'s `ranges` (#478): the units of which the tape
+/// holds only a range, the slices it holds, and where the version is whole
+/// or its slice 1 is.
+fn range_units_json(ranges: &[volume::restore::RangeUnit]) -> serde_json::Value {
+    ranges
+        .iter()
         .map(|c| {
             serde_json::json!({
                 "unit": c.unit_name,
                 "version": c.version,
+                "first_slice": c.range.0,
+                "last_slice": c.range.1,
                 "whole_on": c.whole_on,
-            })
-        })
-        .collect()
-}
-
-/// `restore volume --json`'s `ranges` (#478): the units of which the tape
-/// holds only a range, the slices it holds, and where the version is whole
-/// or its slice 1 is.
-fn range_units_json(cut: &[volume::restore::CutUnit]) -> serde_json::Value {
-    cut.iter()
-        .filter_map(|c| {
-            c.range.map(|(first, last)| {
-                serde_json::json!({
-                    "unit": c.unit_name,
-                    "version": c.version,
-                    "first_slice": first,
-                    "last_slice": last,
-                    "whole_on": c.whole_on,
-                    "starts_on": c.starts_on,
-                })
+                "starts_on": c.starts_on,
             })
         })
         .collect()

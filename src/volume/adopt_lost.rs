@@ -39,7 +39,7 @@
 //! splits three ways by its positions and the seal (`volume-format-v3.md`
 //! §5.3), as confirm splits it and the rebuild recorded it, for any staging:
 //! `completed` when the tape holds every slice of the set, `range` when it
-//! holds some, `cut` when it holds none. A `range` row is adopted when its
+//! holds some, and no row when it holds none. A `range` row is adopted when its
 //! positions are one unbroken run of the set's slices at consecutive tape
 //! positions, the run the rows plan; its version is promoted only once every
 //! slice of the set is on a sealed volume, this one counted (item 128), and
@@ -111,10 +111,9 @@ pub enum LostAdoption {
 
 /// Whether `volume_id` is in the state #360 is about: `initialized`, its
 /// seal never recorded, its condition `ok`, and writes rows that are all
-/// `completed`, `range` or `cut` — what a rebuild attaches to a row a
-/// pre-write backup left behind (`cut` for a unit a tape that ended early
-/// does not hold whole, #420; `range` for a spannable set the tape holds
-/// some of, #478, ADR-0012 item 130). A recorded seal is #280's territory
+/// `completed` or `range` — what a rebuild attaches to a row a pre-write
+/// backup left behind (`range` for a set the tape holds some of, #478,
+/// ADR-0012 items 130 and 288; a set it holds none of has no row). A recorded seal is #280's territory
 /// (an interrupted or aborted session of this catalog's own), and any
 /// unresolved row is a session `volume resume` continues the ordinary way,
 /// so neither is adopted here.
@@ -125,7 +124,7 @@ pub fn is_lost_write(conn: &Connection, volume_id: i64) -> Result<bool> {
                 AND EXISTS(SELECT 1 FROM writes WHERE volume_id = v.id)
                 AND NOT EXISTS(SELECT 1 FROM writes
                                WHERE volume_id = v.id
-                                 AND status NOT IN ('completed', 'range', 'cut'))
+                                 AND status NOT IN ('completed', 'range'))
          FROM volumes v WHERE v.id = ?1",
         params![volume_id],
         |r| r.get(0),
@@ -177,8 +176,8 @@ pub fn adopt(
     if !is_lost_write(conn, volume_id)? {
         return Err(TapectlError::Other(format!(
             "volume \"{label}\" is not a write this catalog lost: only an `initialized` volume \
-             with no recorded seal, an `ok` condition and nothing but completed (or range, or \
-             cut) writes attached is adopted this way (ADR-0012, 2026-09-29 later)"
+             with no recorded seal, an `ok` condition and nothing but completed (or range) \
+             writes attached is adopted this way (ADR-0012, 2026-09-29 later)"
         )));
     }
     let expected_uuid: Option<String> = conn.query_row(
@@ -308,10 +307,10 @@ fn sealed_front_index(
 /// layout-session.md's condition 3): the front index is the plan, so only
 /// its slices at or before K are on the tape and compared. The catalog's
 /// rows must say what the tape says, by [`span_matches`] for every write
-/// (item 288: a block states no `may_span`): `completed` for a set wholly at
-/// or before K, `range` for one with some of its slices there, `cut` for
-/// one with none, as the rebuild recorded them and a passing confirm would
-/// — and its recorded ending must be the seal's.
+/// (item 288): `completed` for a set wholly at or before K, `range` for one
+/// with some of its slices there, and no row for one with none, as the
+/// rebuild recorded them and a passing confirm would — and its recorded
+/// ending must be the seal's.
 ///
 /// Every staging the tape holds, whole or in part, must still have its file
 /// table in this catalog, or the adoption is refused naming it (item 265).
@@ -418,8 +417,8 @@ fn staged_match(
         }
     }
     // Every write is split as a passing confirm splits it, by its positions
-    // and the seal (`volume-format-v3.md` §5.3, ADR-0012 item 288): a block
-    // states no `may_span`, and any staging may be held in part.
+    // and the seal (`volume-format-v3.md` §5.3, ADR-0012 item 288): any
+    // staging may be held in part.
     let writes: Vec<(i64, i64, String, i64)> = conn
         .prepare(
             "SELECT w.id, w.stage_set_id, w.status,
@@ -462,8 +461,8 @@ fn staged_match(
         // file table in this catalog (ADR-0012 item 265, #557): the
         // adoption records the write as a copy a later write of the
         // staging may be made from, and a write refuses a staging without
-        // one. A `cut` row holds nothing of it here.
-        if status != "cut" && !crate::db::stage_files::exists(conn, stage_set_id)? {
+        // one.
+        if !crate::db::stage_files::exists(conn, stage_set_id)? {
             without_table.push(staging_name(conn, stage_set_id)?);
         }
     }
@@ -499,7 +498,7 @@ fn staging_name(conn: &Connection, stage_set_id: i64) -> Result<String> {
 /// ([`crate::volume::session::span_split`]): of every slice of the set, those
 /// `written` here at or before `counted_through` (K on a short seal, M-1 on a
 /// full one) — all of them `completed` (item 93's middle tape), some `range`,
-/// none `cut`. The front index and the hashes were matched position by
+/// none no row. The front index and the hashes were matched position by
 /// position before this. `Ok(Err(why))` names the disagreement.
 fn span_matches(
     conn: &Connection,
@@ -545,7 +544,7 @@ fn span_matches(
             "range",
             format!("slices {first_slice}-{last_slice} of its {staged}"),
         ),
-        Split::Cut => ("cut", "none of its slices".to_string()),
+        Split::Unwritten => ("no row", "none of its slices".to_string()),
     };
     if status != expected {
         return Ok(Err(format!(
@@ -624,8 +623,8 @@ fn record_adoption(
              adopted. Run the same command again."
         )));
     }
-    // Only a version this tape holds whole is promoted: a cut one's is not
-    // written yet (#420), as a passing short confirm leaves it. A range
+    // Only a version this tape holds whole is promoted: one it holds none of
+    // is not written yet (#420), as a passing short confirm leaves it. A range
     // (#478) promotes its version as confirm's does (ADR-0012 item 128):
     // once every slice of its stage set is on a sealed volume, this one
     // counted (sealed above, in this transaction, and named all the same).
@@ -643,15 +642,8 @@ fn record_adoption(
     // The three-way split the rows record (`staged_match` checked they say
     // what the tape says), each in plan order, for the `write_completed`
     // event a confirm of this write would have recorded.
-    let cut_units: Vec<String> = tx
-        .prepare(
-            "SELECT u.name FROM writes w
-               JOIN snapshots s ON s.id = w.snapshot_id
-               JOIN units u ON u.id = s.unit_id
-              WHERE w.volume_id = ?1 AND w.status = 'cut' ORDER BY w.id",
-        )?
-        .query_map(params![volume_id], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    // A set the tape holds none of has no row to read it from (item 288).
+    let unwritten_units: Vec<String> = Vec::new();
     // A range's run is its row's `written` positions (item 121): the
     // rebuild left the positions past the end `pending`.
     let range_units: Vec<crate::volume::session::RangeUnit> = tx
@@ -701,7 +693,7 @@ fn record_adoption(
     // #420: on a tape that sealed short, the details a short write's own
     // `write_completed` event carries, from the one function that makes them
     // (`write::write_completed_details`: the ending, `ended_after` and the
-    // cut units by name), with the adoption's account beside them under
+    // units planned and not written), with the adoption's account beside them under
     // `adopted`; on a full seal the account alone, as before 1.6.0. #478:
     // with the range units and their runs, on either ending, as confirm's.
     let as_written =
@@ -712,7 +704,7 @@ fn record_adoption(
                 Some(ended_after) => crate::volume::session::Ending::Short { ended_after },
                 None => crate::volume::session::Ending::Full,
             },
-            cut_units,
+            unwritten_units,
             range_units,
         });
     let details = match as_written

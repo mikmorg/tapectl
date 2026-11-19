@@ -199,16 +199,12 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 /// pass [`is_write_target`]'s status test alone while already holding a
 /// whole tape's worth of attached content — this closes that gap.
 ///
-/// `'completed'` counts, and so does `'cut'` (#420; ADR-0012 item 112): a cut
-/// write is on a sealed volume whose tape ended early, and its slices that
-/// reached the tape are on it. It is never a copy, but the volume holds bytes
-/// tapectl knows about and is no write target, whatever its status says (a
-/// rebuild or an adoption can leave a short tape's rows on an `initialized`
-/// row exactly as it leaves `completed` ones). So does `'range'` (#478;
-/// ADR-0012 item 121): the run of a spannable set's slices that the early
-/// warning ended on this tape. A range is on the tape, so a volume holding
-/// one holds known bytes and is no write target, for the same reason as a
-/// cut. `session::SealedPending::confirm` moves
+/// `'completed'` counts, and so does `'range'` (#478; ADR-0012 items 121 and
+/// 288): the run of a set's slices that the early warning ended on this
+/// tape. A range is on the tape, so a volume holding one holds known bytes
+/// and is no write target, whatever its status says (a rebuild or an
+/// adoption can leave a short tape's rows on an `initialized` row exactly as
+/// it leaves `completed` ones). `session::SealedPending::confirm` moves
 /// every `writes` row of a session to `completed` in the SAME transaction
 /// that flips `volumes.status` to `sealed`, so in NORMAL operation
 /// `completed` and `initialized` never coexist on one volume — only the
@@ -236,7 +232,7 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 pub fn has_completed_write(conn: &Connection, volume_id: i64) -> crate::error::Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM writes
-                       WHERE volume_id = ?1 AND status IN ('completed', 'cut', 'range'))",
+                       WHERE volume_id = ?1 AND status IN ('completed', 'range'))",
         params![volume_id],
         |row| row.get(0),
     )?)
@@ -580,8 +576,8 @@ impl<'a> CoverageQuery<'a> {
 //   of the set, 1 to N, is on that volume, so the row holds them all by its
 //   status), or with a `range` write whose `write_positions` row for the
 //   slice is `written` (the range is the row's written positions, item 121).
-//   A `cut` write holds nothing that counts (item 112), and no other status
-//   is a finished write on a sealed tape. A recorded warehouse deposit of a
+//   No other status is a finished write on a sealed tape (a set the tape
+//   was planned to take and did not has no row, item 288). A recorded warehouse deposit of a
 //   holder holds what its volume holds (item 127: "a deposit of a range
 //   volume counts for that range"; ADR-0006).
 // - **Item 138's credit.** Each tape, deposit and place counts for ONE stage
@@ -2620,23 +2616,42 @@ pub fn sole_slices(conn: &Connection, volume_id: i64) -> crate::error::Result<Ve
     Ok(rows)
 }
 
-/// A SQL boolean expression: stage set `stage_set_expr` has a copy on an
-/// [`eligible`] volume that was FULLY READ BACK — a `completed` write with
-/// `write_verified = 1`, which only an Integrity confirm or a passing full
-/// `volume verify` sets (ADR-0012 2026-10-06 item 24). It is the fact that
-/// lifts a pending rewrite's hold on a staged set: item 106 releases the
-/// staged slices only after the new volume has passed a full readback, and
-/// asking for the fact rather than the command that produced it makes the
-/// release independent of which command ran the readback.
+/// A SQL boolean expression: every slice of stage set `stage_set_expr` is
+/// held, in a write that was FULLY READ BACK, by an [`eligible`] volume: a
+/// `completed` write with `write_verified = 1` holds all of them, a `range`
+/// write with `write_verified = 1` the slices it has `written` (ADR-0012
+/// items 121, 127 and 288). `write_verified` is set only by an Integrity
+/// confirm or a passing full `volume verify` (ADR-0012 2026-10-06 item 24).
+/// It is the fact that lifts a pending rewrite's hold on a staged set: item
+/// 106 releases the staged slices only after the new volume has passed a
+/// full readback, and asking for the fact rather than the command that
+/// produced it makes the release independent of which command ran the
+/// readback. Slice by slice, because the early warning may end the
+/// destination inside a set (item 288): the rest of its slices are then
+/// held until an ordinary write with a full readback has taken them.
 ///
-/// Embeds `writes`/`volumes` under the aliases `hw`/`hv`; `stage_set_expr`
-/// is the caller's own column or placeholder.
+/// Embeds `writes`/`volumes`/`stage_slices` under the aliases `hw`/`hv`/`hs`
+/// and `write_positions` as `hp`; `stage_set_expr` is the caller's own
+/// column or placeholder.
 pub fn fully_read_back_copy(stage_set_expr: &str) -> String {
     format!(
-        "EXISTS (SELECT 1 FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
-                 WHERE hw.stage_set_id = {stage_set_expr} AND hw.status = 'completed'
-                   AND hw.write_verified = 1 AND {})",
-        eligible("hv")
+        "(EXISTS (SELECT 1 FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
+                  WHERE hw.stage_set_id = {stage_set_expr} AND hw.status = 'completed'
+                    AND hw.write_verified = 1 AND {eligible})
+          OR (EXISTS (SELECT 1 FROM stage_slices hs WHERE hs.stage_set_id = {stage_set_expr})
+              AND NOT EXISTS (
+                  SELECT 1 FROM stage_slices hs WHERE hs.stage_set_id = {stage_set_expr}
+                    AND NOT EXISTS (
+                        SELECT 1 FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
+                         WHERE hw.stage_set_id = hs.stage_set_id AND hw.write_verified = 1
+                           AND {eligible}
+                           AND (hw.status = 'completed'
+                                OR (hw.status = 'range'
+                                    AND EXISTS (SELECT 1 FROM write_positions hp
+                                                 WHERE hp.write_id = hw.id
+                                                   AND hp.stage_slice_id = hs.id
+                                                   AND hp.status = 'written')))))))",
+        eligible = eligible("hv")
     )
 }
 
@@ -4650,7 +4665,7 @@ pub(crate) mod tests {
         // set's slices this tape holds. A volume holding only one holds bytes
         // tapectl knows about and is no write target.
         conn.execute(
-            "UPDATE writes SET status = 'range', may_span = 1 WHERE volume_id = ?1",
+            "UPDATE writes SET status = 'range' WHERE volume_id = ?1",
             params![volume_id],
         )
         .unwrap();
@@ -4986,7 +5001,7 @@ pub(crate) mod tests {
         let (conn, unit_id, here) = setup_at_stake(false);
         let set = |status: &str| {
             conn.execute(
-                "UPDATE writes SET status = ?1, may_span = 1 WHERE volume_id = ?2",
+                "UPDATE writes SET status = ?1 WHERE volume_id = ?2",
                 params![status, here],
             )
             .unwrap();
@@ -5578,8 +5593,8 @@ pub(crate) mod tests {
         ) {
             self.conn
                 .execute(
-                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                     SELECT id, snapshot_id, ?2, 'range', 1 FROM stage_sets WHERE id = ?1",
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT id, snapshot_id, ?2, 'range' FROM stage_sets WHERE id = ?1",
                     params![stage_set_id, volume_id],
                 )
                 .unwrap();
@@ -5954,9 +5969,9 @@ pub(crate) mod tests {
         ) -> i64 {
             self.conn
                 .execute(
-                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                     SELECT id, snapshot_id, ?2, ?3, ?4 FROM stage_sets WHERE id = ?1",
-                    params![set, volume, status, i64::from(status == "range")],
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT id, snapshot_id, ?2, ?3 FROM stage_sets WHERE id = ?1",
+                    params![set, volume, status],
                 )
                 .unwrap();
             let write = self.conn.last_insert_rowid();

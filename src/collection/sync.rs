@@ -1117,7 +1117,6 @@ mod tests {
             compression_level: None,
             slice_size: None,
             warehouse_copies: None,
-            allow_spanning: None,
             copies_at: None,
             exclude_patterns: vec![],
         };
@@ -1184,7 +1183,6 @@ mod tests {
                 compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec![],
             },
@@ -1300,7 +1298,6 @@ mod tests {
                 compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec![],
             },
@@ -1415,7 +1412,6 @@ mod tests {
             compression_level: None,
             slice_size: None,
             warehouse_copies: None,
-            allow_spanning: None,
             copies_at: None,
             exclude_patterns: Vec::new(),
         };
@@ -1432,56 +1428,6 @@ mod tests {
             "adopt_dotfile must resolve the dotfile's archive_set, exactly as \
              unit::discovery::sync_discovered_unit does"
         );
-    }
-
-    /// #478 (ADR-0012 item 82): `collection sync` adopts a dotfile carrying
-    /// `[policy] allow_spanning`, keeps the file as it was, and the unit's
-    /// resolved policy then reads it, over its archive set's silence.
-    #[test]
-    fn adopting_a_dotfile_with_allow_spanning_keeps_and_resolves_it() {
-        let conn = db::open_memory().unwrap();
-        seed_tenant(&conn, "media");
-        seed_archive_set(&conn, "bulk-media");
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let dir = root.path().join("alpha");
-        std::fs::create_dir_all(&dir).unwrap();
-        let df = dotfile::UnitDotfile {
-            uuid: uuid::Uuid::new_v4().to_string(),
-            name: "testlib/alpha".to_string(),
-            created: "2026-07-29T00:00:00Z".to_string(),
-            tags: Vec::new(),
-            tenant: "media".to_string(),
-            archive_set: Some("bulk-media".to_string()),
-            checksum_mode: None,
-            compression: None,
-            compression_level: None,
-            slice_size: None,
-            warehouse_copies: None,
-            allow_spanning: Some(true),
-            copies_at: None,
-            exclude_patterns: Vec::new(),
-        };
-        let path = dir.join(dotfile::UNIT_DOTFILE);
-        dotfile::write_dotfile(&path, &df).unwrap();
-        let written = std::fs::read_to_string(&path).unwrap();
-
-        let (_report, errors) = sync_collection(
-            &conn,
-            &paths_in(home.path()),
-            &test_lib(root.path(), "media"),
-            false,
-            &[],
-        )
-        .unwrap();
-        assert!(errors.is_empty(), "sync errors: {errors:?}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
-
-        let unit = queries::get_unit_by_name(&conn, "testlib/alpha")
-            .unwrap()
-            .expect("unit must be adopted");
-        let policy = crate::policy::resolve(&conn, &Config::default(), &unit).unwrap();
-        assert!(policy.allow_spanning);
     }
 
     /// #493 (ADR-0012 item 148): adopting a dotfile is a freeze point. The
@@ -1514,7 +1460,6 @@ mod tests {
             compression_level: None,
             slice_size: None,
             warehouse_copies: None,
-            allow_spanning: None,
             copies_at: copies_at.map(|m| m.iter().map(|(n, c)| (n.to_string(), *c)).collect()),
             exclude_patterns: Vec::new(),
         };

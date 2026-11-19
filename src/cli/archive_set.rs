@@ -192,12 +192,6 @@ pub struct PolicyArgs {
     /// Not read yet: dirty detection compares path, size and mtime only.
     #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub dirty_on_metadata_change: Option<bool>,
-    /// Units may span tapes by their slices (true/false)
-    ///
-    /// From tapectl 1.7.0. Never set means "defer to [defaults]", which is
-    /// off.
-    #[arg(long, value_name = "BOOL", hide_possible_values = true)]
-    pub allow_spanning: Option<bool>,
     /// Copies at a location, NAME=N (repeatable)
     ///
     /// E.g. --copies-at home=1 --copies-at offsite=1; each NAME must be a
@@ -310,7 +304,6 @@ struct PolicyWrite {
     preserve_xattrs: Option<bool>,
     preserve_acls: Option<bool>,
     dirty_on_metadata_change: Option<bool>,
-    allow_spanning: Option<bool>,
     /// #493: the set's whole `copies_at` map, stored as a JSON object.
     copies_at: Option<BTreeMap<String, i64>>,
     description: Option<String>,
@@ -332,7 +325,6 @@ impl PolicyWrite {
             preserve_xattrs,
             preserve_acls,
             dirty_on_metadata_change,
-            allow_spanning,
             copies_at,
             description,
         } = self;
@@ -349,7 +341,6 @@ impl PolicyWrite {
             && preserve_xattrs.is_none()
             && preserve_acls.is_none()
             && dirty_on_metadata_change.is_none()
-            && allow_spanning.is_none()
             && copies_at.is_none()
             && description.is_none()
     }
@@ -413,7 +404,6 @@ impl PolicyWrite {
             preserve_xattrs: args.preserve_xattrs,
             preserve_acls: args.preserve_acls,
             dirty_on_metadata_change: args.dirty_on_metadata_change,
-            allow_spanning: args.allow_spanning,
             copies_at,
             description: args.description.clone(),
         })
@@ -460,7 +450,6 @@ impl PolicyWrite {
             preserve_xattrs: as_cfg.preserve_xattrs,
             preserve_acls: as_cfg.preserve_acls,
             dirty_on_metadata_change: as_cfg.dirty_on_metadata_change,
-            allow_spanning: as_cfg.allow_spanning,
             copies_at: as_cfg.copies_at.clone(),
             description: None,
         })
@@ -513,7 +502,6 @@ impl PolicyWrite {
             "dirty_on_metadata_change",
             self.dirty_on_metadata_change.map(ColumnValue::Bool),
         );
-        push("allow_spanning", self.allow_spanning.map(ColumnValue::Bool));
         push(
             "copies_at",
             self.copies_at
@@ -671,7 +659,6 @@ struct ArchiveSetInfo {
     preserve_xattrs: Option<i64>,
     preserve_acls: Option<i64>,
     dirty_on_metadata_change: Option<i64>,
-    allow_spanning: Option<i64>,
     /// The stored JSON object text, or NULL (#493).
     copies_at: Option<String>,
     unit_count: i64,
@@ -688,7 +675,7 @@ impl ArchiveSetInfo {
                         a.warehouse_copies, a.preserve_xattrs, a.preserve_acls,
                         a.dirty_on_metadata_change, a.created_at, a.updated_at,
                         (SELECT COUNT(*) FROM units u WHERE u.archive_set_id = a.id),
-                        a.allow_spanning, a.copies_at, a.compression_level
+                        a.copies_at, a.compression_level
                  FROM archive_sets a WHERE a.name = ?1",
                 params![name],
                 |row| {
@@ -709,9 +696,8 @@ impl ArchiveSetInfo {
                         created: row.get(12)?,
                         updated: row.get(13)?,
                         unit_count: row.get(14)?,
-                        allow_spanning: row.get(15)?,
-                        copies_at: row.get(16)?,
-                        compression_level: row.get(17)?,
+                        copies_at: row.get(15)?,
+                        compression_level: row.get(16)?,
                     })
                 },
             )
@@ -758,7 +744,6 @@ fn info_json(info: &ArchiveSetInfo) -> serde_json::Value {
         "preserve_xattrs": flag(info.preserve_xattrs),
         "preserve_acls": flag(info.preserve_acls),
         "dirty_on_metadata_change": flag(info.dirty_on_metadata_change),
-        "allow_spanning": flag(info.allow_spanning),
         "copies_at": copies_at,
         "units": info.unit_count,
     })
@@ -826,10 +811,6 @@ fn info_text(info: &ArchiveSetInfo) -> String {
     out.push_str(&format!(
         "  Dirty on metadata change: {}\n",
         flag(info.dirty_on_metadata_change)
-    ));
-    out.push_str(&format!(
-        "  Allow spanning:   {}\n",
-        flag(info.allow_spanning)
     ));
     out.push_str(&format!("  Copies at:        {}\n", text(&info.copies_at)));
     out.push_str(&format!("  Units using:      {}\n", info.unit_count));
@@ -1166,7 +1147,6 @@ mod tests {
             "preserve_acls",
             "dirty_on_metadata_change",
             "warehouse_copies",
-            "allow_spanning",
             "copies_at",
         ] {
             assert_eq!(value[key], serde_json::Value::Null, "{key}: {value}");
@@ -1565,7 +1545,6 @@ mod tests {
             preserve_xattrs: None,
             preserve_acls: None,
             dirty_on_metadata_change: None,
-            allow_spanning: None,
             copies_at: None,
         }
     }
@@ -1646,7 +1625,6 @@ mod tests {
         media.preserve_xattrs = Some(false);
         media.preserve_acls = Some(false);
         media.dirty_on_metadata_change = Some(true);
-        media.allow_spanning = Some(true);
         config.archive_sets.push(media);
 
         run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
@@ -1654,7 +1632,6 @@ mod tests {
             ("preserve_xattrs", 0),
             ("preserve_acls", 0),
             ("dirty_on_metadata_change", 1),
-            ("allow_spanning", 1),
         ] {
             assert_eq!(
                 column_i64(&conn, "media", column),
@@ -1665,13 +1642,7 @@ mod tests {
 
         config.archive_sets[0].preserve_acls = Some(true);
         config.archive_sets[0].dirty_on_metadata_change = Some(false);
-        config.archive_sets[0].allow_spanning = Some(false);
         run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
-        assert_eq!(
-            column_i64(&conn, "media", "allow_spanning"),
-            Some(0),
-            "update"
-        );
         assert_eq!(
             column_i64(&conn, "media", "preserve_acls"),
             Some(1),
@@ -1761,80 +1732,6 @@ mod tests {
         );
     }
 
-    /// #478 (ADR-0012 item 82): `allow_spanning` reaches its column through
-    /// `create`, `edit` and `sync`, and NULL means "not set" (defer to
-    /// `[defaults]`): a set created without the flag stays NULL, and a sync
-    /// of a table that does not name the key leaves it NULL, changes nothing
-    /// and logs nothing.
-    #[test]
-    fn allow_spanning_reaches_its_column_and_null_means_not_set() {
-        let conn = fresh_conn();
-        let mut config = Config::default();
-        run(
-            &conn,
-            &config,
-            &create_cmd("plain", None, None),
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(column_i64(&conn, "plain", "allow_spanning"), None);
-        config.archive_sets.push(set_config("plain"));
-        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
-        assert_eq!(
-            column_i64(&conn, "plain", "allow_spanning"),
-            None,
-            "a table that does not name the key must not write a 0"
-        );
-        let synced: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE entity_type = 'archive_set' \
-                 AND action = 'synced'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(synced, 0, "an unnamed key is no change");
-
-        let mut cmd = create_cmd("span", None, None);
-        if let ArchiveSetCommands::Create { policy, .. } = &mut cmd {
-            policy.allow_spanning = Some(true);
-        }
-        run(&conn, &config, &cmd, false, false).unwrap();
-        assert_eq!(column_i64(&conn, "span", "allow_spanning"), Some(1));
-        run(
-            &conn,
-            &config,
-            &ArchiveSetCommands::Edit {
-                name: "span".to_string(),
-                policy: PolicyArgs {
-                    allow_spanning: Some(false),
-                    ..PolicyArgs::default()
-                },
-            },
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(column_i64(&conn, "span", "allow_spanning"), Some(0));
-        let edited: (Option<String>, String) = conn
-            .query_row(
-                "SELECT old_value, new_value FROM events WHERE entity_type = 'archive_set' \
-                 AND action = 'edited' AND field = 'allow_spanning'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(edited, (Some("true".to_string()), "false".to_string()));
-
-        let mut span = set_config("span");
-        span.allow_spanning = Some(true);
-        config.archive_sets.push(span);
-        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
-        assert_eq!(column_i64(&conn, "span", "allow_spanning"), Some(1));
-        assert_eq!(column_i64(&conn, "plain", "allow_spanning"), None);
-    }
-
     /// `sync` re-applies the same config every run; a set whose columns
     /// already match is `unchanged` and logs nothing, and a changed column
     /// is logged once as a `synced` field event with its old value.
@@ -1886,7 +1783,6 @@ mod tests {
             preserve_xattrs: Some(0),
             preserve_acls: Some(1),
             dirty_on_metadata_change: Some(1),
-            allow_spanning: Some(1),
             verify_days: Some(90),
             ..ArchiveSetInfo::default()
         });
@@ -1895,7 +1791,6 @@ mod tests {
             "  Preserve xattrs:  no\n",
             "  Preserve ACLs:    yes\n",
             "  Dirty on metadata change: yes\n",
-            "  Allow spanning:   yes\n",
             "  Verify interval:  90 days\n",
             "  Slice size:       -\n",
         ] {
