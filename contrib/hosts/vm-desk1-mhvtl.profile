@@ -7,7 +7,7 @@
 #   cargo build && sudo install -m 0755 "${CARGO_TARGET_DIR:-target}/debug/tapectl" /scratch/fr-bin/tapectl
 #   scripts/mhvtl-device.sh --tape /dev/tape/by-id/scsi-XYZZY_A1-nst --ensure-media   # prints LOADED_TAG
 #   mkdir -p /scratch/fr-src/keepsake/{a,b} && echo a >/scratch/fr-src/keepsake/a/f && echo b >/scratch/fr-src/keepsake/b/f
-#   scripts/first-run.sh --profile contrib/hosts/vm-desk1-mhvtl.profile --auto --barcode <LOADED_TAG>
+#   scripts/first-run.sh --profile contrib/hosts/vm-desk1-mhvtl.profile --auto --mint-escrow --barcode <LOADED_TAG>
 #
 # Clean up: rm -rf /scratch/fr-{home,work,kit,backups,staging,src}; sudo rm -rf those
 # owned by tapectl.
