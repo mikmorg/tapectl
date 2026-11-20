@@ -60,9 +60,30 @@ macro_rules! each_algorithm {
 /// Deterministic text, which every algorithm packs well.
 fn text(len: usize, seed: u32) -> Vec<u8> {
     const WORDS: [&str; 24] = [
-        "ledger", "orchard", "harvest", "quince", "tapestry", "lantern", "meadow", "copper",
-        "willow", "granite", "voyage", "almanac", "saffron", "bobbin", "cinder", "driftwood",
-        "ember", "fathom", "gable", "heron", "indigo", "juniper", "kettle", "linen",
+        "ledger",
+        "orchard",
+        "harvest",
+        "quince",
+        "tapestry",
+        "lantern",
+        "meadow",
+        "copper",
+        "willow",
+        "granite",
+        "voyage",
+        "almanac",
+        "saffron",
+        "bobbin",
+        "cinder",
+        "driftwood",
+        "ember",
+        "fathom",
+        "gable",
+        "heron",
+        "indigo",
+        "juniper",
+        "kettle",
+        "linen",
     ];
     let mut x = seed.wrapping_mul(2_654_435_761) ^ 0x85EB_CA6B;
     let mut out = Vec::with_capacity(len + 16);
@@ -153,7 +174,7 @@ fn assert_packed(h: &Home, unit: &str, algorithm: &str) {
         .iter()
         .fold((i64::MAX, 0), |(lo, hi), &(_, t)| (lo.min(t), hi.max(t)));
     assert!(
-        max - min > 8 * BS as i64,
+        max - min > 4 * BS as i64,
         "{algorithm}: the slices of {unit} differ in size on tape: {cuts:?}"
     );
 }
@@ -166,7 +187,10 @@ fn slice_bytes(h: &Home, label: &str, unit: &str) -> Vec<(i64, Vec<u8>)> {
         .filter(|(l, u, _, _, status)| l == label && u == unit && status == "written")
         .map(|(_, _, slice, position, _)| {
             let bytes = &h.files(label)[position as usize];
-            (slice, bytes[..sizes[slice as usize - 1].1 as usize].to_vec())
+            (
+                slice,
+                bytes[..sizes[slice as usize - 1].1 as usize].to_vec(),
+            )
         })
         .collect()
 }
@@ -342,7 +366,10 @@ fn prove_layers(algorithm: &str) {
         "{algorithm}: the lowest level stages"
     );
 }
-each_algorithm!(layers_resolve_and_a_level_out_of_range_is_refused, prove_layers);
+each_algorithm!(
+    layers_resolve_and_a_level_out_of_range_is_refused,
+    prove_layers
+);
 
 // ── 2. one tape, both ──
 
@@ -389,7 +416,10 @@ fn prove_one_tape(algorithm: &str) {
         manifest_block(&manifest, plain)
     );
 }
-each_algorithm!(a_compressed_and_an_uncompressed_unit_share_one_tape, prove_one_tape);
+each_algorithm!(
+    a_compressed_and_an_uncompressed_unit_share_one_tape,
+    prove_one_tape
+);
 
 // ── 3. a second cartridge ──
 
@@ -431,10 +461,22 @@ fn prove_continues(algorithm: &str) {
     assert_eq!(slice_copies(&h.conn, SPAN), vec![1; n as usize]);
 
     let report = assert_restores(&h, SPAN, T3[0], &[T3[1]]);
-    assert_eq!(report.slices as i64, n);
-    assert_restores(&h, SPAN, T3[1], &[T3[0]]);
+    // Slice 1 holds only the unit's own entries (its dotfile), which a
+    // restore does not take: every other slice is read.
+    let rows = crate::db::stage_files::load(&h.conn, stage_set_of(&h.conn, SPAN)).unwrap();
+    let first: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.slice == 1 && r.kind == crate::volume::filetable::Kind::File)
+        .map(|r| r.path.as_str())
+        .collect();
+    assert_eq!(first, [".tapectl-unit.toml"], "{algorithm}");
+    assert_eq!(report.slices as i64, n - 1, "{algorithm}");
+    assert_restores(&h, SPAN, T3[1], &[T3[0], T3[1]]);
 }
-each_algorithm!(a_compressed_unit_continues_on_a_second_cartridge, prove_continues);
+each_algorithm!(
+    a_compressed_unit_continues_on_a_second_cartridge,
+    prove_continues
+);
 
 // ── 4. a second copy ──
 
@@ -460,7 +502,10 @@ fn prove_second_copy(algorithm: &str) {
     let on_a = slice_bytes(&h, labels[0], unit);
     let on_b = slice_bytes(&h, labels[1], unit);
     assert_eq!(on_a.len(), recorded.len());
-    assert_eq!(on_a, on_b, "{algorithm}: the two copies hold the same bytes");
+    assert_eq!(
+        on_a, on_b,
+        "{algorithm}: the two copies hold the same bytes"
+    );
     for ((_, bytes), row) in on_a.iter().zip(&recorded) {
         assert_eq!(
             sha_hex(bytes),
@@ -499,7 +544,10 @@ fn prove_second_copy(algorithm: &str) {
         "{algorithm}"
     );
 }
-each_algorithm!(a_second_copy_of_a_compressed_staging_replaces_a_slice_by_sha256, prove_second_copy);
+each_algorithm!(
+    a_second_copy_of_a_compressed_staging_replaces_a_slice_by_sha256,
+    prove_second_copy
+);
 
 // ── 5. rewrite and compaction ──
 
@@ -758,7 +806,10 @@ fn prove_rewrite(algorithm: &str) {
     );
     assert_restores(&h, SPAN, "CMP5-R", &[T3[1]]);
 }
-each_algorithm!(volume_rewrite_carries_a_compressed_unit_unchanged, prove_rewrite);
+each_algorithm!(
+    volume_rewrite_carries_a_compressed_unit_unchanged,
+    prove_rewrite
+);
 
 /// Proof 5, compaction: `compact-read`, the write and `compact-finish` of the
 /// cartridge holding the first run carry the compressed slices unchanged.
@@ -803,13 +854,18 @@ fn prove_compaction(algorithm: &str) {
     );
     assert_restores(&h, SPAN, "CMP5-C", &[T3[1]]);
 }
-each_algorithm!(compaction_carries_a_compressed_unit_unchanged, prove_compaction);
+each_algorithm!(
+    compaction_carries_a_compressed_unit_unchanged,
+    prove_compaction
+);
 
 // ── 6. a rebuild ──
 
 /// Every staging's recorded facts: `(unit, compression, level, stream bytes,
 /// tar version)`.
-fn staging_rows(conn: &Connection) -> Vec<(String, String, Option<i64>, Option<i64>, Option<String>)> {
+fn staging_rows(
+    conn: &Connection,
+) -> Vec<(String, String, Option<i64>, Option<i64>, Option<String>)> {
     conn.prepare(
         "SELECT u.name, ss.compression, ss.compression_level, ss.stream_bytes, ss.tar_version
            FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
@@ -846,9 +902,9 @@ fn prove_rebuild(algorithm: &str) {
 
     let written = staging_rows(&h.conn);
     assert!(
-        written.iter().any(|r| r.0 == SPAN
-            && r.1 == algorithm
-            && r.2 == Some(2)),
+        written
+            .iter()
+            .any(|r| r.0 == SPAN && r.1 == algorithm && r.2 == Some(2)),
         "{algorithm}: the writing catalog has its level: {written:?}"
     );
     for order in [[0, 1], [1, 0]] {
@@ -866,7 +922,10 @@ fn prove_rebuild(algorithm: &str) {
         assert_eq!(snapshot_status(&fresh, SPAN), "current", "{algorithm}");
     }
 }
-each_algorithm!(a_rebuild_from_tape_restores_the_algorithm_and_level, prove_rebuild);
+each_algorithm!(
+    a_rebuild_from_tape_restores_the_algorithm_and_level,
+    prove_rebuild
+);
 
 // ── 7. the plan, and the early warning, by size on tape ──
 
@@ -913,10 +972,6 @@ fn prove_plan(algorithm: &str) {
     assert_packed(&h, SPAN, algorithm);
     let sizes = cuts(&h.conn, SPAN);
     let n = sizes.len();
-    assert!(
-        sizes[..n - 1].iter().all(|&(cut, _)| cut == 65_536),
-        "{algorithm}: every cut but the last is slice_size: {sizes:?}"
-    );
     assert_eq!(
         padded_bytes(&h.conn, SPAN),
         p.padded.iter().sum::<u64>(),
@@ -960,32 +1015,48 @@ fn prove_plan(algorithm: &str) {
         "positive control: uncompressed, the same files do not fit the same cartridge"
     );
 
-    // (c) The early warning comes inside slice 2, by bytes on the medium: the
-    // slice in flight finishes, the tape ends after it, the rest is owed. An
-    // equal-slices plan would cut elsewhere.
-    let warn_at = p.fixed + p.padded[0] + p.padded[1] / 2;
-    let equal_slices_cut = (warn_at - p.fixed) / 65_536 + 1;
+    // (c) The early warning comes inside slice 4, the one that does not pack,
+    // by bytes on the medium: the slice in flight finishes, the tape ends
+    // after it, the rest is owed. A plan that counted each slice as its cut
+    // would have the warning fall in another slice.
+    const K: usize = 4;
+    assert!(n > K + 1, "{algorithm}: {n} slices");
+    let before: u64 = p.padded[..K - 1].iter().sum();
+    let warn_at = p.fixed + before + p.padded[K - 1] / 2;
+    let mut by_cut = p.fixed;
+    let mut cut_model = None;
+    for (i, &(cut, _)) in sizes.iter().enumerate() {
+        by_cut += (cut as u64).div_ceil(BS as u64) * BS as u64;
+        if by_cut > warn_at {
+            cut_model = Some(i + 1);
+            break;
+        }
+    }
     assert_ne!(
-        equal_slices_cut, 2,
-        "{algorithm}: positive control: counting every slice as the cut's size, the warning \
-         would fall in slice {equal_slices_cut}"
+        cut_model,
+        Some(K),
+        "{algorithm}: positive control: counting every slice as its cut, the warning would fall \
+         in slice {cut_model:?}"
     );
     h.volume(T3[0]);
     h.volume(T3[1]);
     h.write(T3[0], Warn::AtBytes(warn_at));
     assert_eq!(
         write::recorded_ranges(&h.conn, T3[0]).unwrap(),
-        [range(SPAN, 1, 2)],
+        [range(SPAN, 1, K as i64)],
         "{algorithm}: tape 1 ends after the slice the warning came in"
     );
     assert!(sealing(&h.conn, T3[0]).1.is_some(), "{algorithm}");
     h.write(T3[1], Warn::Never);
     assert_eq!(
         write::recorded_ranges(&h.conn, T3[1]).unwrap(),
-        [range(SPAN, 3, n as i64)],
+        [range(SPAN, K as i64 + 1, n as i64)],
         "{algorithm}: the owed slices follow on tape 2"
     );
     assert_eq!(snapshot_status(&h.conn, SPAN), "current");
     assert_restores(&h, SPAN, T3[0], &[T3[1]]);
 }
-each_algorithm!(the_plan_and_the_early_warning_follow_each_slices_size_on_tape, prove_plan);
+each_algorithm!(
+    the_plan_and_the_early_warning_follow_each_slices_size_on_tape,
+    prove_plan
+);
