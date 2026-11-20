@@ -2414,8 +2414,10 @@ the result.
 > dry run against a scratch bucket before your first real deposit; `rclone copy
 > --dry-run` will tell you if a flag has moved. The way back (the last part of
 > this section) is the Layout 3 heir path of `docs/design/volume-format-v3.md`
-> §7.2 applied to the dumped files; it was written from that text and is the
-> second thing to rehearse, on a small volume, before you rely on a deposit.
+> §7.2 applied to the dumped files. Its manual steps and its write-back to a
+> blank cartridge were rehearsed on mhvtl on 2026-11-20
+> (`docs/runs/2026-11-20-warehouse-write-back.md`); rehearse it yourself, on a
+> small volume, before you rely on a deposit.
 
 **1. Dump the sealed volume to a directory.** `restore raw-volume` reads a
 tape using only what is on the tape itself, verifies every file against the
@@ -2634,10 +2636,12 @@ this guide: `mt -f "$TAPE" setblk 524288`, `mt -f "$TAPE" rewind`, then for each
 if=NNNN_type.bin of="$TAPE" bs=512k conv=sync` (closing the non-rewinding
 device after each `dd` writes its filemark; the front index and the seal
 marker are already full blocks, and `conv=sync` pads the others with zeros as
-the writer did). Then `RESTORE.sh --verify` reads every file against the
+the writer did). Then, with `export TAPE_DEVICE="$TAPE"` (RESTORE.sh reads
+`/dev/nst0` without it), `RESTORE.sh --verify` reads every file against the
 front index with no key, and `RESTORE.sh --restore --key KEY --to DIR --all`
-is the heir's restore (§7.4). This write-back was not run when this was
-written; take the manual path above if you cannot rehearse it.
+is the heir's restore (§7.4): one unit lands in `DIR` itself, several each in
+`DIR/NAME`. This write-back was rehearsed on mhvtl on 2026-11-20 with GNU tar
+1.35 and age 1.1.1; take the manual path above if you cannot rehearse it.
 
 ### Asking for warehouse copies by policy
 
