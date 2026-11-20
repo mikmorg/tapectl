@@ -782,7 +782,7 @@ pub enum QuarantineReason {
         /// ID thunk (still a mismatch — never overwrite on ambiguity).
         found: Option<format::IdThunkIdentity>,
     },
-    /// Resume found a tapectl volume of another layout where this session
+    /// Resume found a volume of another layout (a tapectl one) where this session
     /// wrote its File 0 (`volume-format-v3.md` §7.6; ADR-0012 item 269;
     /// #586). The divergence is the same as an identity mismatch's, but what
     /// File 0 said is known: its layout and label, which the event keeps.
