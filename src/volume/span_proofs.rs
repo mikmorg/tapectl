@@ -1870,3 +1870,6 @@ fn a_short_seal_leaves_a_range_and_a_set_planned_and_not_written() {
 // T5.3: a range carried by `volume rewrite` and by compaction.
 #[path = "range_carry_proofs.rs"]
 mod range_carry_proofs;
+// T5.7: compression, proven for each algorithm carried.
+#[path = "compression_proofs.rs"]
+mod compression_proofs;
