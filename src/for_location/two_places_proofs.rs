@@ -580,30 +580,6 @@ fn a_version_on_two_cartridges_is_read_back_from_each_cartridge_in_turn() {
     let plan = super::plan(&h.conn, &h.config, "offsite", "SPAN-3", DEVICE).unwrap();
     assert_eq!(plan.skipped, Vec::new(), "{:?}", plan.skipped);
     let commands = plan.read_slices();
-    {
-        let dbg: Vec<(String, String)> = h
-            .conn
-            .prepare("SELECT sn.status, u.status FROM snapshots sn JOIN units u ON u.id=sn.unit_id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        let w: Vec<(String, String)> = h
-            .conn
-            .prepare("SELECT v.label, w.status FROM writes w JOIN volumes v ON v.id=w.volume_id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        eprintln!(
-            "DEBUG planned={:?} skipped={:?} statuses={dbg:?} writes={w:?} nholders={}",
-            plan.planned,
-            plan.skipped,
-            holders.len()
-        );
-    }
     assert_eq!(
         commands.iter().map(|c| c.from.as_str()).collect::<Vec<_>>(),
         ["SPAN-1", "SPAN-2"],
@@ -622,8 +598,10 @@ fn a_version_on_two_cartridges_is_read_back_from_each_cartridge_in_turn() {
     let staged = stage(&h.conn, &h.paths, &h.config, &plan, 1, true).unwrap();
     assert_eq!(staged, [Staged::ReadSlices]);
 
-    // A cartridge that goes missing leaves a slice nothing holds: the unit is
-    // skipped, and the words say the cartridges together lack it.
+    // A cartridge that goes missing leaves slices nothing holds. The version
+    // is then a span in progress whose owed run continues at the place of the
+    // range already written (item 159): it is not read back, and it is not
+    // dropped quietly either: the plan names it among the spans waiting.
     h.conn
         .execute(
             "UPDATE volumes SET status = 'retired' WHERE label = 'SPAN-2'",
@@ -632,11 +610,9 @@ fn a_version_on_two_cartridges_is_read_back_from_each_cartridge_in_turn() {
         .unwrap();
     let plan = super::plan(&h.conn, &h.config, "offsite", "SPAN-3", DEVICE).unwrap();
     assert!(plan.read_slices().is_empty());
-    let skipped = plan.skipped.first().expect("the unit is skipped");
-    assert_eq!(skipped.unit, "reel");
-    assert!(
-        skipped.reason.contains("together") && skipped.reason.contains("v1"),
-        "{}",
-        skipped.reason
-    );
+    assert!(plan.planned.is_empty());
+    assert_eq!(plan.spans_waiting.len(), 1, "{:?}", plan.spans_waiting);
+    assert_eq!(plan.spans_waiting[0].unit, "reel");
+    assert_eq!(plan.spans_waiting[0].version, 1);
+    assert_eq!(plan.spans_waiting[0].at, [Some("rack".to_string())]);
 }
