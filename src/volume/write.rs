@@ -5983,14 +5983,22 @@ pub(crate) fn record_write_bookkeeping(
     // this runs after confirm, hours after the session started, and
     // stamping it now made it the same instant as `last_write`.
     // `last_write` stays the completion.
+    // The script this tape carries at file 2: the hash the layout already
+    // computed when it built the entry, never a second hash of the constant.
+    let restore_sh_sha256: Option<&str> = layout
+        .entries
+        .iter()
+        .find(|e| matches!(e.kind, ZoneKind::RestoreSh))
+        .and_then(|e| e.sha256.as_deref());
     conn.execute(
         "UPDATE volumes SET bytes_written = ?1, num_data_files = ?2, has_manifest = 1,
+         restore_sh_sha256 = COALESCE(?4, restore_sh_sha256),
          first_write = COALESCE(first_write,
                                 (SELECT MIN(started_at) FROM writes WHERE volume_id = ?3),
                                 datetime('now')),
          last_write = datetime('now')
          WHERE id = ?3",
-        params![bytes_written, num_data_files, volume_id],
+        params![bytes_written, num_data_files, volume_id, restore_sh_sha256],
     )?;
     Ok(())
 }
@@ -18307,6 +18315,44 @@ mod tests {
         assert_eq!(readback_bytes(&unsized_only, None), None);
     }
 
+    /// #548 (D18): the volume's row records the sha256 of the RESTORE.sh its
+    /// own layout carries at file 2, so a drill can name the script the
+    /// tape holds, not the one the running binary would write.
+    #[test]
+    fn record_write_bookkeeping_records_the_script_the_layout_carries() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('BKSCRIPT', 'lto', 'lto0', 1000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let layout = Layout {
+            label: "BKSCRIPT".to_string(),
+            volume_uuid: "u".to_string(),
+            media_type: "LTO-6".to_string(),
+            block_size: 4096,
+            budget: CapacityBudget {
+                available_bytes: 0,
+                reserve_bytes: 0,
+                plan_bound_bytes: None,
+                span_tail_from: None,
+            },
+            entries: vec![LayoutEntry {
+                position: 2,
+                kind: ZoneKind::RestoreSh,
+                size_bytes: Some(10),
+                sha256: Some("ab".repeat(32)),
+                source: ContentSource::Generated,
+            }],
+        };
+        record_write_bookkeeping(&conn, 1, &layout, 4096).unwrap();
+        let got: Option<String> = conn
+            .query_row("SELECT restore_sh_sha256 FROM volumes WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(got, Some("ab".repeat(32)));
+    }
+
     /// Issue #392: `first_write` was stamped when the write session
     /// FINISHED, the same instant as `last_write`. It is when the volume's
     /// first write began (`writes.started_at`); `last_write` stays the
@@ -26924,6 +26970,24 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(figures, (2 * 3 * SBS as i64, 2));
+
+                // #548 (D18): the row names the script the tape carries at
+                // file 2, the hash of those bytes on the store.
+                let script = &store.inner.files[2];
+                let want = crate::volume::heir::RESTORE_SH.as_bytes();
+                assert_eq!(&script[..want.len()], want, "file 2 is RESTORE.sh");
+                let recorded: Option<String> = f
+                    .conn
+                    .query_row(
+                        "SELECT restore_sh_sha256 FROM volumes WHERE label = 'SE-1'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    recorded,
+                    Some(format!("{:x}", sha2::Sha256::digest(&script[..want.len()])))
+                );
 
                 // The release `volume write` runs after it: `a` has its one
                 // copy and is released; `b` is a range and `c` has no row, so

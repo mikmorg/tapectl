@@ -401,7 +401,11 @@ CREATE TABLE volumes (
     sealed_at              TEXT,
     ended_after            INTEGER,
     write_lbp              TEXT CHECK (write_lbp IN ('on', 'off', 'mixed')),
-    write_lbp_note         TEXT
+    write_lbp_note         TEXT,
+    -- The sha256 (hex) of the RESTORE.sh at the tape's file 2, as the layout
+    -- that wrote it recorded it. NULL where the catalog never learned it.
+    -- `drill record` copies it (D18).
+    restore_sh_sha256      TEXT
 );
 
 CREATE INDEX idx_volumes_location ON volumes(location_id);
