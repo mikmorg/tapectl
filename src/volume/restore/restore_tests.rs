@@ -1162,37 +1162,48 @@ fn a_unit_of_many_long_names_restores_whole_reading_each_slice_once() {
 }
 
 /// A slice whose age header does not open cannot be read around: no chunk of
-/// it can be told from another, so nothing can be a hole. The restore fails
-/// naming the slice, and no copy of it is given; the slice is read to its
-/// end, and the tape is not rewound for it.
-///
-/// This is the case where a bad slice fails a restore outright. A slice
-/// whose header opens but whose chunks do not authenticate is a hole instead
-/// and the restore goes on past it
-/// (`a_slice_whose_every_chunk_fails_is_a_hole_and_the_restore_is_incomplete`,
-/// and `repair_tests` for one bad chunk).
+/// it can be told from another. With no other copy the slice is bad as a
+/// whole: the members cut from it are left out and listed, the restore goes
+/// on with the next slice, and no byte that did not authenticate is written
+/// (ADR-0012 item 264, `volume-format-v3.md` §7.1; #583). It was a failure of
+/// the whole restore in 1.x (#484), when a dar slice could not be skipped; a
+/// Layout 3 slice holds whole members, so it can.
 ///
 /// The byte is a landmark of the age file, not an offset: age's grease stanza
 /// makes the header's length random (#484).
 #[test]
-fn a_corrupt_slice_header_names_the_slice_and_cannot_be_read_around() {
+fn a_corrupt_slice_header_leaves_its_members_out_and_the_restore_goes_on() {
+    const SLICE: u64 = 128 * 1024;
     let mut h = written(&tree(), "128K", "ST-3");
-    assert!(h.num_slices(UNIT) >= 3);
+    let slices = h.num_slices(UNIT);
+    assert!(slices >= 3);
     let pos = h.position("ST-3", UNIT, 2);
     let at = header_mac_offset(&h, "ST-3", pos);
     h.flip("ST-3", pos, at);
+    let lost = members_touching(&h, SLICE, 2);
+    assert!(
+        lost.len() < h.rows(UNIT).len(),
+        "positive control: members outside slice 2 exist"
+    );
+    let all: Vec<u32> = (1..=slices)
+        .map(|n| h.position("ST-3", UNIT, n) as u32)
+        .collect();
     let r = Rig::new(h, "ST-3");
     let dest = TempDir::new().unwrap();
     let err = r
         .unit("ST-3", dest.path(), &RestoreOptions::default())
         .unwrap_err()
         .to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
     assert!(err.contains("slice 2"), "{err}");
-    assert!(err.contains("checksum mismatch"), "{err}");
     assert!(err.contains("cannot be read around"), "{err}");
-    let pos1 = r.h.position("ST-3", UNIT, 1) as u32;
-    let pos2 = r.h.position("ST-3", UNIT, 2) as u32;
-    assert_eq!(r.reads(), vec![pos1, pos2], "{:?}", r.fake.ops());
+    assert_eq!(
+        lost_paths(&err),
+        lost,
+        "exactly the members the table puts in slice 2: {err}"
+    );
+    assert_all_but(&r.h, dest.path(), &lost);
+    assert_eq!(r.reads(), all, "every slice is read, in one forward pass");
     assert_eq!(r.fake.rewinds(), 1);
     assert!(
         !dest.path().join(SCRATCH_NAME).exists(),
@@ -1201,6 +1212,7 @@ fn a_corrupt_slice_header_names_the_slice_and_cannot_be_read_around() {
     let row = only_row(&r.h.conn);
     assert_eq!(row.outcome, "failed");
     assert_eq!(row.error.as_deref(), Some(err.as_str()));
+    assert!(row.tar_argv.is_some(), "tar ran for the other slices");
 }
 
 /// The other half of #484: a byte of the payload nonce, outside the header's

@@ -748,6 +748,18 @@ struct Ended {
     open_error: Option<TapectlError>,
 }
 
+/// What became of a slice that was asked for.
+enum Fate {
+    /// It was read: whole, or with holes recorded for what no copy gave.
+    Read,
+    /// It is on a cartridge the restore was not given (item 266, R6).
+    Unavailable(String),
+    /// Nothing could read it, as a whole: its age header would not open, or
+    /// no cartridge is left to read it from. Its members are left out and
+    /// listed and the restore goes on (item 264).
+    Bad(String),
+}
+
 /// One attempt at a slice, classified.
 enum Attempt {
     /// Every chunk the slice still lacked authenticated and was kept.
@@ -929,13 +941,22 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 ..SliceRead::default()
             });
         }
-        let unavailable = self.fill_slice(wp, identities, &mut out)?;
+        let fate = self.fill_slice(wp, identities, &mut out)?;
+        let (unavailable, bad) = match fate {
+            Fate::Read => (None, None),
+            Fate::Unavailable(why) => (Some(why), None),
+            Fate::Bad(why) => (None, Some(why)),
+        };
         Ok(SliceRead {
-            authentic_bytes: out.delivered() - out.hole_bytes,
-            bytes: out.bytes,
-            holes: out.holes,
+            authentic_bytes: if bad.is_some() {
+                0
+            } else {
+                out.delivered() - out.hole_bytes
+            },
+            bytes: if bad.is_some() { Vec::new() } else { out.bytes },
+            holes: if bad.is_some() { Vec::new() } else { out.holes },
             unavailable,
-            bad: None,
+            bad,
         })
     }
 
@@ -959,7 +980,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         wp: &WritePositionInfo,
         identities: &[age::x25519::Identity],
         out: &mut SliceOut,
-    ) -> Result<Option<String>> {
+    ) -> Result<Fate> {
         let mut holders: Option<Vec<Holder>> = None;
         // The first cartridge it failed on and why: what a substitution, a
         // refusal or a hole is described by.
@@ -994,7 +1015,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                             if let Some((damaged_on, defect)) = &first {
                                 self.supplied(wp, damaged_on, defect);
                             }
-                            return Ok(None);
+                            return Ok(Fate::Read);
                         }
                         Attempt::Stopped(defect) | Attempt::Unproven(defect, _) => {
                             let label = self.here_label().unwrap_or_default();
@@ -1041,10 +1062,14 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                     // damaged (R6): the files in them are left out and
                     // listed, and the restore goes on with what it has.
                     if self.declined.contains(&holder.volume_id) {
-                        return Ok(Some(self.not_given(wp, &holder, "was not loaded")));
+                        return Ok(Fate::Unavailable(self.not_given(
+                            wp,
+                            &holder,
+                            "was not loaded",
+                        )));
                     }
                     if !self.bay.attended() {
-                        return Ok(Some(self.not_given(
+                        return Ok(Fate::Unavailable(self.not_given(
                             wp,
                             &holder,
                             "cannot be loaded: tapectl swaps no cartridge without a person at \
@@ -1067,7 +1092,11 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                         Changed::Loaded => {}
                         Changed::Declined => {
                             self.declined.insert(holder.volume_id);
-                            return Ok(Some(self.not_given(wp, &holder, "was not loaded")));
+                            return Ok(Fate::Unavailable(self.not_given(
+                                wp,
+                                &holder,
+                                "was not loaded",
+                            )));
                         }
                     }
                 }
@@ -1096,10 +1125,24 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             // Already delivered in full: reading it again could only say the
             // same.
             self.record_damage(wp, on, reason, Vec::new());
-            return Ok(None);
+            return Ok(Fate::Read);
         }
-        self.salvage(wp, identities, out, first)?;
-        Ok(None)
+        Ok(match self.salvage(wp, identities, out, first)? {
+            None => Fate::Read,
+            Some(why) => {
+                self.note_bad(wp, &why);
+                Fate::Bad(why)
+            }
+        })
+    }
+
+    /// A slice nothing could read, as a whole: said, and put on the
+    /// restore's account. The members in it are left out and listed by the
+    /// reader, and the restore goes on (item 264).
+    fn note_bad(&mut self, wp: &WritePositionInfo, why: &str) {
+        warn!(slice = wp.slice_number, "{why}: the files in the slice are left out");
+        progress::log(&format!("slice {}: left out, {why}", wp.slice_number));
+        self.note_here(format!("slice {} could not be read", wp.slice_number));
     }
 
     /// The words for a slice that is on a cartridge the restore was not
@@ -1132,9 +1175,9 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         identities: &[age::x25519::Identity],
         out: &mut SliceOut,
         first: Option<(String, Defect)>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let Some(position) = self.last_position else {
-            return Err(TapectlError::Other(format!(
+            return Ok(Some(format!(
                 "slice {} of {} is held by no cartridge the catalog knows of that has not \
                  already failed it",
                 wp.slice_number, self.subject
@@ -1155,14 +1198,14 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         let ended = match raw.ended {
             Ok(ended) => ended,
             Err(sink) => {
-                return Err(match described(&cause) {
-                    Some(d) => TapectlError::Other(format!("{d}; {sink}")),
-                    None => sink,
-                })
+                return Ok(Some(match described(&cause) {
+                    Some(d) => format!("{d}; {sink}"),
+                    None => sink.to_string(),
+                }))
             }
         };
         if let Some(e) = ended.open_error {
-            return Err(TapectlError::Other(format!(
+            return Ok(Some(format!(
                 "{}; and it cannot be read around: {e}",
                 described(&cause)
                     .unwrap_or_else(|| format!("slice {} cannot be read", wp.slice_number)),
@@ -1176,7 +1219,10 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 out.reset();
                 return self.salvage(wp, identities, out, cause);
             }
-            return Err(self.other_file_error(wp, hash_ok, described(&cause)));
+            return Ok(Some(
+                self.other_file_error(wp, hash_ok, described(&cause))
+                    .to_string(),
+            ));
         }
         let new_holes: Vec<Range<u64>> = out.holes[before_holes..].to_vec();
         if new_holes.is_empty() {
@@ -1194,7 +1240,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                     if let Some((on, d)) = &cause {
                         self.supplied(wp, on, d);
                     }
-                    return Ok(());
+                    return Ok(None);
                 }
                 Proof::Wrong => {
                     // Authentic bytes that are not this slice are no use to
@@ -1209,7 +1255,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                         described(&cause).unwrap_or_else(|| format!("slice {}", wp.slice_number)),
                     );
                     self.record_damage(wp, label, reason, out.holes.clone());
-                    return Ok(());
+                    return Ok(None);
                 }
                 Proof::Unproven(why) => {
                     let reason = format!(
@@ -1217,7 +1263,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                         described(&cause).unwrap_or_else(|| format!("slice {}", wp.slice_number)),
                     );
                     self.record_damage(wp, label, reason, Vec::new());
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
@@ -1236,7 +1282,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             new_holes.len()
         ));
         self.record_damage(wp, label, reason, new_holes);
-        Ok(())
+        Ok(None)
     }
 
     /// Put a slice that could not be proven whole on the restore's account.
