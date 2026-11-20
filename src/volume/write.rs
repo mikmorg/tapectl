@@ -6095,6 +6095,17 @@ pub(crate) fn describe_quarantine(reason: &QuarantineReason) -> String {
              found {}",
             describe_file0_identity(found.as_ref())
         ),
+        QuarantineReason::OtherLayout {
+            expected_label,
+            expected_uuid,
+            other,
+        } => format!(
+            "the loaded cartridge is not this volume's: expected label={expected_label:?}, \
+             uuid={expected_uuid:?}; File 0 holds a volume of another layout: {}. Nothing was \
+             written. If the cartridge is to be reused, `tapectl cartridge erase` reads it, asks \
+             for its label and erases it",
+            other.sentence()
+        ),
         QuarantineReason::AlreadySealed { seal_position } => format!(
             "tape already carries a seal marker at position {seal_position} \
              (ADR-0003: sealed volumes are immutable)"
@@ -18688,6 +18699,25 @@ mod tests {
         assert!(!msg.contains("Some("), "Debug output leaked into: {msg}");
     }
 
+    /// #586: another layout's File 0 at resume is said to be one, with its
+    /// layout and label, never "corrupt".
+    #[test]
+    fn describe_quarantine_other_layout_names_the_layout_and_not_corruption() {
+        let msg = describe_quarantine(&QuarantineReason::OtherLayout {
+            expected_label: "VOL-A".into(),
+            expected_uuid: "u-1".into(),
+            other: super::format::OtherLayout {
+                layout: 2,
+                label: Some("L6-0001".into()),
+            },
+        });
+        assert!(msg.contains("volume of Layout 2"), "{msg}");
+        assert!(msg.contains("label \"L6-0001\""), "{msg}");
+        assert!(msg.contains("RESTORE.sh in its own file 2"), "{msg}");
+        assert!(msg.contains("cartridge erase"), "{msg}");
+        assert!(!msg.contains("corrupt"), "{msg}");
+    }
+
     #[test]
     fn describe_quarantine_already_sealed_mentions_position_and_adr() {
         let msg = describe_quarantine(&QuarantineReason::AlreadySealed { seal_position: 12 });
@@ -29771,6 +29801,34 @@ mod tests {
                         )),
                         "layout {n}: the drive was written to"
                     );
+                    assert_eq!(volume_count(&conn), 0);
+                }
+            }
+        }
+
+        /// #587: a File 0 of another layout that is not Layout 2's TOML (a
+        /// Layout 1 tape, a barcode with a quote) is still another layout:
+        /// `volume init --force` is refused, naming item 269's consent.
+        #[test]
+        fn init_force_over_an_unparseable_file_0_of_another_layout_is_refused() {
+            use crate::volume::format::foreign_layouts as f;
+            for (n, file0) in [
+                (2, f::layout_2_file_0_bad_barcode()),
+                (1, f::LAYOUT_1_FILE_0.to_string()),
+            ] {
+                for force in [false, true] {
+                    let conn = crate::db::open_memory().unwrap();
+                    let fake = another_layout_tape(&file0, f::LAYOUT_2_SEAL);
+                    let before = fake.state().files.clone();
+                    let det = chip(Some("SER-NEW"), Some(0));
+                    let msg = refusal(init_with(&conn, "NEWVOL", &fake, &det, force, None));
+                    assert!(
+                        msg.contains(&format!("volume of Layout {n}"))
+                            && msg.contains("--force cannot override")
+                            && msg.contains("tapectl cartridge erase"),
+                        "layout {n}, force={force}: {msg}"
+                    );
+                    assert_eq!(fake.state().files, before, "nothing was written");
                     assert_eq!(volume_count(&conn), 0);
                 }
             }

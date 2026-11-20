@@ -782,6 +782,15 @@ pub enum QuarantineReason {
         /// ID thunk (still a mismatch — never overwrite on ambiguity).
         found: Option<format::IdThunkIdentity>,
     },
+    /// Resume found a tapectl volume of another layout where this session
+    /// wrote its File 0 (`volume-format-v3.md` §7.6; ADR-0012 item 269;
+    /// #586). The divergence is the same as an identity mismatch's, but what
+    /// File 0 said is known: its layout and label, which the event keeps.
+    OtherLayout {
+        expected_label: String,
+        expected_uuid: String,
+        other: format::OtherLayout,
+    },
     /// Resume found a parseable seal marker at the tape's last position, and
     /// [`resume_reconfirm_eligible`] found at least one of its three
     /// conditions did not hold (ADR-0012's 2026-09-21 amendment, issues
@@ -1252,13 +1261,8 @@ pub(crate) fn contact_report(
             // is known by File 0's label and layout alone, BEFORE anything
             // else of it is read: its seal pointer and seal are of a layout
             // this tapectl does not parse, so they are not asked.
-            if identity.is_ok() {
-                if let Some(other) = format::parse_id_thunk_claims(&text)
-                    .ok()
-                    .and_then(|claims| claims.other_layout())
-                {
-                    return (ContactOutcome::OtherLayout(other), facts);
-                }
+            if let Some(other) = format::recognise_other_layout(&text) {
+                return (ContactOutcome::OtherLayout(other), facts);
             }
             let matches = matches!(
                 &identity,
@@ -2556,14 +2560,10 @@ impl InterruptedSession {
                     self.built.layout.label, self.built.layout.label
                 )));
             }
-            contact @ (ContactOutcome::IdentityMismatch { .. }
-            | ContactOutcome::EmptyFileZero
-            | ContactOutcome::OtherLayout(_)) => {
+            contact @ (ContactOutcome::IdentityMismatch { .. } | ContactOutcome::EmptyFileZero) => {
                 // Issue #327: an empty File 0 at resume is divergence too —
                 // this session wrote a real ID thunk there. It quarantines
-                // exactly as an unparseable File 0 does (`found: None`). So
-                // does another layout's (#560): this session wrote a Layout 3
-                // File 0 there, and what is there now is not it.
+                // exactly as an unparseable File 0 does (`found: None`).
                 let found = match contact {
                     ContactOutcome::IdentityMismatch { found } => found,
                     _ => None,
@@ -2582,6 +2582,23 @@ impl InterruptedSession {
                         expected_label: self.built.layout.label.clone(),
                         expected_uuid: self.built.layout.volume_uuid.clone(),
                         found,
+                    },
+                )?));
+            }
+            // Another layout's File 0 (#560, #586): this session wrote a
+            // Layout 3 File 0 there, and what is there now is not it. It
+            // quarantines as a mismatch does, and says what it found: the
+            // layout and label File 0 states (§7.6), never "corrupt".
+            ContactOutcome::OtherLayout(other) => {
+                return Ok(ResumeOutcome::Quarantined(record_quarantine(
+                    conn,
+                    self.volume_id,
+                    &self.built.layout.label,
+                    &self.write_ids,
+                    QuarantineReason::OtherLayout {
+                        expected_label: self.built.layout.label.clone(),
+                        expected_uuid: self.built.layout.volume_uuid.clone(),
+                        other,
                     },
                 )?));
             }
@@ -7824,6 +7841,64 @@ mod tests {
                 assert_eq!(seal_position, seal_pos);
             }
             other => panic!("expected AlreadySealed, got {other:?}"),
+        }
+    }
+
+    /// #586, #587: a resume that meets another layout's File 0 (Layout 2
+    /// whole, a Layout 1 body that is not TOML, a barcode with a quote)
+    /// quarantines naming the layout and label, in the outcome and in the
+    /// recorded event, and never says "corrupt".
+    #[test]
+    fn resume_quarantines_naming_another_layout() {
+        use crate::volume::format::foreign_layouts as fl;
+        for (n, file0) in [
+            (2, fl::LAYOUT_2_FILE_0.to_string()),
+            (2, fl::layout_2_file_0_bad_barcode()),
+            (1, fl::LAYOUT_1_FILE_0.to_string()),
+        ] {
+            let f = make_fixture();
+            let mut store = MemStore::new(BS as usize);
+            let validated = f
+                .built
+                .into_validated(&f.keys, SliceCheck::Size, &mut store)
+                .unwrap();
+            let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+            let interrupted = match planned
+                .execute_checking(&f.conn, &mut store, || true)
+                .unwrap()
+            {
+                ExecuteOutcome::Interrupted(i) => i,
+                _ => panic!("expected Interrupted"),
+            };
+            let mut padded = file0.into_bytes();
+            padded.resize(BS as usize, 0);
+            store.files[0] = padded;
+
+            let quarantined = match interrupted
+                .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+                .expect("resume must not hard-error")
+            {
+                ResumeOutcome::Quarantined(q) => q,
+                _ => panic!("expected Quarantined"),
+            };
+            match &quarantined.reason {
+                QuarantineReason::OtherLayout { other, .. } => {
+                    assert_eq!(other.layout, n);
+                    assert_eq!(other.label.as_deref(), Some("L6-0001"));
+                }
+                other => panic!("expected OtherLayout, got {other:?}"),
+            }
+            let event: String = f
+                .conn
+                .query_row(
+                    "SELECT new_value FROM events WHERE action = 'write_quarantined'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(event.contains(&format!("volume of Layout {n}")), "{event}");
+            assert!(event.contains("label \"L6-0001\""), "{event}");
+            assert!(!event.contains("corrupt"), "{event}");
         }
     }
 

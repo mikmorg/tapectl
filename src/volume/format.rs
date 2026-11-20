@@ -578,6 +578,72 @@ struct ClaimsDoc {
     volume: ClaimsToml,
 }
 
+/// File 0's `[volume]` claims read line by line, without requiring the rest
+/// of the document to be TOML (`volume-format-v3.md` §7.6; #587). A Layout 1
+/// development tape, or a 1.x File 0 whose `[media]` holds an unescaped `"` or
+/// `\` in a barcode, does not parse as a whole; its `[volume]` table still
+/// says `magic`. Only `magic`, `layout_version`, `tapectl_version` and `label`
+/// are read, and only plain `key = "value"` or `key = N` lines of that table.
+fn lenient_volume_claims(raw: &str) -> FormatClaims {
+    let stripped = raw.trim_end_matches('\0');
+    let mut claims = FormatClaims::default();
+    let mut in_volume = false;
+    for line in stripped.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_volume = line == "[volume]";
+            continue;
+        }
+        if !in_volume {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let text = || {
+            let v = value.strip_prefix('"')?;
+            // The closing quote is the line's last: an unescaped one inside
+            // does not end the value early.
+            let end = v.rfind('"')?;
+            Some(v[..end].to_string())
+        };
+        match key.trim() {
+            "magic" => claims.magic = text(),
+            "label" => claims.label = text(),
+            "tapectl_version" => claims.tapectl_version = text(),
+            "layout_version" => {
+                claims.layout_version = value.split('#').next().and_then(|n| n.trim().parse().ok());
+            }
+            _ => {}
+        }
+    }
+    claims
+}
+
+/// The one recognition of a tapectl volume of another layout, from File 0's
+/// bytes (`volume-format-v3.md` §7.6; ADR-0012 item 269; #560, #587). Every
+/// path that classifies File 0 asks this and nothing else.
+///
+/// `[volume] magic`'s `tapectl-volume-v` prefix is enough, read without
+/// requiring the whole body to parse. A File 0 with no `magic` is recognised
+/// only when its identity parses and it states a `layout_version` (a damaged
+/// File 0 still says its layout, §1.2 rule 2); one that is not tapectl's
+/// stays `None`. Our own layout is `None`.
+pub fn recognise_other_layout(raw: &str) -> Option<OtherLayout> {
+    let claims = parse_id_thunk_claims(raw).unwrap_or_else(|_| lenient_volume_claims(raw));
+    if claims
+        .magic
+        .as_deref()
+        .is_some_and(|m| m.starts_with(MAGIC_PREFIX))
+        || parse_id_thunk_identity(raw).is_ok()
+    {
+        claims.other_layout()
+    } else {
+        None
+    }
+}
+
 /// Parse File 0's `[volume]` claims. Unknown keys are ignored (they are
 /// allowed by the extension rule); a `requires` that is not a list of
 /// strings is an `Err`, which callers treat as a refusal.
@@ -736,7 +802,15 @@ impl FormatClaims {
 /// File 0 whose claims do not parse (say, a `requires` that is not a list)
 /// is refused too: it cannot be shown to be readable.
 pub fn check_id_thunk_readable(raw: &str) -> Result<()> {
-    let claims = parse_id_thunk_claims(raw)?;
+    let claims = match parse_id_thunk_claims(raw) {
+        Ok(claims) => claims,
+        // A tapectl volume of another layout is named as one even when its
+        // body is not this layout's TOML (§7.6; #587).
+        Err(e) => match recognise_other_layout(raw) {
+            Some(_) => lenient_volume_claims(raw),
+            None => return Err(e),
+        },
+    };
     match claims.refusal("File 0") {
         Some(why) => Err(TapectlError::Other(why)),
         None => Ok(()),
@@ -1444,6 +1518,36 @@ mod forward_compat_tests {
     /// volume of another layout". Its claims, and the sentence every command
     /// says. Positive control: this tapectl's own File 0 is not one, and a
     /// document that is not tapectl's, or states no layout, is not one.
+    /// #587: `magic`'s prefix alone recognises another layout, whatever the
+    /// rest of File 0 is. A Layout 1 development tape (no uuid) and a 1.x
+    /// File 0 whose barcode broke the TOML are both recognised, with their
+    /// label; a File 0 that is not tapectl's, and our own, are not.
+    #[test]
+    fn another_layout_is_recognised_by_its_magic_whatever_the_body() {
+        use foreign_layouts as f;
+        let bad = f::layout_2_file_0_bad_barcode();
+        assert!(parse_id_thunk_identity(&bad).is_err(), "premise: not TOML");
+        assert!(parse_id_thunk_identity(f::LAYOUT_1_FILE_0).is_err());
+        for (text, layout) in [(bad.as_str(), 2), (f::LAYOUT_1_FILE_0, 1)] {
+            let other = recognise_other_layout(text).expect("another layout");
+            assert_eq!(other.layout, layout);
+            assert_eq!(other.label.as_deref(), Some("L6-0001"));
+            let why = check_id_thunk_readable(text).unwrap_err().to_string();
+            assert!(why.contains(&format!("volume of Layout {layout}")), "{why}");
+        }
+        // Positive controls: the whole-document cases, ours, and not tapectl's.
+        assert_eq!(
+            recognise_other_layout(f::LAYOUT_2_FILE_0).unwrap().layout,
+            2
+        );
+        assert_eq!(recognise_other_layout(&thunk()), None);
+        assert_eq!(recognise_other_layout("not a tapectl tape"), None);
+        assert_eq!(
+            recognise_other_layout("[volume]\nmagic = \"something-else\"\nlayout_version = 2\n["),
+            None
+        );
+    }
+
     #[test]
     fn a_tapectl_volume_of_another_layout_is_named_with_its_label() {
         use super::foreign_layouts as f;
@@ -2831,6 +2935,24 @@ cartridge_identity_source = "mam"
 tape_length_meters = 846
 load_count_at_write = 7
 "#;
+
+    /// File 0 of a 1.x Layout 2 tape whose operator barcode held a `"` and a
+    /// `\`: 1.9.2 interpolated `cartridge_serial = "{serial}"` unescaped, so
+    /// the body is not TOML (#547, #587).
+    pub fn layout_2_file_0_bad_barcode() -> String {
+        let t = LAYOUT_2_FILE_0.replace(
+            "cartridge_serial = \"EW7VWMVKF6\"",
+            "cartridge_serial = \"EW\"7\\VW\"",
+        );
+        assert_ne!(t, LAYOUT_2_FILE_0);
+        t
+    }
+
+    /// File 0 of a pre-1.0 Layout 1 development tape: `magic` and
+    /// `layout_version` but no `uuid`, and a body that is not Layout 2's.
+    pub const LAYOUT_1_FILE_0: &str = "TAPECTL ARCHIVAL VOLUME\n\n[volume]\n\
+        magic = \"tapectl-volume-v1\"\nlabel = \"L6-0001\"\nlayout_version = 1\n\
+        created_at = \"2026-05-01T09:30:00Z\"\n\n[layout]\nfront_index = [\n";
 
     /// The seal marker of that tape, at file 5, as 1.9.2's
     /// `generate_seal_marker` wrote it.

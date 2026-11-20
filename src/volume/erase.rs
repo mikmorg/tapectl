@@ -585,6 +585,17 @@ fn identify(
             });
         }
     }
+    // File 0 of another layout is known by its label and layout alone, even
+    // when its body is not this layout's TOML (§7.6; #587): the label is the
+    // consent word, and the layout is what `other_layout` asks.
+    if let (ContactOutcome::OtherLayout(other), Some(f0)) = (&outcome, report.file0.as_mut()) {
+        if f0.label.is_none() {
+            f0.label = other.label.clone();
+        }
+        if f0.layout_version.is_none() {
+            f0.layout_version = Some(other.layout);
+        }
+    }
     if let ContactOutcome::AlreadySealed { seal_position } = outcome {
         if let Some(seal) = facts
             .seal_bytes(seal_position)

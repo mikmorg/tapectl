@@ -197,6 +197,13 @@ pub fn adopt(
             })
         }
     };
+    // A tapectl volume of another layout is named as one (§7.6; #586).
+    if let Some(other) = format::recognise_other_layout(&file0) {
+        return Ok(LostAdoption::IdentityMismatch {
+            expected_uuid,
+            found: format!("a volume of another layout ({})", other.sentence()),
+        });
+    }
     let identity = match format::parse_id_thunk_identity(&file0) {
         Ok(identity) => identity,
         Err(e) => {

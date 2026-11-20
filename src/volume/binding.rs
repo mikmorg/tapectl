@@ -1976,10 +1976,7 @@ pub(crate) fn file0_facts_from_text(text: &str) -> File0Facts {
         unreadable: format::check_id_thunk_readable(text)
             .err()
             .map(|e| e.to_string()),
-        other_layout: identity
-            .as_ref()
-            .and_then(|_| format::parse_id_thunk_claims(text).ok())
-            .and_then(|claims| claims.other_layout()),
+        other_layout: format::recognise_other_layout(text),
     }
 }
 
