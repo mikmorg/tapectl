@@ -6902,7 +6902,9 @@ fn a_rebuild_that_could_not_read_the_seal_records_the_volume_unreadable_not_unse
     assert!(total > 0 && aborted == total, "{aborted} of {total}");
     assert_eq!(event_count(&conn, "seal_unreadable"), 1);
     assert!(!tapectl::policy::coverage::counts_as_copy(&conn, LABEL).unwrap());
-    assert!(!tapectl::policy::coverage::is_write_target(&status, &condition));
+    assert!(!tapectl::policy::coverage::is_write_target(
+        &status, &condition
+    ));
 }
 
 /// A tape with NO seal (it was read, and is absent) is still the aborted
@@ -7027,9 +7029,14 @@ fn volume_resume_of_an_aborted_write_does_not_just_say_run_volume_write() {
     )
     .unwrap_err()
     .to_string();
-    assert!(msg.contains("ABORTED before its seal was recorded"), "{msg}");
     assert!(
-        !msg.contains(&format!("Run `tapectl volume write {LABEL}` to start a new one")),
+        msg.contains("ABORTED before its seal was recorded"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains(&format!(
+            "Run `tapectl volume write {LABEL}` to start a new one"
+        )),
         "{msg}"
     );
     assert!(msg.contains("never taken as absent"), "{msg}");

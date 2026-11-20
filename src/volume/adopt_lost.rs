@@ -295,11 +295,19 @@ fn sealed_front_index(
         )
     })?;
 
-    let fi_raw = crate::store::read_small_bytes(store, fi_pos, "front index")
-        .map_err(|e| (false, format!("the front index (file {fi_pos}) did not read: {e}")))?;
+    let fi_raw = crate::store::read_small_bytes(store, fi_pos, "front index").map_err(|e| {
+        (
+            false,
+            format!("the front index (file {fi_pos}) did not read: {e}"),
+        )
+    })?;
     let fi_true = format::without_nul_padding(&fi_raw);
-    let entries = format::parse_front_index(&String::from_utf8_lossy(fi_true))
-        .map_err(|e| (false, format!("the front index (file {fi_pos}) does not parse: {e}")))?;
+    let entries = format::parse_front_index(&String::from_utf8_lossy(fi_true)).map_err(|e| {
+        (
+            false,
+            format!("the front index (file {fi_pos}) does not parse: {e}"),
+        )
+    })?;
 
     // The judgement is `rebuild::locate_and_judge_seal`'s, shared with
     // `catalog rebuild` (#458, #420): a seal this tapectl may not read, and

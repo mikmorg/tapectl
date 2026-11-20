@@ -1049,7 +1049,7 @@ fn dispatch(
                             report.label, report.label, report.label, report.label
                         );
                     } else {
-                    println!(
+                        println!(
                         "  warning: volume \"{}\" was already in this catalog as \"{status}\", \
                          not sealed — most likely a backup taken before its write. The rebuild \
                          attached its units to that row and left the status alone; until it is \
@@ -1545,17 +1545,21 @@ fn seal_unreadable_lines(report: &RebuildReport, why: &str) -> Vec<String> {
         "  warning: volume \"{label}\": THE SEAL MARKER COULD NOT BE READ, which is not the \
          same as no seal: {why}"
     )];
-    lines.push(match (&report.found_volume_status, report.volume_inserted) {
-        (None, _) => "    recorded as an initialized volume with its writes \"aborted\" and its slice \
+    lines.push(
+        match (&report.found_volume_status, report.volume_inserted) {
+            (None, _) => {
+                "    recorded as an initialized volume with its writes \"aborted\" and its slice \
              positions \"pending\", and QUARANTINED, so that `volume write` and `volume resume` \
              refuse it. It is NOT a copy yet: nothing on it counts toward any unit's copies."
-            .to_string(),
-        (Some(status), _) => format!(
+                    .to_string()
+            }
+            (Some(status), _) => format!(
             "    this catalog already holds \"{label}\" as \"{status}\"; the rebuild left that row \
              alone and attached the units it was missing as \"aborted\" writes. They are NOT \
              copies. The row itself is not quarantined: do not write to this cartridge."
         ),
-    });
+        },
+    );
     lines.push(format!(
         "    The tape may carry a sealed volume. Do NOT run `volume write {label}` on it. Read it \
          again (another drive, or after cleaning this one), and rebuild again into a catalog with \
