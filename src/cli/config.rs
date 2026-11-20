@@ -361,6 +361,12 @@ fn run_check(
         .map(|cfg| check_notes(paths.db_file.exists().then_some(conn), cfg))
         .unwrap_or_default();
 
+    // #571 / ADR-0012 item 298: the memory a restore of what this config
+    // stages would hold, against what the host has now (read once, here).
+    let memory_warnings = loaded
+        .map(|cfg| restore_memory_warnings(cfg, crate::staging::jobs::mem_available()))
+        .unwrap_or_default();
+
     let verify_interval_days = loaded.map(|cfg| cfg.defaults.verify_interval_days);
     let defaults_json = loaded.map(|cfg| {
         serde_json::json!({
@@ -385,6 +391,7 @@ fn run_check(
             &ops_lines,
             defaults_json,
             &notes,
+            &memory_warnings,
             home,
         );
     } else {
@@ -405,6 +412,7 @@ fn run_check(
             &ops_lines,
             verify_interval_days,
             &notes,
+            &memory_warnings,
             home,
         );
     }
@@ -462,6 +470,7 @@ fn print_json(
     ops_lines: &[String],
     defaults_json: Option<serde_json::Value>,
     notes: &[String],
+    memory_warnings: &[String],
     home: Option<&crate::startup::Startup>,
 ) {
     let shadowing_json: Vec<_> = shadowing_hits
@@ -597,6 +606,7 @@ fn print_json(
         "ops": ops_lines,
         "defaults": defaults_json,
         "notes": notes,
+        "restore_memory": memory_warnings,
         "home": home.map(|h| h.paths.home.display().to_string()),
         "home_source": home.map(|h| h.source.key()),
     }));
@@ -620,6 +630,7 @@ fn print_human(
     ops_lines: &[String],
     verify_interval_days: Option<i64>,
     notes: &[String],
+    memory_warnings: &[String],
     home: Option<&crate::startup::Startup>,
 ) {
     if report.valid {
@@ -732,6 +743,9 @@ fn print_human(
     for note in notes {
         println!("note: {note}");
     }
+    for line in memory_warnings {
+        println!("{line}");
+    }
     if let Some(days) = verify_interval_days {
         println!(
             "defaults: verify_interval_days = {days} (`audit` warns when a unit has gone \
@@ -739,6 +753,58 @@ fn print_human(
              own interval overrides this for its units)"
         );
     }
+}
+
+/// The restore-memory warning for a config that loads (#571, ADR-0012 item
+/// 298), as lines: the largest figure among `[defaults]` and each archive
+/// set's effective level (a set's own `slice_size` and `compression`, else
+/// the defaults'), compressed levels doubled by
+/// [`crate::volume::restore::restore_memory_figure`], against `available`
+/// (`MemAvailable`, read once by the caller; `None` when the host does not
+/// say). Empty when it fits. Advisory: the exit code never moves.
+pub(crate) fn restore_memory_warnings(
+    cfg: &crate::config::Config,
+    available: Option<u64>,
+) -> Vec<String> {
+    use crate::volume::restore::{restore_memory_figure, restore_memory_warning};
+    let compressed = |name: &str| matches!(crate::staging::pack::packing(name, None), Ok(Some(_)));
+    let mut levels = vec![(
+        "[defaults]".to_string(),
+        cfg.defaults.slice_size.clone(),
+        cfg.defaults.compression.clone(),
+    )];
+    for set in &cfg.archive_sets {
+        levels.push((
+            format!("archive set \"{}\"", set.name),
+            set.slice_size
+                .clone()
+                .unwrap_or_else(|| cfg.defaults.slice_size.clone()),
+            set.compression
+                .clone()
+                .unwrap_or_else(|| cfg.defaults.compression.clone()),
+        ));
+    }
+    let worst = levels
+        .into_iter()
+        .filter_map(|(at, size, compression)| {
+            let bytes = u64::try_from(crate::staging::parse_size_to_bytes(&size).ok()?).ok()?;
+            let compressed = compressed(&compression);
+            Some((
+                restore_memory_figure(bytes, compressed),
+                at,
+                size,
+                bytes,
+                compressed,
+            ))
+        })
+        .max_by_key(|(figure, ..)| *figure);
+    let Some((_, at, size, bytes, compressed)) = worst else {
+        return Vec::new();
+    };
+    restore_memory_warning(bytes, compressed, available)
+        .map(|line| format!("{line} (the largest: {at} slice_size = {size})"))
+        .into_iter()
+        .collect()
 }
 
 /// `config check`'s notes on a config that loads (ADR-0012 item 214): each
@@ -924,6 +990,62 @@ pub(crate) fn describe_host_check(present: bool, hc: &crate::config::HostCheckCo
 mod tests {
     use super::*;
     use crate::config::HostCheckConfig;
+
+    /// #571: the restore-memory warning takes the largest figure among
+    /// `[defaults]` and the archive sets (a set's own `slice_size` and
+    /// `compression`, else the defaults'), doubled where compressed, and
+    /// compares it with the memory passed in. Nothing here reads the host.
+    #[test]
+    fn config_check_names_the_level_with_the_largest_restore_memory_figure() {
+        const G: u64 = 1 << 30;
+        let mut cfg = crate::config::Config::default();
+        cfg.defaults.slice_size = "1G".into();
+        cfg.defaults.compression = "none".into();
+        assert!(
+            restore_memory_warnings(&cfg, Some(G)).is_empty(),
+            "1G fits 1G"
+        );
+        assert!(
+            restore_memory_warnings(&cfg, None).is_empty(),
+            "no reading, no warning"
+        );
+        let w = restore_memory_warnings(&cfg, Some(G - 1));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("[defaults] slice_size = 1G"), "{w:?}");
+
+        let set = |name: &str, slice: Option<&str>, compression: Option<&str>| {
+            let mut a: crate::config::ArchiveSetConfig =
+                toml::from_str(&format!("name = \"{name}\"")).unwrap();
+            a.slice_size = slice.map(String::from);
+            a.compression = compression.map(String::from);
+            a
+        };
+        // A set that only turns compression on doubles the defaults' size.
+        cfg.archive_sets.push(set("squeezed", None, Some("zstd")));
+        assert!(restore_memory_warnings(&cfg, Some(2 * G)).is_empty());
+        let w = restore_memory_warnings(&cfg, Some(2 * G - 1));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("archive set \"squeezed\" slice_size = 1G"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("holds up to 2.0 GiB"), "{w:?}");
+        // A bigger uncompressed set is not doubled, and 1.5G < 2G.
+        cfg.archive_sets
+            .push(set("big", Some("1.5G"), Some("none")));
+        let w = restore_memory_warnings(&cfg, Some(2 * G - 1));
+        assert!(w[0].contains("squeezed"), "the largest figure wins: {w:?}");
+        cfg.archive_sets.push(set("huge", Some("3G"), None));
+        let w = restore_memory_warnings(&cfg, Some(2 * G));
+        assert!(
+            w[0].contains("archive set \"huge\" slice_size = 3G"),
+            "{w:?}"
+        );
+        // A size that does not parse is for `config check`'s own problems.
+        let mut bad = crate::config::Config::default();
+        bad.defaults.slice_size = "huge".into();
+        assert!(restore_memory_warnings(&bad, Some(0)).is_empty());
+    }
 
     /// Issue #431: `config check` says which backends' `device_sg` it
     /// derived — those the file does not set, and only those that now carry a

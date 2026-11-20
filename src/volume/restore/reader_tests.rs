@@ -714,3 +714,73 @@ fn what_tar_says_is_repeated_and_recorded() {
         .as_deref()
         .is_some_and(|v| v.contains("tar")));
 }
+
+// ── #571: a size that cannot be allocated is a bad slice ──
+
+/// A corrupt catalog row that records a slice's size as more than any host
+/// holds makes that slice bad, by name, and leaves out exactly the members
+/// that begin in it. The process is not aborted by the allocation, the
+/// other slices' files are whole (ADR-0012 item 298). `column` is what the
+/// row's corruption is: `size_bytes` (the decoded cut's buffer, and an
+/// uncompressed slice's) or `encrypted_bytes` (a compressed slice's frame).
+fn a_slice_whose_recorded_size_cannot_be_held_is_bad(compression: Option<&str>, column: &str) {
+    let items = files("many", 12, 20_000, 7);
+    let h = home_with("alpha", &items, "64K", compression);
+    assert!(h.num_slices("alpha") >= 3, "several slices");
+    // The last slice: a size that no later slice's start disagrees with (the
+    // catalog is checked against the file table before any tape is read).
+    let n = h.num_slices("alpha");
+    let held = members_in_slice(&h, "alpha", n as u64);
+    assert!(!held.is_empty(), "the last slice holds members");
+    let set = h.stage_set("alpha", 1);
+    let absurd = i64::MAX / 4;
+    h.conn
+        .execute(
+            &format!(
+                "UPDATE stage_slices SET {column} = ?1 WHERE stage_set_id = ?2 AND slice_number = ?3"
+            ),
+            rusqlite::params![absurd, set, n],
+        )
+        .unwrap();
+    let mut bay = h.bay("RDR-A", &[]);
+    let options = RestoreOptions {
+        no_space_check: true,
+        ..RestoreOptions::default()
+    };
+    let (r, dest) = h.restore("alpha", What::Unit, "RDR-A", &options, &mut bay);
+    let err = r.expect_err("a slice that cannot be held").to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
+    assert!(err.contains("cannot be held in memory"), "{err}");
+    assert!(err.contains(&format!("slice {n} is bad")), "{err}");
+    // The reason has parentheses of its own, so read the paths by hand.
+    let lost: BTreeSet<String> = err
+        .lines()
+        .filter(|l| l.starts_with("    ") && !l.starts_with("     "))
+        .filter_map(|l| l.trim().split_once(" (").map(|(p, _)| p.to_string()))
+        .collect();
+    assert!(held.is_subset(&lost), "{held:?} of {lost:?}: {err}");
+    assert!(
+        lost.len() < items.len(),
+        "only the files in that slice: {err}"
+    );
+    assert_all_but(&h, "alpha", dest.path(), &lost);
+    assert!(
+        listing(dest.path()).len() > 1,
+        "positive control: the other slices' files are there"
+    );
+}
+
+#[test]
+fn an_uncompressed_slice_whose_recorded_size_cannot_be_held_is_bad() {
+    a_slice_whose_recorded_size_cannot_be_held_is_bad(None, "size_bytes");
+}
+
+#[test]
+fn a_compressed_slice_whose_recorded_cut_cannot_be_held_is_bad() {
+    a_slice_whose_recorded_size_cannot_be_held_is_bad(Some("zstd"), "size_bytes");
+}
+
+#[test]
+fn a_compressed_slice_whose_recorded_frame_cannot_be_held_is_bad() {
+    a_slice_whose_recorded_size_cannot_be_held_is_bad(Some("zstd"), "encrypted_bytes");
+}

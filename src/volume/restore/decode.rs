@@ -30,20 +30,26 @@ pub(super) struct Decoded {
     /// The frame decoded to its end without a complaint from the decoder.
     /// Not a verdict by itself.
     pub complete: bool,
+    /// Set when the buffer for the cut could not be allocated (a recorded
+    /// size no host could hold: a corrupt catalog row). Nothing was decoded;
+    /// the slice is bad, and this says why.
+    pub unallocatable: Option<String>,
 }
 
-/// Read `decoder` to its end into `out`, keeping at most `cap` bytes. `true`
-/// when it ended cleanly inside the cap.
-fn drain(mut decoder: impl Read, cap: usize, out: &mut Vec<u8>) -> bool {
+/// Read `decoder` to its end, handing what it produces to `sink` and keeping
+/// at most `cap` bytes. `true` when it ended cleanly inside the cap.
+fn drain(mut decoder: impl Read, cap: usize, mut sink: impl FnMut(&[u8])) -> bool {
     let mut buf = vec![0u8; 64 * 1024];
+    let mut kept = 0usize;
     loop {
         match decoder.read(&mut buf) {
             Ok(0) => return true,
             Ok(n) => {
                 // A frame that decodes to more than the slice's recorded
                 // size is not that slice's frame (and may be a bomb).
-                let room = cap.saturating_sub(out.len());
-                out.extend_from_slice(&buf[..n.min(room)]);
+                let room = cap.saturating_sub(kept);
+                sink(&buf[..n.min(room)]);
+                kept += n.min(room);
                 if n > room {
                     return false;
                 }
@@ -54,22 +60,62 @@ fn drain(mut decoder: impl Read, cap: usize, out: &mut Vec<u8>) -> bool {
     }
 }
 
+/// Decode `frame` as one frame of `algorithm` through `sink`, keeping at most
+/// `cap` bytes. `true` when it ended cleanly inside the cap.
+fn run(algorithm: Algorithm, frame: &[u8], cap: usize, sink: impl FnMut(&[u8])) -> bool {
+    match algorithm {
+        Algorithm::Gzip => drain(flate2::read::GzDecoder::new(frame), cap, sink),
+        Algorithm::Xz => drain(liblzma::read::XzDecoder::new(frame), cap, sink),
+        Algorithm::Zstd => match zstd::stream::read::Decoder::new(frame) {
+            Ok(d) => drain(d.single_frame(), cap, sink),
+            Err(_) => false,
+        },
+    }
+}
+
 /// Decode `frame` as one frame of `algorithm`, keeping at most `cap` decoded
 /// bytes. The bytes produced are returned whether or not the frame decoded
 /// to its end: a frame that stops (a hole in it, a bad chunk, a cut-short
 /// copy) gives the cut's bytes up to there.
+///
+/// The buffer is made once, at `cap` (the slice's recorded size, which a
+/// whole frame decodes to exactly), never grown by doubling (#571, ADR-0012
+/// item 298); a `cap` that cannot be allocated is reported in
+/// [`Decoded::unallocatable`] and aborts nothing.
 pub(super) fn decode(algorithm: Algorithm, frame: &[u8], cap: u64) -> Decoded {
     let cap = usize::try_from(cap).unwrap_or(usize::MAX);
     let mut bytes = Vec::new();
-    let complete = match algorithm {
-        Algorithm::Gzip => drain(flate2::read::GzDecoder::new(frame), cap, &mut bytes),
-        Algorithm::Xz => drain(liblzma::read::XzDecoder::new(frame), cap, &mut bytes),
-        Algorithm::Zstd => match zstd::stream::read::Decoder::new(frame) {
-            Ok(d) => drain(d.single_frame(), cap, &mut bytes),
-            Err(_) => false,
-        },
-    };
-    Decoded { bytes, complete }
+    if let Err(e) = bytes.try_reserve_exact(cap) {
+        return Decoded {
+            bytes: Vec::new(),
+            complete: false,
+            unallocatable: Some(format!(
+                "the {cap} bytes the catalog records for it cannot be held in memory ({e})"
+            )),
+        };
+    }
+    let complete = run(algorithm, frame, cap, |b| bytes.extend_from_slice(b));
+    Decoded {
+        bytes,
+        complete,
+        unallocatable: None,
+    }
+}
+
+/// sha256 of what `frame` decodes to, taken as the decoder produces it (a
+/// 64 KiB buffer, never the cut whole), when it decodes to its end inside
+/// `cap` and to exactly `cap` bytes; `None` otherwise. The same bytes, the
+/// same completeness and length conditions as hashing [`decode`]'s output.
+pub(super) fn digest(algorithm: Algorithm, frame: &[u8], cap: u64) -> Option<[u8; 32]> {
+    use sha2::Digest;
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+    let mut hasher = crate::pass_count::Sha256::new();
+    let mut total = 0usize;
+    let complete = run(algorithm, frame, cap, |b| {
+        hasher.update(b);
+        total += b.len();
+    });
+    (complete && total == cap).then(|| hasher.finalize().into())
 }
 
 #[cfg(test)]
@@ -137,6 +183,58 @@ mod tests {
             let d = decode(a, &frame(a, &cut), 50_000);
             assert!(!d.complete, "{}", a.name());
             assert!(d.bytes.len() <= 50_000, "{}", a.name());
+        }
+    }
+
+    /// The streamed digest is the sha256 of the decoded cut, and `None` in
+    /// every case the decoded bytes would not have been the whole cut.
+    #[test]
+    fn the_streamed_digest_is_of_the_decoded_cut_and_of_nothing_short_of_it() {
+        use sha2::Digest;
+        let cut = mixed(300_000);
+        let want: [u8; 32] = sha2::Sha256::digest(&cut).into();
+        for a in ALL {
+            let f = frame(a, &cut);
+            let n = cut.len() as u64;
+            assert_eq!(digest(a, &f, n), Some(want), "{}", a.name());
+            assert_eq!(
+                digest(a, &f, n + 1),
+                None,
+                "{}: not the recorded size",
+                a.name()
+            );
+            assert_eq!(digest(a, &f, n - 1), None, "{}: over the cap", a.name());
+            assert_eq!(
+                digest(a, &f[..f.len() / 2], n),
+                None,
+                "{}: half a frame",
+                a.name()
+            );
+        }
+    }
+
+    /// The buffer is made once, at the recorded size: it is never bigger.
+    #[test]
+    fn the_decoded_buffer_is_exactly_the_recorded_size() {
+        let cut = mixed(300_007);
+        for a in ALL {
+            let d = decode(a, &frame(a, &cut), cut.len() as u64);
+            assert!(d.complete && d.unallocatable.is_none(), "{}", a.name());
+            assert_eq!(d.bytes.capacity(), cut.len(), "{}", a.name());
+        }
+    }
+
+    /// A recorded size no host can hold (a corrupt catalog row) is refused by
+    /// name, with nothing decoded, and the process goes on.
+    #[test]
+    fn a_size_that_cannot_be_allocated_is_a_bad_slice_and_not_an_abort() {
+        let cut = mixed(10_000);
+        for a in ALL {
+            let d = decode(a, &frame(a, &cut), u64::MAX / 2);
+            assert!(!d.complete, "{}", a.name());
+            assert!(d.bytes.is_empty(), "{}", a.name());
+            let why = d.unallocatable.expect("says why");
+            assert!(why.contains("cannot be held in memory"), "{why}");
         }
     }
 }

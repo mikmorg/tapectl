@@ -76,7 +76,7 @@ pub struct StageOutcome {
 
 /// The memory the kernel says is available for new work (`MemAvailable`),
 /// in bytes, or `None` where it does not say.
-fn mem_available() -> Option<u64> {
+pub(crate) fn mem_available() -> Option<u64> {
     #[cfg(test)]
     if let Some(bytes) = MEMORY_OVERRIDE.with(|m| m.get()) {
         return Some(bytes);

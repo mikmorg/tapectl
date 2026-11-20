@@ -413,27 +413,47 @@ impl SliceOut {
 
     /// sha256 of the slice's cut as delivered (holes included, as zeros): of
     /// the bytes themselves, or, for a compressed staging, of what the frame
-    /// decodes to. `None` when the frame does not decode to a whole cut of
+    /// decodes to, hashed as the decoder produces it (no second copy of the
+    /// cut is held). `None` when the frame does not decode to a whole cut of
     /// the recorded size.
     fn plain_digest(&self) -> Option<[u8; 32]> {
-        let cut = self.cut()?;
-        let mut hasher = Sha256::new();
-        hasher.update(&cut);
-        Some(hasher.finalize().into())
+        match self.compression {
+            None => {
+                let mut hasher = Sha256::new();
+                hasher.update(&self.bytes);
+                Some(hasher.finalize().into())
+            }
+            Some(algorithm) => super::decode::digest(algorithm, &self.bytes, self.cut_bytes),
+        }
     }
 
-    /// The cut the bytes hold: themselves, or what the frame decodes to when
-    /// it decodes to a whole cut. `None` when a compressed slice's frame
-    /// does not.
-    fn cut(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+    /// How many plaintext bytes this slice is expected to hold, from the
+    /// catalog: the recorded cut for an uncompressed staging; for a
+    /// compressed one the frame, which is not recorded, taken from the
+    /// slice's encrypted size less age's 16-byte tag per 64 KiB chunk. That
+    /// leaves only the age header and nonce (a few hundred bytes) over the
+    /// frame's true length, an upper bound within them.
+    fn expected_bytes(&self, encrypted_bytes: u64) -> u64 {
         match self.compression {
-            None => Some(std::borrow::Cow::Borrowed(&self.bytes)),
-            Some(algorithm) => {
-                let d = super::decode::decode(algorithm, &self.bytes, self.cut_bytes);
-                (d.complete && d.bytes.len() as u64 == self.cut_bytes)
-                    .then_some(std::borrow::Cow::Owned(d.bytes))
-            }
+            None => self.cut_bytes,
+            Some(_) => encrypted_bytes.saturating_sub(
+                encrypted_bytes.div_ceil(chunks::ENCRYPTED_CHUNK as u64)
+                    * (chunks::ENCRYPTED_CHUNK - chunks::CHUNK) as u64,
+            ),
         }
+    }
+
+    /// Make the one allocation the plaintext needs, at its exact size, so no
+    /// write grows the buffer by doubling (#571, ADR-0012 item 298). `Err`
+    /// says why when the size cannot be allocated (a corrupt catalog row).
+    fn reserve(&mut self, expected: u64) -> std::result::Result<(), String> {
+        let want = usize::try_from(expected).unwrap_or(usize::MAX);
+        let more = want.saturating_sub(self.bytes.len());
+        self.bytes.try_reserve_exact(more).map_err(|e| {
+            format!(
+                "the {expected} bytes the catalog records for it cannot be held in memory ({e})"
+            )
+        })
     }
 
     /// Start the slice over: what was written is not to be kept (it is not
@@ -477,6 +497,10 @@ pub(super) struct SliceRead {
     /// answer "I do not have it"). Not damage: R6 says a slice that is on
     /// another tape is never reported as damaged.
     pub unavailable: Option<String>,
+    /// Why the slice is bad before a byte of it was read: the memory for its
+    /// recorded size cannot be had (a corrupt catalog row). Nothing was read;
+    /// the slice is bad, and the restore goes on without it.
+    pub bad: Option<String>,
 }
 
 /// Why a slice could not be had from the cartridge it was read from.
@@ -899,12 +923,19 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         compression: Option<Algorithm>,
     ) -> Result<SliceRead> {
         let mut out = SliceOut::new(wp.slice_number, compression, wp.size_bytes.max(0) as u64);
+        if let Err(why) = out.reserve(out.expected_bytes(wp.encrypted_bytes.max(0) as u64)) {
+            return Ok(SliceRead {
+                bad: Some(why),
+                ..SliceRead::default()
+            });
+        }
         let unavailable = self.fill_slice(wp, identities, &mut out)?;
         Ok(SliceRead {
             authentic_bytes: out.delivered() - out.hole_bytes,
             bytes: out.bytes,
             holes: out.holes,
             unavailable,
+            bad: None,
         })
     }
 
@@ -1971,6 +2002,60 @@ mod tests {
         assert!(out.bound.is_none(), "free to be tied to another file");
         out.write(b"xy");
         assert_eq!(out.bytes, b"xy");
+    }
+
+    /// #571: the plaintext's buffer is made once, at the size the catalog
+    /// gives, and an uncompressed slice's is its cut.
+    #[test]
+    fn the_plaintext_buffer_is_reserved_exactly_once_from_the_catalog() {
+        let mut out = SliceOut::new(1, None, 3 * 1024 * 1024);
+        assert_eq!(
+            out.expected_bytes(999),
+            3 * 1024 * 1024,
+            "the cut, not the cipher"
+        );
+        out.reserve(out.expected_bytes(0)).unwrap();
+        assert_eq!(out.bytes.capacity(), 3 * 1024 * 1024);
+        out.write(&[7u8; 4096]);
+        assert_eq!(
+            out.bytes.capacity(),
+            3 * 1024 * 1024,
+            "a write grows nothing"
+        );
+        // What is kept across an attempt is not reserved twice.
+        out.reserve(3 * 1024 * 1024).unwrap();
+        assert_eq!(out.bytes.capacity(), 3 * 1024 * 1024);
+    }
+
+    /// #571: a compressed slice's frame is not recorded; it is the encrypted
+    /// size less one 16-byte tag per 64 KiB chunk, which is the plaintext
+    /// plus only the age header and nonce.
+    #[test]
+    fn a_frames_size_is_the_encrypted_size_less_the_tags() {
+        let out = SliceOut::new(1, Some(Algorithm::Zstd), 123);
+        let chunks = 5u64;
+        let plain = 4 * chunks::CHUNK as u64 + 1000;
+        let header = 200u64;
+        let encrypted = header + plain + 16 * chunks;
+        let expected = out.expected_bytes(encrypted);
+        assert!(expected >= plain, "never below the frame: {expected}");
+        assert_eq!(
+            expected - plain,
+            header,
+            "over by the header and nonce only"
+        );
+        assert_eq!(out.expected_bytes(0), 0);
+    }
+
+    /// #571: a size no host can hold is an `Err` that says why, never an abort.
+    #[test]
+    fn a_plaintext_size_that_cannot_be_allocated_is_an_error_not_an_abort() {
+        let mut out = SliceOut::new(1, None, u64::MAX / 2);
+        let why = out.reserve(out.expected_bytes(0)).unwrap_err();
+        assert!(why.contains("cannot be held in memory"), "{why}");
+        let mut out = SliceOut::new(1, Some(Algorithm::Zstd), 1);
+        assert!(out.reserve(u64::MAX / 2).is_err());
+        assert!(out.bytes.is_empty());
     }
 
     /// A slice is tied to the age file that delivered its first bytes, and to

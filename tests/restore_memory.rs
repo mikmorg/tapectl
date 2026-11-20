@@ -250,17 +250,28 @@ fn measure(slice_size: &str, compression: &str, sizes: &[usize]) -> Measured {
     }
 }
 
-/// The two slice sizes on one shape, and the peak stated as `k` slices.
-/// `k_lo`/`k_hi`: the multiple of the largest cut the reader's holdings give
-/// (see the module doc), plus [`FIXED`] for everything that is not the cut.
-fn prove(what: &str, compression: &str, sizes: &[usize], k_lo: f64, k_hi: f64) {
+/// The slice sizes measured. 2M and 8M land exactly on a `Vec`'s doubling (a
+/// whole power of two of capacity), so they cannot tell an exact allocation
+/// from luck; 3M, a multiple of 512 that is not a power of two, can (T5.11).
+const SIZES: [&str; 3] = ["2M", "3M", "8M"];
+
+/// One shape at [`SIZES`], and the peak stated against the largest cut.
+/// `frames`: how many frames the reader holds beside the decoded cut (0 for an
+/// uncompressed staging, which holds the cut alone; 1 for a compressed one,
+/// whose frame is held beside the decoded cut). The peak is then
+/// `cut + frames * frame + FIXED`, the frame being at most the cut plus the
+/// compressor's worst-case expansion ([`frame_bound`]).
+fn prove(what: &str, compression: &str, sizes: &[usize], frames: usize) {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-    let small = measure("2M", compression, sizes);
-    let large = measure("8M", compression, sizes);
-    for (size, m) in [("2M", &small), ("8M", &large)] {
+    let runs: Vec<(&str, Measured)> = SIZES
+        .iter()
+        .map(|&size| (size, measure(size, compression, sizes)))
+        .collect();
+    let k_lo = (1 + frames) as f64;
+    for (size, m) in &runs {
         eprintln!(
             "restore peak | {what} | {compression} | slice_size {size} | {} slices | largest cut \
-             {:.2} MiB | peak {:.2} MiB | k = {:.2}",
+             {:.2} MiB | peak {:.2} MiB | k = {:.3}",
             m.slices,
             m.max_cut as f64 / MIB as f64,
             m.peak as f64 / MIB as f64,
@@ -274,33 +285,52 @@ fn prove(what: &str, compression: &str, sizes: &[usize], k_lo: f64, k_hi: f64) {
             m.peak,
             m.max_cut
         );
+        let held = m.max_cut + frames * frame_bound(m.max_cut);
         assert!(
-            m.peak as f64 <= k_hi * cut + FIXED as f64,
-            "{what}/{compression}/{size}: the peak {} is within {k_hi} cut(s) of {} + {FIXED}",
+            m.peak <= held + FIXED,
+            "{what}/{compression}/{size}: the peak {} is within the cut {} plus {frames} frame(s) \
+             ({held} in all) plus {FIXED}: a buffer is bigger than it needs to be",
             m.peak,
             m.max_cut
         );
     }
-    // Scaling: what 6 MiB more slice costs. This is the real check; the absolute
-    // bound above (with its constant) only keeps the figures sane.
-    let d_peak = large.peak as f64 - small.peak as f64;
-    let d_cut = large.max_cut as f64 - small.max_cut as f64;
-    let k = d_peak / d_cut;
-    eprintln!("restore scaling | {what} | {compression} | d_peak/d_cut = {k:.2}");
-    assert!(
-        d_cut > 5.0 * MIB as f64,
-        "the two sizes differ by about 6 MiB of cut"
-    );
-    assert!(
-        k >= k_lo - 0.05 && k <= k_hi + 0.05,
-        "{what}/{compression}: the peak grows {k:.2} bytes per byte of cut, expected within \
-         [{k_lo}, {k_hi}]"
-    );
+    // Scaling: what more slice costs, between sizes that are NOT both powers
+    // of two as well as between those that are. This is the real check; the
+    // absolute bound above only keeps the figures sane.
+    let k_hi = k_lo + frames as f64 / 256.0 + 0.01;
+    for (from, to, least) in [(0, 2, 5.0), (1, 2, 4.0)] {
+        let (a, b) = (&runs[from].1, &runs[to].1);
+        let d_cut = b.max_cut as f64 - a.max_cut as f64;
+        let k = (b.peak as f64 - a.peak as f64) / d_cut;
+        eprintln!(
+            "restore scaling | {what} | {compression} | {} to {} | d_peak/d_cut = {k:.3}",
+            runs[from].0, runs[to].0
+        );
+        assert!(
+            d_cut > least * MIB as f64,
+            "{what}/{compression}: the two sizes differ by more than {least} MiB of cut ({d_cut})"
+        );
+        assert!(
+            k >= k_lo - 0.02 && k <= k_hi,
+            "{what}/{compression}: {} to {}: the peak grows {k:.3} bytes per byte of cut, \
+             expected within [{k_lo}, {k_hi}]",
+            runs[from].0,
+            runs[to].0
+        );
+    }
 }
 
-/// Everything in a restore that is not a slice: catalog rows, buffers, the
-/// file table, thread stacks' bookkeeping.
-const FIXED: usize = 4 * MIB;
+/// The most a zstd frame of `cut` bytes of noise can be: zstd's documented
+/// worst case (`ZSTD_compressBound`: `n + n/256` for a large `n`, plus a few
+/// bytes of frame header) rounded up.
+fn frame_bound(cut: usize) -> usize {
+    cut + cut / 256 + 1024
+}
+
+/// Everything in a restore that is not a slice: catalog rows, the file table,
+/// buffers (measured: about 0.2 MiB). Small enough that a `Vec` grown by
+/// doubling to a 3 MiB cut (4 MiB of capacity) shows.
+const FIXED: usize = 3 * MIB / 4;
 
 /// Positive control: an allocation of a known size inside the window raises
 /// the peak by at least that size, and one freed before the window does not.
@@ -335,22 +365,22 @@ fn one_long() -> Vec<usize> {
 /// up to two with growth slack (measured: 1.0 to 1.2).
 #[test]
 fn uncompressed_many_small_members_peak_is_one_slice() {
-    prove("many small", "none", &many_small(), 1.0, 2.0);
+    prove("many small", "none", &many_small(), 0);
 }
 
 #[test]
 fn uncompressed_one_long_member_peak_is_one_slice() {
-    prove("one long", "none", &one_long(), 1.0, 2.0);
+    prove("one long", "none", &one_long(), 0);
 }
 
 /// zstd, on noise (frame about the cut's size): the frame and the decoded cut
 /// are alive together, 2 to 4 cuts by capacity (measured: 2.0 to 3.0).
 #[test]
 fn zstd_many_small_members_peak_is_frame_plus_cut() {
-    prove("many small", "zstd", &many_small(), 2.0, 4.0);
+    prove("many small", "zstd", &many_small(), 1);
 }
 
 #[test]
 fn zstd_one_long_member_peak_is_frame_plus_cut() {
-    prove("one long", "zstd", &one_long(), 2.0, 4.0);
+    prove("one long", "zstd", &one_long(), 1);
 }

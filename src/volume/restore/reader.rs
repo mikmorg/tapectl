@@ -169,28 +169,44 @@ fn cut_of(
     algorithm: Option<Algorithm>,
 ) -> Cut {
     let size = wp.size_bytes.max(0) as u64;
+    // Nothing was read: the memory for the recorded size could not be had.
+    if let Some(why) = read.bad {
+        return Cut {
+            bytes: Vec::new(),
+            lost: Vec::new(),
+            bad: Some(why),
+        };
+    }
+    let super::supply::SliceRead { bytes, holes, .. } = read;
     let Some(algorithm) = algorithm else {
-        let bad = (read.bytes.len() as u64 != size && read.holes.is_empty()).then(|| {
+        let bad = (bytes.len() as u64 != size && holes.is_empty()).then(|| {
             format!(
                 "it holds {} bytes where the catalog records {size}",
-                read.bytes.len()
+                bytes.len()
             )
         });
         return Cut {
-            bytes: read.bytes,
-            lost: read.holes,
+            bytes,
+            lost: holes,
             bad,
         };
     };
     // A compressed slice: what the frame decodes to before the first hole.
     // Nothing after a bad chunk decodes (item 284), and what comes before it
     // is still the cut's own bytes.
-    let frame_end = read
-        .holes
-        .first()
-        .map_or(read.bytes.len() as u64, |h| h.start);
-    let decoded = decode::decode(algorithm, &read.bytes[..frame_end as usize], size);
-    if read.holes.is_empty() {
+    let frame_end = holes.first().map_or(bytes.len() as u64, |h| h.start);
+    let decoded = decode::decode(algorithm, &bytes[..frame_end as usize], size);
+    // The frame is not needed again: freed here, before the cut is hashed or
+    // any member of it is fed to tar (#571, ADR-0012 item 298).
+    drop(bytes);
+    if let Some(why) = decoded.unallocatable {
+        return Cut {
+            bytes: Vec::new(),
+            lost: Vec::new(),
+            bad: Some(why),
+        };
+    }
+    if holes.is_empty() {
         let mut hasher = Sha256::new();
         hasher.update(&decoded.bytes);
         let got: [u8; 32] = hasher.finalize().into();

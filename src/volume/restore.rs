@@ -113,6 +113,52 @@ pub struct RestoreOptions {
     pub keys: Vec<keys::KeyFile>,
 }
 
+/// What tapectl's restore holds in memory at once for slices of `slice_bytes`
+/// (#571, ADR-0012 item 298): one whole slice's plaintext, and, when the
+/// staging is compressed, its frame beside it, so about twice that. Each
+/// buffer is allocated at its exact size, so this is the figure, not a
+/// bound that doubling could double again.
+pub fn restore_memory_figure(slice_bytes: u64, compressed: bool) -> u64 {
+    if compressed {
+        slice_bytes.saturating_mul(2)
+    } else {
+        slice_bytes
+    }
+}
+
+/// The warning for a restore of slices of `slice_bytes` (compressed or not)
+/// when `available` bytes of memory (`MemAvailable`) are less than the
+/// figure ([`restore_memory_figure`]); `None` when it fits, or when the host
+/// does not say what is available. Advisory: it is text, and refuses
+/// nothing. Pure, so that what it decides never depends on the host a test
+/// runs on: the callers read the memory once and pass it in.
+pub fn restore_memory_warning(
+    slice_bytes: u64,
+    compressed: bool,
+    available: Option<u64>,
+) -> Option<String> {
+    let available = available?;
+    let figure = restore_memory_figure(slice_bytes, compressed);
+    if figure <= available {
+        return None;
+    }
+    let size = |b: u64| crate::util::format_bytes_binary(i64::try_from(b).unwrap_or(i64::MAX));
+    let what = if compressed {
+        "one whole slice and its compressed frame beside it"
+    } else {
+        "one whole slice"
+    };
+    Some(format!(
+        "warning: a restore of slices of {} holds up to {} in memory at once ({what}), and only \
+         {} is available (MemAvailable): it may be killed for memory or slow to a crawl in \
+         swap; free memory first, or restore on a host with more. `slice_size` sets this for \
+         new stagings",
+        size(slice_bytes),
+        size(figure),
+        size(available),
+    ))
+}
+
 /// The scratch directory's name, inside the destination or `--scratch`. Only
 /// `restore file` makes one: it extracts the one file there, then places it.
 pub(crate) const SCRATCH_NAME: &str = ".tapectl-restore-tmp";
@@ -1700,6 +1746,21 @@ fn restore_planned(
         overwrite: options.overwrite,
         file_check: !options.no_file_check,
     };
+    // One warning, before the first slice is read, from what this restore is
+    // about to read (a rebuilt catalog on another host does not share the
+    // configuration's `slice_size`). `restore_planned` is the one path every
+    // restore of a unit, a file or a volume's units goes through.
+    if let Some(line) = restore_memory_warning(
+        plan.positions
+            .iter()
+            .map(|wp| wp.size_bytes.max(0) as u64)
+            .max()
+            .unwrap_or(0),
+        facts.compression.is_some(),
+        crate::staging::jobs::mem_available(),
+    ) {
+        progress::say(&line);
+    }
     let phase = progress::phase("extract", None);
     phase.item(unit_name.to_string());
     let outcome = reader::run(&job, supply, trace);
@@ -2848,6 +2909,54 @@ mod tests {
     //! it's now shared with `store.rs` and `volume/write.rs` too) cover that
     //! directly.
     use super::*;
+
+    /// #571: the figure is one slice, doubled when compressed.
+    #[test]
+    fn the_restore_memory_figure_is_one_slice_and_twice_that_compressed() {
+        assert_eq!(restore_memory_figure(1 << 30, false), 1 << 30);
+        assert_eq!(restore_memory_figure(1 << 30, true), 2 << 30);
+        assert_eq!(restore_memory_figure(u64::MAX, true), u64::MAX);
+    }
+
+    /// #571: below, at and above the boundary, both ways, and with no
+    /// reading of the host's memory. Pure: nothing here reads the host.
+    #[test]
+    fn the_restore_memory_warning_is_given_only_above_what_is_available() {
+        const G: u64 = 1 << 30;
+        // Uncompressed: the figure is the slice.
+        assert_eq!(restore_memory_warning(G, false, Some(G + 1)), None);
+        assert_eq!(
+            restore_memory_warning(G, false, Some(G)),
+            None,
+            "at the line"
+        );
+        let w = restore_memory_warning(G, false, Some(G - 1)).expect("one byte short warns");
+        assert!(w.starts_with("warning: "), "{w}");
+        for want in [
+            "1.0 GiB",
+            "in memory at once (one whole slice)",
+            "MemAvailable",
+        ] {
+            assert!(w.contains(want), "{want}: {w}");
+        }
+        assert!(!w.contains("frame"), "uncompressed holds no frame: {w}");
+        // Compressed: the figure is the slice's frame and its cut.
+        assert_eq!(
+            restore_memory_warning(G, true, Some(2 * G)),
+            None,
+            "at the line"
+        );
+        assert_eq!(restore_memory_warning(G, true, Some(3 * G)), None);
+        let w = restore_memory_warning(G, true, Some(2 * G - 1)).expect("one byte short warns");
+        for want in ["2.0 GiB", "its compressed frame beside it"] {
+            assert!(w.contains(want), "{want}: {w}");
+        }
+        // 1.5 GiB is enough for an uncompressed slice and not a compressed one.
+        assert_eq!(restore_memory_warning(G, false, Some(G + G / 2)), None);
+        assert!(restore_memory_warning(G, true, Some(G + G / 2)).is_some());
+        // The host does not say: no warning.
+        assert_eq!(restore_memory_warning(u64::MAX, true, None), None);
+    }
     use crate::store::{MemStore, TapeStore};
     use crate::tape::contact::Medium;
     use sha2::{Digest, Sha256};
