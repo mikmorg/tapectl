@@ -1379,6 +1379,13 @@ pub(crate) fn volume_write_contacted<'c>(
                 status: volume_status,
             });
         }
+        // #582: quarantined because a rebuild could not READ the seal, which
+        // is not the contact-check evidence `VolumeQuarantined` speaks of.
+        if crate::volume::rebuild::seal_unreadable_recorded(conn, volume_id)? {
+            return Err(TapectlError::VolumeSealUnreadable {
+                label: label.to_string(),
+            });
+        }
         return Err(TapectlError::VolumeQuarantined {
             label: label.to_string(),
         });
@@ -3246,6 +3253,12 @@ pub(crate) fn volume_resume_contacted<'c>(
         {
             return Err(aborted_not_adoptable(conn, volume_id, label, &verdict));
         }
+        // #582: as in `volume_write`.
+        if crate::volume::rebuild::seal_unreadable_recorded(conn, volume_id)? {
+            return Err(TapectlError::VolumeSealUnreadable {
+                label: label.to_string(),
+            });
+        }
         return Err(TapectlError::VolumeQuarantined {
             label: label.to_string(),
         });
@@ -4025,8 +4038,16 @@ fn aborted_not_adoptable(
         AbortedAdoption::NotSealed => TapectlError::Other(format!(
             "volume \"{label}\" has no write session `volume resume` can adopt: its session was \
              ABORTED before its seal was recorded (`volumes.sealed_at` is empty), so there is no \
-             sealed tape to re-confirm, and an unsealed aborted session is never resumable. Run \
-             `tapectl volume write {label}` to start a new one."
+             sealed tape to re-confirm, and an unsealed aborted session is never resumable. \
+             `tapectl volume write {label}` would start a new session over the same tape from \
+             its beginning: run it only if this tape holds nothing to keep. It refuses a tape \
+             that carries a sealed volume, and a seal it cannot read is never taken as absent. \
+             If a `catalog rebuild` of this tape could not read its seal, or read it after an \
+             earlier rebuild could not, the tape may be sealed: read it again, check it with \
+             `tapectl volume verify {label}`, restore what it holds (`tapectl restore`, or \
+             RESTORE.sh at tape file 2), and rebuild into a catalog with no row for \"{label}\" \
+             to record it as sealed; `tapectl cartridge erase` (it asks for the label) only if \
+             the tape is to be given up."
         )),
         AbortedAdoption::ConditionNotOk { condition } => TapectlError::Other(format!(
             "volume \"{label}\": its write session was aborted AFTER its seal was recorded, so \

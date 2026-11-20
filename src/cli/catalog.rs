@@ -851,8 +851,17 @@ fn dispatch(
                 // per key and that literal is at the macro's limit.
                 obj["seal_valid"] = serde_json::json!(report.unsealed_reason.is_none());
                 obj["unsealed_reason"] = serde_json::json!(report.unsealed_reason);
-                obj["recorded_as_unsealed"] =
-                    serde_json::json!(report.volume_inserted && report.unsealed_reason.is_some());
+                // #582: a seal that could not be READ is not an absent one:
+                // `seal_read_failed`, and the row it inserted is
+                // `quarantined`, not recorded as an unsealed tape.
+                obj["recorded_as_unsealed"] = serde_json::json!(
+                    report.volume_inserted
+                        && report.unsealed_reason.is_some()
+                        && !report.seal_read_failed
+                );
+                obj["seal_read_failed"] = serde_json::json!(report.seal_read_failed);
+                obj["recorded_as_seal_unreadable"] =
+                    serde_json::json!(report.volume_inserted && report.seal_read_failed);
                 obj["found_volume_status"] = serde_json::json!(report.found_volume_status);
                 // #420: additive. Where a short tape ended, the units it
                 // took none of (planned and not written: no row), and what
@@ -1021,7 +1030,25 @@ fn dispatch(
                     .filter(|s| s.as_str() == "initialized")
                 {
                     // #360 (ADR-0012, 2026-09-29 later): the lost-write case
-                    // has a way back, and the warning names it.
+                    // has a way back, and the warning names it. When the
+                    // writes it attached are `aborted` (an EARLIER rebuild
+                    // could not read this tape's seal, #582), there is no
+                    // way back through `volume resume`, and it says so.
+                    if report.found_writes_aborted {
+                        println!(
+                            "  warning: volume \"{}\" was already in this catalog as \"{status}\" \
+                             with its writes \"aborted\" — an earlier rebuild could not read this \
+                             tape's seal. The seal reads now, but this rebuild does not edit that \
+                             row or its writes (#158), so nothing on it counts as a copy yet, and \
+                             `tapectl volume resume {}` will refuse it (it adopts no aborted \
+                             session whose seal was never recorded). Do NOT run `volume write` on \
+                             it: the tape carries a sealed volume. What works today: `tapectl \
+                             restore` or RESTORE.sh (tape file 2) restore what it holds, `tapectl \
+                             volume verify {}` checks it, and a rebuild into a catalog with no \
+                             row for \"{}\" records it as sealed",
+                            report.label, report.label, report.label, report.label
+                        );
+                    } else {
                     println!(
                         "  warning: volume \"{}\" was already in this catalog as \"{status}\", \
                          not sealed — most likely a backup taken before its write. The rebuild \
@@ -1031,6 +1058,7 @@ fn dispatch(
                          tape holds the slices this catalog staged",
                         report.label, report.label, report.label
                     );
+                    }
                 } else if let Some(status) = &report.volume_status_mismatch {
                     println!(
                         "  warning: volume \"{}\" was already in this catalog as \"{status}\", \
@@ -1467,6 +1495,9 @@ fn unsealed_tape_lines(report: &RebuildReport) -> Vec<String> {
         return Vec::new();
     };
     let label = &report.label;
+    if report.seal_read_failed {
+        return seal_unreadable_lines(report, why);
+    }
     let mut lines = vec![format!(
         "  warning: volume \"{label}\" has NO VALID SEAL MARKER: {why}"
     )];
@@ -1500,6 +1531,39 @@ fn unsealed_tape_lines(report: &RebuildReport) -> Vec<String> {
          beginning of the same tape, or retire the volume (`tapectl volume retire {label}`) and \
          run `tapectl cartridge erase`. What the tape does hold restores with RESTORE.sh at its \
          file 2."
+    ));
+    lines
+}
+
+/// What `catalog rebuild` says when the seal marker could not be READ (#582):
+/// not "no seal". The tape may be a sealed one the drive could not read just
+/// now, so none of these lines sends the operator to write over it (ADR-0012
+/// #277; ADR-0008). What was recorded, and what works.
+fn seal_unreadable_lines(report: &RebuildReport, why: &str) -> Vec<String> {
+    let label = &report.label;
+    let mut lines = vec![format!(
+        "  warning: volume \"{label}\": THE SEAL MARKER COULD NOT BE READ, which is not the \
+         same as no seal: {why}"
+    )];
+    lines.push(match (&report.found_volume_status, report.volume_inserted) {
+        (None, _) => "    recorded as an initialized volume with its writes \"aborted\" and its slice \
+             positions \"pending\", and QUARANTINED, so that `volume write` and `volume resume` \
+             refuse it. It is NOT a copy yet: nothing on it counts toward any unit's copies."
+            .to_string(),
+        (Some(status), _) => format!(
+            "    this catalog already holds \"{label}\" as \"{status}\"; the rebuild left that row \
+             alone and attached the units it was missing as \"aborted\" writes. They are NOT \
+             copies. The row itself is not quarantined: do not write to this cartridge."
+        ),
+    });
+    lines.push(format!(
+        "    The tape may carry a sealed volume. Do NOT run `volume write {label}` on it. Read it \
+         again (another drive, or after cleaning this one), and rebuild again into a catalog with \
+         no row for \"{label}\" to record it as sealed. `tapectl volume verify {label}` checks \
+         the tape against its own front index and, when clean and full, clears the quarantine \
+         (it does not seal the row). What the tape holds restores with `tapectl restore` or \
+         RESTORE.sh at its file 2. Only to give the tape up: `tapectl volume retire {label}`, \
+         then `tapectl cartridge erase`, which asks for the tape's label."
     ));
     lines
 }
@@ -2158,6 +2222,33 @@ mod tests {
     /// current, and the to-do list's span half: the missing slices and the
     /// tapes the index names for them, or that it names none. Nothing is said
     /// for a tape with no spannable set.
+    #[test]
+    fn an_unreadable_seal_names_only_true_remedies_and_never_write_over_it() {
+        let report = RebuildReport {
+            label: "L6-0009".to_string(),
+            volume_inserted: true,
+            unsealed_reason: Some("no seal marker reads at file 40: Input/output error".into()),
+            seal_read_failed: true,
+            ..Default::default()
+        };
+        let text = super::unsealed_tape_lines(&report).join("\n");
+        assert!(text.contains("COULD NOT BE READ"), "{text}");
+        assert!(text.contains("QUARANTINED"), "{text}");
+        assert!(text.contains("Do NOT run `volume write L6-0009`"), "{text}");
+        assert!(text.contains("tapectl volume verify L6-0009"), "{text}");
+        assert!(text.contains("RESTORE.sh"), "{text}");
+        assert!(text.contains("cartridge erase"), "{text}");
+        assert!(!text.contains("starts over from the beginning"), "{text}");
+        assert!(!text.contains("write over the tape"), "{text}");
+        // No seal at all (read, and absent) keeps its own words.
+        let absent = RebuildReport {
+            seal_read_failed: false,
+            ..report
+        };
+        let text = super::unsealed_tape_lines(&absent).join("\n");
+        assert!(text.contains("NO VALID SEAL MARKER"), "{text}");
+    }
+
     #[test]
     fn a_range_and_a_span_in_progress_are_named_in_the_rebuild_report() {
         use crate::volume::rebuild::{RebuildReport, RebuiltRange, SpanHolder, SpanInProgress};

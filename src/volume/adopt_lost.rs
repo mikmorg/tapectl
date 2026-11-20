@@ -97,6 +97,10 @@ pub enum LostAdoption {
     /// — the write never finished on this tape, or its tail or File 3 does
     /// not read back as what was sealed.
     NotSealed { why: String },
+    /// Condition 1, second half, but the seal could not be READ (a read
+    /// error, or a medium whose end is not known): not a tape with no seal
+    /// (ADR-0012 #277, #582). Nothing is adopted and nothing is overwritten.
+    SealUnreadable { why: String },
     /// Condition 2's anchor is missing: no `catalog rebuild --from-volume`
     /// of this volume is recorded, so nothing says the writes rows on it
     /// came from this tape.
@@ -231,7 +235,8 @@ pub fn adopt(
     // Condition 1, second half: actually written — a seal binds File 3.
     let tape = match sealed_front_index(store, &file0) {
         Ok(tape) => tape,
-        Err(why) => return Ok(LostAdoption::NotSealed { why }),
+        Err((true, why)) => return Ok(LostAdoption::SealUnreadable { why }),
+        Err((false, why)) => return Ok(LostAdoption::NotSealed { why }),
     };
 
     // Condition 2: every byte read back good, recorded after the rebuild.
@@ -272,19 +277,29 @@ struct SealedIndex {
 fn sealed_front_index(
     store: &mut dyn Store,
     file0: &str,
-) -> std::result::Result<SealedIndex, String> {
+) -> std::result::Result<SealedIndex, (bool, String)> {
+    // `Err((true, why))`: the seal could not be READ (#582); `(false, why)`:
+    // it is not a seal that seals this tape.
     let pointers = format::parse_id_thunk_layout_pointers(file0)
-        .map_err(|e| format!("File 0 records no layout pointers ({e})"))?;
-    let fi_pos = u32::try_from(pointers.front_index)
-        .map_err(|_| format!("File 0 names front index position {}", pointers.front_index))?;
-    let seal_pos = u32::try_from(pointers.seal_marker)
-        .map_err(|_| format!("File 0 names seal marker position {}", pointers.seal_marker))?;
+        .map_err(|e| (false, format!("File 0 records no layout pointers ({e})")))?;
+    let fi_pos = u32::try_from(pointers.front_index).map_err(|_| {
+        (
+            false,
+            format!("File 0 names front index position {}", pointers.front_index),
+        )
+    })?;
+    let seal_pos = u32::try_from(pointers.seal_marker).map_err(|_| {
+        (
+            false,
+            format!("File 0 names seal marker position {}", pointers.seal_marker),
+        )
+    })?;
 
     let fi_raw = crate::store::read_small_bytes(store, fi_pos, "front index")
-        .map_err(|e| format!("the front index (file {fi_pos}) did not read: {e}"))?;
+        .map_err(|e| (false, format!("the front index (file {fi_pos}) did not read: {e}")))?;
     let fi_true = format::without_nul_padding(&fi_raw);
     let entries = format::parse_front_index(&String::from_utf8_lossy(fi_true))
-        .map_err(|e| format!("the front index (file {fi_pos}) does not parse: {e}"))?;
+        .map_err(|e| (false, format!("the front index (file {fi_pos}) does not parse: {e}")))?;
 
     // The judgement is `rebuild::locate_and_judge_seal`'s, shared with
     // `catalog rebuild` (#458, #420): a seal this tapectl may not read, and
@@ -299,7 +314,9 @@ fn sealed_front_index(
             front_index_sha256: seal.front_index_sha256,
             ended_after: located.ended_after,
         }),
-        format::SealVerdict::Unsealed(why) | format::SealVerdict::Refused(why) => Err(why),
+        format::SealVerdict::Unsealed(why) | format::SealVerdict::Refused(why) => {
+            Err((located.read_failed, why))
+        }
     }
 }
 
@@ -787,6 +804,15 @@ pub fn refusal(label: &str, verdict: &LostAdoption) -> TapectlError {
              `volume resume` adopts a write this catalog lost only from a sealed tape \
              (ADR-0012, 2026-09-29 later, condition 1), so nothing makes this one count as a \
              copy: write its units again to another cartridge, or erase this one and reuse it."
+        ),
+        LostAdoption::SealUnreadable { why } => format!(
+            "volume \"{label}\": this tape's seal marker could not be READ ({why}), which is not \
+             the same as the tape having none: it may carry a sealed volume. Nothing was \
+             adopted, nothing was written and the volume's status is unchanged. Read the tape \
+             again (another drive, or after cleaning this one) and run `tapectl volume resume \
+             {label}` again; `tapectl volume verify {label}` checks the tape, and what it holds \
+             restores with `tapectl restore` or RESTORE.sh at tape file 2. `tapectl cartridge \
+             erase` (it asks for the label) only if the tape is to be given up."
         ),
         LostAdoption::NoRecordedRebuild => format!(
             "volume \"{label}\" is `initialized` with completed writes attached, but no `catalog \

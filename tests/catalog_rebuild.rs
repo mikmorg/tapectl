@@ -6742,3 +6742,297 @@ mod tables {
         );
     }
 }
+
+// ── Issue #582: a seal that could not be READ is never taken as no seal ──
+
+/// A `MemStore` whose read of one position fails while `fail` is set, as a
+/// drive does on a transient error. Every `Store` method is delegated, the
+/// defaulted ones too, so the seal's location is found by the double's own
+/// answers (`eod_at_or_before`, `files_on_medium`) as on `MemStore` itself.
+struct FlakyRead<'a> {
+    inner: &'a mut MemStore,
+    at: u32,
+    fail: bool,
+}
+
+impl tapectl::store::Store for FlakyRead<'_> {
+    fn capacity(&mut self) -> tapectl::error::Result<tapectl::store::CapacityReport> {
+        self.inner.capacity()
+    }
+    fn execute(
+        &mut self,
+        src: &mut dyn std::io::Read,
+        len: u64,
+        sync: bool,
+    ) -> tapectl::error::Result<u64> {
+        self.inner.execute(src, len, sync)
+    }
+    fn early_warning(&self) -> Option<tapectl::store::EarlyWarning> {
+        self.inner.early_warning()
+    }
+    fn protection(&self) -> tapectl::tape::lbp::Protection {
+        self.inner.protection()
+    }
+    fn logical_position(&mut self) -> tapectl::error::Result<Option<u64>> {
+        self.inner.logical_position()
+    }
+    fn arm_read_check(&mut self) -> tapectl::error::Result<bool> {
+        self.inner.arm_read_check()
+    }
+    fn read_file(
+        &mut self,
+        position: u32,
+        sink: &mut dyn std::io::Write,
+    ) -> tapectl::error::Result<u64> {
+        self.inner.read_file(position, sink)
+    }
+    fn read_file_head(
+        &mut self,
+        position: u32,
+        max_bytes: u64,
+        sink: &mut dyn std::io::Write,
+    ) -> tapectl::error::Result<u64> {
+        if self.fail && position == self.at {
+            return Err(tapectl::error::TapectlError::Other(
+                "injected: Input/output error".to_string(),
+            ));
+        }
+        self.inner.read_file_head(position, max_bytes, sink)
+    }
+    fn reposition_for_resume(&mut self, file_index: u32) -> tapectl::error::Result<()> {
+        self.inner.reposition_for_resume(file_index)
+    }
+    fn reposition_at_most(&mut self, file_index: u32) -> tapectl::error::Result<u32> {
+        self.inner.reposition_at_most(file_index)
+    }
+    fn blank_at_bot(&mut self) -> tapectl::error::Result<bool> {
+        self.inner.blank_at_bot()
+    }
+    fn eod_at_or_before(&mut self, position: u32) -> tapectl::error::Result<bool> {
+        self.inner.eod_at_or_before(position)
+    }
+    fn files_on_medium(&mut self) -> tapectl::error::Result<Option<u32>> {
+        self.inner.files_on_medium()
+    }
+}
+
+/// [`rebuild`] through a [`FlakyRead`] failing the seal's read while `fail`.
+fn rebuild_with_seal_read(
+    conn: &rusqlite::Connection,
+    vol: &mut SealedVolume,
+    scratch: &Path,
+    fail: bool,
+) -> tapectl::error::Result<rebuild::RebuildReport> {
+    let secret = vol.operator_secret.clone();
+    let key_dir = tempfile::tempdir().unwrap();
+    let key = key_file(key_dir.path(), "k.age.key", &secret);
+    let identity: age::x25519::Identity = tapectl::crypto::keys::read_secret_key(&key)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let at = vol.store.files.len() as u32 - 1;
+    let mut flaky = FlakyRead {
+        inner: &mut vol.store,
+        at,
+        fail,
+    };
+    let site = ContactSite::new(
+        cfg(),
+        Operation::CatalogRebuild,
+        "memstore",
+        Medium::NoBackend,
+    );
+    rebuild::rebuild_from_store(
+        conn,
+        &mut flaky,
+        &[identity],
+        Some(&vol.label),
+        "recovered",
+        Some("lto0"),
+        scratch,
+        "memstore",
+        site,
+    )
+}
+
+fn event_count(conn: &rusqlite::Connection, action: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE action = ?1",
+        rusqlite::params![action],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Positive control: the same wrapper with the failure off finds the seal,
+/// so the tests below fail because of the read, not the fixture.
+#[test]
+fn a_seal_that_reads_through_the_flaky_store_seals_the_tape() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let report = rebuild_with_seal_read(&conn, &mut vol, scratch.path(), false).unwrap();
+    assert_eq!(report.unsealed_reason, None, "{report:?}");
+    let (status, condition, _) = volume_state(&conn, LABEL);
+    assert_eq!((status.as_str(), condition.as_str()), ("sealed", "ok"));
+    assert_eq!(event_count(&conn, "seal_unreadable"), 0);
+}
+
+/// #582 (ADR-0012 #277): a rebuild that could not READ the seal records the
+/// row so that no command takes it for an unsealed tape that may be written:
+/// quarantined, with its writes aborted, and the reason carries the error.
+#[test]
+fn a_rebuild_that_could_not_read_the_seal_records_the_volume_unreadable_not_unsealed() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let report = rebuild_with_seal_read(&conn, &mut vol, scratch.path(), true).unwrap();
+    let why = report.unsealed_reason.as_deref().expect("not sealed");
+    assert!(why.contains("injected: Input/output error"), "{why}");
+    let (status, condition, sealed_at) = volume_state(&conn, LABEL);
+    assert_eq!(status, "initialized");
+    assert_eq!(sealed_at, None);
+    assert_eq!(
+        condition, "quarantined",
+        "an unreadable seal must not leave an ordinary, writable `initialized` row"
+    );
+    let (aborted, total) = write_counts(&conn, LABEL, "aborted");
+    assert!(total > 0 && aborted == total, "{aborted} of {total}");
+    assert_eq!(event_count(&conn, "seal_unreadable"), 1);
+    assert!(!tapectl::policy::coverage::counts_as_copy(&conn, LABEL).unwrap());
+    assert!(!tapectl::policy::coverage::is_write_target(&status, &condition));
+}
+
+/// A tape with NO seal (it was read, and is absent) is still the aborted
+/// write's shape, writable as before: only an unreadable seal is quarantined.
+#[test]
+fn a_tape_with_no_seal_is_still_not_quarantined() {
+    let mut vol = build_sealed_volume(true);
+    drop_seal_marker(&mut vol);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert_eq!(volume_state(&conn, LABEL).1, "ok");
+    assert_eq!(event_count(&conn, "seal_unreadable"), 0);
+}
+
+/// `volume write` and `volume resume` refuse that volume, name the unreadable
+/// seal, and no flag passes it; the remedies never say to write over it.
+#[test]
+fn volume_write_and_resume_refuse_a_volume_whose_seal_could_not_be_read() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    rebuild_with_seal_read(&conn, &mut vol, scratch.path(), true).unwrap();
+
+    let home = tempfile::tempdir().unwrap();
+    let paths = tapectl::config::TapectlPaths::new(home.path().join("home"));
+    let config = tapectl::config::Config::default();
+    let write_err = tapectl::volume::write::volume_write(
+        &conn,
+        &paths,
+        &config,
+        LABEL,
+        "/nonexistent/tapectl-582-nst",
+        512 * 1024,
+        true,  // --force
+        false, // allow_missing_escrow
+        false,
+        false,
+        true,
+    )
+    .unwrap_err()
+    .to_string();
+    let resume_err = tapectl::volume::write::volume_resume(
+        &conn,
+        &paths,
+        &config,
+        LABEL,
+        "/nonexistent/tapectl-582-nst",
+        512 * 1024,
+        false,
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    for (what, msg) in [("write", &write_err), ("resume", &resume_err)] {
+        assert!(msg.contains("could not be READ"), "{what}: {msg}");
+        assert!(msg.contains("--force` does not apply"), "{what}: {msg}");
+        assert!(msg.contains("Do not overwrite"), "{what}: {msg}");
+        assert!(msg.contains("volume verify"), "{what}: {msg}");
+        assert!(msg.contains("cartridge erase"), "{what}: {msg}");
+        assert!(!msg.contains("nonexistent"), "{what}: {msg}");
+        assert!(
+            !msg.contains(&format!("Run `tapectl volume write {LABEL}`")),
+            "{what}: {msg}"
+        );
+    }
+}
+
+/// The issue's own sequence: the seal fails to read, then a rebuild into the
+/// same catalog reads it. The rows are not edited (#158); the row stays one
+/// `volume resume` refuses, and the message says what is true there: it does
+/// not send the operator to `volume write` over the sealed tape.
+#[test]
+fn a_later_clean_read_edits_no_row_of_the_earlier_rebuild() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    rebuild_with_seal_read(&conn, &mut vol, scratch.path(), true).unwrap();
+    let second = rebuild_with_seal_read(&conn, &mut vol, scratch.path(), false).unwrap();
+    assert_eq!(second.unsealed_reason, None, "{second:?}");
+    assert_eq!(volume_state(&conn, LABEL).0, "initialized", "no promotion");
+    let (aborted, total) = write_counts(&conn, LABEL, "aborted");
+    assert!(total > 0 && aborted == total, "writes are not edited");
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(copies(&conn, unit_name), 0, "{unit_name}");
+    }
+    let vid = volume_id_of(&conn, LABEL);
+    assert!(matches!(
+        tapectl::volume::session::resume_admission(&conn, vid).unwrap(),
+        tapectl::volume::session::ResumeAdmission::Aborted(_)
+    ));
+}
+
+/// `volume resume` on an unsealed aborted write says what is true: a new
+/// `volume write` starts over the same tape, so it is named as a choice to make
+/// only when the tape holds nothing to keep, and the true remedies for a tape
+/// whose seal did not read are named (#582).
+#[test]
+fn volume_resume_of_an_aborted_write_does_not_just_say_run_volume_write() {
+    let mut vol = build_sealed_volume(true);
+    drop_seal_marker(&mut vol);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let paths = tapectl::config::TapectlPaths::new(home.path().join("home"));
+    let msg = tapectl::volume::write::volume_resume(
+        &conn,
+        &paths,
+        &tapectl::config::Config::default(),
+        LABEL,
+        "/nonexistent/tapectl-582-nst",
+        512 * 1024,
+        false,
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(msg.contains("ABORTED before its seal was recorded"), "{msg}");
+    assert!(
+        !msg.contains(&format!("Run `tapectl volume write {LABEL}` to start a new one")),
+        "{msg}"
+    );
+    assert!(msg.contains("never taken as absent"), "{msg}");
+    assert!(msg.contains("volume verify"), "{msg}");
+    assert!(msg.contains("cartridge erase"), "{msg}");
+}

@@ -510,6 +510,24 @@ pub enum TapectlError {
     )]
     VolumeQuarantined { label: String },
 
+    /// #582: a `catalog rebuild` could not READ this volume's seal marker and
+    /// quarantined the row it inserted (event `seal_unreadable`). Not an
+    /// unsealed tape: it may carry a sealed volume the drive could not read
+    /// then (ADR-0012 #277, ADR-0003). Neither `--force` nor `--yes` crosses it.
+    #[error(
+        "volume \"{label}\": the catalog was rebuilt from this tape and its seal marker could \
+         not be READ then, which is not the same as the tape having none — it may carry a \
+         SEALED volume. The row is quarantined, so this command will not write to it or resume \
+         it as an unsealed one, and `--force` does not apply. Do not overwrite the tape. Read it \
+         again (another drive, or after cleaning this one) and rebuild again into a catalog with \
+         no row for \"{label}\", which records it as sealed; `tapectl volume verify {label}` \
+         checks the tape against its own front index (it does not seal the row); what it holds \
+         restores with `tapectl restore` or RESTORE.sh at its file 2. Only if the tape is to be \
+         given up: `tapectl volume retire {label}`, then `tapectl cartridge erase`, which asks \
+         for the tape's label."
+    )]
+    VolumeSealUnreadable { label: String },
+
     /// Issue #376: another process holds this volume's session lock
     /// (`staging::lock::acquire_volume`) — a `volume init`, `write`,
     /// `resume` (through its confirm) or `verify` is running on it right

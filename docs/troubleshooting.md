@@ -3197,6 +3197,37 @@ serial the drive reported, learnt onto that cartridge (the `note: cartridge
 checks the tape against its own front index; if it passes, the catalog's rows
 are the ones in doubt.
 
+### `catalog rebuild`: `THE SEAL MARKER COULD NOT BE READ`
+
+```text
+  warning: volume "<label>": THE SEAL MARKER COULD NOT BE READ, which is not the same as no seal: <why>
+    recorded as an initialized volume with its writes "aborted" ... and QUARANTINED ...
+```
+
+The seal position failed to read (a read error, or a medium whose end is not
+known), which is not the same as the tape having no seal: it may carry a sealed
+volume that the drive could not read just then (ADR-0012 #277). The rebuild
+records the volume the way it records any tape it cannot call sealed (`initialized`, writes
+`aborted`, positions `pending`, so nothing counts it as a copy), and also
+quarantines it, with a `seal_unreadable` event, so `volume write` and
+`volume resume` refuse it and say why; no flag passes that refusal. Do not write
+over the tape. What works:
+
+- read it again, with another drive or after cleaning this one, and rebuild into
+  a catalog that has no row for the label: that rebuild records it as `sealed`;
+- `tapectl volume verify <label>` checks the tape against its own front index; a
+  clean full verify clears the quarantine, and does not seal the row;
+- restore what it holds: `tapectl restore`, or RESTORE.sh at tape file 2 with a
+  tenant key or the escrow key;
+- only if the tape is to be given up: `tapectl volume retire <label>`, then
+  `tapectl cartridge erase`, which asks for the tape's label.
+
+A later rebuild that reads the seal cleanly does not edit the rows the earlier
+one wrote (it never edits a row it finds), so it warns that the volume is still
+`initialized` with `aborted` writes. `volume resume` refuses that state, since no
+seal was ever recorded, and `volume write` is not the way on: the tape carries a
+sealed volume.
+
 ### `catalog rebuild`: `NO VALID SEAL MARKER`
 
 ```text
@@ -3212,7 +3243,8 @@ its slices, so the catalog can describe slices that were never written. The rows
 are recorded as the catalog records any aborted write (`initialized`, writes
 `aborted`, positions `pending`), so the data is findable and nothing counts it as
 a copy in `audit` or `report copies`. A full `volume verify` cannot seal it.
-Three ways out:
+Three ways out (the seal was read and is absent, so the tape holds no sealed
+volume; a seal that did not READ is the section above, and none of these):
 
 - write over it: `tapectl volume write <label>` starts again at the beginning of
   the same tape;

@@ -257,6 +257,18 @@ pub struct RebuildReport {
     /// tapectl must NOT interpret (an unknown `requires`) is not this: it
     /// refuses the rebuild, as every other reader of the tape does.
     pub unsealed_reason: Option<String>,
+    /// With [`Self::unsealed_reason`]: the seal could not be READ (a read
+    /// error, or a medium whose end is not known), so the tape is NOT known
+    /// to lack one. A row this run inserts is then `initialized` with
+    /// `aborted` writes as for any unsealed tape, and is also `quarantined`
+    /// (`observed_condition`), with a `seal_unreadable` event, so that no
+    /// command writes or resumes it as an unsealed tape (ADR-0012 #277, #582).
+    /// A found row is never edited (#158).
+    pub seal_read_failed: bool,
+    /// A found `initialized` row that already held `aborted` writes when the
+    /// seal read cleanly: what an earlier rebuild that could not read it left
+    /// (#582). Report-only.
+    pub found_writes_aborted: bool,
     /// The status of the `volumes` row this run FOUND, when it found one.
     /// `None` when the row was inserted here. Report-only: a found row is
     /// never edited (#158), so this is how an unsealed tape under a row the
@@ -953,6 +965,7 @@ fn rebuild_contacted(
     let LocatedSeal {
         verdict: seal,
         ended_after,
+        read_failed: seal_read_failed,
         ..
     } = read_seal(store, &pointers, &thunk_text, &fi, &ident.label);
     if let format::SealVerdict::Refused(why) = &seal {
@@ -1022,6 +1035,7 @@ fn rebuild_contacted(
         sealed_at: dates.sealed_at.clone(),
         load_count_at_write: dates.load_count_at_write,
         unsealed_reason,
+        seal_read_failed,
         ended_after: ended_after.map(u64::from),
         ..Default::default()
     };
@@ -1942,6 +1956,22 @@ struct TapeDates {
     restore_sh_sha256: Option<String>,
 }
 
+/// The `events.action` a rebuild records when it inserts a volume whose seal
+/// it could not READ (#582): the volume is quarantined for that reason, which
+/// the write and resume refusals read to say so.
+pub const SEAL_UNREADABLE_EVENT: &str = "seal_unreadable";
+
+/// Whether a rebuild recorded `volume_id` as one whose seal it could not read
+/// ([`SEAL_UNREADABLE_EVENT`]).
+pub fn seal_unreadable_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events
+                       WHERE entity_type = 'volume' AND entity_id = ?1 AND action = ?2)",
+        params![volume_id, SEAL_UNREADABLE_EVENT],
+        |r| r.get(0),
+    )?)
+}
+
 /// What `volume-format-v3.md` §1.2 rule 6 found at the end of a tape and
 /// accepts as its seal, judged against the front index beside it (#420): the
 /// one judgement `catalog rebuild`, the adoption of a lost write
@@ -1959,6 +1989,13 @@ pub(crate) struct LocatedSeal {
     /// position after K is not on the tape (§5.1). `None` for a full seal,
     /// and for no seal.
     pub ended_after: Option<u32>,
+    /// The seal's position could not be READ (a read error, or a medium
+    /// whose end is not known): the verdict is `Unsealed` so that nothing
+    /// counts, but the tape is NOT known to lack a seal, and every caller that
+    /// records or advises on it must say so (ADR-0012 #277: an unreadable
+    /// seal never silently means "unsealed"; #582). False for every seal that
+    /// read and was judged.
+    pub read_failed: bool,
 }
 
 impl LocatedSeal {
@@ -1967,6 +2004,15 @@ impl LocatedSeal {
             verdict: format::SealVerdict::Unsealed(why),
             position,
             ended_after: None,
+            read_failed: false,
+        }
+    }
+
+    /// An unsealed verdict for a seal that could not be read ([`Self::read_failed`]).
+    fn unreadable(position: Option<u32>, why: String) -> Self {
+        Self {
+            read_failed: true,
+            ..Self::unsealed(position, why)
         }
     }
 }
@@ -1988,8 +2034,10 @@ impl LocatedSeal {
 /// of a catalog row only ever records a tape sealed on a seal it accepts. A
 /// seal this tapectl must not interpret is [`format::SealVerdict::Refused`]
 /// wherever it is (§1.2 rule 1: refused by name, never misread). A read that
-/// fails is unsealed here, as it was before 1.6.0: neither caller verifies a
-/// tape, and an unsealed reading records no copy (#458).
+/// fails is `Unsealed` here, so that no caller counts the tape (#458), but it
+/// is marked [`LocatedSeal::read_failed`]: a seal that could not be read is
+/// not a seal that is absent (ADR-0012 #277), and a caller that records or
+/// advises on the tape must not treat the two alike (#582).
 pub(crate) fn locate_and_judge_seal(
     store: &mut dyn Store,
     _file0: &str,
@@ -2018,7 +2066,7 @@ pub(crate) fn locate_and_judge_seal(
             )
         }
         crate::store::SealLocation::Unreadable { position, error } => {
-            return LocatedSeal::unsealed(
+            return LocatedSeal::unreadable(
                 Some(position),
                 format!("no seal marker reads at file {position}: {error}"),
             )
@@ -2031,6 +2079,7 @@ pub(crate) fn locate_and_judge_seal(
                 verdict,
                 position: Some(position),
                 ended_after: None,
+                read_failed: false,
             }
         }
     };
@@ -2044,6 +2093,7 @@ pub(crate) fn locate_and_judge_seal(
                 verdict: format::SealVerdict::Sealed(seal),
                 position: Some(position),
                 ended_after: None,
+                read_failed: false,
             },
             _ => LocatedSeal::unsealed(
                 Some(position),
@@ -2076,6 +2126,7 @@ pub(crate) fn locate_and_judge_seal(
                 verdict: format::SealVerdict::Sealed(seal),
                 position: Some(position),
                 ended_after: Some(k),
+                read_failed: false,
             },
             _ => LocatedSeal::unsealed(
                 Some(position),
@@ -2280,6 +2331,18 @@ fn insert_all(
             // the found row is the report's `found_volume_status` and
             // `unsealed_reason`; the two are not the same question.)
             if status != "sealed" {
+                // #582: with the seal read cleanly, a found row that already
+                // holds `aborted` writes is the shape an EARLIER rebuild left
+                // when it could not read the seal. This run does not edit it
+                // (#158), and `volume resume` will refuse it; the CLI says so.
+                if sealed && status == "initialized" {
+                    report.found_writes_aborted = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM writes WHERE volume_id = ?1
+                                       AND status = 'aborted')",
+                        params![id],
+                        |r| r.get(0),
+                    )?;
+                }
                 report.volume_status_mismatch = Some(status);
             }
             // Issue #242: the sibling check for `observed_condition` — most
@@ -2340,7 +2403,31 @@ fn insert_all(
                 ],
             )?;
             report.volume_inserted = true;
-            tx.last_insert_rowid()
+            let id = tx.last_insert_rowid();
+            // #582: a seal that could not be read is not a seal that is
+            // absent. The row is the aborted write's shape (nothing counts),
+            // and `quarantined` so that `volume write` and `volume resume`
+            // refuse it as the unsealed tape they would otherwise take it
+            // for; the event says why, for the refusal's words.
+            if report.seal_read_failed {
+                tx.execute(
+                    "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+                    params![id],
+                )?;
+                crate::db::events::log_event(
+                    tx,
+                    "volume",
+                    id,
+                    Some(label),
+                    SEAL_UNREADABLE_EVENT,
+                    Some("observed_condition"),
+                    Some("ok"),
+                    Some("quarantined"),
+                    report.unsealed_reason.as_deref(),
+                    None,
+                )?;
+            }
+            id
         }
     };
 
@@ -3302,6 +3389,15 @@ fn record_event(
                 }
             ),
         },
+        Some(why) if report.seal_read_failed => format!(
+            "; SEAL COULD NOT BE READ ({why}): the tape is NOT known to be unsealed — {} — \
+             not a copy",
+            if report.volume_inserted {
+                "recorded as an initialized volume, its writes aborted, quarantined"
+            } else {
+                "the existing volume row was left alone, the writes this run added are aborted"
+            }
+        ),
         Some(why) => format!(
             "; NO VALID SEAL MARKER ({why}): {} — not a copy",
             if report.volume_inserted {
