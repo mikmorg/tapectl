@@ -26,12 +26,11 @@ pub enum ZoneKind {
     IdThunk,
     SystemGuide,
     RestoreSh,
-    /// The plaintext front index (File 3, layout v2 — ADR-0007): carries
-    /// per-file position/type/size and ciphertext hashes for every file. The
-    /// v1 mid-tape mini-index and the standalone planning-header zone are
-    /// both gone (`volume-format-v2.md` §8) — the mini-index's facts moved
-    /// here, and the planning header survives only as the operator
-    /// envelope's `PLAN.toml` tar member (`generate_planning_header`).
+    /// The plaintext front index (File 3, ADR-0007; `volume-format-v3.md`
+    /// §4): carries per-file position/type/size and ciphertext hashes for
+    /// every file. There is no mid-tape mini-index and no standalone
+    /// planning-header zone: the planning header survives only as the
+    /// operator envelope's `PLAN.toml` tar member (`generate_planning_header`).
     FrontIndex,
     /// An encrypted data slice, keyed by `stage_slices.id`.
     Slice {
@@ -43,7 +42,7 @@ pub enum ZoneKind {
     },
     OperatorEnvelope,
     OperatorEnvelopeBackup,
-    /// A tenant envelope's backup copy (`volume-format-v2.md` §1.3, #418
+    /// A tenant envelope's backup copy (`volume-format-v3.md` §1.3, #418
     /// item 2): the primary's exact bytes, after the operator pair, in the
     /// primaries' order. Keyed by `tenants.id` like its primary.
     TenantEnvelopeBackup {
@@ -65,7 +64,7 @@ impl ZoneKind {
             ZoneKind::Slice { .. } => "data_slice",
             ZoneKind::TenantEnvelope { .. } => "tenant_envelope",
             ZoneKind::OperatorEnvelope => "operator_envelope",
-            // Distinct from OperatorEnvelope per volume-format-v2.md §3's type
+            // Distinct from OperatorEnvelope per volume-format-v3.md §4's type
             // enum ("...operator_envelope, operator_envelope_backup..."), and
             // matched literally by RESTORE.sh's v1 *and* v2 --find-envelope
             // awk pattern (layout.rs, `$2=="operator_envelope_backup"`). Fixed
@@ -83,7 +82,7 @@ impl ZoneKind {
     /// front-index `type` string. `Slice`/`TenantEnvelope` carry an id in a
     /// production `Layout`, but a front index's plaintext `type` field is
     /// only ever the bare label — no id travels with it (isolation
-    /// invariant, `volume-format-v2.md` §2) — so a caller reconstructing a
+    /// invariant, `volume-format-v3.md` §2) — so a caller reconstructing a
     /// `Layout` from a *parsed* front index alone (rather than from the
     /// original build inputs) has no id to supply and uses `0` as a dummy
     /// payload. `write.rs::volume_verify`'s post-hoc reconstruction is the
@@ -129,7 +128,7 @@ pub enum ContentSource {
     /// regenerated or re-encrypted by the Layout — it arrives already
     /// encrypted from stage time; the Layout only records its existing size
     /// and `sha256_encrypted` verbatim (no third read of the slice bulk,
-    /// `volume-format-v2.md` §3).
+    /// `volume-format-v3.md` §4).
     Staged(PathBuf),
     /// A generated zone (ID thunk, guide, RESTORE.sh, front index, envelopes,
     /// seal marker) frozen to a file under the session staging directory at
@@ -185,7 +184,7 @@ pub fn pad_to_blocks(size: u64, block_size: u64) -> u64 {
 /// `reserve_bytes` is the end-of-tape reserve (`enospc_buffer`), counted
 /// against it.
 ///
-/// **The plan bound** (ADR-0012 item 113; `volume-format-v2.md` §4.3, its
+/// **The plan bound** (ADR-0012 item 113; `volume-format-v3.md` §5.2, its
 /// closing paragraph). `plan_bound_bytes` is `Some(capacity)` — 100% of the
 /// cartridge's nominal capacity, the figure `volume init` decided (ADR-0010)
 /// — only when the writing drive declares `post_warning_bytes`
@@ -200,7 +199,7 @@ pub fn pad_to_blocks(size: u64, block_size: u64) -> u64 {
 ///
 /// The reserve is the fill ceiling's: the bound is the plan's end itself,
 /// with no reserve under it. Past the ceiling the defence is the early
-/// warning and the short seal (§4.3 W4), not a margin.
+/// warning and the short seal (§5.2 W4), not a margin.
 ///
 /// Frozen into the session's `layout.json` with the rest of the Layout, so a
 /// resume revalidates against the bound the plan was made with. Absent from
@@ -638,7 +637,7 @@ impl LayoutError {
 /// (see [`ContentSource`] above for why regeneration is unsafe). That sidecar
 /// is a staging-side artifact only — it is never a [`LayoutEntry`], never
 /// occupies a tape position, and never reaches the medium. Nothing in
-/// `volume-format-v2.md` describes it, and nothing should: the on-tape
+/// `volume-format-v3.md` describes it, and nothing should: the on-tape
 /// self-describing record is the front index and the seal marker.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
@@ -2033,7 +2032,7 @@ mod tests {
 
     #[test]
     fn operator_envelope_backup_has_a_distinct_type_label() {
-        // volume-format-v2.md §3's type enum lists operator_envelope and
+        // volume-format-v3.md §4's type enum lists operator_envelope and
         // operator_envelope_backup as distinct values, and RESTORE.sh's
         // --find-envelope awk pattern (layout.rs) matches the literal
         // "operator_envelope_backup" string separately from
@@ -2051,7 +2050,7 @@ mod tests {
 
     #[test]
     fn tenant_envelope_backup_has_a_distinct_type_label() {
-        // volume-format-v2.md §1.3: a reader pairs a backup with its primary
+        // volume-format-v3.md §1.3: a reader pairs a backup with its primary
         // by hash and must be able to tell the two apart by kind, so
         // RESTORE.sh opens the primary first and the backup only on failure.
         let kind = ZoneKind::TenantEnvelopeBackup { tenant_id: 3 };
@@ -2098,7 +2097,7 @@ mod tests {
         assert_eq!(ZoneKind::from_type_label("not_a_real_type"), None);
         assert_eq!(ZoneKind::from_type_label(""), None);
         // Case-sensitive: the format is a fixed lower-case vocabulary
-        // (`volume-format-v2.md` §3), not case-insensitive matching.
+        // (`volume-format-v3.md` §4), not case-insensitive matching.
         assert_eq!(ZoneKind::from_type_label("Seal_Marker"), None);
     }
 }

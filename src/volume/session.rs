@@ -89,7 +89,7 @@ use super::layout_model::{
 
 // ── the ending (#420, 1.6.0) ──
 
-/// How a write session's tape ends (`volume-format-v2.md` §4.1, §4.3 W4;
+/// How a write session's tape ends (`volume-format-v3.md` §5, §5.2 W4;
 /// `layout-session.md` "The short ending"). Decided once: by `run_entries`
 /// after the entry in which the drive's early warning came, by a resume from
 /// the recorded warning or the seal it found, and never changed after.
@@ -133,7 +133,7 @@ impl Ending {
 }
 
 /// Test support (#420): the embedded copy of a seal that keeps
-/// `volume-format-v2.md` §4.1's rules S1-S5, for fixtures that put a seal on
+/// `volume-format-v3.md` §5's rules S1-S5, for fixtures that put a seal on
 /// a tape by hand: Files 0-2, File 3 (filled in), data slices from 4, through
 /// `ended_after`. A 1.6.0 seal with an empty or inconsistent copy is
 /// unparseable (rule S6), which is the unsealed signal, so a fixture that
@@ -592,7 +592,7 @@ pub struct ReadyToSeal {
     ending: Ending,
     /// The drive's early warning came in a data slice (W4's first two
     /// cases): the confirm reads back the entry at `ended_after` and the
-    /// seal under every tier (§4.3 W9, ADR-0012 item 114).
+    /// seal under every tier (§5.2 W9, ADR-0012 item 114).
     warning_in_data: bool,
     /// This run already spent item 174's one retry after a write the drive
     /// refused with Logical Block Protection armed (#388).
@@ -1057,7 +1057,7 @@ pub enum ContactOutcome {
 ///
 /// The two probes are independent: the seal-marker check runs whether or
 /// not File 0 was readable (a File-0-unreadable-but-sealed-tail tape is
-/// exactly the front/tail damage asymmetry `volume-format-v2.md` §4 designs
+/// exactly the front/tail damage asymmetry `volume-format-v3.md` §5 designs
 /// for), but not if File 0 was readable and already mismatched (no need —
 /// that already refuses).
 ///
@@ -1121,7 +1121,7 @@ enum SealRead {
 /// [`ContactFacts::probe_seal`]'s answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SealProbe {
-    /// A seal marker that `volume-format-v2.md` §1.2 rule 6 accepts is at
+    /// A seal marker that `volume-format-v3.md` §1.2 rule 6 accepts is at
     /// `position`: the planned one, or K+1 on a tape that ended early.
     Parses { position: u32 },
     /// There is none, and positively so.
@@ -1137,7 +1137,7 @@ impl ContactFacts {
     /// (issue #403: resume used to read the same seal position up to three
     /// times, each a long locate).
     ///
-    /// The seal is found by `volume-format-v2.md` §1.2 rule 6
+    /// The seal is found by `volume-format-v3.md` §1.2 rule 6
     /// ([`crate::store::locate_seal`], #420): at `planned`, or, when the
     /// medium ends before it, as the last file on the medium. Before 1.6.0
     /// END OF DATA at `planned` read as "no seal", so a cartridge sealed
@@ -1347,7 +1347,7 @@ pub(crate) fn contact_report(
     // Issue #400: an unreadable File 0 is blank only on positive evidence,
     // asked of the medium itself. Asked before the seal probe below, which
     // stays independent of it: a File-0-unreadable-but-sealed-tail tape is
-    // exactly the front/tail damage asymmetry `volume-format-v2.md` §4
+    // exactly the front/tail damage asymmetry `volume-format-v3.md` §5
     // designs for.
     let blank = file_zero_error.is_some() && store.blank_at_bot().unwrap_or(false);
 
@@ -2824,8 +2824,8 @@ impl InterruptedSession {
             let reason = format!(
                 "the drive's early warning was recorded in tape file {warned_at}, but the tape \
                  holds only {seal_at} file(s), so a seal now would end it before its first data \
-                 slice: a tape that ends inside its metadata holds no unit (volume-format-v2.md \
-                 §4.3 W6). The session aborts and the tape is left unsealed; write these units \
+                 slice: a tape that ends inside its metadata holds no unit (volume-format-v3.md \
+                 §5.2 W6). The session aborts and the tape is left unsealed; write these units \
                  to another cartridge"
             );
             crate::progress::log(&reason);
@@ -3120,7 +3120,7 @@ impl ReadyToSeal {
         let placeholder_len = seal_entry.size_bytes.ok_or_else(|| {
             TapectlError::Other("seal: seal_marker entry has no recorded size".into())
         })?;
-        // X7 (ADR-0012 item 124, `volume-format-v2.md` §1.2): the seal states
+        // X7 (ADR-0012 item 124, `volume-format-v3.md` §1.2): the seal states
         // the `requires` File 0 states, and `build` sized the placeholder
         // with the same features. Read from the frozen File 0, so a session
         // rehydrated after a restart states it too, and never resolved again.
@@ -3129,7 +3129,7 @@ impl ReadyToSeal {
         // The embedded copy: File 3's own entry gets its real size+hash
         // (known now); the seal marker's own entry stays bare (self-reference)
         // — same construction `build()` used for the placeholder
-        // (`volume-format-v2.md` §4), reconstructed here from the Layout's
+        // (`volume-format-v3.md` §5), reconstructed here from the Layout's
         // own entries rather than carried as extra state, since
         // `layout.entries` already has everything (verified: `build.rs`'s
         // `front_index_layout_entry_carries_its_true_size_and_hash` test
@@ -3169,7 +3169,7 @@ impl ReadyToSeal {
                 }
                 real
             }
-            // §4.1: the plan's entries 0 to K (File 3's filled in), then the
+            // §5: the plan's entries 0 to K (File 3's filled in), then the
             // seal's own at K+1. The Layout — File 3 — is unchanged: a short
             // seal binds the same front index a full one would have.
             Ending::Short { ended_after } => {
@@ -3180,7 +3180,7 @@ impl ReadyToSeal {
                 {
                     return Err(TapectlError::Other(format!(
                         "seal: a short seal ends after a data slice before the last one \
-                         (volume-format-v2.md §4.1), but ended_after = {ended_after} is {} on a \
+                         (volume-format-v3.md §5), but ended_after = {ended_after} is {} on a \
                          Layout whose seal is planned at {planned}",
                         at_k.map_or("not a position of the Layout", |f| f.type_label)
                     )));
@@ -3196,13 +3196,13 @@ impl ReadyToSeal {
                     &through_k,
                     features,
                 );
-                // §4.1 "Length": never longer than the placeholder build
+                // §5 "Length": never longer than the placeholder build
                 // sized; never required to be equal.
                 if real.len() as u64 > placeholder_len {
                     return Err(TapectlError::Other(format!(
                         "seal: the short seal ({} bytes) is longer than the frozen placeholder \
                          ({placeholder_len} bytes) build sized for the full one — \
-                         volume-format-v2.md §4.1 says it never is",
+                         volume-format-v3.md §5 says it never is",
                         real.len()
                     )));
                 }
@@ -3684,7 +3684,7 @@ pub struct SealedPending {
     /// How the tape ended: the seal is at M (full) or K+1 (short).
     ending: Ending,
     /// The early warning came in a data slice: the readback past it is owed
-    /// under every tier (§4.3 W9, ADR-0012 item 114).
+    /// under every tier (§5.2 W9, ADR-0012 item 114).
     warning_in_data: bool,
 }
 
@@ -3698,8 +3698,8 @@ impl SealedPending {
     }
 
     /// Whether the drive's early warning came in a data slice of this
-    /// session (§4.3 W4's first two cases), so its confirm owes the readback
-    /// of the entry at `ended_after` and the seal under every tier (§4.3 W9,
+    /// session (§5.2 W4's first two cases), so its confirm owes the readback
+    /// of the entry at `ended_after` and the seal under every tier (§5.2 W9,
     /// ADR-0012 item 114).
     pub fn readback_past_warning(&self) -> bool {
         self.warning_in_data
@@ -3820,9 +3820,9 @@ impl SealedPending {
             Tier::Navigable => plan,
         };
         // #420: the walk reads the seal at K+1 on a short ending and nothing
-        // after K (§4.2, §5), and after a warning in a data slice it reads
+        // after K (§5.1, §6), and after a warning in a data slice it reads
         // back the entry at `ended_after` (K, or M-1 when the warning came in
-        // the last slice) under every tier (§4.3 W9, ADR-0012 item 114).
+        // the last slice) under every tier (§5.2 W9, ADR-0012 item 114).
         let ended_after = self.ending.recorded_ended_after();
         let readback = if self.warning_in_data {
             match ended_after {
@@ -4720,7 +4720,7 @@ fn run_entries(
             }
         }
 
-        // #420 (`volume-format-v2.md` §4.3 W4; `layout-session.md` "Deciding
+        // #420 (`volume-format-v3.md` §5.2 W4; `layout-session.md` "Deciding
         // the ending"): after every `Written` entry, the store's early
         // warning. The store retried every refused block itself (W2), so
         // this entry is whole, its filemark included. The warning is sticky
@@ -4741,7 +4741,7 @@ fn run_entries(
                     "the drive's early warning (the end of the medium is near) came in tape \
                      file {position} ({}), before the first data slice: a tape that ends inside \
                      its metadata holds no unit, so the session aborts and the tape is left \
-                     unsealed (volume-format-v2.md §4.3 W6). {} block write(s) were refused and \
+                     unsealed (volume-format-v3.md §5.2 W6). {} block write(s) were refused and \
                      retried; the warning came {} bytes into the tape. Write these units to \
                      another cartridge",
                     entry.kind.type_label(),
@@ -5046,7 +5046,7 @@ pub(crate) fn span_split(conn: &Connection, write_id: i64, ended_after: u32) -> 
 }
 
 /// The `write_early_warning` event (`layout-session.md`, "The
-/// `write_early_warning` event"; §4.3 W5): one `events` row, committed after
+/// `write_early_warning` event"; §5.2 W5): one `events` row, committed after
 /// entry K's cursor row is `written` and before the seal's first block goes
 /// to the store. `new_value` is K, the `ended_after` the session seals at;
 /// `details` is the wear record of ADR-0012 item 98, in the spec's key
@@ -11443,7 +11443,7 @@ mod tests {
         }
     }
 
-    // ── #420: the short ending (volume-format-v2.md §4.1-§4.3, §5;
+    // ── #420: the short ending (volume-format-v3.md §5-§5.2, §6;
     // layout-session.md "The short ending") ──
     mod short_ending {
         use super::*;
@@ -12889,7 +12889,7 @@ mod tests {
         /// The early warning before a spannable set's first slice: the tape
         /// holds none of it, so it is `cut` (X2), like a whole unit. The tape
         /// still states `spanning`: the fence follows the plan
-        /// (`volume-format-v2.md` §1.2).
+        /// (`volume-format-v3.md` §1.2).
         #[test]
         fn the_early_warning_before_a_sets_first_slice_leaves_it_unwritten() {
             let s = span_fixture(&[("a", &[SLICE, SLICE]), ("b", &[SLICE, SLICE])], &["b"]);

@@ -490,7 +490,7 @@ pub enum SealVerdict {
 ///
 /// The check order, and the wording, are those `adopt_lost` has always
 /// refused with: a seal that does not read, one that does not parse (from
-/// 1.6.0 that includes one breaking §4.1's rules S1-S5, rule S6), one this
+/// 1.6.0 that includes one breaking §5's rules S1-S5, rule S6), one this
 /// tapectl must not read, then one binding a different front index.
 pub fn judge_seal(
     seal_read: std::result::Result<&[u8], &str>,
@@ -1516,8 +1516,8 @@ mod forward_compat_tests {
 }
 
 /// tapectl 1.6.0's seal and front-index grammar on the read side
-/// (`volume-format-v2.md` §3, §4.1; ADR-0012 items 110-111, #420). The seals
-/// here are written from §4.1's grammar as literals, not by
+/// (`volume-format-v3.md` §4, §5; ADR-0012 items 110-111, #420). The seals
+/// here are written from §5's grammar as literals, not by
 /// `layout::generate_seal_marker`, so they pin the spec's bytes rather than
 /// whatever the generator emits.
 #[cfg(test)]
@@ -1563,7 +1563,7 @@ mod short_seal_tests {
     }
 
     /// A short seal's copy: the plan's entries 0 to `k`, then its own, bare,
-    /// at `k + 1` (§4.1).
+    /// at `k + 1` (§5).
     fn short_entries(slices: i64, k: i64) -> Vec<Entry> {
         let mut entries: Vec<Entry> = plan(slices).into_iter().take(k as usize + 1).collect();
         entries.push((k + 1, "seal_marker", false));
@@ -1602,7 +1602,7 @@ mod short_seal_tests {
             }
         }
 
-        /// The seal's bytes, in §4.1's grammar and key order.
+        /// The seal's bytes, in §5's grammar and key order.
         fn text(&self) -> String {
             let mut s = String::from(
                 "================================================================\n\
@@ -1696,7 +1696,7 @@ mod short_seal_tests {
         assert_eq!(seal.ending(13), SealEnding::Full);
     }
 
-    /// §4.1's short seal: entries 0 to K and its own at K+1, `file_count =
+    /// §5's short seal: entries 0 to K and its own at K+1, `file_count =
     /// K+2`, `ended_after = K`. It parses, padded as a tape read returns it,
     /// at the first data slice, in the middle, and at M-2.
     #[test]
@@ -1896,7 +1896,7 @@ mod short_seal_tests {
         assert!(why.contains("rule S1"), "{why}");
     }
 
-    /// §1.2 rule 1 comes before §4.1's rules: a seal requiring a feature this
+    /// §1.2 rule 1 comes before §5's rules: a seal requiring a feature this
     /// tapectl does not know, beside `short-seal`, parses uninterpreted —
     /// though it breaks S2 — so it is refused by name and not read as
     /// unsealed. The same for another layout version.
@@ -2066,7 +2066,7 @@ mod tests {
     /// A well-formed 6-file layout: id_thunk, guide, restore_sh, front_index,
     /// one data slice, seal_marker — used as the shared fixture for
     /// round-trip and consistency tests. Mirrors the true business rule
-    /// (`volume-format-v2.md` §3): every file has size+hash except the front
+    /// (`volume-format-v3.md` §4): every file has size+hash except the front
     /// index's own entry (neither) and the seal marker's entry (size only,
     /// no hash — not yet written when File 3 is built).
     fn sample_files() -> Vec<FrontIndexFile> {
@@ -2341,7 +2341,7 @@ mod tests {
     }
 
     /// THE rule that makes every pre-#192 tape safe to read
-    /// (`docs/design/volume-format-v2.md` §1.1): absent means UNKNOWN and
+    /// (`docs/design/volume-format-v3.md` §1.1): absent means UNKNOWN and
     /// never "mam". The input here is a File 0 `[media]` body exactly as the
     /// generator emitted it before the field existed — written as a literal,
     /// not generated, so this cannot silently start testing the new shape.
@@ -2376,7 +2376,7 @@ load_count_at_write = 5
         assert_eq!(parsed.load_count_at_write, Some(5));
     }
 
-    /// The writer's `0` is "unknown" (`volume-format-v2.md` §1.1) and must
+    /// The writer's `0` is "unknown" (`volume-format-v3.md` §1.1) and must
     /// not come back as a confident zero (#184). The non-zero case in the
     /// same test proves the parser is not simply `None` for everything.
     #[test]
@@ -2578,7 +2578,7 @@ cartridge_serial = \"SERIAL1\"
     }
 
     /// Before 1.6.0 an empty copy parsed as an empty list. A 1.6.0 seal
-    /// with no `[[files]]` breaks §4.1's rules (S1: `ended_after = -2`; S4:
+    /// with no `[[files]]` breaks §5's rules (S1: `ended_after = -2`; S4:
     /// no entries) and is unparseable, rule S6: the unsealed signal, an
     /// `Err` and never a panic.
     #[test]

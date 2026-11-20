@@ -36,7 +36,7 @@ pub struct IdThunkV2Params<'a> {
     /// chip reported it) or `"operator"` (no serial was readable when this
     /// volume was bound, so the operator named the cartridge with
     /// `volume init --cartridge <barcode>` and `cartridge_serial` carries
-    /// THAT barcode). `docs/design/volume-format-v2.md` §1.1, ADR-0012.
+    /// THAT barcode). `docs/design/volume-format-v3.md` §1.1, ADR-0012.
     ///
     /// `None` OMITS the line entirely, and that is load-bearing: absent means
     /// UNKNOWN and must never read as `"mam"`. Every tape written before this
@@ -54,7 +54,7 @@ pub struct IdThunkV2Params<'a> {
 }
 
 /// Generate the v2 ID thunk (File 0) content. Per sheet §2.3 and
-/// `docs/design/volume-format-v2.md` §1: `[volume]` carries identity
+/// `docs/design/volume-format-v3.md` §1.1: `[volume]` carries identity
 /// (unchanged in spirit from v1, plus a new `uuid` field) and `[layout]`
 /// carries ONLY `front_index = 3`, `seal_marker` (the last file), and
 /// `total_files` — the v1 `data_start`/`data_end`/`first_envelope`/
@@ -661,7 +661,7 @@ fn guide_drive_basics() -> String {
 /// Rewrites v1's Quick Reference to the v2 zone order (front index at File 3,
 /// tenant envelopes from File 4, seal marker last with an embedded copy of
 /// the front index); replaces every "mini-index" reference with File 3 (the
-/// v1 mid-tape mini-index no longer exists — `volume-format-v2.md` §8); adds
+/// v1 mid-tape mini-index no longer exists); adds
 /// the accepted size-disclosure statement (§2 "Accepted disclosure") and the
 /// three-rung degradation ladder with the zero-strip procedure (sheet §3.3,
 /// §3.4).
@@ -2363,7 +2363,7 @@ total_bytes = {bytes}
 /// the front index's own entry (its length is self-referential), and
 /// `sha256_encrypted` is `None` for both the front index itself (self-reference)
 /// and the seal marker (not yet written when File 3 is generated). See
-/// `docs/design/volume-format-v2.md` §3-4 and ADR-0007.
+/// `docs/design/volume-format-v3.md` §4-4 and ADR-0007.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontIndexFile {
     pub position: i32,
@@ -2380,7 +2380,7 @@ pub struct FrontIndexFile {
 /// giving an heir keyless navigation and keyless byte-integrity with only `dd`
 /// and `sha256sum` (ADR-0007). It carries NO content metadata: no filenames, no
 /// plaintext-content hashes, no tenant/unit names — the isolation invariant of
-/// `volume-format-v2.md` §2. The ciphertext hashes are safe in plaintext because
+/// `volume-format-v3.md` §2. The ciphertext hashes are safe in plaintext because
 /// they hash pseudorandom age output and are non-attributable (D4).
 ///
 /// File 3 is the PLAN (§3): it is written before any slice, so from 1.6.0 its
@@ -2444,12 +2444,12 @@ fn append_files_entries(s: &mut String, files: &[FrontIndexFile]) {
 /// "every file before me is present" — and its `front_index_sha256` binds the
 /// front index, making the seal marker the unhashed root of the keyless
 /// integrity chain (seal marker → front index → every content file; ADR-0007,
-/// `volume-format-v2.md` §4). Its absence means the tape is legitimately
+/// `volume-format-v3.md` §5). Its absence means the tape is legitimately
 /// unsealed (interrupted or EOT-aborted).
 ///
-/// From 1.6.0 it is §4.1's **full seal**: `requires = ["short-seal"]` (every
-/// 1.6.0 seal, full or short, ADR-0012 item 111) and `ended_after =
-/// file_count - 2`, the last data slice. `build` sizes the seal placeholder
+/// It is §5's **full seal**: `requires` as File 0 states it (empty on every
+/// Layout 3 tape, §1.2) and `ended_after = file_count - 2`, the last data
+/// slice. `build` sizes the seal placeholder
 /// with this function, and a short seal ([`generate_short_seal_marker`]) is
 /// never longer than it.
 ///
@@ -2461,7 +2461,7 @@ fn append_files_entries(s: &mut String, files: &[FrontIndexFile]) {
 /// complete than File 3 itself); only the seal marker's own entry stays
 /// hash-less (self-reference). The copy is not hash-protected by anything on
 /// the tape — readers validate its per-file claims by hashing the files they
-/// describe (`volume-format-v2.md` §4).
+/// describe (`volume-format-v3.md` §5).
 pub fn generate_seal_marker(
     label: &str,
     file_count: i32,
@@ -2472,8 +2472,8 @@ pub fn generate_seal_marker(
 }
 
 /// The full seal stating `features` in `requires`, as File 0 of the same tape
-/// states them (`volume-format-v2.md` §4.1: "From 1.7.0 the seal of a span
-/// tape states `requires = ["short-seal", "spanning"]`"; ADR-0012 item 124).
+/// states them (`volume-format-v3.md` §1.2: the seal repeats File 0's
+/// `requires`).
 /// `build` sizes the placeholder with it; the seal written at execute time
 /// must state the same features, or it is not the placeholder's length.
 pub fn generate_seal_marker_requiring(
@@ -2494,9 +2494,9 @@ pub fn generate_seal_marker_requiring(
     s
 }
 
-/// Generate the plaintext **short seal marker** (`volume-format-v2.md` §4.1,
+/// Generate the plaintext **short seal marker** (`volume-format-v3.md` §5,
 /// tapectl 1.6.0): the seal at K+1 of a tape the drive's early warning ended
-/// after data slice K (§4.3 W4), `ended_after = K`, `file_count = K+2`.
+/// after data slice K (§5.2 W4), `ended_after = K`, `file_count = K+2`.
 ///
 /// `files_through_k` is File 3's entries 0 to K, with File 3's own entry
 /// filled in as for a full seal (its `size_bytes` and `sha256_encrypted`);
@@ -2506,7 +2506,7 @@ pub fn generate_seal_marker_requiring(
 ///
 /// The header is the full seal's, word for word, and the timestamp the same
 /// fixed width: a short seal is never longer than the placeholder `build`
-/// sized with [`generate_seal_marker`] (§4.1 "Length"), which
+/// sized with [`generate_seal_marker`] (§5 "Length"), which
 /// `ReadyToSeal::seal` checks.
 pub fn generate_short_seal_marker(
     label: &str,
@@ -2560,7 +2560,7 @@ pub fn generate_short_seal_marker_requiring(
 }
 
 /// The seal marker's human header and `[seal]` table, the same for a full
-/// and a short seal (`volume-format-v2.md` §4.1, "Grammar" and "The
+/// and a short seal (`volume-format-v3.md` §5, "Grammar" and "The
 /// human-readable header"), so the two kinds cannot drift apart in anything
 /// but the numbers and the embedded copy.
 fn seal_document(
@@ -2630,8 +2630,8 @@ pub fn generate_manifest_toml(label: &str, tenant_name: &str, units: &[ManifestU
         volume: label.to_string(),
         tenant: tenant_name.to_string(),
         created_at: now,
-        // Every envelope of every tape 1.6.0 writes (`volume-format-v2.md`
-        // §1.7, ADR-0012 item 111): the tape may end early, and only its seal
+        // Every envelope of every tape 1.6.0 writes (`volume-format-v3.md`
+        // §1.8, ADR-0012 item 111): the tape may end early, and only its seal
         // says whether it did.
         may_end_early: true,
         units: units.to_vec(),
@@ -3172,7 +3172,7 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
 
-    // ---- what a 1.6.0 tape declares up front (volume-format-v2.md §1.7,
+    // ---- what a 1.6.0 tape declares up front (volume-format-v3.md §1.8,
     // ADR-0012 item 111, #420) ----
 
     /// D1 (`volume-format-v3.md` §1.1, §1.2): File 0 states Layout 3's magic
@@ -3619,7 +3619,7 @@ mod tests {
     }
 
     /// A seal's embedded copy for a plan of `m + 1` files that keeps
-    /// `volume-format-v2.md` §4.1's rules: Files 0-2, File 3 (filled in, as
+    /// `volume-format-v3.md` §5's rules: Files 0-2, File 3 (filled in, as
     /// the seal step fills it), the operator envelope at 4, data slices from
     /// 5 to `m - 1`, the seal's own bare entry at `m`. Sizes and hashes have
     /// production widths (a slice's size has 10 digits, a hash 64), so the
@@ -3680,7 +3680,7 @@ mod tests {
         assert!(chrono::DateTime::parse_from_rfc3339(sealed_at).is_ok());
     }
 
-    /// `volume-format-v2.md` §4.1 "Grammar": one `key = value` per line, in
+    /// `volume-format-v3.md` §5 "Grammar": one `key = value` per line, in
     /// exactly this order, on both kinds. RESTORE.sh's line-oriented reads
     /// depend on it, so the lines are pinned as text, not as TOML.
     #[test]
@@ -3719,7 +3719,7 @@ mod tests {
         }
     }
 
-    /// §4.1 "The human-readable header": the same on both kinds, so it does
+    /// §5 "The human-readable header": the same on both kinds, so it does
     /// not change a seal's length, and exactly the spec's words.
     #[test]
     fn both_seals_carry_the_specs_header_word_for_word() {
@@ -3750,7 +3750,7 @@ verify any entry by hashing the file it describes.
     }
 
     /// Both kinds round-trip through `format.rs`'s parser (A's reader), keep
-    /// rules S1-S5, and classify against the plan as §4.1 says: the full seal
+    /// rules S1-S5, and classify against the plan as §5 says: the full seal
     /// `Full`, the short one `Short { ended_after: K }`.
     #[test]
     fn the_full_and_the_short_seal_round_trip_through_the_parser() {
@@ -3810,7 +3810,7 @@ verify any entry by hashing the file it describes.
         }
     }
 
-    /// §4.1 "Length": `build` sizes the seal with the full seal as a
+    /// §5 "Length": `build` sizes the seal with the full seal as a
     /// placeholder, and a short seal must never be longer (the writer checks
     /// `<=`, the full seal `==`). Every K from the first data slice to M-2,
     /// over plans whose M crosses a digit boundary (9→10, 99→100, 999→1000),
@@ -3931,7 +3931,7 @@ verify any entry by hashing the file it describes.
         // The seal marker's own entry stays hash-less.
         assert_eq!(arr[5].get("type").unwrap().as_str(), Some("seal_marker"));
         assert!(arr[5].get("sha256_encrypted").is_none());
-        // A consistent 1.6.0 seal: it parses by §4.1's rules.
+        // A consistent 1.6.0 seal: it parses by §5's rules.
         assert!(crate::volume::format::parse_seal_marker(&s).is_ok());
         // The embedded copy's grammar matches the front index's byte-for-byte
         // (same emitter): the [[files]] tail of both documents is identical.
@@ -4369,7 +4369,7 @@ verify any entry by hashing the file it describes.
 
         // ...and the present case differs by exactly one inserted line, in
         // exactly one place: immediately after `cartridge_serial`, inside
-        // `[media]` (`docs/design/volume-format-v2.md` §1.1).
+        // `[media]` (`docs/design/volume-format-v3.md` §1.1).
         let with_source = generate_id_thunk_v2(&IdThunkV2Params {
             cartridge_identity_source: Some("mam"),
             ..params
@@ -4403,8 +4403,8 @@ verify any entry by hashing the file it describes.
 
     #[test]
     fn v2_generators_never_mention_mini_index() {
-        // The v1 mid-tape mini-index is gone in v2 (volume-format-v2.md §8);
-        // its facts moved into the front index (File 3). Neither v2 generator
+        // There is no mid-tape mini-index; its facts are in the front index
+        // (File 3). Neither v2 generator
         // may reference it under either spelling, in any case.
         let guide = generate_system_guide_v2("MINI1", 12).to_lowercase();
         for needle in ["mini-index", "mini_index"] {
