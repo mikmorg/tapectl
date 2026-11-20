@@ -838,10 +838,16 @@ fn read_back(
         // Holder labels in the order `holders_of_set` gives them for the
         // first slice each holds: in service first, then volume order.
         let mut held: Vec<(String, Vec<i64>)> = Vec::new();
+        let mut in_service: Vec<String> = Vec::new();
         for h in &holders {
             match held.iter_mut().find(|(l, _)| *l == h.holder.label) {
                 Some((_, s)) => s.push(h.slice_number),
                 None => held.push((h.holder.label.clone(), vec![h.slice_number])),
+            }
+            if h.holder.standing == crate::volume::slice_holders::Standing::InService
+                && !in_service.contains(&h.holder.label)
+            {
+                in_service.push(h.holder.label.clone());
             }
         }
         let mut left: Vec<i64> = slices.clone();
@@ -852,10 +858,13 @@ fn read_back(
                 .filter(|(_, s)| s.contains(&lowest))
                 .max_by_key(|(l, s)| {
                     let n = s.iter().filter(|n| left.contains(n)).count();
-                    // `max_by_key` keeps the LAST maximum: rank earlier
-                    // holders higher so the first in order wins a tie.
+                    // Standing before the count, as the doc says: a tape
+                    // in service is asked for before a quarantined one
+                    // that holds more of what is left. `max_by_key` keeps
+                    // the LAST maximum: rank earlier holders higher so the
+                    // first in order wins a tie.
                     let rank = held.len() - held.iter().position(|(x, _)| x == l).unwrap_or(0);
-                    (n, rank)
+                    (in_service.contains(l), n, rank)
                 });
             let Some((label, s)) = best else {
                 break;
@@ -1075,7 +1084,7 @@ fn judge_unit(
             }
             (Source::Unavailable(_), None) => None,
             (_, None) if !unreadable.is_empty() => Some(format!(
-                "no live volume holds every slice of {}, so it cannot be read back",
+                "live volumes together do not hold every slice of {}, so it cannot be read back",
                 unreadable
                     .iter()
                     .map(|v| format!("v{v}"))
@@ -2135,7 +2144,8 @@ mod tests {
             plan.skipped,
             [Skipped {
                 unit: "lost".into(),
-                reason: "no live volume holds every slice of v1, so it cannot be read back".into(),
+                reason: "live volumes together do not hold every slice of v1, so it cannot be read back"
+                    .into(),
             }]
         );
         let paths = TapectlPaths::new(c.tmp.path().join("home"));
@@ -2150,6 +2160,45 @@ mod tests {
         assert!(out
             .iter()
             .any(|l| l == "then write them: tapectl volume write L1 --for-location offsite"));
+    }
+
+    /// `read_back` ranks a holder by standing before it counts the slices left:
+    /// an in-service tape is asked for before a quarantined one even when the
+    /// quarantined tape holds more of what remains.
+    #[test]
+    fn read_back_asks_an_in_service_tape_before_a_quarantined_one_holding_more() {
+        let c = Cat::new();
+        let q = c.tape("QUAR", Some("home"));
+        let a = c.tape("A1", Some("home"));
+        let b = c.tape("A2", Some("home"));
+        c.conn
+            .execute(
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+                params![q],
+            )
+            .unwrap();
+        let u = c.unit("split", "tape_only", None);
+        c.targets(u, r#"{"offsite":1}"#);
+        let v = c.version(u, 1, "current");
+        let set = c.set(v, &[MIB; 6], "cleaned", false);
+        c.write(set, q, "range", 1, 5);
+        c.write(set, a, "range", 1, 2);
+        c.write(set, b, "range", 3, 6);
+        let plan = c.plan("offsite").unwrap();
+        let commands: Vec<(String, Vec<i64>)> = plan
+            .read_slices()
+            .iter()
+            .map(|r| (r.from.clone(), r.slices.clone()))
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                ("A1".to_string(), vec![1, 2]),
+                ("A2".to_string(), vec![3, 4, 5, 6]),
+            ],
+            "{:?}",
+            plan.skipped
+        );
     }
 
     /// A version already staged is reused, never staged again: `stage`
