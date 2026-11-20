@@ -2133,7 +2133,7 @@ fn check_drill_age(ctx: &Ctx<'_>) -> Result<Findings> {
 /// drilled yet. A warning, never a violation (ADR-0004).
 fn drill_age_findings(conn: &Connection, interval_days: i64) -> Result<Vec<AuditFinding>> {
     let sealed: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM volumes WHERE status = 'sealed')",
+        "SELECT EXISTS(SELECT 1 FROM volumes v WHERE v.status = 'sealed')",
         [],
         |r| r.get(0),
     )?;
@@ -6698,16 +6698,16 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 10 per-unit checks + 10 archive-wide checks (#534 added
-            // `collection_unsynced`). `policy_unresolvable`
+            // 10 per-unit checks + 11 archive-wide checks (#534 added
+            // `collection_unsynced`, #548 `drill_age`). `policy_unresolvable`
             // is not one of them (see below), `escrow_kit_missing`/
             // `escrow_kit_stale` share one row, and so do
             // `completed_past_ending` (#420) and the
             // four range invariants (#478, X27).
             assert_eq!(
                 names.len(),
-                20,
-                "expected 10 per-unit + 10 archive-wide CHECKS rows, got: {names:?}"
+                21,
+                "expected 10 per-unit + 11 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {

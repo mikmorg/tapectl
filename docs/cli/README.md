@@ -143,6 +143,8 @@ definitions it parses. For what to *do* with them, start at the
 | &nbsp;&nbsp;[`restore volume`](restore.md#tapectl-restore-volume) | Restore several units from one volume in one pass over the tape |
 | &nbsp;&nbsp;[`restore file`](restore.md#tapectl-restore-file) | Restore a single file from a unit |
 | &nbsp;&nbsp;[`restore raw-volume`](restore.md#tapectl-restore-raw-volume) | Dump every file off a tape verbatim, using only the tape itself (no catalog) |
+| [`drill`](drill.md) | Record heir drills (RESTORE.sh run with the stock tools) |
+| &nbsp;&nbsp;[`drill record`](drill.md#tapectl-drill-record) | Record that an heir drill was done on a volume |
 
 ### Drive and cartridges
 

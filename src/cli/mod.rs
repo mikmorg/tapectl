@@ -142,7 +142,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Sources", &["collection", "unit", "snapshot"]),
     ("Stage and write", &["stage", "volume", "quick-archive"]),
     ("Check", &["status", "audit", "report"]),
-    ("Restore", &["restore"]),
+    ("Restore", &["restore", "drill"]),
     ("Drive and cartridges", &["drive", "cartridge"]),
     (
         "Catalog and maintenance",

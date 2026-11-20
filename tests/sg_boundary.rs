@@ -295,6 +295,10 @@ const SPAWNS: &[(&str, &str)] = &[
     // `key escrow-kit --static-binary` (ADR-0012 item 234): its version is
     // checked before the kit copies it. Stdin closed, no device named.
     ("src/crypto/escrow_kit.rs", "program"),
+    // `<tool> --version` for `tar` and `age` over `drill record` (#548, D18):
+    // the first line of each, kept in the drill's row. Output only, stdin
+    // not read, no device named.
+    ("src/cli/drill.rs", "tool"),
 ];
 
 #[test]
