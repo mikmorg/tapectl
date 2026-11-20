@@ -1543,7 +1543,15 @@ check_destination() {
     # A destination that holds the damaged-file list of an earlier run is one a
     # later run from another tape adds to (whether it is the same unit and
     # version is judged when the unit is read).
-    if [ -f "$TO/.tapectl-damaged-files.txt" ] || compgen -G "$TO/*/.tapectl-damaged-files.txt" >/dev/null 2>&1; then
+    # The list lies in the directory of its unit, $TO/<unit name>, and a unit
+    # name may hold slashes (tv/breaking-bad/s01): no one-level glob finds it
+    # (#577). The units of this run are not known yet, so any depth is looked
+    # at; each unit's own directory is judged when that unit is restored.
+    if (
+      shopt -s globstar nullglob
+      set -- "$TO"/**/.tapectl-damaged-files.txt # ** also matches no directory at all: $TO itself
+      [ $# -gt 0 ]
+    ); then
       TO_HELD_LIST=1
       return 0
     fi

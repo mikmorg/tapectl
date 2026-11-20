@@ -259,3 +259,44 @@ fn a_refused_cartridge_does_not_cost_the_run_its_home_tape() {
     }
 }
 
+// ---- #577 ----
+
+/// #577: a later run into the same `--to` from another copy, units whose
+/// names hold a `/`: the damaged-file list under `TO/tv/a/s01` is found.
+#[test]
+fn a_later_run_finds_the_list_of_a_unit_with_a_hierarchical_name() {
+    let mut shape = Shape::two();
+    shape.units = vec![
+        ("tv/a/s01".into(), heir::TENANT_A, false),
+        ("tv/a/s02".into(), heir::TENANT_A, false),
+    ];
+    shape.copies = 2;
+    let t = Tape::build_series(&shape);
+    let h1 = Heir::of(&t[0]);
+    let ka = key(&h1, Who::TenantA);
+    // Slice 1 of each unit is bad on the first copy.
+    let all_slices = t[0].slice_positions();
+    let second = t[0].units[0].slices;
+    h1.flip(all_slices[0], 500);
+    h1.flip(all_slices[second], 500);
+    let dest = h1.dest("out");
+    let o = h1.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(dest.join("tv/a/s01/.tapectl-damaged-files.txt").is_file());
+    let h2 = Heir::of(&t[1]);
+    let o = h2.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&dest)]);
+    let all = o.all();
+    assert!(!all.contains("is not empty"), "{all}");
+    assert_eq!(o.code, 0, "{all}");
+    assert!(all.contains("RESTORE COMPLETE"), "{all}");
+    for name in ["tv/a/s01", "tv/a/s02"] {
+        for (p, bytes) in unit_files(&t[0], name) {
+            assert_eq!(
+                &std::fs::read(dest.join(name).join(p)).unwrap(),
+                bytes,
+                "{name}/{p}"
+            );
+        }
+    }
+}
+
