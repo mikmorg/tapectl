@@ -370,3 +370,145 @@ fn a_ranges_written_slices_are_a_repair_source_and_an_unwritten_units_are_none()
             .is_empty()
     );
 }
+
+/// restore-4: a unit that cannot be planned is known before the drive opens.
+/// It heads the report, and with `--fail-fast` the pass stops before any
+/// unit is read: the others are reported not attempted.
+#[test]
+fn a_unit_that_cannot_be_planned_heads_the_report_and_stops_a_fail_fast_pass() {
+    let mut t = short_tape::short_tape();
+    let dest = TempDir::new().unwrap();
+    fs::create_dir_all(dest.path().join("alpha")).unwrap();
+    fs::write(dest.path().join("alpha").join("stray"), b"x").unwrap();
+    let run = |t: &mut ShortTape, fail_fast: bool| {
+        restore_units_from_loaded_store(
+            &t.conn,
+            &t.paths,
+            &Config::default(),
+            &[],
+            &dest.path().to_string_lossy(),
+            &RestoreOptions::default(),
+            fail_fast,
+            &mut t.store,
+            site(Operation::RestoreVolume),
+        )
+        .unwrap()
+    };
+    let names = |r: &super::UnitsReport| -> Vec<String> {
+        r.units.iter().map(|u| u.unit_name.clone()).collect()
+    };
+
+    let report = run(&mut t, false);
+    assert_eq!(names(&report), ["alpha", "bravo"], "the refused unit first");
+    assert!(report.units[1].attempted, "{report:?}");
+
+    // `--fail-fast`: nothing is read.
+    let _ = fs::remove_dir_all(dest.path().join("bravo"));
+    let report = run(&mut t, true);
+    assert_eq!(names(&report), ["alpha", "bravo"]);
+    assert!(report.units[0].error.is_some(), "{report:?}");
+    assert!(!report.units[1].attempted, "bravo was not read: {report:?}");
+    assert!(
+        !dest.path().join("bravo").exists(),
+        "nothing was extracted before the stop"
+    );
+    assert_eq!(report.failed(), 2);
+}
+
+/// C3: only a refusal of a unit's plan is listed. A catalog error (here a
+/// table that is gone, as a failed read would be) is the command's own.
+#[test]
+fn a_catalog_error_is_not_listed_as_a_unit_that_cannot_be_planned() {
+    let t = short_tape::short_tape();
+    let dest = TempDir::new().unwrap();
+    let names = units_on_volume(&t.conn, LABEL).unwrap();
+    let requests = super::unit_requests(&names, &dest.path().to_string_lossy()).unwrap();
+    t.conn
+        .execute_batch("ALTER TABLE write_positions RENAME TO write_positions_gone")
+        .unwrap();
+    let err = super::plan_set(&t.conn, LABEL, &requests, &RestoreOptions::default(), true)
+        .err()
+        .expect("the catalog error stops the command");
+    assert!(
+        matches!(err.unwrapped(), crate::error::TapectlError::Database(_)),
+        "{err}"
+    );
+}
+
+/// A store that answers File 0 and the envelopes and then loses the drive:
+/// every read at or after `from` fails as the kernel's ENODEV does.
+struct Gone<'a> {
+    inner: &'a mut crate::store::MemStore,
+    from: u32,
+}
+
+impl crate::store::Store for Gone<'_> {
+    fn capacity(&mut self) -> crate::error::Result<crate::store::CapacityReport> {
+        self.inner.capacity()
+    }
+    fn execute(
+        &mut self,
+        src: &mut dyn std::io::Read,
+        len: u64,
+        sync: bool,
+    ) -> crate::error::Result<u64> {
+        self.inner.execute(src, len, sync)
+    }
+    fn read_file(
+        &mut self,
+        position: u32,
+        sink: &mut dyn std::io::Write,
+    ) -> crate::error::Result<u64> {
+        if position >= self.from {
+            return Err(crate::error::TapectlError::TapeIo(
+                "read: No such device (os error 19)".into(),
+            ));
+        }
+        self.inner.read_file(position, sink)
+    }
+    fn reposition_for_resume(&mut self, file_index: u32) -> crate::error::Result<()> {
+        self.inner.reposition_for_resume(file_index)
+    }
+    fn blank_at_bot(&mut self) -> crate::error::Result<bool> {
+        self.inner.blank_at_bot()
+    }
+    fn eod_at_or_before(&mut self, position: u32) -> crate::error::Result<bool> {
+        self.inner.eod_at_or_before(position)
+    }
+    fn files_on_medium(&mut self) -> crate::error::Result<Option<u32>> {
+        self.inner.files_on_medium()
+    }
+}
+
+/// C1: a drive that stops answering is a stop, not a stream of bad slices:
+/// the restore ends at the first slice it cannot read for that reason, with no
+/// list of "damaged" files for a repair from another copy.
+#[test]
+fn a_drive_that_stops_answering_ends_the_restore() {
+    let mut t = short_tape::short_tape();
+    let first = t.positions_of("alpha")[0];
+    let dest = TempDir::new().unwrap();
+    let dest_str = dest.path().to_string_lossy().to_string();
+    let mut gone = Gone {
+        inner: &mut t.store,
+        from: first,
+    };
+    let err = restore_unit_from_store(
+        &t.conn,
+        &t.paths,
+        &Config::default(),
+        "alpha",
+        LABEL,
+        1,
+        RestoreTarget::Unit {
+            dest_dir: &dest_str,
+        },
+        &RestoreOptions::default(),
+        &mut gone,
+        site(Operation::RestoreUnit),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("the drive is not answering"), "{err}");
+    assert!(!err.contains("INCOMPLETE"), "{err}");
+}

@@ -1188,6 +1188,17 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         };
         let before_holes = out.holes.len();
         let mut raw = self.attempt_raw(position, wp, identities, out, Mode::Tolerant)?;
+        // A drive that does not answer is not a bad slice: the next slice
+        // would fail the same way, and each would be listed as damaged. The
+        // restore ends here, as it did before slices could be left out.
+        if let Some(Err(e)) = &raw.read {
+            if device_failure(e) {
+                return Err(TapectlError::Other(format!(
+                    "slice {} of {} cannot be read, and the drive is not answering: {e}",
+                    wp.slice_number, self.subject
+                )));
+            }
+        }
         let label = self.here_label().unwrap_or_default();
         let hash_ok = raw.hash_ok;
         let here_defect = raw.defect();
@@ -1200,19 +1211,32 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             first.or_else(|| here_defect.map(|d| (label.clone(), d)));
         let ended = match raw.ended {
             Ok(ended) => ended,
+            // The sink failed (the pipe, the host): not the medium, and not
+            // one slice's fault. Said as `attempt` says it.
             Err(sink) => {
-                return Ok(Some(match described(&cause) {
-                    Some(d) => format!("{d}; {sink}"),
-                    None => sink.to_string(),
-                }))
+                return Err(match described(&cause) {
+                    Some(d) => TapectlError::Other(format!("{d}; {sink}")),
+                    None => sink,
+                });
             }
         };
         if let Some(e) = ended.open_error {
-            return Ok(Some(format!(
+            let text = format!(
                 "{}; and it cannot be read around: {e}",
                 described(&cause)
                     .unwrap_or_else(|| format!("slice {} cannot be read", wp.slice_number)),
-            )));
+            );
+            // The evidence says whose fault it is, as `attempt` reads it: a
+            // checksum that does not match, or a failed read, is the medium's
+            // and the slice is bad (item 264). A header that will not open
+            // under a ciphertext that hashes as written is the keys, or a
+            // file that is not age: every slice would say so, and the
+            // restore is refused here, at the first one.
+            return if cause.is_some() {
+                Ok(Some(text))
+            } else {
+                Err(TapectlError::Other(text))
+            };
         }
         if ended.other_file {
             // The cartridge in the drive is not the file the slice was begun
@@ -1883,6 +1907,22 @@ impl Raw {
     }
 }
 
+/// Whether a failed tape read says the drive is gone, not that the medium
+/// is bad: the kernel's ENXIO (6), EBADF (9), ENODEV (19) and ENOMEDIUM
+/// (123), or no cartridge loaded. `TapeDevice` reports a failed read as
+/// `TapeIo("read: <strerror> (os error N)")`, so the number is read from
+/// that text; EIO (5), a read error on the medium, and anything else are
+/// not classed here, and stay a bad slice.
+fn device_failure(e: &TapectlError) -> bool {
+    match e {
+        TapectlError::NoCartridgeLoaded { .. } => true,
+        TapectlError::TapeIo(text) if text.starts_with("read: ") => [6, 9, 19, 123]
+            .iter()
+            .any(|n| text.ends_with(&format!("(os error {n})"))),
+        _ => false,
+    }
+}
+
 /// `subject` with its first letter capitalised, to open a sentence.
 fn capitalised(subject: &str) -> String {
     let mut chars = subject.chars();
@@ -1981,6 +2021,26 @@ mod tests {
 
     fn digest(bytes: &[u8]) -> [u8; 32] {
         sha2::Sha256::digest(bytes).into()
+    }
+
+    /// C1: which failed reads say the drive is gone. EIO is the medium's.
+    #[test]
+    fn a_failed_read_is_the_drives_only_when_the_device_is_gone() {
+        let read = |text: &str| TapectlError::TapeIo(format!("read: {text}"));
+        for gone in [
+            "No such device (os error 19)",
+            "No medium found (os error 123)",
+            "No such device or address (os error 6)",
+        ] {
+            assert!(device_failure(&read(gone)), "{gone}");
+        }
+        assert!(device_failure(&TapectlError::NoCartridgeLoaded {
+            device: "/dev/nst0".into()
+        }));
+        assert!(!device_failure(&read("Input/output error (os error 5)")));
+        assert!(!device_failure(&TapectlError::TapeIo(
+            "sink write: No such device (os error 19)".into()
+        )));
     }
 
     /// The clean path hashes no plaintext of its own accord (the ciphertext

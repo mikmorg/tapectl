@@ -180,6 +180,14 @@ pub(super) fn plan_across(
         next += 1;
     }
     while next <= n {
+        // The start cartridge's own slices are read from it, whatever its
+        // standing (starting there was the operator's call, item 266): a
+        // retired tape that is the only copy left still gives its range.
+        if let Some(wp) = on_start.get(&next) {
+            plan.push(wp.clone());
+            next += 1;
+            continue;
+        }
         let candidates = by_slice.get(&next).map(Vec::as_slice).unwrap_or_default();
         // How far a volume reads on from `next`, and whether it holds every
         // slice of the version.
@@ -192,10 +200,14 @@ pub(super) fn plan_across(
             last
         };
         let whole = |volume_id: i64| by_volume[&volume_id].len() as i64 == n;
-        // A slice on no live volume is skipped: it is in `unheld`.
+        // A slice on no live volume is skipped, and only if it is in
+        // `unheld`: a slice in neither is a bug, said by name.
         if candidates.is_empty() {
-            next += 1;
-            continue;
+            if unheld.contains_key(&next) {
+                next += 1;
+                continue;
+            }
+            return Err(not_planned(unit_name, version, next));
         }
         let Some(pick) = candidates.iter().min_by_key(|h| {
             (
@@ -205,8 +217,7 @@ pub(super) fn plan_across(
                 h.volume_id,
             )
         }) else {
-            next += 1;
-            continue;
+            return Err(not_planned(unit_name, version, next));
         };
         let last = reach(pick.volume_id);
         let held = &by_volume[&pick.volume_id];
@@ -233,6 +244,16 @@ pub(super) fn plan_across(
         positions: plan,
         unheld,
     })
+}
+
+/// A slice the plan could place nowhere and that is not listed as unheld: the
+/// catalog and the plan disagree.
+fn not_planned(unit_name: &str, version: i64, slice: i64) -> TapectlError {
+    TapectlError::Other(format!(
+        "unit \"{unit_name}\" version {version}: slice {slice} is on no cartridge the plan can \
+         read and is not among those on no live volume. The catalog disagrees with itself; \
+         `tapectl audit` names the rows. Nothing was read from tape."
+    ))
 }
 
 /// The stage set's slices, in slice order.

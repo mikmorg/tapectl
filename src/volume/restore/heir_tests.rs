@@ -409,6 +409,10 @@ fn an_heir_with_only_the_escrow_secret_rebuilds_and_restores_through_tapectl() {
         "{err}"
     );
     assert!(!err.contains("--key"), "no --key was given: {err}");
+    assert!(
+        !err.contains("INCOMPLETE") && err.contains("cannot be read around"),
+        "a wrong key is refused at the first slice, not listed as damage: {err}"
+    );
 
     // `restore unit --unit keepsake --key escrow.key --to DIR`
     let dest = TempDir::new().unwrap();
@@ -654,6 +658,10 @@ fn the_commands_as_the_heir_types_them_restore_with_the_escrow_key_alone() {
     assert!(
         err.contains(&age::DecryptError::NoMatchingKeys.to_string()),
         "{err}"
+    );
+    assert!(
+        !err.contains("INCOMPLETE") && err.contains("cannot be read around"),
+        "a wrong key is refused at the first slice, not listed as damage: {err}"
     );
     let err = run_line(unit_line(&["--key", &stranger]))
         .unwrap_err()

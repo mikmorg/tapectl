@@ -1314,6 +1314,116 @@ pub(crate) mod tests {
         assert_eq!(bay.asked_labels(), [B]);
     }
 
+    /// restore-6: a folder the repair fills gets the mode and time the copy
+    /// recorded for it, applied after the files under it are in (a 0555
+    /// folder still receives them), not the temporary owner-writable mode
+    /// the repair made it with, nor the time of the repair.
+    #[test]
+    fn a_folder_the_repair_fills_gets_its_recorded_mode_and_time() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut h = Home::new("256K", None, 2);
+        h.unit(TENANT, UNIT, &tree());
+        let sub = h.source(UNIT).join("sub");
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        fs::File::open(&sub).unwrap().set_modified(old).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+        h.stage(UNIT);
+        h.volume(A);
+        h.volume(B);
+        h.write(A);
+        let one = h.stage_set(UNIT, 1);
+        restage(&mut h, "192K");
+        h.write(B);
+        let rows = stage_files::load(&h.conn, one).unwrap();
+        let folder = rows.iter().find(|r| r.path == "sub").expect("the folder");
+        let begins = filetable::slice_start(&rows, SLICE_256K, folder.slice).unwrap();
+        let chunk = (folder.start - begins) / CHUNK;
+        let slice = folder.slice;
+        damage_in(&mut h, A, one, slice as i64, chunk);
+        let lost = lost_in_chunk(&h, one, SLICE_256K, slice, chunk);
+        assert!(
+            lost.contains("sub") && lost.contains("sub/deep.txt"),
+            "{lost:?}"
+        );
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let (r, dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        let made = dest.path().join("sub");
+        // Leave the 0555 folders removable whatever the test says.
+        let _undo = scopeguard_chmod(vec![sub.clone(), made.clone()]);
+        r.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            fs::read(made.join("deep.txt")).unwrap(),
+            b"deep in a folder\n"
+        );
+        let meta = fs::metadata(&made).unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o555, "the recorded mode");
+        assert_eq!(meta.modified().unwrap(), old, "the recorded time");
+    }
+
+    /// Puts 0755 back on the folders when dropped.
+    struct Chmod(Vec<PathBuf>);
+    impl Drop for Chmod {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            for p in &self.0 {
+                let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+    fn scopeguard_chmod(paths: Vec<PathBuf>) -> Chmod {
+        Chmod(paths)
+    }
+
+    /// restore-7: one lost path that cannot be put in place (the destination
+    /// has a folder where the copy has a file) stays lost with its reason, and
+    /// the fill goes on: the other files of the copy are installed. Nothing in
+    /// the destination is deleted but a file or a link.
+    #[test]
+    fn one_path_that_cannot_be_installed_does_not_end_the_fill() {
+        let (mut h, one, _two) = two_stagings();
+        damage_in(&mut h, A, one, 1, 0);
+        let lost = lost_in_chunk(&h, one, SLICE_256K, 1, 0);
+        assert!(lost.contains("alpha-01.bin") && lost.len() > 1, "{lost:?}");
+        let dest = TempDir::new().unwrap();
+        // A folder, with a file in it, where the lost file belongs.
+        let blocked = dest.path().join("alpha-01.bin");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(blocked.join("mine"), b"not for removal").unwrap();
+        let options = RestoreOptions {
+            overwrite: true,
+            ..RestoreOptions::default()
+        };
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let r = h.restore_into(
+            UNIT,
+            What::Unit,
+            A,
+            &options,
+            &mut bay,
+            &dest.path().to_string_lossy(),
+        );
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("INCOMPLETE"), "{err}");
+        assert_eq!(
+            lost_paths(&err),
+            BTreeSet::from(["alpha-01.bin".to_string()]),
+            "only the path that could not be put in place stays lost: {err}"
+        );
+        assert!(err.contains("could not be put in place"), "{err}");
+        assert!(
+            !err.contains("could not be used"),
+            "the copy is not given up: {err}"
+        );
+        assert_eq!(fs::read(blocked.join("mine")).unwrap(), b"not for removal");
+        for path in lost.iter().filter(|p| *p != "alpha-01.bin") {
+            assert_eq!(
+                fs::read(dest.path().join(path)).unwrap(),
+                fs::read(h.source(UNIT).join(path)).unwrap(),
+                "{path} was installed from the copy"
+            );
+        }
+    }
+
     /// Another VERSION is never a source, even where the file is unchanged.
     #[test]
     fn another_version_is_never_a_source() {
@@ -1655,7 +1765,7 @@ pub(crate) mod tests {
 
     /// The wrong-key refusal as it stands today, with no `--key`: the control
     /// every test below compares to: age's own words, and no key file named.
-    fn assert_wrong_key_refusal_without_keys(h: &Home, from: &str, bay: &mut TestBay) {
+    fn assert_wrong_key_refusal_without_keys(h: &Home, from: &str, bay: &mut TestBay) -> String {
         let (r, _dest) = restore_unit(h, from, &RestoreOptions::default(), bay);
         let err = r.unwrap_err().to_string();
         assert!(
@@ -1663,6 +1773,25 @@ pub(crate) mod tests {
             "{err}"
         );
         assert!(!err.contains("--key"), "no --key was given: {err}");
+        assert!(
+            !err.contains("INCOMPLETE") && !err.contains("damaged or missing"),
+            "a wrong key is not a list of damaged files: {err}"
+        );
+        err
+    }
+
+    /// A wrong key is a refusal at the first slice, as it was before slices
+    /// could be left out: the cartridge is healthy, so no file is "damaged
+    /// or missing", and nothing is listed for a repair from another copy.
+    fn assert_refused_at_first_slice(err: &str) {
+        assert!(
+            !err.contains("INCOMPLETE") && !err.contains("damaged or missing"),
+            "a wrong key is not a list of damaged files: {err}"
+        );
+        assert!(
+            err.contains("slice 1 ") && err.contains("cannot be read around"),
+            "refused at the first slice, by name: {err}"
+        );
     }
 
     /// SLICE SUBSTITUTION with only the given identity: the acceptance test
@@ -1706,7 +1835,8 @@ pub(crate) mod tests {
 
         // Control: the home's keys open nothing, and the refusal says so.
         let mut bay = h.bay(A, &[]);
-        assert_wrong_key_refusal_without_keys(&h, A, &mut bay);
+        let refused = assert_wrong_key_refusal_without_keys(&h, A, &mut bay);
+        assert_refused_at_first_slice(&refused);
 
         let mut bay = h.bay(A, &[]);
         let (r, dest) = restore_unit(&h, A, &with_keys(&given), &mut bay);
@@ -1758,6 +1888,7 @@ pub(crate) mod tests {
             err.contains(&age::DecryptError::NoMatchingKeys.to_string()),
             "the refusal as it stands: {err}"
         );
+        assert_refused_at_first_slice(&err);
         for f in [&wrong_a, &wrong_b] {
             assert!(err.contains(&f.display().to_string()), "{f:?} named: {err}");
         }

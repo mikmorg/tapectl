@@ -323,6 +323,9 @@ fn fill_from(
     let read = read?;
 
     let by_path: HashMap<&str, &Row> = ctx.rows.iter().map(|r| (r.path.as_str(), r)).collect();
+    // Folders the copy gave, `(copy's folder, destination)`: their recorded
+    // metadata is applied once everything under them is in (restore-6).
+    let mut folders: Vec<(PathBuf, PathBuf)> = Vec::new();
     for path in &wanted {
         let source = out.join(crate::volume::index::on_disk(path));
         if read.lost.contains_key(*path) || fs::symlink_metadata(&source).is_err() {
@@ -330,7 +333,22 @@ fn fill_from(
         }
         match verified(&source, by_path.get(*path).copied()) {
             Ok(how) => {
-                install(&source, &ex.root.join(crate::volume::index::on_disk(path)))?;
+                let dest = ex.root.join(crate::volume::index::on_disk(path));
+                // One path that cannot be put in place does not end the
+                // fill: it stays lost, with the reason, and the others go on.
+                if let Err(e) = install(&source, &dest) {
+                    warn!(file = %path, volume = %holder.label, "cannot be installed: {e}");
+                    if let Some(why) = lost.get_mut(*path) {
+                        why.push_str(&format!(
+                            "; the copy on {} holds it, but it could not be put in place: {e}",
+                            holder.label
+                        ));
+                    }
+                    continue;
+                }
+                if by_path.get(*path).is_some_and(|r| r.kind == Kind::Folder) {
+                    folders.push((source.clone(), dest));
+                }
                 supply.note_here(format!(
                     "supplied {path} of unit \"{}\" v{} for the restore",
                     ctx.unit_name, ctx.version
@@ -350,6 +368,32 @@ fn fill_from(
             }
         }
     }
+    // The folders last, the deepest first, so a folder whose mode forbids
+    // writing has received its files and its own time is not moved by them.
+    folders.sort_by_key(|(_, dest)| std::cmp::Reverse(dest.components().count()));
+    for (source, dest) in &folders {
+        if let Err(e) = apply_folder_metadata(source, dest) {
+            warn!(folder = %dest.display(), "the copy's metadata could not be set on the folder: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Give the folder `dest` the mode, owner and modification time of the
+/// copy's `source` (restore-6): what tar would have set had the folder's own
+/// member come through. The owner is set where the process may (a failed
+/// chown for want of permission is not an error), then the mode, since a
+/// chown can clear bits.
+fn apply_folder_metadata(source: &Path, dest: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = fs::symlink_metadata(source)?;
+    match std::os::unix::fs::chown(dest, Some(meta.uid()), Some(meta.gid())) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(e) => return Err(e.into()),
+    }
+    fs::set_permissions(dest, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    fs::File::open(dest)?.set_modified(meta.modified()?)?;
     Ok(())
 }
 
@@ -396,7 +440,10 @@ fn verified(source: &Path, expected: Option<&Row>) -> std::result::Result<String
 /// installed by its own turn. A folder that is already there is left as it
 /// is; one that is not is made, with the copy's permission bits and the
 /// owner's write and search bits besides, so the files that follow can be
-/// installed in it (tar sets a folder's mode last for the same reason).
+/// installed in it; [`apply_folder_metadata`] gives it its recorded mode,
+/// owner and time after they are (tar sets a folder's mode last for the same
+/// reason). A file over a folder in the destination is refused, never
+/// removed: nothing is deleted from the destination but a file or a link.
 fn install(source: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
@@ -416,7 +463,12 @@ fn install(source: &Path, dest: &Path) -> Result<()> {
         )?;
         return Ok(());
     }
-    if fs::symlink_metadata(dest).is_ok() {
+    if let Ok(m) = fs::symlink_metadata(dest) {
+        if m.is_dir() {
+            return Err(TapectlError::Other(
+                "a folder is there, and a file is not put over it".to_string(),
+            ));
+        }
         fs::remove_file(dest)?;
     }
     if fs::rename(source, dest).is_err() {
