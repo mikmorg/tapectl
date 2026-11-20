@@ -1262,6 +1262,82 @@ pub(crate) mod tests {
         assert!(bay.asked.is_empty());
     }
 
+    /// #584, a lost folder: the folder `sub` and its one file are in one bad
+    /// chunk, so `sub` is not under the destination at all. The repair
+    /// makes the folder and installs the file in it; it does not move the
+    /// whole subtree in and then call the file damaged because its source
+    /// is gone.
+    #[test]
+    fn a_lost_folder_is_made_and_its_files_installed_one_by_one() {
+        let (mut h, one, _two) = two_stagings();
+        let rows = stage_files::load(&h.conn, one).unwrap();
+        let sub = rows.iter().find(|r| r.path == "sub").expect("the folder");
+        let begins = filetable::slice_start(&rows, SLICE_256K, sub.slice).unwrap();
+        let chunk = (sub.start - begins) / CHUNK;
+        let slice = sub.slice;
+        damage_in(&mut h, A, one, slice as i64, chunk);
+        let lost = lost_in_chunk(&h, one, SLICE_256K, slice, chunk);
+        assert!(
+            lost.contains("sub") && lost.contains("sub/deep.txt"),
+            "the folder and its file are lost: {lost:?}"
+        );
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let (r, dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        let report = r.unwrap_or_else(|e| panic!("{e}"));
+        assert_restored(&h, UNIT, dest.path(), &[]);
+        let filled: BTreeSet<String> = report.filled.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(filled, lost, "every lost path was filled");
+    }
+
+    /// #584, a lost folder: the folder `sub` and its one file are in one bad
+    /// chunk, so `sub` is not under the destination at all. The repair
+    /// makes the folder and installs the file in it; it does not move the
+    /// whole subtree in and then call the file damaged because its source
+    /// is gone.
+    #[test]
+    fn a_lost_folder_is_made_and_its_files_installed_one_by_one() {
+        let (mut h, one, _two) = two_stagings();
+        let rows = stage_files::load(&h.conn, one).unwrap();
+        let sub = rows.iter().find(|r| r.path == "sub").expect("the folder");
+        let begins = filetable::slice_start(&rows, SLICE_256K, sub.slice).unwrap();
+        let chunk = (sub.start - begins) / CHUNK;
+        let slice = sub.slice;
+        damage_in(&mut h, A, one, slice as i64, chunk);
+        let lost = lost_in_chunk(&h, one, SLICE_256K, slice, chunk);
+        assert!(
+            lost.contains("sub") && lost.contains("sub/deep.txt"),
+            "the folder and its file are lost: {lost:?}"
+        );
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let (r, dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        let report = r.unwrap_or_else(|e| panic!("{e}"));
+        assert_restored(&h, UNIT, dest.path(), &[]);
+        let filled: BTreeSet<String> = report.filled.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(filled, lost, "every lost path was filled");
+    }
+
+    /// #583 and item 264: a slice of the restoring staging whose age header
+    /// will not open, on its only copy, leaves its members out and the
+    /// restore goes on; the repair then fills them from the other staging.
+    #[test]
+    fn a_slice_whose_header_will_not_open_is_repaired_from_the_other_staging() {
+        let (mut h, one, _two) = two_stagings();
+        let position = h.position_in(A, one, 3);
+        let file = &h.tapes[A].files[position];
+        let at = file
+            .windows(5)
+            .position(|w| w == b"\n--- ")
+            .expect("an age header's MAC line")
+            + 10;
+        h.flip(A, position, at);
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let (r, dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        let report = r.unwrap_or_else(|e| panic!("{e}"));
+        assert_restored(&h, UNIT, dest.path(), &[]);
+        assert!(!report.filled.is_empty(), "{report:?}");
+        assert_eq!(bay.asked_labels(), [B]);
+    }
+
     /// Another VERSION is never a source, even where the file is unchanged.
     #[test]
     fn another_version_is_never_a_source() {

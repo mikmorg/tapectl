@@ -305,6 +305,7 @@ fn fill_from(
         slice_size: facts.slice_size,
         compression: facts.compression,
         positions: &subset,
+        unheld: &BTreeMap::new(),
         offsets: &facts.offsets,
         identities: ctx.identities,
         tar_binary: &ctx.config.tar.binary,
@@ -389,9 +390,31 @@ fn verified(source: &Path, expected: Option<&Row>) -> std::result::Result<String
 }
 
 /// Put the verified file where the damaged one is: replacing only that path.
+///
+/// A folder is not moved and nothing is unlinked in its place (#584): the
+/// copy's folder holds its whole subtree, and each lost path under it is
+/// installed by its own turn. A folder that is already there is left as it
+/// is; one that is not is made, with the copy's permission bits and the
+/// owner's write and search bits besides, so the files that follow can be
+/// installed in it (tar sets a folder's mode last for the same reason).
 fn install(source: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
+    }
+    let meta = fs::symlink_metadata(source)?;
+    if meta.is_dir() {
+        match fs::symlink_metadata(dest) {
+            Ok(m) if m.is_dir() => return Ok(()),
+            Ok(_) => fs::remove_file(dest)?,
+            Err(_) => {}
+        }
+        fs::create_dir(dest)?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            dest,
+            fs::Permissions::from_mode(meta.permissions().mode() | 0o700),
+        )?;
+        return Ok(());
     }
     if fs::symlink_metadata(dest).is_ok() {
         fs::remove_file(dest)?;
@@ -506,6 +529,43 @@ mod tests {
         assert!(verified(&file, Some(&row(Kind::HardLink, "h", Some(want)))).is_ok());
         let other: [u8; 32] = sha2::Sha256::digest(b"beta").into();
         assert!(verified(&file, Some(&row(Kind::HardLink, "h", Some(other)))).is_err());
+    }
+
+    /// #584: a folder is never unlinked and never moved with its subtree. One
+    /// that is there (the unit's root `.` among them) is left as it is, and
+    /// the paths under it are installed by their own turns; one that is not
+    /// there is made empty.
+    #[test]
+    fn a_folder_is_left_or_made_and_never_unlinked_or_moved_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        fs::create_dir_all(out.join("d")).unwrap();
+        fs::write(out.join("d/x"), b"from the copy").unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::write(root.join("d/keep"), b"keep").unwrap();
+
+        // The unit's root, which exists.
+        install(&out, &root.join(".")).expect("the root is left as it is");
+        assert_eq!(fs::read(root.join("d/keep")).unwrap(), b"keep");
+        assert!(!root.join("d/x").exists(), "its subtree is not moved in");
+
+        // A folder that exists keeps what is in it.
+        install(&out.join("d"), &root.join("d")).expect("an existing folder is left");
+        assert_eq!(fs::read(root.join("d/keep")).unwrap(), b"keep");
+        assert!(!root.join("d/x").exists());
+
+        // A folder that is not there is made, empty: its files come later.
+        fs::set_permissions(&out.join("d"), std::os::unix::fs::PermissionsExt::from_mode(0o555))
+            .unwrap();
+        install(&out.join("d"), &root.join("e")).expect("a missing folder is made");
+        assert!(root.join("e").is_dir());
+        assert_eq!(fs::read_dir(root.join("e")).unwrap().count(), 0);
+        fs::write(&out.join("f"), b"file").unwrap();
+        install(&out.join("f"), &root.join("e/f")).expect("a file goes in the made folder");
+        assert_eq!(fs::read(root.join("e/f")).unwrap(), b"file");
+        fs::set_permissions(&out.join("d"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
     }
 
     /// A verified file replaces only the damaged path, and a path under a
