@@ -2103,10 +2103,19 @@ restore_one() { # <chosen row> <destination>
 # is never rewritten, and the list follows the merge rule of the repair.
 continue_unit() { # <destination>
   local dest=$1 k
-  note "$(safe_str "$dest") holds the damaged-file list of an earlier run of unit $(safe_str "$U_NAME") version $U_VER: this run adds to it. Only the files that do not already pass the table's sha256 are restored (the cartridge a file needs is asked for, as the repair asks); a file that passes is left alone."
+  if [ "$NO_FILE_CHECK" = 1 ]; then
+    note "$(safe_str "$dest") holds the damaged-file list of an earlier run of unit $(safe_str "$U_NAME") version $U_VER: this run adds to it. With --no-file-check nothing says which files are whole, so every file the list names is restored again (the cartridge a file needs is asked for, as the repair asks)."
+  else
+    note "$(safe_str "$dest") holds the damaged-file list of an earlier run of unit $(safe_str "$U_NAME") version $U_VER: this run adds to it. Only the files that do not already pass the table's sha256 are restored (the cartridge a file needs is asked for, as the repair asks); a file that passes is left alone."
+  fi
   : >"$WORK/failed.paths"
   if [ "$NO_FILE_CHECK" = 0 ]; then
     file_check "$U_TABLE" "$dest" "$WORK/failed.paths"
+  else
+    # Nothing can say which of the files pass, so none is taken to: every path
+    # the list names is fed again, as the repair feeds them, and what this run
+    # does not read stays on the list (#574).
+    sed -n '2,$p' "$dest/.tapectl-damaged-files.txt" | grep -v '^$' >"$WORK/failed.paths" || true
   fi
   # A folder, a link or a special file is wanted when it is not there.
   awk -F'\t' '!/^#/ && $1 != "f" && $1 != "h" { print $7 }' "$U_TABLE" >"$WORK/other.rows"
@@ -2117,6 +2126,12 @@ continue_unit() { # <destination>
     if [ ! -e "$dest/$REPLY" ] && [ ! -L "$dest/$REPLY" ]; then printf '%s\n' "$esc" >>"$WORK/other.missing"; fi
   done <"$WORK/other.rows"
   sort -u "$WORK/failed.paths" "$WORK/other.missing" >"$WORK/want.paths"
+  if [ ! -s "$WORK/want.paths" ] && [ "$NO_FILE_CHECK" = 1 ]; then
+    note "--no-file-check: the restored files were not checked against the file table, and the damaged-file list in $dest names no path to restore: it is kept."
+    print_id_map "$U_POS" "$U_IDM"
+    UNITS_DONE=$((UNITS_DONE + 1))
+    return 0
+  fi
   if [ ! -s "$WORK/want.paths" ]; then
     rm -f -- "$dest/.tapectl-damaged-files.txt"
     say "File check: every file the unit's table lists is here and passes; the damaged-file list in $dest is removed: nothing is left to restore."
@@ -2466,7 +2481,9 @@ restore_paths() { # <destination> <how>
     DAMAGED_TOTAL=$((DAMAGED_TOTAL + ndam))
     report_absent "$WORK/damaged.paths"
   elif [ "$how" != path ] && [ "$merged" = 0 ]; then
-    if [ "$LIST_LEFT" -eq 0 ]; then
+    if [ "$LIST_LEFT" -eq 0 ] && [ "$NO_FILE_CHECK" = 1 ]; then
+      say "The damaged-file list in $dest is removed: every path it named was read from this tape (--no-file-check: not checked against the table)."
+    elif [ "$LIST_LEFT" -eq 0 ]; then
       say "The damaged-file list in $dest is removed: nothing is left to repair."
     else
       say "The damaged-file list in $dest is kept with the $LIST_LEFT path(s) this run did not name."
