@@ -439,6 +439,18 @@ fn the_typed_consent_for_a_range_names_the_version_its_slices_and_the_volumes_ho
         facts.contains(&format!("the rest is on \"{}\"", R1[1])),
         "{facts}"
     );
+
+    // A quarantined holder holds nothing a reader may rely on: it is not
+    // named as holding the rest.
+    h.conn
+        .execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE label = ?1",
+            params![R1[1]],
+        )
+        .unwrap();
+    let plan = rewrite::plan(&h.conn, &h.config, &options(R1[0], "RNG-T1R")).unwrap();
+    let facts = plan.typed_facts(R1[0], "RNG-T1R").join("\n");
+    assert!(facts.contains("the rest is on no other volume"), "{facts}");
 }
 
 /// The rehearsal (the source still sealed) and the write after the erase

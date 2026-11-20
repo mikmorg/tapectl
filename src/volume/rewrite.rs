@@ -889,22 +889,26 @@ fn partly_held_versions(
         let on_source: i64 = conn.query_row(
             "SELECT COUNT(DISTINCT wp.stage_slice_id) FROM write_positions wp
              JOIN writes w ON w.id = wp.write_id
-             WHERE w.volume_id = ?1 AND w.stage_set_id = ?2 AND wp.status = 'written'",
+             WHERE w.volume_id = ?1 AND w.stage_set_id = ?2 AND wp.status = 'written'
+               AND w.status IN ('completed', 'range')",
             params![source_id, set],
             |r| r.get(0),
         )?;
         if on_source >= total {
             continue;
         }
+        // Only a volume that counts as a copy is named: a retired or
+        // quarantined one holds nothing a reader may rely on.
         let others: Vec<String> = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT DISTINCT v.label FROM write_positions wp
                  JOIN writes w ON w.id = wp.write_id
                  JOIN volumes v ON v.id = w.volume_id
                  WHERE w.stage_set_id = ?1 AND w.volume_id <> ?2 AND wp.status = 'written'
-                   AND w.status IN ('completed', 'range') AND v.status <> 'erased'
+                   AND w.status IN ('completed', 'range') AND {}
                  ORDER BY v.label",
-            )?
+                coverage::eligible("v")
+            ))?
             .query_map(params![set, source_id], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<_, _>>()?;
         let which = held
