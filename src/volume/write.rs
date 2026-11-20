@@ -9343,6 +9343,12 @@ impl From<Option<&[i64]>> for StagedScope {
     }
 }
 
+/// The scope of the write after a rewrite's erase: `Some` the rewrite's own
+/// stage sets, `None` every staged set (`volume rewrite --with-staged`).
+pub(crate) fn rewrite_write_scope(only: Option<&[i64]>) -> StagedScope {
+    StagedScope::from(only)
+}
+
 /// One write's scope ([`volume_write_scoped`]): the staged sets it takes and
 /// the location its tape is moved to once it is sealed and confirmed, when
 /// it is moved (#493).
@@ -27571,6 +27577,65 @@ mod tests {
                     pairs(&[("a", "completed"), ("b", "completed"), ("c", "completed")])
                 );
                 assert_eq!(volume_row(&f, "SE-P"), ("sealed".into(), true, None));
+            }
+
+            /// #580, ADR-0012 items 142 and 289, T5.3: the write after a
+            /// rewrite's erase plans under the fill ceiling even with
+            /// `--with-staged` (every staged set, `None`), on a drive that
+            /// declares `post_warning_bytes`. The same fixture and budget as
+            /// [`plans_past_the_ceiling_and_names_the_units`], through the
+            /// scope the rewrite's real write step builds
+            /// ([`rewrite_write_scope`]): there all three sets are written,
+            /// here the plan ends at the ceiling and `c` stays staged.
+            #[test]
+            fn a_with_staged_rewrites_write_plans_under_the_fill_ceiling_on_a_drive_with_post_warning_bytes(
+            ) {
+                for with_staged in [true, false] {
+                    let mut f = fixture(WIDE_ABC, &["SE-R"]);
+                    let fixed = wide_fixed(&f, "SE-R");
+                    let fill = fixed + 2 * WIDE_PADDED;
+                    let capacity = fixed + 5 * WIDE_PADDED;
+                    budget(&mut f, "SE-R", capacity, fill, true);
+                    let ids: Vec<i64> = checked_staged_units(&f.conn, &f.config, None)
+                        .unwrap()
+                        .units
+                        .iter()
+                        .map(|u| u.stage_set_id)
+                        .collect();
+                    let own = ids[..1].to_vec();
+                    let scope = rewrite_write_scope(if with_staged { None } else { Some(&own[..]) });
+                    let mut store = MemStore::new(SBS);
+                    let mut slot = ContactSlot::empty();
+                    let r = volume_write_contacted(
+                        &f.conn,
+                        &f.paths,
+                        &f.config,
+                        "SE-R",
+                        GENCHK_DEVICE,
+                        SBS,
+                        false,
+                        false,
+                        false,
+                        false,
+                        true,
+                        &mut slot,
+                        ContactStore::Injected(&mut store),
+                        scope,
+                    );
+                    slot.finish_result(r)
+                        .expect("a plan under the ceiling is written");
+                    let rows = writes_of(&f, "SE-R");
+                    assert_eq!(
+                        rows[0],
+                        ("a".to_string(), "completed".to_string()),
+                        "with_staged={with_staged}: {rows:?}"
+                    );
+                    assert!(
+                        rows.iter().all(|(u, _)| u != "c"),
+                        "with_staged={with_staged}: nothing of c reached the tape: {rows:?}"
+                    );
+                    assert_eq!(stage_set_status(&f, "c"), "staged");
+                }
             }
 
             /// Without `post_warning_bytes` the plan ends at the fill ceiling

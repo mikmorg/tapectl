@@ -1223,7 +1223,7 @@ impl RewriteSteps for DriveRewriteSteps<'_> {
             // `host_preflight`); it is not asked again with the cartridge
             // erased and the slices staged.
             true,
-            only_stage_sets,
+            write::rewrite_write_scope(only_stage_sets),
         )
     }
 
