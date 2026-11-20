@@ -7748,7 +7748,7 @@ pub(crate) fn live_recovery_slices(
          JOIN stage_slices ss ON ss.id = wp.stage_slice_id
          JOIN stage_sets sts ON sts.id = w.stage_set_id
          JOIN snapshots s ON s.id = sts.snapshot_id
-         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
+         WHERE w.volume_id = ?1 AND w.status IN ('completed', 'range') AND wp.status = 'written'
            AND s.status NOT IN ('reclaimable', 'purged')
          ORDER BY CAST(wp.position AS INTEGER)",
     )?;
@@ -8379,17 +8379,6 @@ fn compact_read_contacted(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
-    // 1.7.0 (#478, X25; ADR-0012 item 133): a volume holding a range is
-    // refused by name from the catalog, before File 0 or a slice is read and
-    // before anything is staged. `volume compact` reads through here too.
-    refuse_range_holder(
-        conn,
-        label,
-        "volume compact-read",
-        COMPACTION_CARRIES_NO_RANGE,
-        "Nothing was read or staged.",
-    )?;
-
     // Corroborate at contact (ADR-0012, issue #193). `compact-read` is a
     // contact issue #193 did not name — it reads slices off a tape by
     // position exactly as `read-slices` does, and is wired with it. Like it,
@@ -8428,22 +8417,24 @@ fn compact_read_contacted(
     // Restore stage_sets status so find_staged_data() picks them up.
     // Guard: only promote sets that were previously successfully staged.
     //
-    // Issue #474: and only sets every slice of which was read and verified
-    // THIS run. A set with a skipped slice (or one with a slice this volume
-    // does not hold) promoted to `staged` is a set `volume write` refuses to
-    // write — its skipped slice has no staged file (#402) — and the remedy it
-    // then names is a read from this same volume. It stays as it was
-    // (`cleaned`), and the slices that were read for it are taken back.
+    // Issue #474: and only sets every slice of which the volume holds was
+    // read and verified THIS run. A set with a skipped slice promoted to
+    // `staged` is a set `volume write` refuses to write — its skipped slice
+    // has no staged file (#402) — and the remedy it then names is a read from
+    // this same volume. It stays as it was (`cleaned`), and the slices that
+    // were read for it are taken back. A range holds a run of its set, never
+    // all of it (item 122): what the volume holds of the set is what must have
+    // been read (ADR-0012 item 288 over item 133), and the slices it does not
+    // hold are staged by whatever holds them (T5.3).
     let decided = (|| -> Result<(Vec<i64>, std::collections::BTreeSet<i64>)> {
         let mut left_alone = tally.skipped_sets.clone();
         let mut whole = Vec::new();
         for (ss_id, read) in &tally.read_per_set {
-            let recorded: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = ?1",
-                params![ss_id],
-                |row| row.get(0),
-            )?;
-            if tally.skipped_sets.contains(ss_id) || *read != recorded {
+            let held = live_slices
+                .iter()
+                .filter(|s| s.stage_set_id == *ss_id)
+                .count() as i64;
+            if tally.skipped_sets.contains(ss_id) || *read != held {
                 left_alone.insert(*ss_id);
             } else {
                 whole.push(*ss_id);
@@ -8478,8 +8469,9 @@ fn compact_read_contacted(
             )
         } else {
             format!(
-                "compact-read \"{label}\": {} stage set(s) have slices this volume does not \
-                 hold — investigate before proceeding with compact-write.",
+                "compact-read \"{label}\": {} stage set(s) were not read in full from the \
+                 slices this volume holds of them — investigate before proceeding with \
+                 compact-write.",
                 left_alone.len(),
             )
         };
@@ -9447,23 +9439,47 @@ fn plan_span_set(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    // The volumes this write carries a run FROM (a `volume rewrite`'s source,
+    // a compaction's): the volumes whose `compact-LABEL` staging directory
+    // holds this set's staged slices. A set is planned as if they hold
+    // nothing, so the run they hold is owed and the one Owed branch plans it
+    // (T5.3; ADR-0012 items 106 and 288). The rewrite's rehearsal (source
+    // still sealed), its write after the erase (source retired) and
+    // `compact-write` (source still sealed) therefore plan the same slices.
+    let sources = carrying_sources(conn, &rows)?;
     let span_in_progress: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM writes w JOIN volumes v ON v.id = w.volume_id
                         WHERE w.stage_set_id = ?1 AND w.status = 'range'
-                          AND v.status = 'sealed')",
-        params![stage_set_id],
+                          AND (v.status = 'sealed'
+                               OR v.id IN (SELECT value FROM json_each(?2))))",
+        params![
+            stage_set_id,
+            serde_json::to_string(&sources.iter().map(|(id, _)| id).collect::<Vec<_>>())
+                .expect("ids serialize")
+        ],
         |r| r.get(0),
     )?;
     let floor = coverage::copy_floor(config, min_copies, &unit.status);
-    let owed: Vec<i64> = if span_in_progress {
-        coverage::slice_copies(conn, stage_set_id)?
-            .into_iter()
-            .filter(|s| s.copies < floor)
-            .map(|s| s.slice_number)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut owed: Vec<i64> = Vec::new();
+    if span_in_progress {
+        for s in coverage::slice_copies(conn, stage_set_id)? {
+            let mut copies = s.copies;
+            let mut carried = false;
+            for (volume_id, label) in &sources {
+                if source_holds(conn, *volume_id, s.stage_slice_id)? {
+                    carried |= rows
+                        .iter()
+                        .any(|r| r.slice.slice_id == s.stage_slice_id && r.staging_path.is_some());
+                    if coverage::counts_as_copy(conn, label)? {
+                        copies -= 1;
+                    }
+                }
+            }
+            if copies < floor || carried {
+                owed.push(s.slice_number);
+            }
+        }
+    }
     let (class, run) = match (owed.iter().min(), owed.iter().max()) {
         (Some(&first), Some(&last)) => (PlanClass::Owed, Some((first, last))),
         _ => (PlanClass::Queued, None),
@@ -9496,6 +9512,51 @@ fn plan_span_set(
         slices: rows.into_iter().map(|r| r.slice).collect(),
     };
     Ok((planned, span, class))
+}
+
+/// The volumes a staged set is being carried from: the label of each
+/// `compact-LABEL` directory that holds one of its staged slices (what
+/// `compact-read`, and so `volume rewrite`, stage into), as `(volume id,
+/// label)`, for the volumes that exist.
+fn carrying_sources(conn: &Connection, rows: &[SpanRow]) -> Result<Vec<(i64, String)>> {
+    let mut labels = std::collections::BTreeSet::new();
+    for row in rows {
+        let dir = row
+            .staging_path
+            .as_deref()
+            .and_then(|p| Path::new(p).parent())
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str());
+        if let Some(label) = dir.and_then(|n| n.strip_prefix("compact-")) {
+            labels.insert(label.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    for label in labels {
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = id {
+            out.push((id, label));
+        }
+    }
+    Ok(out)
+}
+
+/// `volume_id` holds a written position of the slice in a `completed` or
+/// `range` write.
+fn source_holds(conn: &Connection, volume_id: i64, slice_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM write_positions wp JOIN writes w ON w.id = wp.write_id
+                        WHERE w.volume_id = ?1 AND wp.stage_slice_id = ?2
+                          AND w.status IN ('completed', 'range') AND wp.status = 'written')",
+        params![volume_id, slice_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// The refusal of a slice this tape plans whose staged file was released
@@ -20519,14 +20580,8 @@ mod tests {
         }
     }
 
-    /// 1.7.0 (#478, X25; `layout-session.md` "From 1.7.0", ADR-0012 item
-    /// 133): compaction refuses a volume that holds a range, by name.
-    /// `volume compact` runs `compact_read` as its step 1 and
-    /// `compact_finish` as its step 3 (pinned by `cli::volume`'s
-    /// `run_routes_to_through_the_swap_unconditionally` and
-    /// `the_compact_arm_routes_step_3_through_the_outcome`; `run` itself
-    /// refuses before step 1 under `cfg(test)`, which has no terminal), so
-    /// these two refusals are its refusal too.
+    /// T5.3 (ADR-0012 item 288 over item 133): `compact-read` carries a
+    /// volume that holds a range.
     mod compaction_of_a_range {
         use super::*;
         use crate::tape::fake::Op;
@@ -20540,57 +20595,26 @@ mod tests {
             (conn, volume_id, fake)
         }
 
-        /// The refusal, read from the catalog: the store is asked nothing
-        /// past the open's rewind (no File 0, no slice), nothing is staged
-        /// and no compact directory is made. The contact is recorded
-        /// `failed`, as every refusal of a loaded tape's read is. Positive
-        /// control: the same tape with the write `completed` reads its slice.
+        /// T5.3 (ADR-0012 item 288 over item 133): `compact-read` of a volume
+        /// holding only a range reads the slices the volume holds, stages
+        /// them, and promotes the set to `staged`: what must have been read
+        /// is what the volume holds of it, not every slice of the set.
         #[test]
-        fn compact_read_refuses_a_volume_holding_a_range_before_reading_anything() {
-            let (conn, volume_id, fake) = range_fixture("RG-CR");
+        fn compact_read_of_a_volume_holding_a_range_stages_the_slices_it_holds() {
+            let (conn, _volume_id, fake) = range_fixture("RG-CR");
+            // The set has a second slice no volume in this fixture holds.
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           sha256_plain, encrypted_bytes, sha256_encrypted)
+                 SELECT stage_set_id, 2, 10, 'p2', 10, 'e2' FROM stage_slices LIMIT 1",
+                [],
+            )
+            .unwrap();
             let mut store = fake_store(&fake);
-            let opened = fake.ops();
-            assert_eq!(opened, [Op::Rewind], "the store's open rewinds");
             let tmp = tempfile::TempDir::new().unwrap();
             let mut config = Config::default();
             config.staging.directory = tmp.path().to_string_lossy().into_owned();
 
-            let err = compact_read(
-                &conn,
-                &config,
-                "RG-CR",
-                &mut store,
-                site(Operation::VolumeCompactRead),
-            )
-            .expect_err("a volume holding a range")
-            .to_string();
-            assert_eq!(
-                err,
-                "volume compact-read refused: volume \"RG-CR\" holds a range, one run of the \
-                 slices of a unit that spans cartridges: \"lv-unit\" v1 (slice 1). Compaction \
-                 carries a volume's live units to another tape whole, and a range is not a \
-                 whole unit: carrying one forward is its own design, not built in 1.7.0 \
-                 (ADR-0012 item 133). Nothing was read or staged."
-            );
-            assert_eq!(fake.ops(), opened, "nothing was read from the tape");
-            let staged: Option<String> = conn
-                .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
-                .unwrap();
-            assert!(staged.is_none(), "nothing was staged: {staged:?}");
-            assert_eq!(
-                fs::read_dir(tmp.path()).unwrap().count(),
-                0,
-                "no compact directory was made"
-            );
-            let contacts = contact_rows(&conn);
-            assert_eq!(contacts.len(), 1, "{contacts:?}");
-            assert_eq!(contacts[0].0, "volume compact-read");
-            assert_eq!(contacts[0].1, Some(volume_id));
-            assert_eq!(contacts[0].2.as_deref(), Some("failed"));
-
-            conn.execute("UPDATE writes SET status = 'completed'", [])
-                .unwrap();
-            let mut store = fake_store(&fake);
             let report = compact_read(
                 &conn,
                 &config,
@@ -20598,9 +20622,18 @@ mod tests {
                 &mut store,
                 site(Operation::VolumeCompactRead),
             )
-            .expect("the same tape, its write whole");
+            .expect("a range's slices are read");
             assert_eq!(report.slices_read, 1);
             assert!(fake.ops().contains(&Op::Read(4)), "{:?}", fake.ops());
+            assert_eq!(report.staged_sets.len(), 1, "the set is promoted");
+            let staged: Vec<Option<String>> = conn
+                .prepare("SELECT staging_path FROM stage_slices ORDER BY slice_number")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(staged[0].is_some() && staged[1].is_none(), "{staged:?}");
         }
     }
 

@@ -466,6 +466,10 @@ pub(crate) struct Plan {
     /// The Tier-2 facts (empty: nothing falls below policy).
     pub tier2_facts: Vec<String>,
     pub compact_dir: PathBuf,
+    /// For a version of which the source holds only part (a range): which of
+    /// its slices the source alone holds, and which volumes hold the rest.
+    /// Keyed by `(unit, version)`; the consent says it (T5.3).
+    pub partly_held: std::collections::BTreeMap<(String, i64), String>,
 }
 
 impl Plan {
@@ -500,10 +504,15 @@ impl Plan {
              erases that copy before its replacement exists:"
         )];
         for (unit, version, slices, bytes) in self.sole_versions() {
+            let part = self
+                .partly_held
+                .get(&(unit.clone(), version))
+                .map(|p| format!(" ({p})"))
+                .unwrap_or_default();
             facts.push(if slices > 0 {
                 format!(
                     "  unit \"{unit}\" v{version}: {slices} slice(s), {} with no copy on any \
-                     other volume",
+                     other volume{part}",
                     fmt(bytes)
                 )
             } else {
@@ -606,20 +615,6 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
             }
         )));
     }
-
-    // 1.7.0 (#478; ADR-0012 items 133 and 142): a source holding a range is
-    // refused by name, here, before the drive is asked anything and before a
-    // slice is staged. A rewrite plans every unit whole and never writes a
-    // range, because it may hold a unit's only copy.
-    write::refuse_range_holder(
-        conn,
-        source,
-        "volume rewrite",
-        "A rewrite may hold a unit's only copy, so it plans every unit whole to the fill \
-         ceiling and never writes a range (ADR-0012 item 142); carrying a range forward is \
-         its own design, not built in 1.7.0 (item 133).",
-        "Nothing was changed.",
-    )?;
 
     // An earlier rewrite of this volume that stopped before it retired
     // anything holds nothing but its staging: it is replaced. One that got
@@ -791,13 +786,16 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
         &format!("the live slices of \"{source}\" for a rewrite"),
     )?;
 
+    // What the volume holds of reclaimable and purged versions, slice by
+    // slice: a `range` holds a run of its set, not all of it (item 122).
     let reclaimable_bytes: i64 = conn.query_row(
         "SELECT COALESCE(SUM(sl.encrypted_bytes), 0)
          FROM writes w
+         JOIN write_positions wp ON wp.write_id = w.id AND wp.status = 'written'
+         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
          JOIN stage_sets sts ON sts.id = w.stage_set_id
          JOIN snapshots s ON s.id = sts.snapshot_id
-         JOIN stage_slices sl ON sl.stage_set_id = sts.id
-         WHERE w.volume_id = ?1 AND w.status = 'completed'
+         WHERE w.volume_id = ?1 AND w.status IN ('completed', 'range')
            AND s.status IN ('reclaimable', 'purged')",
         params![source_id],
         |r| r.get(0),
@@ -837,6 +835,8 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
         }
     }
 
+    let partly_held = partly_held_versions(conn, source_id, source, &sole)?;
+
     Ok(Plan {
         source_id,
         cartridge_barcode,
@@ -853,7 +853,83 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
         last_copy_versions,
         tier2_facts,
         compact_dir,
+        partly_held,
     })
+}
+
+/// For each version the source holds only some slices of (a range), the
+/// sentence the consent adds: which slices of how many the source alone holds
+/// and which volumes hold the rest (T5.3; ADR-0012 items 106, 122, 288).
+fn partly_held_versions(
+    conn: &Connection,
+    source_id: i64,
+    source: &str,
+    sole: &[coverage::SoleSlice],
+) -> Result<std::collections::BTreeMap<(String, i64), String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let sets: std::collections::BTreeSet<(i64, String, i64)> = sole
+        .iter()
+        .map(|s| (s.stage_set_id, s.unit_name.clone(), s.version))
+        .collect();
+    for (set, unit, version) in sets {
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = ?1",
+            params![set],
+            |r| r.get(0),
+        )?;
+        let mut held: Vec<i64> = Vec::new();
+        for s in sole.iter().filter(|s| s.stage_set_id == set) {
+            held.push(conn.query_row(
+                "SELECT slice_number FROM stage_slices WHERE id = ?1",
+                params![s.stage_slice_id],
+                |r| r.get(0),
+            )?);
+        }
+        held.sort_unstable();
+        let on_source: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT wp.stage_slice_id) FROM write_positions wp
+             JOIN writes w ON w.id = wp.write_id
+             WHERE w.volume_id = ?1 AND w.stage_set_id = ?2 AND wp.status = 'written'",
+            params![source_id, set],
+            |r| r.get(0),
+        )?;
+        if on_source >= total {
+            continue;
+        }
+        let others: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT v.label FROM write_positions wp
+                 JOIN writes w ON w.id = wp.write_id
+                 JOIN volumes v ON v.id = w.volume_id
+                 WHERE w.stage_set_id = ?1 AND w.volume_id <> ?2 AND wp.status = 'written'
+                   AND w.status IN ('completed', 'range') AND v.status <> 'erased'
+                 ORDER BY v.label",
+            )?
+            .query_map(params![set, source_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let which = held
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.insert(
+            (unit, version),
+            format!(
+                "slice(s) {which} of {total}, which \"{source}\" holds of this version; the \
+                 rest is on {}",
+                if others.is_empty() {
+                    "no other volume".to_string()
+                } else {
+                    others
+                        .iter()
+                        .map(|l| format!("\"{l}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+        );
+    }
+    Ok(out)
 }
 
 impl Plan {
@@ -1777,8 +1853,8 @@ fn fully_read_back_holders(conn: &Connection, stage_sets: &[i64]) -> Result<Vec<
     let mut labels = std::collections::BTreeSet::new();
     let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT hv.label FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
-         WHERE hw.stage_set_id = ?1 AND hw.status = 'completed' AND hw.write_verified = 1
-           AND {}",
+         WHERE hw.stage_set_id = ?1 AND hw.status IN ('completed', 'range')
+           AND hw.write_verified = 1 AND {}",
         coverage::eligible("hv")
     ))?;
     for ss in stage_sets {
@@ -1920,14 +1996,21 @@ fn short_at_the_destination(
         units.push(unit.unwrap_or_else(|| format!("stage set {ss}")));
     }
     Ok(TapectlError::WriteInterrupted(format!(
-        "volume \"{destination}\" took only part of this rewrite: its tape ended{}, and {} \
+        "volume \"{destination}\" took only part of this rewrite: {}, and {} \
          {} not whole on it: {}. The slices it did not take are not on \"{destination}\"; \
          their staged slices are their only copy and stay held (nothing releases them, \
          `--force` included). Write them onto another cartridge with a full readback — \
          load one and run `tapectl volume write <LABEL> --init --full-confirm` (it writes \
          every staged set, these among them) — then `tapectl volume rewrite --resume \
          {destination}` closes the rewrite and releases staging.",
-        ended_after.map_or_else(String::new, |k| format!(" after file {k}")),
+        ended_after.map_or_else(
+            || {
+                "it holds the run of slices the source held (a range, by design), and the \
+                 rest of the staging is on no volume read back in full"
+                    .to_string()
+            },
+            |k| format!("its tape ended after file {k}"),
+        ),
         crate::render::plural(units.len() as i64, "unit", "units"),
         if units.len() == 1 { "is" } else { "are" },
         units.join(", ")
@@ -3264,14 +3347,13 @@ mod tests {
         assert!(refuse(&none, "SRC", "NEW").contains("no live slices"));
     }
 
-    /// 1.7.0 (#478; `layout-session.md` "From 1.7.0", ADR-0012 items 133 and
-    /// 142): a source volume that holds a range is refused, naming the unit,
-    /// its version and the run of slices the volume holds, before the drive
-    /// is asked anything and before a slice is staged; `--dry-run`'s plan
-    /// refuses the same. Positive control: the same volume without the range
-    /// plans.
+    /// T5.3 (ADR-0012 item 288 over item 133): a source volume that holds a
+    /// range is planned, not refused. Its slices are the range's, the
+    /// typed consent names the version and the slices the volume alone
+    /// holds, and the bytes freed count the volume's own slices of a
+    /// reclaimable range (the end-to-end carry is `range_carry_proofs`).
     #[test]
-    fn a_source_holding_a_range_is_refused_naming_it_before_the_drive_is_asked() {
+    fn a_source_holding_a_range_is_planned_with_its_slices_named_in_the_consent() {
         let s = scene(1);
         let span = add_version(&s.w, "span", 1, "staged", &data("span", 3));
         // The tape ended in it: slices 1-2 at files 8 and 9 are the range,
@@ -3302,51 +3384,35 @@ mod tests {
                 .unwrap();
         }
 
-        let mut o = opts("SRC", "NEW");
-        o.only_copy_on_staging = Some("SRC");
-        let fake = Fake::new(&s);
-        let err = rewrite(&s.w.conn, &s.w.config, &fake, &o)
-            .expect_err("a source holding a range")
-            .to_string();
-        assert_eq!(
-            err,
-            "volume rewrite refused: volume \"SRC\" holds a range, one run of the slices of a \
-             unit that spans cartridges: \"span\" v1 (slices 1-2). A rewrite may hold a unit's \
-             only copy, so it plans every unit whole to the fill ceiling and never writes a \
-             range (ADR-0012 item 142); carrying a range forward is its own design, not built \
-             in 1.7.0 (item 133). Nothing was changed."
-        );
-        assert!(fake.calls().is_empty(), "no drive step: {:?}", fake.calls());
+        let p = plan(&s.w.conn, &s.w.config, &opts("SRC", "NEW")).expect("a range plans");
+        let carried: Vec<i64> = p.slices.iter().map(|x| x.slice_id).collect();
         assert!(
-            fake.asked.borrow().is_empty(),
-            "nothing was asked of the host or the drive: {:?}",
-            fake.asked.borrow()
+            span.slice_ids[..2].iter().all(|id| carried.contains(id)),
+            "the range's two slices are live slices: {carried:?}"
         );
-        assert!(staged_files(&s.w.config).is_empty(), "nothing was staged");
-        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
-        assert_eq!(
-            scalar::<i64>(&s.w.conn, "SELECT COUNT(*) FROM pending_rewrites"),
-            0
+        assert!(
+            !carried.contains(&span.slice_ids[2]),
+            "the pending one is not"
         );
-        assert_eq!(events_of(&s.w.conn, "rewrite_started"), 0);
-        assert_eq!(
-            plan(&s.w.conn, &s.w.config, &opts("SRC", "NEW"))
-                .err()
-                .map(|e| e.to_string()),
-            Some(err),
-            "--dry-run refuses the same"
+        assert!(p.needs_typed_consent());
+        assert!(
+            p.sole_versions()
+                .iter()
+                .any(|(u, v, n, _)| u == "span" && *v == 1 && *n == 2),
+            "{:?}",
+            p.sole_versions()
         );
-
+        // The bytes a rewrite frees count a reclaimable range's own slices.
         s.w.conn
             .execute(
-                "DELETE FROM write_positions WHERE write_id = ?1",
-                params![write_id],
+                "UPDATE snapshots SET status = 'reclaimable' WHERE id = ?1",
+                params![span.snapshot_id],
             )
             .unwrap();
-        s.w.conn
-            .execute("DELETE FROM writes WHERE id = ?1", params![write_id])
-            .unwrap();
-        plan(&s.w.conn, &s.w.config, &opts("SRC", "NEW")).expect("without the range it plans");
+        let p = plan(&s.w.conn, &s.w.config, &opts("SRC", "NEW")).unwrap();
+        let held: i64 = span.data[..2].iter().map(|d| d.len() as i64).sum();
+        let old: i64 = s.old.data.iter().map(|d| d.len() as i64).sum();
+        assert_eq!(p.reclaimable_bytes, old + held);
     }
 
     #[test]

@@ -1866,3 +1866,7 @@ fn a_short_seal_leaves_a_range_and_a_set_planned_and_not_written() {
     assert_eq!(write::keep_together(c, T0[1]).unwrap().len(), 1);
     assert_eq!(snapshot_status(c, B0), "current");
 }
+
+// T5.3: a range carried by `volume rewrite` and by compaction.
+#[path = "range_carry_proofs.rs"]
+mod range_carry_proofs;
