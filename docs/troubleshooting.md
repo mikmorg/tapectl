@@ -1405,48 +1405,17 @@ before a long batch.
 
 ### A unit larger than one cartridge
 
-```text
-error: unit "<unit>" is <size> bytes (<size, binary>), <over> bytes (<over, binary>) more than one cartridge
-can take — one LTO-6 tape takes 2.42 TB (2424947571200 bytes): its 2.50 TB capacity at the 97% fill ceiling,
-less the 50.0 MiB end-of-tape reserve. A unit that does not allow spanning (allow_spanning) is never split
-across cartridges (ADR-0012), so it cannot be written; nothing was staged. To let it span cartridges, set
-`allow_spanning = true` in the [policy] of its .tapectl-unit.toml, in its archive set or in [defaults]; a span
-is written only by a drive whose `[[backends.lto]]` entry declares `post_warning_bytes`. The fill ceiling is
-the drive's `fill_ceiling` in its `[[backends.lto]]` entry of config.toml (default 97%).
-```
+A unit larger than one cartridge is not refused, and nothing is set to allow it (ADR-0012
+items 288 and 289): every unit continues on the next cartridge at the drive's early
+warning. Its slices run across tapes, each tape ending its run at the warning, and
+restoring it takes every one of those tapes, in slice order. Do not split a unit by hand.
 
-A write session fills one cartridge, and a unit that does not allow spanning
-is never split across two (ADR-0012, 2026-10-06). `stage create` refuses such
-a unit before tar runs, so it costs no staging time; `collection plan` and
-`collection run` refuse it the same way, naming the per-tape budget, by how
-much the unit is over, and the same key. The limit is the largest generation
-any configured drive writes, times the
-[fill ceiling](#over-full-plan-the-pre-flight-capacity-gate), less the
-`enospc_buffer` reserve; with no drive configured, `stage create` has no
-generation to name and the check is left to `volume write`'s pre-flight gate.
-The size checked is the unit's source size, the same figure `collection plan`
-uses, whatever compression would later make of it.
-
-From 1.7.0 a unit may span cartridges if its policy allows it
-([`allow_spanning`](configuration.md#defaults), off by default): its slices
-then run across tapes, each tape ending its run at the drive's early warning,
-and restoring it takes every one of those tapes, in slice order. A span is
-written only by a drive that declares `post_warning_bytes`
-([below](#a-unit-that-allows-spanning-would-pass-the-fill-ceiling)). Do not
-split a unit by hand.
-
-A unit that allows spanning is admitted whatever its size against one tape,
-but it is staged whole before its first tape is written, and its slices are
-released only as each tape gives them their copies. So one larger than the
-staging area is refused:
+What does refuse a unit is the staging area. A unit is staged whole before its first
+tape is written, and its slices are released only as each tape gives them their copies, so
+one larger than the staging area is refused:
 
 ```text
-error: unit "<unit>" allows spanning (allow_spanning) and is <size> bytes (<size, binary>), larger than the
-staging area: the filesystem of staging directory <directory> is <total> bytes (<total, binary>) in all. A unit
-that spans cartridges is staged whole before its first tape is written, and its slices are released only as
-each tape gives them their copies (ADR-0012 items 85 and 94), so it cannot be staged here; nothing was staged.
-It can be once the staging area is larger than the unit: grow that filesystem, or point `[staging] directory`
-in config.toml at a larger one.
+error: unit "<unit>" is <size> bytes (<size, binary>), larger than the staging area: the filesystem of staging directory <directory> is <total> bytes (<total, binary>) in all. A unit is staged whole before its first tape is written, and its slices are released only as each tape gives them their copies (ADR-0012 items 85 and 129), so it cannot be staged here; nothing was staged. It can be once the staging area is larger than the unit: grow that filesystem, or point `[staging] directory` in config.toml at a larger one.
 ```
 
 The staging area is the staging filesystem's total size, not its free space
@@ -1914,15 +1883,17 @@ at all. On such a host, watching disk load during a write is up to you.
 ### Over-full plan: the pre-flight capacity gate
 
 ```text
-error: volume "<label>" failed pre-write validation: capacity exceeded: the layout needs <needed> bytes on tape plus a <reserve>-byte end-of-tape reserve, <over> bytes (<over, binary>) over the <available> bytes this volume may be filled to; the fill ceiling is 97% of this volume's 2.50 TB capacity (ADR-0012). Write less to this volume — a unit that does not allow spanning (allow_spanning) is never split — or, if you know this cartridge can take it, raise the ceiling for this write with --fill-ceiling
+error: volume "<label>" failed pre-write validation: capacity exceeded: the layout needs <needed> bytes on tape plus a <reserve>-byte end-of-tape reserve, <over> bytes (<over, binary>) over the <available> bytes this volume may be filled to; the fill ceiling is 97% of this volume's 2.50 TB capacity (ADR-0012). Write less to this volume, or, if you know this cartridge can take it, raise the ceiling for this write with --fill-ceiling
 ```
 
 tapectl has no end-of-tape salvage, so the capacity gate is its only defence
 against running out of tape. It compares the whole planned layout with the
 capacity decided **at `volume init`**: the cartridge's detected generation,
 times the **fill ceiling** (`fill_ceiling`, 97% by default), less the
-`enospc_buffer` reserve. The staged batch does not fit on this cartridge, by the
-amount the message names. Nothing has been written.
+`enospc_buffer` reserve. The planned layout does not fit on this cartridge, by the
+amount the message names. Nothing has been written. A write plans the queue only as far
+as the cartridge takes it and leaves the rest staged for the next cartridge (ADR-0012
+items 288 and 289), so a batch that is merely larger than one tape is not this refusal.
 
 The ceiling exists because usable capacity is not fixed: a worn cartridge, or an
 irregular feed, costs tape the plan assumed it had, and a real end of tape aborts
@@ -1948,23 +1919,28 @@ along. Or split the work across cartridges. The
 [Collection](cli/collection.md#tapectl-collection) commands batch
 folder-per-unit archives to fit.
 
-### A unit that allows spanning would pass the fill ceiling
+### A drive with no `post_warning_bytes`
+
+No refusal names the key: a unit that would pass the fill ceiling is not refused on a drive
+whose `[[backends.lto]]` entry lacks `post_warning_bytes` (ADR-0012 item 289). On a drive
+that declares it, the plan reaches past the fill ceiling to the cartridge's nominal capacity
+and the unit that carries it past is planned to its end, so the drive's early warning ends
+the tape inside it. Without the key the plan stops at the last slice that fits the fill
+ceiling, inside a unit if that is where it falls, and the rest continues on the next
+cartridge; nothing is written past the ceiling.
+
+`tapectl config check` says so, once per such drive (the line ends with the command that
+records the figure):
 
 ```text
-error: volume "<label>" failed pre-write validation: capacity exceeded: a unit that allows spanning would pass the fill ceiling: the layout needs <needed> bytes on tape plus a <reserve>-byte end-of-tape reserve, <over> bytes (<over, binary>) over the <available> bytes this volume may be filled to. A unit that allows spanning is planned past the fill ceiling, to the drive's early warning, only when the drive declares post_warning_bytes in its [[backends.lto]] entry of config.toml (ADR-0012 item 123)
+note: drive "<name>" has no post_warning_bytes, so a write's plan stops at the fill ceiling and no slice cap applies; …
 ```
 
-The batch holds a unit that allows spanning (`allow_spanning`), and the
-drive's `[[backends.lto]]` entry does not declare `post_warning_bytes`. A tape
-that holds a span is planned past the fill ceiling and ended by the drive's
-early warning, not by the plan, which is safe only when the drive's room past
-its warning has been measured (ADR-0012 items 84 and 123). Nothing has been
-written. Either give the drive its measured figure
+Give the drive its measured figure
 ([`post_warning_bytes`](configuration.md#backendslto), which
-`scripts/lto-profile.sh --emit` prints), or keep the unit whole on one tape
-with `allow_spanning = false`. With one drive configured the bare key names it;
-with several, `backends.lto[NAME].post_warning_bytes`, where `NAME` is the
-`name` of the drive's table:
+`scripts/lto-profile.sh --emit` prints) to let a tape fill to the early warning. With one
+drive configured the bare key names it; with several,
+`backends.lto[NAME].post_warning_bytes`, where `NAME` is the `name` of the drive's table:
 
 ```bash
 tapectl config set post_warning_bytes 99008M
@@ -1974,11 +1950,7 @@ tapectl config check
 `99008M` is home2's HP LTO-6 figure; use your own drive's. On a host installed
 by `scripts/first-run.sh`, put the figure in the host profile's
 `POST_WARNING_BYTES` instead, and step 8 writes it onto the drive
-([install.md](install.md)). `collection plan`
-and `collection run` refuse the same unit before anything is staged: "it
-allows spanning (allow_spanning), but a span is written only by a drive whose
-`[[backends.lto]]` entry declares `post_warning_bytes` (ADR-0012 item 123),
-and this one does not".
+([install.md](install.md)).
 
 ### A span would continue onto another LTO generation
 
@@ -1993,10 +1965,10 @@ the generation the message names last.
 ### A slice a span owes was released from staging
 
 ```text
-error: refusing to write: "<unit>" v<n> (stage set <id>) may span, and this tape plans its slice <s>, whose staged file was released from staging. A range is one unbroken run of a unit's slices, so the slice is never skipped. Nothing was written and the drive was not touched. Stage it again, then write: tapectl volume read-slices <unit> --from <holder> --version <n>
+error: refusing to write: "<unit>" v<n> (stage set <id>) is planned on this tape with its slice <s>, whose staged file was released from staging. A range is one unbroken run of a unit's slices, so the slice is never skipped. Nothing was written and the drive was not touched. Stage it again, then write: tapectl volume read-slices <unit> --from <holder> --version <n>
 ```
 
-Staging is released slice by slice for a unit that spans cartridges, once
+Staging is released slice by slice for a unit held across cartridges, once
 each slice has its copies. This tape needs one of those slices again, for
 example to make a further copy. Run the command the message ends with: it
 reads the slice back into staging from a tape that holds it. When no tape
@@ -2322,9 +2294,9 @@ error](#restoresh-every-read-fails-with-an-io-error)).
 ### A real end of tape during the write
 
 The drive's early warning is not this. Since 1.6.0 a write that reaches the
-warning finishes the slice in flight, seals the tape short and exits 0; from
-1.7.0 a unit that allows spanning is continued on the next cartridge, and any
-other unit after the warning is written whole on another one. This section is
+warning finishes the slice in flight, seals the tape short and exits 0; the unit
+it interrupted is a `range` on that tape and continues on the next cartridge, and a unit
+planned after the warning has no row and stays staged (ADR-0012 items 288 and 289). This section is
 the medium's hard end past the warning (more than 16 refusals of one block in
 a row), a refused filemark, or a warning before the first data slice.
 
@@ -2431,12 +2403,12 @@ seal marker at position <n> (ADR-0003: sealed volumes are immutable)`.
 
 ### `volume rewrite`
 
-- **`volume rewrite refused: volume "<label>" holds a range`** (from 1.7.0): the volume holds
-  a run of the slices of a unit that spans cartridges, named with its version and slices. A
-  rewrite plans every unit whole and never writes a range, and carrying a range forward is not
-  built (ADR-0012 items 133 and 142). Nothing was changed. `volume compact-read`, `volume
-  compact-finish` and `volume compact` refuse such a volume the same way, before the drive is
-  opened, and `report compaction-candidates` leaves it out.
+- **A source that holds a range** (a unit's slices that the tape took before its early
+  warning) is carried like any other volume: the rewrite writes the slices the source
+  holds, and a set it never took has no row (its slices stay staged until their version is
+  whole elsewhere; `--with-staged` carries them). `volume compact-read`, `volume
+  compact-finish` and `volume compact` carry it the same way. There is no refusal to look
+  for.
 - **"refused: some of this volume's live data has no copy on any other volume"**: expected when
   the volume holds the only copy. Give `--only-copy-on-staging <SOURCE_LABEL>` (or type the label
   at a terminal) if you accept the window in which the staging disk holds the only copy.
@@ -3297,12 +3269,11 @@ below) run only for a whole-archive audit, not with `--unit`. The `short_seal` f
 | `no_full_verify` | warning | `volume "<label>" is sealed with no full readback recorded — its write confirmed the front index and seal only` | A write's confirm reads back only the front index and the seal marker unless `--full-confirm` was given (ADR-0012, 2026-10-06), so this volume counts as a copy with none of its data read back yet. Fix: `tapectl volume verify <label>` (full, the default); a passing one clears it, a `--quick` one does not. |
 | `volume_verify_age` | warning | `volume "<label>" (cartridge <barcode>, at <place>) was last read back in full on <date>, <n> days ago: past the <d>-day verify interval of the unit on it with the shortest one, whatever the unit's other copies show` | The per-volume clock (#454): `verify_age` is satisfied by the newest readback of any copy, so a fresh home copy would hide a stale offsite one. The interval is the shortest resolved `verify_interval_days` among the units on the volume (an archive set's, else `[defaults]`, 365 days when that is absent). A volume never read back in full is `no_full_verify`'s alone. Fix: fetch the cartridge from the place named and run `tapectl volume verify <label>`. |
 | `tape_alert` | warning | `volume "<label>": the drive raised a TapeAlert — <n> <flag>; … — at <time> during "<command>" with cartridge <barcode> loaded on drive <serial>` | A contact with this volume, or with the cartridge it is on (a [`drive poll`](operator-guide.md#the-daily-drive-poll) included), read page 0x2E with a flag raised, not before the volume's last passed full verify started (an alert raised during a readback, its own included, is not answered by it). Retired, erased and quarantined volumes are not named; an `initialized` one an interrupted write left is. A warning, never a violation: a flag may be the medium ("Media", "Read failure") or only the drive ("Cleaning required"), and the volume still counts as a copy. A cleaning flag (TapeAlert 20-23) is printed with its action, `<n> <flag> => clean the drive: …` (22 and 23 name the cleaning cartridge instead); the fix column is still the verify, which is what clears the warning. Fix: `tapectl volume verify <label>` — a pass clears it; a failure quarantines the volume and the copy checks take over. `report health` lists every sighting. |
-| `cut_without_ending` | warning | `` volume "<label>" has <n> writes recorded `cut` but no `ended_after`: a cut row exists only on a volume that sealed short, so this catalog does not say where that tape ended `` | One of the `short_seal` invariants (1.6.0, #420). A unit is `cut` only on a tape that sealed short, and the catalog records where such a tape ended (`volumes.ended_after`). Without it, `volume verify` would look for the seal at the planned position. Confirm, `catalog rebuild` and the adoption of a lost write never leave this, nor any of the five rows below: each means the catalog was edited around tapectl, or a bug. Fix: `tapectl volume verify <label>` (the `fix:` line): a full verify reads the tape's seal and names any disagreement with the catalog (`ended_after_disagrees`); report the finding. |
-| `completed_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes on it recorded `completed` have a slice past that (up to file <m>): those units are not on this tape whole, yet they count as copies `` | A `short_seal` invariant (1.6.0). A unit with a slice past where the tape ended is not on it whole, but the catalog counts it as a copy, so its copy count is too high. Fix: as for `cut_without_ending`. |
-| `range_without_may_span` | warning | `` volume "<label>" has <n> writes recorded `range` with `may_span` unset: only a write planned as spannable is ever a range, and the schema refuses this row, so the catalog was edited around it `` | A `short_seal` invariant (1.7.0). Migration 039's row check refuses such a row, so it exists only where someone edited around it. Fix: as for `cut_without_ending`. |
-| `range_written_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes recorded `range` on it record a slice `written` past that (up to file <m>): those slices are not on this tape, yet they count as copies of those slices `` | A `short_seal` invariant (1.7.0). Confirm records a range's slices past the tape's end as `pending`, never `written`. Fix: as for `cut_without_ending`. |
-| `range_not_one_run` | warning | `` volume "<label>" has <n> writes recorded `range` whose `written` slices are not one unbroken run: a volume holds at most one unbroken range of a stage set, so this catalog does not say which slices the tape holds `` | A `short_seal` invariant (1.7.0, ADR-0012 item 122). Fix: as for `cut_without_ending`. |
-| `range_without_written_slice` | warning | `` volume "<label>" has <n> writes recorded `range` with no slice `written`: a range is the slices the tape holds, and a write whose tape holds none of its set is `cut` `` | A `short_seal` invariant (1.7.0). Fix: as for `cut_without_ending`. |
+| `completed_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes on it recorded `completed` have a slice past that (up to file <m>): those units are not on this tape whole, yet they count as copies `` | A `short_seal` invariant (1.6.0). A unit with a slice past where the tape ended is not on it whole, but the catalog counts it as a copy, so its copy count is too high. Confirm, `catalog rebuild` and the adoption of a lost write never leave this, nor any of the rows below: each means the catalog was edited around tapectl, or a bug. Fix: `tapectl volume verify <label>` (the `fix:` line): a full verify reads the tape's seal and names any disagreement with the catalog (`ended_after_disagrees`); report the finding. |
+| `completed_without_every_slice` | warning | `` volume "<label>" has <n> writes recorded `completed` that lack a `written` position of some slice of their set: a `completed` write is a copy of every slice, 1 to N, so those units count copies that do not exist `` | A `short_seal` invariant (ADR-0012 item 288: a set is `completed` only when every slice of it is on the tape). Fix: as for `completed_past_ending`. |
+| `range_written_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes recorded `range` on it record a slice `written` past that (up to file <m>): those slices are not on this tape, yet they count as copies of those slices `` | A `short_seal` invariant (1.7.0). Confirm records a range's slices past the tape's end as `pending`, never `written`. Fix: as for `completed_past_ending`. |
+| `range_not_one_run` | warning | `` volume "<label>" has <n> writes recorded `range` whose `written` slices are not one unbroken run: a volume holds at most one unbroken range of a stage set, so this catalog does not say which slices the tape holds `` | A `short_seal` invariant (1.7.0, ADR-0012 item 122). Fix: as for `completed_past_ending`. |
+| `range_without_written_slice` | warning | `` volume "<label>" has <n> writes recorded `range` with no slice `written`: a range is the slices the tape holds, and a write whose tape holds none of its set has no row `` | A `short_seal` invariant (1.7.0). Fix: as for `completed_past_ending`. |
 | `span_in_progress` | warning | `` v<n> is a span still in progress: slices <runs> of <total> are on no sealed volume yet, and <label> (slices <a>-<b>) holds the rest. The version stays `staged`, and counts no copy, until every slice is on a sealed volume `` | From 1.7.0 (ADR-0012 item 128). A Version of a unit that spans cartridges is on tape in part: some of its slices are on sealed volumes, others are not yet on any. That is the normal state between two tapes of a span, not damage. Until the last slice is on a sealed volume the Version stays `staged`, `copy_count` does not count it, and the retire floor protects the tapes that hold its only copy of a slice. With several holders the message lists each with its run and says they "hold the rest"; with none, "no sealed volume holds a written slice of it". Fix: load a fresh cartridge and run `tapectl volume write <LABEL>`, as the `fix:` line says: it writes the slices the span still owes first. |
 
 ---
