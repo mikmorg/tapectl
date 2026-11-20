@@ -252,10 +252,8 @@ impl<'c, 'a> Arrival<'c, 'a> {
 
 /// The restore handed one store and nothing else: the cartridge in it is the
 /// only one there will ever be.
-#[cfg(test)]
 pub(crate) struct FixedBay<'s>(pub &'s mut dyn Store);
 
-#[cfg(test)]
 impl Bay for FixedBay<'_> {
     fn store(&mut self) -> &mut dyn Store {
         self.0

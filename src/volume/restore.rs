@@ -24,7 +24,6 @@ mod reader;
 pub(crate) mod short_tape;
 mod span;
 mod supply;
-#[cfg(test)]
 use supply::FixedBay;
 pub use supply::Substitution;
 use supply::{Bay, DeviceBay, Supply};
@@ -1051,6 +1050,41 @@ pub(crate) fn restore_unit_from_store(
         options,
         &mut FixedBay(store),
         site,
+    )
+}
+
+/// Test seam for integration tests (tests/restore_memory.rs, #571): a whole-unit restore over
+/// any Store. Production code goes through restore_unit / restore_units.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn restore_unit_from_store_for_tests(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    volume_label: &str,
+    version: i64,
+    dest_dir: &Path,
+    options: &RestoreOptions,
+    store: &mut dyn Store,
+) -> Result<RestoreReport> {
+    let dest = dest_dir.to_string_lossy().into_owned();
+    restore_unit_from_bay(
+        conn,
+        paths,
+        config,
+        unit_name,
+        volume_label,
+        version,
+        RestoreTarget::Unit { dest_dir: &dest },
+        options,
+        &mut FixedBay(store),
+        ContactSite::new(
+            config,
+            Operation::RestoreUnit,
+            "memstore",
+            contact::Medium::NoBackend,
+        ),
     )
 }
 
