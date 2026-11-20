@@ -861,11 +861,11 @@ each_algorithm!(
 
 // ── 6. a rebuild ──
 
+type StagingRow = (String, String, Option<i64>, Option<i64>, Option<String>);
+
 /// Every staging's recorded facts: `(unit, compression, level, stream bytes,
 /// tar version)`.
-fn staging_rows(
-    conn: &Connection,
-) -> Vec<(String, String, Option<i64>, Option<i64>, Option<String>)> {
+fn staging_rows(conn: &Connection) -> Vec<StagingRow> {
     conn.prepare(
         "SELECT u.name, ss.compression, ss.compression_level, ss.stream_bytes, ss.tar_version
            FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
