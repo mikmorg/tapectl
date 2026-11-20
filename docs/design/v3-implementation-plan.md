@@ -2287,7 +2287,7 @@ on Layout 3. Most of this stage is proof, with the fixes the proof finds.
 Waves: T5.1 alone (it touches the write plan); then T5.2 and T5.4; then T5.3 alone (it
 shares `src/cli/audit.rs` and `src/cli/report.rs` with T5.2, and its order of work is a
 safety rule); then T5.5, T5.6, T5.7 and T5.8 (T5.8 waits for T5.5 if the doc #543 names
-is one of T5.8's); then T5.9; then T5.10 alone.
+is one of T5.8's); then T5.9; then T5.10 alone; then T5.11 alone, on the CTO's choice.
 
 The coordinator, at the landings: when T5.4 lands, rehearses the warehouse write-back on
 mhvtl (a volume's files dumped, written back to a blank cartridge one tape file each, then
@@ -2725,6 +2725,21 @@ the CTO's choice (Appendix B), and the build follows it.
 **Fence:** a test of the measurement, `docs/configuration.md`'s `slice_size` row.
 **Done when:** the measurement is a test that states the peak; the choice is with the CTO.
 
+### T5.11 The restore's memory, as ruled (#571, item 298)
+
+**Owner:** worker. The CTO chose A (item 298): the restore keeps one whole slice in memory,
+sizes each buffer exactly from the catalog (the frame from the encrypted size, the cut from
+`size_bytes`), frees the frame before tar is fed, and warns, from `config check` and from the
+restore, when the figure (1× the slice uncompressed, frame plus cut, about 2×, compressed) is
+more than `MemAvailable`. Item 298's determinations say where each figure comes from.
+**Fence:** the restore reader and its supply (`src/volume/restore/`), the restore's entry,
+`config check`, `tests/restore_memory.rs` (its bounds tightened to the new figure, and a slice
+size that is not a power of two, so that exact sizing is proved and not met by chance), and
+the `slice_size` row of `docs/configuration.md`.
+**Done when:** `tests/restore_memory.rs` holds the peak at the new figure at every size it
+measures; both warnings are tested through a pure function that takes the available memory;
+the suite is green.
+
 ---
 
 ## S6. Stage 6: reads and proof
@@ -2870,7 +2885,7 @@ coordinator when every task named beside it has landed and the gate has run.
 | #541 | T2.1 | #565 | T0.5, T0.6, T4.0, T4.5, T4.6, T4.8, T4.10, T4.13, T4.14, T4.16, T5.7 |
 | #566 | closed: slices stay (item 282) | #567 | T0.7, T4.2, T4.3, T4.5, T4.6, T4.8 to T4.13, T4.16, T5.1, T5.3 |
 | #569 | T4.17 (item 297) | #570 | T4.5b |
-| #571 | T5.10 (the measurement; the choice is the CTO's) | | |
+| #571 | T5.10 (the measurement), T5.11 (item 298: A) | | |
 
 **ADR-0012's items from 239.**
 
@@ -2947,4 +2962,5 @@ and built where shown.
 4. Each real-drive run of T6.6, and the tag.
 5. A SERIOUS finding of T6.1 or T6.2, and a finding that asks for a design change.
 6. #571 (T5.10): whether the restore's memory is bounded below `slice_size` or the bound
-   is accepted with a warning, once T5.10 has measured it.
+   is accepted with a warning, once T5.10 has measured it. Ruled 2026-11-20 (item 298):
+   accepted, with exact sizing and two warnings; T5.11 builds it.
