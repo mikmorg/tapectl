@@ -408,11 +408,18 @@ pub fn not_initialized_message(startup: &Startup) -> String {
     } else if startup.pointer_file.is_none() && !startup.tapectl_home_set {
         let init = match &startup.source {
             HomeSource::HomeFlag | HomeSource::ConfigFlag => {
-                format!("`tapectl --home {} init`", home.display())
+                format!("tapectl --home {} init", home.display())
             }
-            _ => "`tapectl init`".to_string(),
+            _ => "tapectl init".to_string(),
         };
-        msg.push_str(&format!(" To start a new archive there: {init}."));
+        // #524: a reader from the Heir Kit's sheet must not take the plain
+        // form for a way in to an existing archive.
+        msg.push_str(&format!(
+            " To start a new archive there: `{init}`, which mints a NEW escrow identity with a \
+             new secret shown once, that no tape knows. To read tapes of an existing archive, \
+             give the home that archive's escrow public key (it is on the Heir Kit's sheet): \
+             `{init} --operator NAME --escrow-public-key KEY`."
+        ));
     }
     msg
 }
@@ -1787,6 +1794,37 @@ mod tests {
         let msg = not_initialized(None, None, &own, Some(&ptr));
         assert!(msg.contains("outranks the home pointer"), "{msg}");
         assert!(!msg.contains("init`"), "{msg}");
+    }
+
+    /// #524 criterion 2: where `init` is offered, the message says what a
+    /// plain one mints and names the recovery form the Heir Kit's sheet
+    /// prints, and offers it in the same two places `init` is offered.
+    #[test]
+    fn not_initialized_says_what_a_plain_init_mints_and_names_the_recovery_form() {
+        let fx = Pointer::new();
+        let none = fx.home_without_own();
+        let absent = fx.absent(1000);
+        let recovery = "`tapectl init --operator NAME --escrow-public-key KEY`";
+
+        let msg = not_initialized(None, None, &none, Some(&absent));
+        assert!(msg.contains("`tapectl init`"), "{msg}");
+        assert!(msg.contains("NEW escrow identity"), "{msg}");
+        assert!(msg.contains("secret"), "{msg}");
+        assert!(msg.contains("no tape knows"), "{msg}");
+        assert!(msg.contains(recovery), "{msg}");
+
+        let msg = not_initialized(Some("/mnt/new"), None, &none, Some(&absent));
+        assert!(msg.contains("`tapectl --home /mnt/new init`"), "{msg}");
+        assert!(msg.contains("NEW escrow identity"), "{msg}");
+        assert!(
+            msg.contains("`tapectl --home /mnt/new init --operator NAME --escrow-public-key KEY`"),
+            "{msg}"
+        );
+
+        // Item 213 stands: where init is not offered, neither is the recovery form.
+        let env = os("/mnt/env-home");
+        let msg = not_initialized(None, Some(&env), &none, Some(&absent));
+        assert!(!msg.contains("escrow"), "{msg}");
     }
 
     // ---- peek_logging_config ----
