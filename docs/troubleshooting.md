@@ -377,9 +377,13 @@ and the rule that chose it: `--home`, `TAPECTL_HOME`, the directory of
 the default `~/.tapectl` ([configuration.md](configuration.md#where-the-configuration-lives)).
 Its last sentence says what to do:
 
-- **`To start a new archive there: tapectl init.`** Nothing named a home and
-  the host has no home pointer, so this looks like a new machine: run
-  [`tapectl init`](cli/init.md#tapectl-init) if it is one.
+- **`To start a new archive there: tapectl init, which mints a NEW escrow
+  identity …`** Nothing named a home and the host has no home pointer, so this
+  looks like a new machine: run [`tapectl init`](cli/init.md#tapectl-init) if it
+  is one. If you are reading tapes of an archive that already exists (an heir, or
+  a rebuilt host), do not: run the form the message names next,
+  `tapectl init --operator NAME --escrow-public-key KEY`, with the escrow public
+  key from the Heir Kit's sheet, so the home adopts the identity the tapes know.
 - **`TAPECTL_HOME is set, so the archive is meant to be there already`**, or
   **`This host has a home pointer (…), so its archive is meant to exist
   already`**: tapectl offers no `init`, because one would make a second archive

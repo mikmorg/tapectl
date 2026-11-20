@@ -670,7 +670,7 @@ next one at a prompt (see step 5).
    same text, but only once tapectl has a home. Until then every command except
    `init` stops with an error that names the home it looked at and why that one:
    ```text
-   error: tapectl is not initialized at /home/heir/.tapectl: there is no catalog /home/heir/.tapectl/tapectl.db there. The home was chosen because nothing named a home (no --home, TAPECTL_HOME or --config, no ~/.tapectl and no home pointer), so it is ~/.tapectl. To start a new archive there: `tapectl init`.
+   error: tapectl is not initialized at /home/heir/.tapectl: there is no catalog /home/heir/.tapectl/tapectl.db there. The home was chosen because nothing named a home (no --home, TAPECTL_HOME or --config, no ~/.tapectl and no home pointer), so it is ~/.tapectl. To start a new archive there: `tapectl init`, which mints a NEW escrow identity with a new secret shown once, that no tape knows. To read tapes of an existing archive, give the home that archive's escrow public key (it is on the Heir Kit's sheet): `tapectl init --operator NAME --escrow-public-key KEY`.
    ```
    Do not answer that with a plain `init`, which mints a new escrow identity that
    none of the tapes know. With the Heir Kit cover sheet's `age1…` public key
@@ -1296,7 +1296,8 @@ tapectl, needs to know this:
   without it.
 - **With tapectl installed**, first give it a home: it refuses every other command
   until one exists (`error: tapectl is not initialized at <home>: …`, naming the
-  home and ending `To start a new archive there: tapectl init`).
+  home and naming both a plain `tapectl init`, which mints a new escrow identity,
+  and the recovery form `tapectl init --operator NAME --escrow-public-key KEY`).
   Do **not** run a plain `init`, which makes a new escrow identity that none of
   the tapes know. Use the identity printed on the cover sheet:
   `tapectl init --operator <name> --escrow-public-key age1…`
