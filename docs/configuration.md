@@ -1085,7 +1085,7 @@ not name alone (see [`[[archive_sets]]`](#archive_sets)).
 
 | Command | Flags that set policy |
 |---|---|
-| [`archive-set create <NAME>`](cli/archive-set.md#tapectl-archive-set-create) | `--min-copies`, `--required-locations a,b` (registered locations only), `--copies-at NAME=N` (repeatable, registered locations only), `--encrypt true\|false`, `--compression`, `--checksum-mode`, `--slice-size`, `--verify-interval-days`, `--warehouse-copies`, `--preserve-xattrs true\|false`, `--preserve-acls true\|false`, `--dirty-on-metadata-change true\|false`, `--allow-spanning true\|false`, `-d/--description`. A flag you leave out stays empty and defers to `[defaults]`. |
+| [`archive-set create <NAME>`](cli/archive-set.md#tapectl-archive-set-create) | `--min-copies`, `--required-locations a,b` (registered locations only), `--copies-at NAME=N` (repeatable, registered locations only), `--encrypt true\|false`, `--compression`, `--compression-level`, `--checksum-mode`, `--slice-size`, `--verify-interval-days`, `--warehouse-copies`, `--preserve-xattrs true\|false`, `--preserve-acls true\|false`, `--dirty-on-metadata-change true\|false`, `-d/--description`. A flag you leave out stays empty and defers to `[defaults]`. |
 | [`archive-set edit <NAME>`](cli/archive-set.md#tapectl-archive-set-edit) | the same flags. Only the ones you pass change, and each change is recorded in the event log. |
 | [`archive-set sync`](cli/archive-set.md#tapectl-archive-set-sync) | none. It reads `[[archive_sets]]` from `config.toml` and writes the keys each table names. `--dry-run` is refused. |
 | [`archive-set list`](cli/archive-set.md#tapectl-archive-set-list) / [`info <NAME>`](cli/archive-set.md#tapectl-archive-set-info) | none. These show what is stored. |
