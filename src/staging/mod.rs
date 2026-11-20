@@ -674,7 +674,7 @@ pub(crate) fn stage_create_admitting(
                     "stage create",
                     crate::db::phase_timings::Subject::StageSet(stage_set_id),
                 );
-                after_failed_stage(conn, paths, config, stage_set_id, &e);
+                after_failed_stage(conn, config, stage_set_id, &e);
             }
             // Issue #404: a stop is a clean end, and says what to run next.
             // Staging resumes by starting the unit over; everything this
@@ -710,13 +710,7 @@ pub(crate) fn stage_create_admitting(
 ///   returns), and `stage clean` reclaims it.
 /// - A set that reached `staged` before the error is complete: its slices
 ///   are the stage, never garbage.
-fn after_failed_stage(
-    conn: &Connection,
-    paths: &TapectlPaths,
-    config: &Config,
-    stage_set_id: i64,
-    e: &TapectlError,
-) {
+fn after_failed_stage(conn: &Connection, config: &Config, stage_set_id: i64, e: &TapectlError) {
     let staged = conn
         .query_row(
             "SELECT status = 'staged' FROM stage_sets WHERE id = ?1",
@@ -731,7 +725,7 @@ fn after_failed_stage(
             "stage_create stopped; its staging files were left in place"
         );
     } else {
-        cleanup_failed_stage_set(conn, paths, config, stage_set_id);
+        cleanup_failed_stage_set(conn, config, stage_set_id);
     }
 }
 
@@ -1410,8 +1404,6 @@ fn record_encrypted_slice(
 /// Per-*stage-set*, not per-snapshot (issue #53) — the single place this
 /// shape is computed, so `stage_create_inner`'s slices and
 /// `cleanup_failed_stage_set`'s prefix scan can never drift apart again.
-/// The isolated catalogue is per stage set too since issue #419, by its
-/// directory ([`stage_set_catalogue_dir`]).
 pub(crate) fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
     format!(
         "{}_v{}_s{}",
@@ -1549,21 +1541,6 @@ fn write_left_out(
     let _ = writeln!(notices, "{out}");
 }
 
-/// The directory that held one stage set's Layout 2 catalogue (issue #419):
-/// `<home>/catalogs/{uuid8}/s{stage_set_id}/`. A staging on tar makes none;
-/// `volume::rebuild` still names it until T4.9 ports it, and a failed stage
-/// removes it when it is there.
-pub(crate) fn stage_set_catalogue_dir(
-    paths: &TapectlPaths,
-    unit_uuid: &str,
-    stage_set_id: i64,
-) -> PathBuf {
-    paths
-        .catalogs_dir
-        .join(unit_uuid.get(..8).unwrap_or(unit_uuid))
-        .join(format!("s{stage_set_id}"))
-}
-
 /// Best-effort cleanup of a `stage_set` that `stage_create` failed to
 /// finish, run from the `stage_create` wrapper's `Err` path (issue #54).
 ///
@@ -1586,19 +1563,14 @@ pub(crate) fn stage_set_catalogue_dir(
 /// `recover_orphaned_sessions` (`src/db/mod.rs`) mark it `'failed'` on the
 /// next `db::open()`, which is the operator's only signal that this stage
 /// attempt didn't complete.
-fn cleanup_failed_stage_set(
-    conn: &Connection,
-    paths: &TapectlPaths,
-    config: &Config,
-    stage_set_id: i64,
-) {
+fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i64) {
     let staging_dir = Path::new(&config.staging.directory);
 
     // Resolve this stage set's archive_base prefix via the SAME
     // `archive_base_name`/`archive_base_prefix` helpers `stage_create_inner`
     // used to build it — the lockstep issue #53 requires: this is not a
     // parallel re-derivation, it's the identical computation.
-    let (prefix, uuid) = match conn
+    let prefix = match conn
         .query_row(
             "SELECT u.uuid, sn.version
              FROM stage_sets ss
@@ -1610,7 +1582,7 @@ fn cleanup_failed_stage_set(
         )
         .ok()
     {
-        Some((uuid, version)) => (archive_base_prefix(&uuid, version, stage_set_id), uuid),
+        Some((uuid, version)) => archive_base_prefix(&uuid, version, stage_set_id),
         None => {
             tracing::warn!(
                 stage_set_id,
@@ -1660,22 +1632,6 @@ fn cleanup_failed_stage_set(
         params![stage_set_id],
     ) {
         tracing::warn!(stage_set_id, error = %e, "cleanup: could not delete stage_slices rows");
-    }
-
-    // Issue #419: a Layout 2 stage set's own isolated catalogue (and its
-    // on-the-fly one, if the run died before it was re-isolated). Nothing
-    // else uses the directory: it is per stage set.
-    let catalogue_dir = stage_set_catalogue_dir(paths, &uuid, stage_set_id);
-    if catalogue_dir.exists() {
-        match fs::remove_dir_all(&catalogue_dir) {
-            Ok(()) => removed += 1,
-            Err(e) => tracing::warn!(
-                stage_set_id,
-                path = %catalogue_dir.display(),
-                error = %e,
-                "cleanup: could not remove the stage set's catalogue directory"
-            ),
-        }
     }
 
     tracing::warn!(
@@ -3664,10 +3620,7 @@ mod tests {
     ///
     /// The failure is injected right after tar (`failpoint::AFTER_TAR`).
     /// It used to be injected with a tenant that had no active keys, until
-    /// issue #354 moved that refusal before tar, and then by making
-    /// `catalogs_dir` a file, until issue #419 created the stage set's
-    /// catalogue directory (Layout 2's; a staging on tar makes none).
-    /// The cleanup also removes that directory when it is there.
+    /// issue #354 moved that refusal before tar.
     #[test]
     fn a_failure_after_tar_leaves_nothing_in_staging() {
         let tmp = TempDir::new().unwrap();
@@ -3747,17 +3700,6 @@ mod tests {
             leaked.is_empty(),
             "the failed stage set's files are all removed — found: {leaked:?}"
         );
-
-        // Issue #419: no catalogue directory is left for this stage set.
-        let unit_catalogues = paths.catalogs_dir.read_dir().unwrap().flatten();
-        for unit_dir in unit_catalogues {
-            let left: Vec<_> = fs::read_dir(unit_dir.path()).unwrap().flatten().collect();
-            assert!(
-                left.is_empty(),
-                "the failed stage set's catalogue directory is removed: {:?}",
-                left.iter().map(|e| e.path()).collect::<Vec<_>>()
-            );
-        }
 
         // The stage_sets row must survive the failure — that 'staging'
         // status is what recover_orphaned_sessions (src/db/mod.rs) sweeps
@@ -3859,7 +3801,7 @@ mod tests {
             fs::write(f, b"x").unwrap();
         }
 
-        cleanup_failed_stage_set(&conn, &paths, &config, failed_set);
+        cleanup_failed_stage_set(&conn, &config, failed_set);
 
         assert!(
             !failed_slice.exists(),
@@ -3967,12 +3909,11 @@ mod tests {
     /// does clean them up.
     #[test]
     fn a_busy_error_keeps_the_stage_sets_files_and_any_other_error_cleans_them() {
-        let (tmp, _db_path, conn, config, stage_set_id, age) = slice_being_recorded();
-        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let (_tmp, _db_path, conn, config, stage_set_id, age) = slice_being_recorded();
         record_encrypted_slice(&conn, QUICK, stage_set_id, 1, false, &age, &slice_info()).unwrap();
 
         let busy_err = TapectlError::CatalogBusy("the stage set's finalization".into());
-        after_failed_stage(&conn, &paths, &config, stage_set_id, &busy_err);
+        after_failed_stage(&conn, &config, stage_set_id, &busy_err);
         assert!(
             age.exists(),
             "a busy catalog must not discard encrypted slices"
@@ -3981,7 +3922,6 @@ mod tests {
 
         after_failed_stage(
             &conn,
-            &paths,
             &config,
             stage_set_id,
             &TapectlError::Other("tar failed".into()),

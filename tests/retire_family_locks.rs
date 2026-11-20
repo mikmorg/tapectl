@@ -248,7 +248,6 @@ fn volume_move_is_refused_while_a_session_holds_the_volume() {
         config_file: home.join("config.toml"),
         db_file: f._dir.path().join("tapectl.db"),
         keys_dir: home.join("keys"),
-        catalogs_dir: home.join("catalogs"),
         stage_reports_dir: home.join("stage-reports"),
         logs_dir: home.join("logs"),
     };

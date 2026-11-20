@@ -2581,7 +2581,6 @@ pub struct TapectlPaths {
     pub config_file: PathBuf,
     pub db_file: PathBuf,
     pub keys_dir: PathBuf,
-    pub catalogs_dir: PathBuf,
     /// The per-stage-set text reports `stage create` writes (slice sizes
     /// and hashes). Not "receipts": that word means the recipient list a
     /// stage set was encrypted to (CONTEXT.md, issue #361).
@@ -2595,7 +2594,6 @@ impl TapectlPaths {
             config_file: home.join("config.toml"),
             db_file: home.join("tapectl.db"),
             keys_dir: home.join("keys"),
-            catalogs_dir: home.join("catalogs"),
             stage_reports_dir: home.join("stage-reports"),
             logs_dir: home.join("logs"),
             home,
@@ -2664,7 +2662,6 @@ impl TapectlPaths {
         for dir in [
             &self.home,
             &self.keys_dir,
-            &self.catalogs_dir,
             &self.stage_reports_dir,
             &self.logs_dir,
             &locks_dir,
@@ -2764,7 +2761,6 @@ mod tests {
         vec![
             ("home", paths.home.clone()),
             ("keys_dir", paths.keys_dir.clone()),
-            ("catalogs_dir", paths.catalogs_dir.clone()),
             ("stage_reports_dir", paths.stage_reports_dir.clone()),
             ("logs_dir", paths.logs_dir.clone()),
             // Issue #393: made by the home's preparation, not first by the

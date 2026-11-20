@@ -429,6 +429,30 @@ fn not_initialized_names_the_path_and_offers_init_only_without_a_pointer() {
     assert!(!empty.join("tapectl.db").exists(), "nothing was made");
 }
 
+/// T5.9: Layout 3 has no dar catalogues, so a new home makes no `catalogs/`
+/// (a home an older binary made may still hold one; nothing reads it).
+#[test]
+fn a_new_home_has_no_catalogs_directory() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("h");
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(&home)
+        .args(["init", "--operator", "op", "--no-escrow"])
+        .env_remove("TAPECTL_HOME")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        home.join("keys").is_dir(),
+        "positive control: init made the home"
+    );
+    assert!(
+        !home.join("catalogs").exists(),
+        "a new home has no catalogs/"
+    );
+}
+
 /// ADR-0012 item 213: `init` ends with the next steps, in order, and names
 /// `tapectl status` for every step after.
 #[test]

@@ -1267,7 +1267,7 @@ pub fn reclaim_session_dirs_and_lockfiles(
 ) -> Result<()> {
     reclaim_session_dirs(conn, config, force, report)?;
     reclaim_lockfiles(conn, db_file, report)?;
-    reclaim_home_leftovers(conn, db_file, report)?;
+    reclaim_home_leftovers(db_file, report)?;
     reclaim_recovery_read_dirs(conn, config, report)?;
     Ok(())
 }
@@ -1372,45 +1372,15 @@ const HOME_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 
 /// and a SIGKILL or a power loss does not (issue #465; `threat-model.md` §3
 /// promises `stage clean` handles what was left):
 ///
-/// - **`<home>/catalogs/<uuid8>/s<id>/`** (issue #419) of a stage set that
-///   never staged: `staged_at IS NULL`, and `failed` — or `cleaned`, because
-///   `clean_staging` releases failed sets before this runs. A set that was
-///   staged keeps its catalogue even when released: Layout 2's restore read
-///   it, until T4.8 ports the restores. A set still `staging` is live; a
-///   staging on tar makes no such directory.
 /// - **`<home>/tmp/*`** (`staging::home_work_dir`: tar's file list and
 ///   probe, the write's `catalog.db`), when nothing in the entry changed for
 ///   [`HOME_TMP_MAX_AGE`]. Never a younger one: a live run is using it.
 ///
 /// The home is the directory holding the catalog, as for the lockfiles.
-fn reclaim_home_leftovers(
-    conn: &Connection,
-    db_file: &Path,
-    report: &mut CleanReport,
-) -> Result<()> {
+fn reclaim_home_leftovers(db_file: &Path, report: &mut CleanReport) -> Result<()> {
     let Some(home) = db_file.parent() else {
         return Ok(());
     };
-    let never_staged: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT ss.id, u.uuid FROM stage_sets ss
-             JOIN snapshots sn ON sn.id = ss.snapshot_id
-             JOIN units u ON u.id = sn.unit_id
-             WHERE ss.status IN ('failed', 'cleaned') AND ss.staged_at IS NULL",
-        )?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows
-    };
-    let paths = crate::config::TapectlPaths::new(home.to_path_buf());
-    for (stage_set_id, uuid) in never_staged {
-        let dir = crate::staging::stage_set_catalogue_dir(&paths, &uuid, stage_set_id);
-        if dir.is_dir() {
-            remove_leftover(&dir, report);
-        }
-    }
-
     let now = std::time::SystemTime::now();
     if let Ok(entries) = fs::read_dir(home.join("tmp")) {
         for entry in entries.flatten() {
@@ -3531,86 +3501,6 @@ mod tests {
             );
             assert_eq!(report.lockfiles_reclaimed, 1);
         }
-    }
-
-    /// Issue #465 item 5: a SIGKILL or a power loss mid-stage leaves the
-    /// stage set's catalogue directory (`<home>/catalogs/<uuid8>/s<id>/`,
-    /// issue #419) behind — `cleanup_failed_stage_set` runs only in-process.
-    /// `stage clean` removes it for a set that never reached `staged`. The
-    /// set is `failed` when the sweep looks, or already `cleaned` (the same
-    /// command's `clean_staging` releases failed sets first); either way
-    /// `staged_at` is NULL. A set that was staged keeps its catalogue — it
-    /// serves `restore` (`entry_slices`) — released or not; a set still
-    /// `staging` is live.
-    #[test]
-    fn staging_clean_removes_the_catalogue_directory_of_a_set_that_never_staged() {
-        let conn = db::open_memory().unwrap();
-        conn.execute(
-            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
-            [],
-        )
-        .unwrap();
-        let tenant_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
-             VALUES ('abcdef01-2345-6789-abcd-ef0123456789', 'u', ?1, '/tmp/u', 'active')",
-            params![tenant_id],
-        )
-        .unwrap();
-        let unit_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
-             VALUES (?1, 1, 'staged', '/tmp/u', 1, 10)",
-            params![unit_id],
-        )
-        .unwrap();
-        let snapshot_id = conn.last_insert_rowid();
-        let home = tempfile::tempdir().unwrap();
-        let db_file = home.path().join("tapectl.db");
-        let catalogue_dir = |id: i64| home.path().join(format!("catalogs/abcdef01/s{id}"));
-
-        let mut sets = Vec::new();
-        for (status, staged) in [
-            ("failed", false),
-            ("cleaned", false),
-            ("cleaned", true),
-            ("staged", true),
-            ("staging", false),
-        ] {
-            conn.execute(
-                "INSERT INTO stage_sets (snapshot_id, status, slice_size, staged_at)
-                 VALUES (?1, ?2, 524288, CASE WHEN ?3 THEN datetime('now') END)",
-                params![snapshot_id, status, staged],
-            )
-            .unwrap();
-            let id = conn.last_insert_rowid();
-            let dir = catalogue_dir(id);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("catalogue"), b"catalogue").unwrap();
-            sets.push((id, status, staged));
-        }
-
-        let mut report = CleanReport::default();
-        reclaim_session_dirs_and_lockfiles(
-            &conn,
-            &config_for(home.path()),
-            &db_file,
-            false,
-            &mut report,
-        )
-        .unwrap();
-
-        for (id, status, staged) in sets {
-            let gone = !staged && matches!(status, "failed" | "cleaned");
-            assert_eq!(
-                catalogue_dir(id).exists(),
-                !gone,
-                "{status} (staged: {staged}): its catalogue directory {}",
-                if gone { "is removed" } else { "is kept" }
-            );
-        }
-        assert_eq!(report.home_leftovers_reclaimed, 2);
-        assert_eq!(report.errors, 0);
     }
 
     /// Issue #465 item 5: `<home>/tmp` holds the plaintext of a stage or a

@@ -607,7 +607,7 @@ group = "tapectl-ops"
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `group` | group name | *(no table: the home stays private)* | Every command run as the service user keeps the home at 0710 and `logs/` at 2750 (setgid), both owned by this group, and writes each session log 0640. Every other entry of the home — `config.toml`, the catalog, the keys, `catalogs/`, `stage-reports/`, `locks/`, `tmp/`, a `staging/` inside it, whatever else is there — has its group and other bits removed on every command, so a member can open none of them even by name. |
+| `group` | group name | *(no table: the home stays private)* | Every command run as the service user keeps the home at 0710 and `logs/` at 2750 (setgid), both owned by this group, and writes each session log 0640. Every other entry of the home — `config.toml`, the catalog, the keys, `stage-reports/`, `locks/`, `tmp/`, a `staging/` inside it, whatever else is there — has its group and other bits removed on every command, so a member can open none of them even by name. |
 
 The service user must be a member of the group itself: giving a directory a
 group (`chgrp`) is limited to one's own groups, and until it can, the home and
