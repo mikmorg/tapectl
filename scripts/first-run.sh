@@ -416,6 +416,14 @@ as_svc()   { if [ "$SVC_MODE" = 1 ]; then sudo -u "$SVC_USER" -H "$@"; else "$@"
 svc_home() { if [ "$SVC_MODE" = 1 ]; then { getent passwd "$SVC_USER" 2>/dev/null || true; } | cut -d: -f6; else printf '%s' "$HOME"; fi; }
 svc_in_group() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -x "$2" >/dev/null; }
 compute_home() { local h; h="$(svc_home)"; EFFECTIVE_HOME="${HOME_DIR:-${TAPECTL_HOME_DIR:-${h:-/var/lib/$SVC_USER}/.tapectl}}"; }
+# home_pointer: the home pointer step 7 keeps (#437). Under --home only one the
+# caller names (TAPECTL_HOME_POINTER, as the mhvtl harnesses do), else none:
+# /etc/tapectl/home is the host's, and a throwaway home must never aim it at
+# itself or remove it (#543).
+home_pointer() {
+  if [ -n "$HOME_DIR" ]; then printf '%s' "${TAPECTL_HOME_POINTER:-}"
+  else printf '%s' "${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"; fi
+}
 compute_home
 # Item 197: before step 14 installs tapectl-op, which carries it, a printed remedy
 # names the home itself: the pointer may not exist yet (it is step 7's only with
@@ -1734,8 +1742,8 @@ EOF
   fi
   # Issue #437: a home pointer left from a deleted home names a directory that
   # no longer exists, and init would refuse on it. It is rewritten in step 7.
-  _ptr="${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"
-  if [ -f "$_ptr" ] && ! sudo test -d "$(cat "$_ptr")"; then run sudo rm -f "$_ptr"; fi
+  _ptr="$(home_pointer)"
+  if [ -n "$_ptr" ] && [ -f "$_ptr" ] && ! sudo test -d "$(cat "$_ptr")"; then run sudo rm -f "$_ptr"; fi
   note "PAPER READY? The escrow secret appears exactly once, next."
   confirm "Run init now? (type y — Enter means no, nothing has been created)" || die "stopped before init: nothing was minted or written. Re-run with --from $STEP and answer y when the paper is ready"
   run_nolog tc "${INIT_ARGS[@]}"
@@ -1802,13 +1810,12 @@ fi
 # agent helping them) watch sessions with `tapectl status` without sudo. The
 # group reads logs/ and nothing else in the home; the service user must be a
 # member too, so tapectl can give the home and logs/ the group itself.
-# Not under --home: the block writes the host-wide pointer /etc/tapectl/home and
-# the group's grants, which a throwaway home must never aim at itself (#543);
-# step 14 treats --home the same way.
-if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ] && [ -n "$HOME_DIR" ]; then
-  note "ops group $OPS_GROUP: not set up for --home $HOME_DIR (the home pointer and the group are the host's, not a throwaway home's)"
+# Under --home only with a pointer the caller names (home_pointer): the host-wide
+# /etc/tapectl/home must never name a throwaway home (#543).
+if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ] && [ -z "$(home_pointer)" ]; then
+  note "ops group $OPS_GROUP: not set up for --home $HOME_DIR (the home pointer /etc/tapectl/home is the host's, not a throwaway home's; TAPECTL_HOME_POINTER names one of its own)"
 fi
-if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ] && [ -z "$HOME_DIR" ]; then
+if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ] && [ -n "$(home_pointer)" ]; then
   explain <<EOF
 THE OPS GROUP. Live progress prints only on the terminal that started a command, and the session logs under $EFFECTIVE_HOME/logs/ belong to $SVC_USER (0700), so your own account cannot see whether a write is running, which phase it is in, or how the last one ended without sudo. With [ops] group = "$OPS_GROUP", every tapectl command run as $SVC_USER keeps the home at 0710 and logs/ at 2750 owned by $OPS_GROUP, and writes each session log 0640: members can run a plain \`tapectl status\` (the pointer /etc/tapectl/home names the home) and read the logs, and open nothing else — every other entry of the home (the catalog, the keys, config.toml, …) is kept closed to the group. Group membership takes effect at the member's next login.
 EOF
@@ -1829,7 +1836,7 @@ EOF
     run tc config check || true
     # Issue #437 / ADR-0012 2026-10-15 item 62: a pointer so members need no
     # --home. tapectl ignores it as root and when the account has its own ~/.tapectl.
-    POINTER="${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"
+    POINTER="$(home_pointer)"
     run sudo install -d -m 0755 "$(dirname "$POINTER")"
     printf '%s\n' "$EFFECTIVE_HOME" | sudo tee "$POINTER" >/dev/null
     run sudo chmod 0644 "$POINTER"

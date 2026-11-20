@@ -77,9 +77,36 @@ fn step_11_says_what_the_backup_service_did() {
 }
 
 #[test]
-fn step_7_leaves_the_ops_group_and_the_home_pointer_alone_under_home() {
+fn step_7_leaves_the_host_home_pointer_alone_under_home() {
     let s = read("scripts/first-run.sh");
-    // The block's own `if` is the last one before its first `explain`.
+    // home_pointer: under --home only the caller's TAPECTL_HOME_POINTER, never
+    // the host's /etc/tapectl/home; without --home the host's is the default.
+    let at = s.find("home_pointer() {").expect("home_pointer");
+    let body = &s[at..at + s[at..].find("\n}\n").expect("home_pointer's end")];
+    let (under_home, otherwise) = body
+        .split_once("else")
+        .expect("home_pointer has an --home branch and an else");
+    assert!(
+        under_home.contains("if [ -n \"$HOME_DIR\" ]")
+            && under_home.contains("${TAPECTL_HOME_POINTER:-}")
+            && !under_home.contains("/etc/tapectl/home"),
+        "under --home the pointer falls back to the host's: {body}"
+    );
+    assert!(
+        otherwise.contains("${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"),
+        "without --home the host's pointer is the default: {body}"
+    );
+    // Positive control: the host's path appears in the script at all, so the
+    // count below searched something.
+    assert!(s.contains("/etc/tapectl/home"));
+    // Every place step 7 names the pointer goes through home_pointer.
+    assert_eq!(
+        s.matches("${TAPECTL_HOME_POINTER:-/etc/tapectl/home}")
+            .count(),
+        1,
+        "a pointer default outside home_pointer"
+    );
+    // The ops-group block (it writes the pointer) runs only with one.
     let at = s.find("THE OPS GROUP.").expect("the ops-group block");
     let line = s[..at]
         .lines()
@@ -87,8 +114,13 @@ fn step_7_leaves_the_ops_group_and_the_home_pointer_alone_under_home() {
         .find(|l| l.starts_with("if [ -n \"$OPS_GROUP\""))
         .expect("the ops-group block's condition");
     assert!(
-        line.contains("[ -z \"$HOME_DIR\" ]"),
-        "the block that writes /etc/tapectl/home has no --home guard: {line}"
+        line.contains("[ -n \"$(home_pointer)\" ]"),
+        "the block that writes the pointer is not guarded by home_pointer: {line}"
+    );
+    // The stale-pointer removal before init removes only home_pointer's.
+    assert!(
+        s.contains("_ptr=\"$(home_pointer)\"\n  if [ -n \"$_ptr\" ]"),
+        "the stale-pointer removal does not go through home_pointer"
     );
 }
 
