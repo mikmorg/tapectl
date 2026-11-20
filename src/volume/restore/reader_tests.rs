@@ -784,3 +784,75 @@ fn a_compressed_slice_whose_recorded_cut_cannot_be_held_is_bad() {
 fn a_compressed_slice_whose_recorded_frame_cannot_be_held_is_bad() {
     a_slice_whose_recorded_size_cannot_be_held_is_bad(Some("zstd"), "encrypted_bytes");
 }
+
+/// The second name of a hard-linked symbolic link (#581, item 299): its row
+/// is `l`, the whole restore makes both names symbolic links to one target,
+/// and the check passes.
+#[test]
+fn both_names_of_a_hard_linked_symbolic_link_are_restored() {
+    let items = vec![
+        Item::file("target.txt", b"what they point at\n".to_vec()),
+        Item::Symlink("s1".into(), "target.txt".into()),
+        Item::Hard("s2".into(), "s1".into()),
+    ];
+    let h = home_with("alpha", &items, "64K", None);
+    use std::os::unix::fs::MetadataExt;
+    let src = h.source("alpha");
+    assert_eq!(fs::symlink_metadata(src.join("s1")).unwrap().nlink(), 2);
+    let rows = h.rows("alpha");
+    for name in ["s1", "s2"] {
+        let r = rows.iter().find(|r| r.path == name).unwrap();
+        assert_eq!(r.kind, crate::volume::filetable::Kind::Symlink, "{name}");
+        assert_eq!((r.size, r.sha256, &r.link), (0, None, &None), "{name}");
+    }
+    let mut bay = h.bay("RDR-A", &[]);
+    let (r, dest) = h.restore(
+        "alpha",
+        What::Unit,
+        "RDR-A",
+        &RestoreOptions::default(),
+        &mut bay,
+    );
+    r.expect("both names restore and the check passes");
+    for name in ["s1", "s2"] {
+        assert_eq!(
+            fs::read_link(dest.path().join(name)).unwrap(),
+            std::path::Path::new("target.txt"),
+            "{name}"
+        );
+    }
+    assert_restored(&h, "alpha", dest.path(), &[]);
+}
+
+/// A slice that holds the second name and not the first cannot make that name
+/// (item 293's limit): the name is listed for the repair, never claimed.
+#[test]
+fn the_second_name_of_a_symbolic_link_is_listed_when_the_first_is_lost() {
+    let items = vec![
+        Item::Symlink("a-s1".into(), "b-fill.bin".into()),
+        Item::file("b-fill.bin", noise_bytes(100_000, 9)),
+        Item::Hard("c-s2".into(), "a-s1".into()),
+    ];
+    let mut h = home_with("alpha", &items, "64K", None);
+    let rows = h.rows("alpha");
+    let first = rows.iter().find(|r| r.path == "a-s1").unwrap();
+    let second = rows.iter().find(|r| r.path == "c-s2").unwrap();
+    assert_ne!(first.slice, second.slice, "the names lie in two slices");
+    let pos = h.position("RDR-A", "alpha", first.slice as i64);
+    h.flip("RDR-A", pos, 2_000);
+    let mut bay = h.bay("RDR-A", &[]);
+    let (r, dest) = h.restore(
+        "alpha",
+        What::Unit,
+        "RDR-A",
+        &RestoreOptions::default(),
+        &mut bay,
+    );
+    let err = r.expect_err("the first name is lost").to_string();
+    let lost = lost_paths(&err);
+    assert!(lost.contains("a-s1") && lost.contains("c-s2"), "{err}");
+    assert!(
+        fs::symlink_metadata(dest.path().join("c-s2")).is_err(),
+        "no claim on a name that was not made"
+    );
+}
