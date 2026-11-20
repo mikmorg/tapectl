@@ -522,7 +522,7 @@ pub enum TapectlError {
          again (another drive, or after cleaning this one) and rebuild again into a catalog with \
          no row for \"{label}\", which records it as sealed; `tapectl volume verify {label}` \
          checks the tape against its own front index (it does not seal the row); what it holds \
-         restores with `tapectl restore` or RESTORE.sh at its file 2. Only if the tape is to be \
+         restores with `tapectl restore unit` or RESTORE.sh at its file 2. Only if the tape is to be \
          given up: `tapectl volume retire {label}`, then `tapectl cartridge erase`, which asks \
          for the tape's label."
     )]

@@ -4044,7 +4044,7 @@ fn aborted_not_adoptable(
              that carries a sealed volume, and a seal it cannot read is never taken as absent. \
              If a `catalog rebuild` of this tape could not read its seal, or read it after an \
              earlier rebuild could not, the tape may be sealed: read it again, check it with \
-             `tapectl volume verify {label}`, restore what it holds (`tapectl restore`, or \
+             `tapectl volume verify {label}`, restore what it holds (`tapectl restore unit`, or \
              RESTORE.sh at tape file 2), and rebuild into a catalog with no row for \"{label}\" \
              to record it as sealed; `tapectl cartridge erase` (it asks for the label) only if \
              the tape is to be given up."

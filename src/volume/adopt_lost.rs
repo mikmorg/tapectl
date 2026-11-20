@@ -819,7 +819,7 @@ pub fn refusal(label: &str, verdict: &LostAdoption) -> TapectlError {
              adopted, nothing was written and the volume's status is unchanged. Read the tape \
              again (another drive, or after cleaning this one) and run `tapectl volume resume \
              {label}` again; `tapectl volume verify {label}` checks the tape, and what it holds \
-             restores with `tapectl restore` or RESTORE.sh at tape file 2. `tapectl cartridge \
+             restores with `tapectl restore unit` or RESTORE.sh at tape file 2. `tapectl cartridge \
              erase` (it asks for the label) only if the tape is to be given up."
         ),
         LostAdoption::NoRecordedRebuild => format!(

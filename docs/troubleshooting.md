@@ -3217,7 +3217,7 @@ over the tape. What works:
   a catalog that has no row for the label: that rebuild records it as `sealed`;
 - `tapectl volume verify <label>` checks the tape against its own front index; a
   clean full verify clears the quarantine, and does not seal the row;
-- restore what it holds: `tapectl restore`, or RESTORE.sh at tape file 2 with a
+- restore what it holds: `tapectl restore unit`, or RESTORE.sh at tape file 2 with a
   tenant key or the escrow key;
 - only if the tape is to be given up: `tapectl volume retire <label>`, then
   `tapectl cartridge erase`, which asks for the tape's label.
