@@ -2609,6 +2609,23 @@ struct AuditFinding {
     action: String,
 }
 
+/// The checks that fired, as `(severity, check, unit)`, for the tests of
+/// other modules that pin what `audit` says of a catalog (T5.2, #550).
+#[cfg(test)]
+pub(crate) fn fired_for_test(
+    conn: &Connection,
+    config: &Config,
+) -> Result<Vec<(&'static str, String, String)>> {
+    let (violations, warnings) = collect_findings(conn, config, None)?;
+    let mut out = Vec::new();
+    for (severity, list) in [("violation", violations), ("warning", warnings)] {
+        for f in list {
+            out.push((severity, f.check, f.unit));
+        }
+    }
+    Ok(out)
+}
+
 fn finding_json(f: &AuditFinding, severity: &str) -> serde_json::Value {
     serde_json::json!({
         "severity": severity,

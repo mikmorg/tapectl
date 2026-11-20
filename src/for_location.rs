@@ -2745,3 +2745,6 @@ mod tests {
         assert_eq!(c.count("stage_sets"), sets + 1);
     }
 }
+
+#[cfg(test)]
+mod two_places_proofs;
