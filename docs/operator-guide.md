@@ -2629,9 +2629,9 @@ left out, never replaced by zeros, and the members in it are the ones lost
 it reads a tape in a drive, not a directory, and tapectl has no command that
 restores from a directory of dumped files. A deposit is the tape's files
 byte for byte, so it can be written back to a blank cartridge (fixed 512 KiB
-blocks, `volume-format-v3.md` §8): `mt -f /dev/nst0 setblk 524288`, `mt -f
-/dev/nst0 rewind`, then for each file in position order, `dd
-if=NNNN_type.bin of=/dev/nst0 bs=512k conv=sync` (closing the non-rewinding
+blocks, `volume-format-v3.md` §8), with `TAPE` the drive's by-id path as at the top of
+this guide: `mt -f "$TAPE" setblk 524288`, `mt -f "$TAPE" rewind`, then for each file in position order, `dd
+if=NNNN_type.bin of="$TAPE" bs=512k conv=sync` (closing the non-rewinding
 device after each `dd` writes its filemark; the front index and the seal
 marker are already full blocks, and `conv=sync` pads the others with zeros as
 the writer did). Then `RESTORE.sh --verify` reads every file against the
