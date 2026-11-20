@@ -2667,15 +2667,21 @@ does not know that holds them is brought into it by `tapectl catalog rebuild --f
 
 When those slices are still staged, the reason says so instead: an ordinary
 `tapectl volume write` writes them onto another cartridge, and a later restore
-can then read them. One refusal comes before any slice is read:
+can then read them.
 
 No one at the terminal (a script, a timer, a pipe on stdin), where the version is
-held across cartridges:
+held across cartridges, is not a refusal either: tapectl swaps no cartridge without
+a person, so it logs a `WARN` line and restores the files this tape holds whole.
+The line reads:
 
 ```text
-error: unit "<unit>" version <n> is held across cartridges, and tapectl swaps no cartridge without a person at
-the terminal, and --yes cannot load one: run it from a terminal and it asks for each cartridge in turn. ...
+WARN unit "<unit>" version <n> is held across cartridges (slices <a> to <b> from "<label>" (<where>), then
+slices <c> to <d> from "<label>" (<where>)), and tapectl swaps no cartridge without a person at the terminal
+(--yes cannot load one): the files this cartridge holds whole are restored and the rest are listed, with the
+cartridges that hold them. Run it from a terminal and it asks for each cartridge in turn.
 ```
+
+and the restore ends INCOMPLETE, listing the files on the other cartridges.
 
 Run it from a terminal. A version a single tape holds whole restores from that
 tape alone, with no prompt. `restore volume` plans each unit it holds a range of
@@ -2732,9 +2738,10 @@ copy if the tape is damaged; `catalog locate` lists them).
 With `--fail-fast` the first failure ends the pass, and the units after it
 are reported `not attempted`.
 
-A unit that cannot be planned at all (see the sections above) is listed
-`FAILED` with its reason before the drive is opened, is never read, and the
-other units are restored (#573). With units named by `--unit`, one that would be
+A unit that cannot be planned at all (see the sections above) is known before the
+drive is opened. It is listed `FAILED` with its reason, first in the report, and
+never read, and the other units are restored (#573); with `--fail-fast` the pass
+stops before any unit is read and the others are reported `not attempted`. With units named by `--unit`, one that would be
 refused refuses the whole set instead: each was asked for. Before it opens the
 drive, `restore volume` also refuses the whole set when one unit's directory
 would lie inside another's:

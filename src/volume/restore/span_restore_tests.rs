@@ -606,7 +606,7 @@ fn a_slice_on_no_live_volume_is_listed_and_the_rest_is_restored() {
 
     let dry_dest = TempDir::new().unwrap();
     let dry_str = dry_dest.path().to_string_lossy().into_owned();
-    restore_unit(
+    let dry = restore_unit(
         &h.conn,
         &h.paths,
         &h.config,
@@ -620,6 +620,48 @@ fn a_slice_on_no_live_volume_is_listed_and_the_rest_is_restored() {
         &RestoreOptions::default(),
     )
     .expect("the dry run plans what the tape holds");
+    // restore-3: it says what it would leave out, not a plain "would restore".
+    assert_eq!(dry.left_out_slices, (4..=n).collect::<Vec<_>>());
+    let why = dry.left_out.as_deref().expect("the reason is carried");
+    assert!(why.contains(&slices), "{why}");
+}
+
+/// A restore may start on any tape, and a tape retired since is still the
+/// operator's call (item 266, D17): its own range is planned from it, even
+/// where it does not begin at slice 1; the other slices come from the live
+/// holders in slice order, and none is left out or called "not given".
+#[test]
+fn a_retired_start_tape_gives_its_own_range() {
+    let (h, n) = spanned(&[A, B, C], &[2, 4]);
+    let (a, b, c) = (volume_id(&h, A), volume_id(&h, B), volume_id(&h, C));
+    h.conn
+        .execute(
+            "UPDATE volumes SET status = 'retired' WHERE label = ?1",
+            params![B],
+        )
+        .unwrap();
+    let selection = select_write_positions(&h.conn, UNIT, B, None).unwrap();
+    let got: Vec<(i64, i64)> = selection
+        .positions
+        .iter()
+        .map(|wp| (wp.slice_number, wp.volume_id))
+        .collect();
+    let want: Vec<(i64, i64)> = (1..=n)
+        .map(|k| {
+            (
+                k,
+                if k <= 2 {
+                    a
+                } else if k <= 4 {
+                    b
+                } else {
+                    c
+                },
+            )
+        })
+        .collect();
+    assert_eq!(got, want, "slices 3 and 4 are read from the start tape");
+    assert!(selection.unheld.is_empty(), "{:?}", selection.unheld);
 }
 
 /// What a restore of the span, started on A, leaves when B is not given: the

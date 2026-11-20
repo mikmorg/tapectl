@@ -323,6 +323,8 @@ fn restore_through_drive(
             filled: Vec::new(),
             id_map: id_map_of(conn, plan.stage_set_id),
             tar_said: Vec::new(),
+            left_out_slices: plan.unheld.keys().copied().collect(),
+            left_out: plan.unheld.values().next().cloned(),
         });
     }
 
@@ -1340,6 +1342,8 @@ fn restore_unit_contacted(
         filled: trace.filled.clone(),
         id_map: id_map_of(conn, plan.stage_set_id),
         tar_said: trace.tar_said.clone(),
+        left_out_slices: Vec::new(),
+        left_out: None,
     })
 }
 
@@ -1926,6 +1930,9 @@ pub struct UnitOutcome {
     pub id_map: Vec<IdRow>,
     /// What tar said, repeated.
     pub tar_said: Vec<String>,
+    /// As [`RestoreReport::left_out_slices`], for a dry run.
+    pub left_out_slices: Vec<i64>,
+    pub left_out: Option<String>,
 }
 
 /// What a multi-unit restore did, unit by unit, in tape order.
@@ -2280,6 +2287,8 @@ impl PlannedUnit {
             filled: Vec::new(),
             id_map: Vec::new(),
             tar_said: Vec::new(),
+            left_out_slices: self.plan.unheld.keys().copied().collect(),
+            left_out: self.plan.unheld.values().next().cloned(),
         }
     }
 }
@@ -2387,7 +2396,19 @@ fn plan_set(
                 needs.extend(n.into_iter().flatten());
                 planned.push(unit);
             }
-            Err(e) if every_unit => {
+            // Only a refusal of this unit's plan is listed. A catalog error
+            // (the database busy, a failed read) is the command's, with its
+            // own exit code.
+            Err(e)
+                if every_unit
+                    && !matches!(
+                        e.unwrapped(),
+                        TapectlError::Database(_)
+                            | TapectlError::CatalogBusy(_)
+                            | TapectlError::DatabaseNeedsRepair(_)
+                            | TapectlError::Migration(_)
+                    ) =>
+            {
                 warn!(unit = %req.unit, error = %e, "unit cannot be planned, and is listed");
                 planned.push(PlannedUnit::refused(req, version, &e));
             }
@@ -2403,7 +2424,11 @@ fn plan_set(
              written to disk.",
         )?;
     }
-    planned.sort_by_key(PlannedUnit::first_position);
+    // The units that could not be planned come first, in the order asked: they
+    // are known before the drive opens, so `--fail-fast` stops before any
+    // unit is read, and without it they head the report. The rest follow in
+    // tape order.
+    planned.sort_by_key(|p| (p.refusal.is_none(), p.first_position()));
     Ok(planned)
 }
 
@@ -2657,6 +2682,12 @@ pub struct RestoreReport {
     pub id_map: Vec<IdRow>,
     /// What tar said, repeated (it is never the verdict, invariant 6).
     pub tar_said: Vec<String>,
+    /// The slices of the version no live volume holds (a dry run's word for
+    /// what a real restore would leave out and list), and the words that say
+    /// where the catalog last saw them. Empty for a version a live volume
+    /// holds whole.
+    pub left_out_slices: Vec<i64>,
+    pub left_out: Option<String>,
 }
 
 /// One slice of the selected version, as restore reads it off the volume.

@@ -532,27 +532,11 @@ pub fn run(
             };
 
             if json_output {
-                crate::render::print_json(&serde_json::json!({
-                    "unit": report.unit_name,
-                    "volume": report.volume_label,
-                    "version": report.version,
-                    "slices": report.slices,
-                    "destination": report.destination,
-                    "dry_run": report.dry_run,
-                    "substitutions": substitutions_json(&report.substitutions),
-                    "filled": filled_json(&report.filled),
-                    "id_map": id_map_json(&report.id_map),
-                    "tar_said": report.tar_said,
-                }));
+                crate::render::print_json(&unit_report_json(&report));
             } else if report.dry_run {
-                println!(
-                    "would restore \"{}\" v{} from {} ({}) to {}",
-                    report.unit_name,
-                    report.version,
-                    report.volume_label,
-                    crate::render::plural(report.slices as i64, "slice", "slices"),
-                    report.destination,
-                );
+                for line in unit_dry_run_lines(&report) {
+                    println!("{line}");
+                }
             } else {
                 println!(
                     "restored \"{}\" v{} from {} ({}) to {}",
@@ -1019,6 +1003,56 @@ fn no_volume_dry_run(command: &str) -> TapectlError {
     )
 }
 
+/// `restore unit --json`: what was restored, or what a dry run would.
+fn unit_report_json(report: &volume::restore::RestoreReport) -> serde_json::Value {
+    serde_json::json!({
+        "unit": report.unit_name,
+        "volume": report.volume_label,
+        "version": report.version,
+        "slices": report.slices,
+        "destination": report.destination,
+        "dry_run": report.dry_run,
+        // A dry run of a version with slices on no live volume would restore
+        // it in part: the files in those slices would be left out and
+        // listed (D17, item 266).
+        "outcome": if !report.dry_run {
+            "restored"
+        } else if report.left_out_slices.is_empty() {
+            "dry-run"
+        } else {
+            "dry-run-partial"
+        },
+        "left_out_slices": report.left_out_slices,
+        "left_out": report.left_out,
+        "substitutions": substitutions_json(&report.substitutions),
+        "filled": filled_json(&report.filled),
+        "id_map": id_map_json(&report.id_map),
+        "tar_said": report.tar_said,
+    })
+}
+
+/// `restore unit --dry-run`'s text: what would be restored, and, when slices
+/// are on no live volume, that it would be in part and what is left out.
+fn unit_dry_run_lines(report: &volume::restore::RestoreReport) -> Vec<String> {
+    let mut lines = vec![format!(
+        "would restore{} \"{}\" v{} from {} ({}) to {}",
+        if report.left_out.is_some() {
+            " in part"
+        } else {
+            ""
+        },
+        report.unit_name,
+        report.version,
+        report.volume_label,
+        crate::render::plural(report.slices as i64, "slice", "slices"),
+        report.destination,
+    )];
+    if let Some(why) = &report.left_out {
+        lines.push(format!("  not whole: {why}"));
+    }
+    lines
+}
+
 /// `restore volume`'s report, one line per unit in the order the units lie
 /// on the tape (the order they were restored in), then a summary.
 pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<String> {
@@ -1038,6 +1072,10 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
         };
         lines.push(match (&u.error, u.attempted, report.dry_run) {
             (Some(e), false, true) => format!("would not restore {what}: {e}"),
+            (_, _, true) if u.left_out.is_some() => format!(
+                "would restore {what} in part: {}",
+                u.left_out.as_deref().unwrap_or_default()
+            ),
             (_, _, true) => format!("would restore {what}"),
             (None, true, false) => format!("restored {what}"),
             (Some(e), _, false) => format!("FAILED {what}: {e}"),
@@ -1047,7 +1085,15 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
         lines.extend(id_map_lines(&u.id_map));
     }
     let total = report.units.len();
-    lines.push(if report.dry_run {
+    lines.push(if report.dry_run && report.failed() > 0 {
+        format!(
+            "would restore {} of {} from {} in one pass; {} could not be planned",
+            total - report.failed(),
+            crate::render::plural(total as i64, "unit", "units"),
+            report.volume_label,
+            report.failed()
+        )
+    } else if report.dry_run {
         format!(
             "would restore {} from {} in one pass",
             crate::render::plural(total as i64, "unit", "units"),
@@ -1070,10 +1116,12 @@ fn units_report_json(report: &volume::restore::UnitsReport) -> serde_json::Value
         .units
         .iter()
         .map(|u| {
-            let outcome = if report.dry_run {
-                "dry-run"
-            } else if u.error.is_some() {
+            let outcome = if u.error.is_some() {
                 "failed"
+            } else if report.dry_run && !u.left_out_slices.is_empty() {
+                "dry-run-partial"
+            } else if report.dry_run {
+                "dry-run"
             } else if u.attempted {
                 "restored"
             } else {
@@ -1090,13 +1138,15 @@ fn units_report_json(report: &volume::restore::UnitsReport) -> serde_json::Value
                 "filled": filled_json(&u.filled),
                 "id_map": id_map_json(&u.id_map),
                 "tar_said": u.tar_said,
+                "left_out_slices": u.left_out_slices,
+                "left_out": u.left_out,
             })
         })
         .collect();
     serde_json::json!({
         "volume": report.volume_label,
         "dry_run": report.dry_run,
-        "failed": if report.dry_run { 0 } else { report.failed() },
+        "failed": report.failed(),
         "units": units,
     })
 }
@@ -1200,5 +1250,106 @@ mod tests {
             .expect("clap leaves this to resolve");
         let err = doubled.resolve().unwrap_err().to_string();
         assert!(err.contains("\"x\" is one argument too many"), "{err}");
+    }
+
+    fn dry_report(left_out: Option<&str>, slices: &[i64]) -> volume::restore::RestoreReport {
+        volume::restore::RestoreReport {
+            unit_name: "u".into(),
+            volume_label: "L".into(),
+            version: 1,
+            slices: 3,
+            destination: "/d".into(),
+            dry_run: true,
+            success: true,
+            substitutions: Vec::new(),
+            filled: Vec::new(),
+            id_map: Vec::new(),
+            tar_said: Vec::new(),
+            left_out_slices: slices.to_vec(),
+            left_out: left_out.map(str::to_string),
+        }
+    }
+
+    /// restore-3: a dry run that would leave files out says so, in words and
+    /// in the JSON, and the outcome is not the whole restore's.
+    #[test]
+    fn a_dry_run_with_slices_on_no_live_volume_says_it_would_restore_in_part() {
+        let why = "unit \"u\" version 1: slices 4 to 6 of it are on no live volume";
+        let part = dry_report(Some(why), &[4, 5, 6]);
+        let lines = unit_dry_run_lines(&part);
+        assert!(
+            lines[0].starts_with("would restore in part \"u\""),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains(why)), "{lines:?}");
+        let json = unit_report_json(&part);
+        assert_eq!(json["outcome"], "dry-run-partial");
+        assert_eq!(json["left_out_slices"], serde_json::json!([4, 5, 6]));
+        assert_eq!(json["left_out"], why);
+        assert_eq!(json["dry_run"], true, "the existing field is stable");
+
+        let whole = dry_report(None, &[]);
+        assert!(unit_dry_run_lines(&whole)[0].starts_with("would restore \"u\""));
+        assert_eq!(unit_report_json(&whole)["outcome"], "dry-run");
+    }
+
+    /// restore-3 and restore-5 for `restore volume --dry-run`: a unit with
+    /// slices on no live volume would be restored in part, one that cannot be
+    /// planned would not be restored, and the summary and the JSON agree with
+    /// the exit status.
+    #[test]
+    fn a_volume_dry_run_counts_what_it_would_not_restore() {
+        use crate::volume::restore::short_tape::{short_tape, LABEL};
+        let t = short_tape();
+        let dest = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dest.path().join("alpha")).unwrap();
+        std::fs::write(dest.path().join("alpha").join("stray"), b"x").unwrap();
+        let report = volume::restore::restore_every_unit(
+            &t.conn,
+            &t.paths,
+            &crate::config::Config::default(),
+            LABEL,
+            &dest.path().to_string_lossy(),
+            &volume::restore::RestoreOptions::default(),
+            false,
+            "/nonexistent/nst",
+            4096,
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.failed(), 1, "{report:?}");
+        let lines = units_report_lines(&report);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("would not restore \"alpha\"")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("would restore \"bravo\"")
+                    && l.contains(" in part: ")
+                    && l.contains("slice 2 of it is on no live volume")),
+            "{lines:?}"
+        );
+        let last = lines.last().unwrap();
+        assert!(
+            last.contains("1 of 2 units") && last.contains("1 could not be planned"),
+            "{last}"
+        );
+        let json = units_report_json(&report);
+        assert_eq!(json["failed"], 1);
+        let outcome = |n: &str| {
+            json["units"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|u| u["unit"] == n)
+                .unwrap()["outcome"]
+                .clone()
+        };
+        assert_eq!(outcome("alpha"), "failed");
+        assert_eq!(outcome("bravo"), "dry-run-partial");
     }
 }
