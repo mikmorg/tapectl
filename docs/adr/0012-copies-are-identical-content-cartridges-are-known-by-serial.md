@@ -3853,3 +3853,9 @@ recommendation.
 volume is refused before the first cartridge is asked for". A restore from a tape that holds
 a range takes the files that tape holds whole and lists the rest, also when the rest is on no
 live volume, naming where the catalog last saw it.
+
+**A reading of item 299, recorded at its build (#581):** "with its link target's text, as any
+symbolic link does" means an ordinary `l` row. volume-format-v3.md §1.6 keeps no target in an
+`l` row ("a symbolic link's target is in the stream, not in the table"), and the format
+document outranks this record, so each name's row is written exactly as any symbolic link's
+is, and the target travels in the stream.
