@@ -9307,6 +9307,11 @@ pub enum StagedScope {
     /// happens to be staged. A rewrite plans under the fill ceiling and never
     /// past it (ADR-0012 items 142 and 289).
     Rewrite(Vec<i64>),
+    /// `volume rewrite --with-staged`'s write (#580): every staged set, as
+    /// [`StagedScope::Every`] takes them, but planned as a rewrite plans:
+    /// under the fill ceiling and never past it, since the sets it carries
+    /// may be a unit's only copy (T5.3; ADR-0012 items 142 and 288).
+    RewriteWithStaged,
     /// `volume write --for-location X` (#493, ADR-0012 item 151): the staged
     /// sets that still have need at X, chosen by `for_location`. Planned by
     /// policy like any ordinary write, so a span in progress whose earlier
@@ -9318,7 +9323,7 @@ impl StagedScope {
     /// The stage sets the scope names; `None` is every staged set.
     pub(crate) fn only(&self) -> Option<&[i64]> {
         match self {
-            StagedScope::Every => None,
+            StagedScope::Every | StagedScope::RewriteWithStaged => None,
             StagedScope::Rewrite(ids) | StagedScope::ForLocation(ids) => Some(ids),
         }
     }
@@ -9327,7 +9332,10 @@ impl StagedScope {
     /// cartridge's nominal capacity (D20): every write but a rewrite's, which
     /// may hold a unit's only copy (ADR-0012 item 142).
     pub(crate) fn may_plan_past_the_ceiling(&self) -> bool {
-        !matches!(self, StagedScope::Rewrite(_))
+        !matches!(
+            self,
+            StagedScope::Rewrite(_) | StagedScope::RewriteWithStaged
+        )
     }
 }
 
@@ -9346,7 +9354,10 @@ impl From<Option<&[i64]>> for StagedScope {
 /// The scope of the write after a rewrite's erase: `Some` the rewrite's own
 /// stage sets, `None` every staged set (`volume rewrite --with-staged`).
 pub(crate) fn rewrite_write_scope(only: Option<&[i64]>) -> StagedScope {
-    StagedScope::from(only)
+    match only {
+        Some(ids) => StagedScope::Rewrite(ids.to_vec()),
+        None => StagedScope::RewriteWithStaged,
+    }
 }
 
 /// One write's scope ([`volume_write_scoped`]): the staged sets it takes and
@@ -15373,6 +15384,11 @@ mod tests {
             [PlanClass::Queued]
         );
         assert!(StagedScope::Every.may_plan_past_the_ceiling());
+        assert!(
+            !StagedScope::RewriteWithStaged.may_plan_past_the_ceiling(),
+            "#580: --with-staged plans under the ceiling too"
+        );
+        assert_eq!(StagedScope::RewriteWithStaged.only(), None);
         assert!(
             !StagedScope::Rewrite(ids.to_vec()).may_plan_past_the_ceiling(),
             "a rewrite plans under the fill ceiling (item 142)"
