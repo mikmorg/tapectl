@@ -6853,7 +6853,7 @@ mod tests {
             msg.contains("unit \"unit1\"")
                 && msg.contains("backends.lto[\"hp\"].post_warning_bytes = 60M (60000000 bytes)")
                 && msg.contains("30000000 bytes")
-                && msg.contains("Lower it to at most")
+                && msg.contains("Set slice_size = ")
                 && msg.contains("Nothing was staged."),
             "names the unit, the key, the drive and the numbers: {msg}"
         );

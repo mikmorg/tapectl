@@ -3599,7 +3599,7 @@ mod tests {
             msg.contains("defaults.slice_size = 1.0 GiB (1073741824 bytes)")
                 && msg.contains("backends.lto[\"d\"].post_warning_bytes = 2G (2000000000 bytes)")
                 && msg.contains("1000000000 bytes")
-                && msg.contains("Lower it to at most")
+                && msg.contains("Set slice_size = ")
                 && msg.contains("ADR-0012 item 100"),
             "{msg}"
         );
