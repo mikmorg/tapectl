@@ -1929,11 +1929,10 @@ the tape inside it. Without the key the plan stops at the last slice that fits t
 ceiling, inside a unit if that is where it falls, and the rest continues on the next
 cartridge; nothing is written past the ceiling.
 
-`tapectl config check` says so, once per such drive (the line ends with the command that
-records the figure):
+`tapectl config check` says so, once per such drive:
 
 ```text
-note: drive "<name>" has no post_warning_bytes, so a write's plan stops at the fill ceiling and no slice cap applies; …
+note: drive "<name>" has no post_warning_bytes, so a write's plan stops at the fill ceiling (97% of the cartridge) instead of using the room past the drive's early warning (ADR-0012 item 113), and no slice cap keeps a slice and the seal inside that room (item 100). scripts/lto-profile.sh measures it (docs/lto-profiling.md); then `tapectl config set 'backends.lto[<name>].post_warning_bytes' <measured>`
 ```
 
 Give the drive its measured figure

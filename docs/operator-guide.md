@@ -1930,13 +1930,17 @@ the drive's fill ceiling less the end-of-tape reserve (and on to its plan bound
 when the drive declares `post_warning_bytes`):
 - what is already staged for the location goes first, and is never staged again
   (when it does not all fit, nothing more is planned, and a warning names it);
-- then a span in progress that continues there, then whole units, then units
-  that may span, and within each, group 1 before group 2. Within group 1 the
+- then the owed runs (a span in progress that continues there), then every other
+  unit in the one queue, group 1 before group 2 (no unit has a class of its own: every
+  unit may continue on the next cartridge, ADR-0012 items 288 and 289). Within group 1 the
   largest shortfall at the location comes first (0 copies there before 1 short),
   the fewest copies in all breaking ties; within group 2, the fewest copies in
   all; then the name (item 152);
 - next-fit: the first unit that does not fit closes the tape, and the rest are
-  named as waiting for the next tape for that location.
+  named as waiting for the next tape for that location. On a drive that declares
+  `post_warning_bytes` the unit that carries the plan past the cartridge's capacity
+  is the last the tape takes, and the drive's early warning ends the tape inside it;
+  the rest of it is written first on the next cartridge.
 
 `--dry-run` prints the plan and stages nothing:
 
@@ -2075,7 +2079,7 @@ interval, …) that units can be assigned to (`unit init --archive-set`). Policy
 resolves in three layers: the unit's dotfile, then its archive set, then
 `[defaults]` in config.toml. Not every key exists in every layer. A dotfile's
 `[policy]` table takes only `checksum_mode`, `compression`, `slice_size`,
-`warehouse_copies`, `allow_spanning` and `copies_at`. `required_locations` exists
+`warehouse_copies` and `copies_at`. `required_locations` exists
 only on an archive set; from 1.7.1 every layer can name places, with a count each,
 through `copies_at` ([Copies by location](#copies-by-location)). `verify_interval_days` exists on an archive set and in
 `[defaults]`, where it is 365 days when the file does not say, so every unit has one.
@@ -2210,8 +2214,9 @@ volumes due a verify and the next commands
 ([Status: where things stand](#status-where-things-stand)); `report summary`
 became it in 1.9.0, and `stage list` holds what its `Staging` line counted.
 
-From 1.7.0 a unit that allows spanning may be held across cartridges, as
-ranges (runs of its slices, one per tape). A range is not a copy on its own.
+A unit may be held across cartridges, as
+ranges (runs of its slices, one per tape): every unit continues on the next cartridge at
+the drive's early warning, with nothing to set (ADR-0012 items 288 and 289). A range is not a copy on its own.
 `report copies` lists a tape that holds a range of a unit's current version
 among its tapes, and names it on a `ranges:` line under the unit, with the
 slices it holds.
