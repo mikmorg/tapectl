@@ -8268,46 +8268,6 @@ pub struct StagedSlice {
     pub prior: Option<String>,
 }
 
-/// Refuse `command` on the volume labelled `label` when it holds a range
-/// (1.7.0, #478; `layout-session.md` "From 1.7.0", ADR-0012 item 133):
-/// `volume rewrite` and compaction (`compact-read`, `compact-finish`, and
-/// `volume compact` through them) refuse such a volume, naming each range,
-/// its unit, version and the run of slices the volume holds. `why` says why
-/// the command does not carry a range; `outcome` what was left as it was.
-///
-/// Catalog only, so every caller asks it before the tape is read and before
-/// anything is staged or changed. Any `range` row the volume holds refuses,
-/// whatever its version's status: carrying a range forward is its own design
-/// and nothing needs it yet (item 133).
-pub(crate) fn refuse_range_holder(
-    conn: &Connection,
-    label: &str,
-    command: &str,
-    why: &str,
-    outcome: &str,
-) -> Result<()> {
-    let ranges = recorded_ranges(conn, label)?;
-    if ranges.is_empty() {
-        return Ok(());
-    }
-    let named: Vec<String> = ranges.iter().map(RecordedRange::describe).collect();
-    let holds = if ranges.len() == 1 {
-        "a range, one run of the slices of a unit that spans cartridges"
-    } else {
-        "ranges, each one run of the slices of a unit that spans cartridges"
-    };
-    Err(TapectlError::Other(format!(
-        "{command} refused: volume \"{label}\" holds {holds}: {}. {why} {outcome}",
-        named.join(", ")
-    )))
-}
-
-/// Why compaction does not carry a range ([`refuse_range_holder`]).
-pub(crate) const COMPACTION_CARRIES_NO_RANGE: &str =
-    "Compaction carries a volume's live units to another tape whole, and a range is not a \
-     whole unit: carrying one forward is its own design, not built in 1.7.0 (ADR-0012 item \
-     133).";
-
 /// Compact-read: read live encrypted slices from a volume to staging.
 /// "Live" means the snapshot is NOT reclaimable or purged.
 ///
@@ -8397,6 +8357,8 @@ fn compact_read_contacted(
             "no live slices on volume \"{label}\""
         )));
     }
+
+    refuse_runs_that_do_not_join(conn, label, &live_slices)?;
 
     let staging_dir = &config.staging.directory;
     let compact_dir = std::path::Path::new(staging_dir).join(format!("compact-{label}"));
@@ -8515,6 +8477,62 @@ fn compact_read_contacted(
             })
             .collect(),
     })
+}
+
+/// Refuse, before anything is read, a read that would leave one staging with
+/// runs of slices that do not join (T5.3; ADR-0012 item 122): the slices
+/// `live` holds of a set, with those of it already staged (another source's
+/// compact-read, a `read-slices`), must be one unbroken run, because a
+/// destination holds at most one unbroken range of a stage set and writes the
+/// run it was staged as. Names the staging.
+fn refuse_runs_that_do_not_join(
+    conn: &Connection,
+    label: &str,
+    live: &[RecoverySlice],
+) -> Result<()> {
+    let sets: std::collections::BTreeSet<i64> = live.iter().map(|s| s.stage_set_id).collect();
+    for set in sets {
+        let mut numbers: std::collections::BTreeSet<i64> = conn
+            .prepare(
+                "SELECT slice_number FROM stage_slices
+                 WHERE stage_set_id = ?1 AND staging_path IS NOT NULL",
+            )?
+            .query_map(params![set], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for s in live.iter().filter(|s| s.stage_set_id == set) {
+            numbers.insert(conn.query_row(
+                "SELECT slice_number FROM stage_slices WHERE id = ?1",
+                params![s.slice_id],
+                |r| r.get(0),
+            )?);
+        }
+        let (Some(first), Some(last)) = (numbers.iter().next(), numbers.iter().next_back()) else {
+            continue;
+        };
+        if (last - first + 1) as usize == numbers.len() {
+            continue;
+        }
+        let (unit, version): (String, i64) = conn.query_row(
+            "SELECT u.name, s.version FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id WHERE ss.id = ?1",
+            params![set],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        return Err(TapectlError::Other(format!(
+            "volume compact-read refused: with the slices of \"{label}\", the staging of \
+             \"{unit}\" v{version} would hold slices {} that do not join into one unbroken \
+             run, and a volume holds at most one unbroken range of a stage set (ADR-0012 item \
+             122). Compact the volume that holds the slices between them in the same \
+             destination, or write what is staged first. Nothing was read or staged.",
+            numbers
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// What [`compact_read_into`] read.
@@ -8725,9 +8743,10 @@ pub struct CompactFinishReport {
 /// Tier 1 (ADR-0004) is unchanged and never gates: evidence age for the
 /// units that DO retain coverage is shown at the moment consent is asked.
 ///
-/// Before the gates (1.7.0, #478): a volume holding a range is refused by
-/// name, as `compact-read` refuses it ([`refuse_range_holder`], ADR-0012
-/// item 133), so no gate is asked about it.
+/// Gate 1 asks [`coverage::sole_slices`], which reads a `range` write on
+/// both sides (T5.3; ADR-0012 item 288 over item 133): a volume holding a
+/// range is retired only when every slice of that range is held by another
+/// eligible volume.
 pub fn compact_finish(
     conn: &Connection,
     config: &crate::config::Config,
@@ -8752,40 +8771,21 @@ pub fn compact_finish(
         &format!("retire volume \"{label}\" (compact-finish)"),
     )?;
 
-    // 1.7.0 (#478, X25; ADR-0012 item 133): as `compact-read`, a volume
-    // holding a range is refused by name before anything is retired.
-    // `volume compact`'s step 3 is this function.
-    refuse_range_holder(
-        conn,
-        label,
-        "volume compact-finish",
-        COMPACTION_CARRIES_NO_RANGE,
-        "Nothing was changed.",
-    )?;
-
-    // Guard: verify all live slices exist on at least one other volume
-    let mut stmt = conn.prepare(
-        "SELECT u.name, sl.slice_number
-         FROM write_positions wp
-         JOIN writes w ON w.id = wp.write_id
-         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-         JOIN stage_sets sts ON sts.id = sl.stage_set_id
-         JOIN snapshots s ON s.id = sts.snapshot_id
-         JOIN units u ON u.id = s.unit_id
-         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
-           AND s.status NOT IN ('reclaimable', 'purged')
-           AND NOT EXISTS (
-             SELECT 1 FROM write_positions wp2
-             JOIN writes w2 ON w2.id = wp2.write_id
-             WHERE wp2.stage_slice_id = wp.stage_slice_id
-               AND w2.volume_id != ?1
-               AND w2.status = 'completed'
-               AND wp2.status = 'written'
-           )",
-    )?;
-    let unprotected: Vec<(String, i64)> = stmt
-        .query_map(params![vol_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Guard: every live slice the volume holds, a range's included, is held
+    // by another eligible volume (T5.3; ADR-0012 item 288 over item 133).
+    // `sole_slices` is the one reading of that, shared with `volume rewrite`:
+    // a `completed` write or a `range` elsewhere counts, a volume that is
+    // retired, erased or quarantined does not.
+    let sole = coverage::sole_slices(conn, vol_id)?;
+    let mut unprotected: Vec<(String, i64)> = Vec::new();
+    for s in &sole {
+        let number: i64 = conn.query_row(
+            "SELECT slice_number FROM stage_slices WHERE id = ?1",
+            params![s.stage_slice_id],
+            |r| r.get(0),
+        )?;
+        unprotected.push((s.unit_name.clone(), number));
+    }
 
     if !unprotected.is_empty() {
         let examples: Vec<String> = unprotected
@@ -10224,13 +10224,13 @@ mod tests {
             assert_eq!(status_of(&conn, "L6-SRC"), "retired");
         }
 
-        /// 1.7.0 (#478, X25; ADR-0012 item 133): a source that also holds a
-        /// range of another unit is refused by name before any gate, and
-        /// `--force`/`--yes` does not reach past it; nothing is retired and
-        /// no event is logged. Positive control: the same catalog without
-        /// the range retires with no consent, as the test above.
+        /// T5.3 (ADR-0012 item 288 over item 133): a source that also holds a
+        /// range of another unit is retired only when every slice of the
+        /// range is held by another eligible volume. Held by none, tier 3
+        /// refuses outright whatever `--yes` says, nothing is retired and no
+        /// event is logged; held elsewhere as a range, it retires.
         #[test]
-        fn a_volume_holding_a_range_is_refused_by_name_whatever_yes_says() {
+        fn a_range_slice_with_no_other_holder_refuses_compact_finish_whatever_yes_says() {
             let conn = setup(true);
             conn.execute_batch(
                 "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
@@ -10266,14 +10266,14 @@ mod tests {
                 .unwrap();
 
             let err = compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
-                .expect_err("a range is refused before any gate");
-            assert_eq!(
-                err.to_string(),
-                "volume compact-finish refused: volume \"L6-SRC\" holds a range, one run of \
-                 the slices of a unit that spans cartridges: \"spanner\" v3 (slices 1-2). \
-                 Compaction carries a volume's live units to another tape whole, and a range \
-                 is not a whole unit: carrying one forward is its own design, not built in \
-                 1.7.0 (ADR-0012 item 133). Nothing was changed."
+                .expect_err("a range slice no other volume holds is refused outright");
+            let text = err.to_string();
+            assert!(
+                text.contains(
+                    "cannot retire \"L6-SRC\": 2 live slice(s) have no copy on another volume"
+                ) && text.contains("spanner slice 1")
+                    && text.contains("spanner slice 2"),
+                "{text}"
             );
             assert_eq!(status_of(&conn, "L6-SRC"), "sealed");
             let after: i64 = conn
@@ -10281,14 +10281,28 @@ mod tests {
                 .unwrap();
             assert_eq!(after, events, "nothing was logged");
 
+            // Another eligible volume holds the same two slices as a range of
+            // its own: a copy elsewhere, so the gate passes.
             conn.execute_batch(
-                "DELETE FROM write_positions WHERE write_id IN
-                     (SELECT id FROM writes WHERE status = 'range');
-                 DELETE FROM writes WHERE status = 'range';",
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                     VALUES ('L6-OTH', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed');
+                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT w.stage_set_id, w.snapshot_id, v.id, 'range'
+                     FROM writes w, volumes v
+                     WHERE w.status = 'range' AND w.volume_id <> v.id AND v.label = 'L6-OTH';
+                 INSERT INTO write_positions (write_id, stage_slice_id, position, status,
+                                              sha256_on_volume)
+                     SELECT ow.id, wp.stage_slice_id, wp.position, 'written', wp.sha256_on_volume
+                     FROM write_positions wp JOIN writes sw ON sw.id = wp.write_id
+                     JOIN volumes sv ON sv.id = sw.volume_id AND sv.label = 'L6-SRC'
+                     JOIN volumes ov ON ov.label = 'L6-OTH'
+                     JOIN writes ow ON ow.volume_id = ov.id AND ow.stage_set_id = sw.stage_set_id
+                     WHERE sw.status = 'range' AND wp.status = 'written';",
             )
             .unwrap();
-            compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", false)
-                .expect("without the range, no gate");
+            compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
+                .expect("a range held elsewhere as a range is a copy");
             assert_eq!(status_of(&conn, "L6-SRC"), "retired");
         }
 

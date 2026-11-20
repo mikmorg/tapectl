@@ -3721,30 +3721,31 @@ impl CompactionRow {
     }
 }
 
-/// Compaction rows for every sealed volume holding completed writes, least
-/// utilized first. Group-A (issue #96): compaction only ever targets a
-/// *finished* volume, so this is the ADR-0004 `sealed` predicate. The one
-/// derivation behind both `report compaction-candidates` and `audit`'s
-/// `compaction_candidate` check (issue #353) — never a second copy.
+/// Compaction rows for every sealed volume holding completed writes or
+/// ranges, least utilized first. Group-A (issue #96): compaction only ever
+/// targets a *finished* volume, so this is the ADR-0004 `sealed` predicate.
+/// The one derivation behind both `report compaction-candidates` and
+/// `audit`'s `compaction_candidate` check (issue #353) — never a second copy.
 ///
-/// A volume that holds a `range` is no row at all (#478, coordinator fork
-/// X25): `volume rewrite` and every compaction command refuse it, naming the
-/// range (ADR-0012 item 133), so flagging it would send the operator to a
-/// command that refuses. The planner (`plan_candidates`) reads these rows, so
-/// it never groups one either.
+/// A volume that holds a `range` is a row like any other (T5.3; ADR-0012
+/// item 288 over item 133: compaction carries a range), sized by what it
+/// holds: a `completed` write holds every slice of its set, a `range` the
+/// slices it has `written`.
 pub(crate) fn compaction_candidate_rows(conn: &Connection) -> Result<Vec<CompactionRow>> {
     let sql = format!(
         "SELECT v.label,
                 SUM(CASE WHEN s.status NOT IN ('reclaimable','purged') THEN ss.encrypted_bytes ELSE 0 END) as live_bytes,
                 SUM(CASE WHEN s.status IN ('reclaimable','purged') THEN ss.encrypted_bytes ELSE 0 END) as reclaimable_bytes
          FROM volumes v
-         JOIN writes w ON w.volume_id = v.id AND w.status = 'completed'
+         JOIN writes w ON w.volume_id = v.id AND w.status IN ('completed', 'range')
          JOIN stage_sets sts ON sts.id = w.stage_set_id
          JOIN snapshots s ON s.id = sts.snapshot_id
          JOIN stage_slices ss ON ss.stage_set_id = sts.id
+              AND (w.status = 'completed'
+                   OR EXISTS (SELECT 1 FROM write_positions wp
+                               WHERE wp.write_id = w.id AND wp.stage_slice_id = ss.id
+                                 AND wp.status = 'written'))
          WHERE {}
-           AND NOT EXISTS (SELECT 1 FROM writes rw
-                            WHERE rw.volume_id = v.id AND rw.status = 'range')
          GROUP BY v.id
          ORDER BY live_bytes * 1.0 / NULLIF(live_bytes + reclaimable_bytes, 0) ASC, v.label ASC",
         crate::policy::coverage::eligible("v")
@@ -3815,6 +3816,9 @@ pub(crate) struct PlanCandidate {
     pub label: String,
     pub live: std::collections::BTreeMap<i64, i64>,
     pub reclaimable_bytes: i64,
+    /// Each live slice's `(stage set, slice number)`, by slice id: what the
+    /// join check reads. Empty means no check.
+    pub numbers: std::collections::BTreeMap<i64, (i64, i64)>,
 }
 
 /// Candidates whose union of live slices fits one destination tape.
@@ -3839,6 +3843,26 @@ impl PlanGroup {
             all.extend(m.live.iter().map(|(k, v)| (*k, *v)));
         }
         all
+    }
+
+    /// The runs of `extra` and of the members join: of each stage set they
+    /// hold slices of, the union is one unbroken run. A destination holds at
+    /// most one unbroken range of a stage set (item 122), so two sources
+    /// whose runs do not join are not paired.
+    fn joins(&self, extra: &PlanCandidate) -> bool {
+        let mut sets: std::collections::BTreeMap<i64, std::collections::BTreeSet<i64>> =
+            Default::default();
+        for m in self.members.iter().chain(std::iter::once(extra)) {
+            for (set, number) in m.numbers.values() {
+                sets.entry(*set).or_default().insert(*number);
+            }
+        }
+        sets.values().all(|n| {
+            n.iter()
+                .next_back()
+                .zip(n.iter().next())
+                .is_none_or(|(last, first)| (last - first + 1) as usize == n.len())
+        })
     }
 
     fn live_bytes_with(&self, extra: &PlanCandidate) -> i64 {
@@ -3895,7 +3919,7 @@ pub(crate) fn plan_compaction(
         match plan
             .groups
             .iter_mut()
-            .find(|g| g.live_bytes_with(&cand) <= budget)
+            .find(|g| g.live_bytes_with(&cand) <= budget && g.joins(&cand))
         {
             Some(group) => group.members.push(cand),
             None => plan.groups.push(PlanGroup {
@@ -3966,26 +3990,41 @@ fn plan_candidates(conn: &Connection, config: &Config) -> Result<Vec<PlanCandida
         .into_iter()
         .filter(|r| r.is_candidate(threshold))
     {
-        // The live slices `compact-read` would stage: a completed write of a
-        // snapshot that is neither reclaimable nor purged.
+        // The live slices `compact-read` would stage: the slices a completed
+        // write or a range of a snapshot neither reclaimable nor purged holds.
         let mut stmt = conn.prepare(
-            "SELECT sl.id, sl.encrypted_bytes
+            "SELECT sl.id, sl.encrypted_bytes, sts.id, sl.slice_number
              FROM volumes v
-             JOIN writes w ON w.volume_id = v.id AND w.status = 'completed'
+             JOIN writes w ON w.volume_id = v.id AND w.status IN ('completed', 'range')
              JOIN stage_sets sts ON sts.id = w.stage_set_id
              JOIN snapshots s ON s.id = sts.snapshot_id
              JOIN stage_slices sl ON sl.stage_set_id = sts.id
+                  AND (w.status = 'completed'
+                       OR EXISTS (SELECT 1 FROM write_positions wp
+                                   WHERE wp.write_id = w.id AND wp.stage_slice_id = sl.id
+                                     AND wp.status = 'written'))
              WHERE v.label = ?1 AND s.status NOT IN ('reclaimable', 'purged')",
         )?;
-        let live = stmt
+        let held = stmt
             .query_map([&row.label], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
             })?
-            .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let live = held.iter().map(|(id, bytes, ..)| (*id, *bytes)).collect();
+        let numbers = held
+            .iter()
+            .map(|(id, _, set, number)| (*id, (*set, *number)))
+            .collect();
         out.push(PlanCandidate {
             label: row.label,
             live,
             reclaimable_bytes: row.reclaimable_bytes,
+            numbers,
         });
     }
     Ok(out)
@@ -5940,13 +5979,13 @@ mod tests {
             );
         }
 
-        /// #478 (coordinator fork X25): a volume holding a `range` is no
-        /// compaction row, however much of it is reclaimable: `volume
-        /// rewrite` and compaction refuse it (ADR-0012 item 133). So `audit`
-        /// does not flag it and the planner (`plan_candidates`, built from
-        /// these rows) never groups it. Its neighbour without a range stays.
+        /// T5.3 (ADR-0012 item 288 over item 133): a volume holding a
+        /// `range` is a compaction row like its neighbour, so `audit` flags it
+        /// and the planner (`plan_candidates`, built from these rows) groups
+        /// it. A range counts the slices it holds (`written` positions): the
+        /// one seeded here holds none, so its row is as it was.
         #[test]
-        fn compaction_rows_exclude_a_volume_holding_a_range() {
+        fn compaction_rows_include_a_volume_holding_a_range() {
             let (conn, unit) = setup();
             seed_written_volume(&conn, unit, "SPAN01", "sealed", 1000, 100, 900);
             seed_written_volume(&conn, unit, "WHOLE01", "sealed", 1000, 100, 900);
@@ -5979,7 +6018,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(labels(&conn), ["WHOLE01"]);
+            assert_eq!(labels(&conn), ["SPAN01", "WHOLE01"]);
             let config = Config::default();
             assert_eq!(
                 plan_candidates(&conn, &config)
@@ -5987,8 +6026,8 @@ mod tests {
                     .into_iter()
                     .map(|c| c.label)
                     .collect::<Vec<_>>(),
-                ["WHOLE01"],
-                "the planner never groups a range volume"
+                ["SPAN01", "WHOLE01"],
+                "the planner takes a range volume"
             );
         }
 
@@ -7650,7 +7689,40 @@ Read error counter page  [0x3]
                 label: label.to_string(),
                 live: live.iter().copied().collect::<BTreeMap<_, _>>(),
                 reclaimable_bytes,
+                numbers: Default::default(),
             }
+        }
+
+        /// `cand` whose slices are numbered: `(slice id, bytes, stage set,
+        /// slice number)`.
+        fn numbered(
+            label: &str,
+            live: &[(i64, i64, i64, i64)],
+            reclaimable_bytes: i64,
+        ) -> PlanCandidate {
+            PlanCandidate {
+                label: label.to_string(),
+                live: live.iter().map(|&(id, bytes, ..)| (id, bytes)).collect(),
+                reclaimable_bytes,
+                numbers: live.iter().map(|&(id, _, set, n)| (id, (set, n))).collect(),
+            }
+        }
+
+        /// T5.3: two sources are paired onto one destination only when their
+        /// runs of a staging join into one unbroken run (item 122). Runs 1-2
+        /// and 3-3 join; 1-2 and 4-4 do not, and are planned apart. A source
+        /// holding a different staging joins anything.
+        #[test]
+        fn sources_are_paired_only_when_their_runs_of_a_staging_join() {
+            let a = numbered("A", &[(1, 10, 7, 1), (2, 10, 7, 2)], 50);
+            let joins = numbered("B", &[(3, 10, 7, 3)], 40);
+            let apart = numbered("C", &[(5, 10, 7, 5)], 30);
+            let other = numbered("D", &[(9, 10, 8, 1)], 20);
+            let plan = plan_compaction(vec![a.clone(), joins, apart, other], 1000);
+            assert_eq!(labels(&plan), [vec!["A", "B", "D"], vec!["C"]]);
+            // Positive control: unnumbered candidates are not checked.
+            let plan = plan_compaction(vec![a, cand("C", &[(5, 10)], 30)], 1000);
+            assert_eq!(labels(&plan), [vec!["A", "C"]]);
         }
 
         fn labels(plan: &CompactionPlan) -> Vec<Vec<&str>> {

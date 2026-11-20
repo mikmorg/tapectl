@@ -38,8 +38,11 @@ struct MemSteps<'a> {
     fail_write: Cell<bool>,
     /// `(step, slices planned)` at the rehearsal and at the write: what
     /// `volume write` would plan for every staged set, `(unit, slice)`.
-    planned: RefCell<Vec<(String, Vec<(String, i64)>)>>,
+    planned: RefCell<Vec<Planned>>,
 }
+
+/// `(step, slices planned)`: `(unit, slice number)` in plan order.
+type Planned = (String, Vec<(String, i64)>);
 
 /// What a write would plan now, `(unit, slice number)` in plan order.
 fn planned_now(h: &Home) -> Vec<(String, i64)> {
@@ -302,7 +305,7 @@ fn options<'a>(source: &'a str, destination: &'a str) -> RewriteOptions<'a> {
 struct Ran {
     result: Result<RewriteReport>,
     log: Vec<String>,
-    planned: Vec<(String, Vec<(String, i64)>)>,
+    planned: Vec<Planned>,
 }
 
 /// `volume rewrite SOURCE --label DESTINATION` of `h`, the typed consent
@@ -678,4 +681,202 @@ fn a_volume_holding_a_tail_and_a_head_is_rewritten_and_each_unit_restores_whole(
     };
     assert_eq!(rehearsal, write);
     assert_both_restore(&h, (T2[0], "TLH-T2R"), ("TLH-T2R", T2[2]));
+}
+
+// ── compaction of a range ──
+
+/// `volume compact-read` of `label`, from a copy of its recorded medium.
+fn compact_read_from(h: &Home, label: &str) -> Result<CompactReadReport> {
+    let mut store = copy_of(&h.tapes[label]);
+    write::compact_read(
+        &h.conn,
+        &h.config,
+        label,
+        &mut store,
+        ContactSite::new(
+            &h.config,
+            Operation::VolumeCompactRead,
+            DEVICE,
+            Medium::NoBackend,
+        ),
+    )
+}
+
+/// `volume compact-write` to `label`: an ordinary write of everything staged,
+/// with the full readback.
+fn compact_write_to(h: &mut Home, label: &str) {
+    write_full(h, label, Warn::Never);
+}
+
+fn compact_finish(h: &Home, label: &str) -> Result<()> {
+    write::compact_finish(&h.conn, &h.config, label, true).map(|_| ())
+}
+
+/// A range-only source is compacted: read, written as the run it was onto a
+/// new volume, and retired by `compact-finish`, which first asks that every
+/// slice it holds is held elsewhere. The destination holds a range of 1-2,
+/// the unit restores whole from it and the cartridge holding the rest, and
+/// `compact-finish` refuses before the write while the range's slices have no
+/// other holder.
+#[test]
+fn a_range_only_source_is_compacted_and_compact_finish_waits_for_the_other_holder() {
+    let mut h = range_only_home();
+    h.volume("RNG-C");
+    let read = compact_read_from(&h, R1[0]).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(read.slices_read, 2);
+    let err = compact_finish(&h, R1[0])
+        .expect_err("the range's slices are held by no other volume yet")
+        .to_string();
+    assert!(
+        err.contains("2 live slice(s) have no copy on another volume"),
+        "{err}"
+    );
+    assert_eq!(volume_status(&h.conn, R1[0]), "sealed");
+
+    compact_write_to(&mut h, "RNG-C");
+    assert_eq!(
+        write::recorded_ranges(&h.conn, "RNG-C").unwrap(),
+        [range(B1, 1, 2)],
+        "the carried run stays a range"
+    );
+    compact_finish(&h, R1[0]).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(volume_status(&h.conn, R1[0]), "retired");
+    assert_eq!(snapshot_status(&h.conn, B1), "current");
+    assert_eq!(slice_copies(&h.conn, B1), [1, 1, 1]);
+    let mut b = bay(&h, "RNG-C", &[Reply::Load(R1[1])]);
+    let (r, dest) = restore(
+        &h,
+        B1,
+        What::Unit,
+        Some("RNG-C"),
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    r.unwrap_or_else(|e| panic!("restore: {e}"));
+    assert_restored(&h, B1, dest.path());
+}
+
+/// The volume holding the tail of one unit and the head of another is
+/// compacted, and each unit restores whole from its cartridges.
+#[test]
+fn a_volume_holding_a_tail_and_a_head_is_compacted_and_each_unit_restores_whole() {
+    let mut h = tail_and_head_home();
+    h.volume("TLH-C");
+    compact_read_from(&h, T2[1]).unwrap_or_else(|e| panic!("{e}"));
+    compact_write_to(&mut h, "TLH-C");
+    assert_eq!(
+        write::recorded_ranges(&h.conn, "TLH-C").unwrap(),
+        [range(X2, 3, 3), range(Y2, 1, 2)]
+    );
+    compact_finish(&h, T2[1]).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(volume_status(&h.conn, T2[1]), "retired");
+    assert_both_restore(&h, (T2[0], "TLH-C"), ("TLH-C", T2[2]));
+}
+
+/// A volume is sized, as a compaction candidate, by what it holds: a range
+/// counts its own slices, not its set's.
+#[test]
+fn a_volume_holding_a_range_is_a_compaction_candidate_sized_by_its_slices() {
+    let h = range_only_home();
+    let rows = crate::cli::report::compaction_candidate_rows(&h.conn).unwrap();
+    let held = |label: &str| -> i64 {
+        h.conn
+            .query_row(
+                "SELECT SUM(sl.encrypted_bytes) FROM write_positions wp
+                   JOIN writes w ON w.id = wp.write_id
+                   JOIN volumes v ON v.id = w.volume_id
+                   JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                  WHERE v.label = ?1 AND wp.status = 'written'",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    for label in R1 {
+        let row = rows
+            .iter()
+            .find(|r| r.label == label)
+            .unwrap_or_else(|| panic!("{label} is a row: {rows:?}"));
+        assert_eq!(row.live_bytes, held(label), "{label}");
+    }
+}
+
+/// Two sources whose runs of one staging do not join are refused onto one
+/// destination, by hand, before the second is read: tape 1 holds slices 1-2
+/// of five, tape 2 slice 3, tape 3 slices 4-5; reading tape 1 and then
+/// tape 3 would stage 1-2 and 4-5.
+#[test]
+fn two_sources_whose_runs_do_not_join_are_refused_naming_the_staging() {
+    let mut h = Home::new(None, 1, "64K");
+    let unit = "kumquat-zspan-delta";
+    h.unit(TENANT_ONE, unit, files("delta-reel", &[50_000; 5], 9));
+    h.stage(unit);
+    assert_eq!(num_slices(&h.conn, unit), 5);
+    for label in ["JN-T1", "JN-T2", "JN-T3"] {
+        h.volume(label);
+    }
+    write_full(&mut h, "JN-T1", Warn::InSlice(unit, 2));
+    write_full(&mut h, "JN-T2", Warn::InSlice(unit, 3));
+    write_full(&mut h, "JN-T3", Warn::Never);
+    assert_eq!(
+        write::recorded_ranges(&h.conn, "JN-T3").unwrap(),
+        [range(unit, 4, 5)]
+    );
+    compact_read_from(&h, "JN-T1").unwrap_or_else(|e| panic!("{e}"));
+    let err = compact_read_from(&h, "JN-T3")
+        .expect_err("1-2 and 4-5 do not join")
+        .to_string();
+    assert!(
+        err.contains(unit) && err.contains("1, 2, 4, 5") && err.contains("unbroken"),
+        "{err}"
+    );
+    assert!(err.contains("Nothing was read or staged"), "{err}");
+    // The joining neighbour is taken.
+    compact_read_from(&h, "JN-T2").unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// A rewritten volume and a compacted one each rebuild, from the tape's own
+/// envelope, to the rows the writing catalog holds for it: its writes, its
+/// positions and its ending, and the slice rows the manifest carries.
+#[test]
+fn a_rewritten_and_a_compacted_volume_rebuild_to_the_same_rows() {
+    let mut h = range_only_home();
+    rewrite_volume(&mut h, R1[0], "RNG-T1R")
+        .0
+        .unwrap_or_else(|e| panic!("{e}"));
+    h.volume("RNG-C");
+    // Compact tape 2 (slice 3) as well.
+    compact_read_from(&h, R1[1]).unwrap_or_else(|e| panic!("{e}"));
+    compact_write_to(&mut h, "RNG-C");
+    compact_finish(&h, R1[1]).unwrap_or_else(|e| panic!("{e}"));
+    let labels = ["RNG-C", "RNG-T1R"];
+    let mine = |rows: Vec<WriteRow>| -> Vec<WriteRow> {
+        rows.into_iter()
+            .filter(|r| labels.contains(&r.0.as_str()))
+            .collect()
+    };
+    let dir = TempDir::new().unwrap();
+    let fresh = crate::db::open(&dir.path().join("rebuilt.db")).unwrap();
+    for label in labels {
+        rebuild(&h, &fresh, label);
+    }
+    assert_eq!(mine(write_rows(&fresh)), mine(write_rows(&h.conn)));
+    let pos = |rows: Vec<PositionRow>| -> Vec<PositionRow> {
+        rows.into_iter()
+            .filter(|r| labels.contains(&r.0.as_str()))
+            .collect()
+    };
+    assert_eq!(pos(position_rows(&fresh)), pos(position_rows(&h.conn)));
+    assert_eq!(slice_rows(&fresh), slice_rows(&h.conn));
+    let vols = |rows: Vec<(String, bool, Option<i64>)>| -> Vec<(String, bool, Option<i64>)> {
+        rows.into_iter()
+            .filter(|r| labels.contains(&r.0.as_str()))
+            .collect()
+    };
+    assert_eq!(vols(volume_rows(&fresh)), vols(volume_rows(&h.conn)));
+    assert_eq!(
+        rewrite::holds(&h.conn).unwrap().len(),
+        0,
+        "no hold is left open"
+    );
 }

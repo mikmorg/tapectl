@@ -1967,6 +1967,9 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 /// `volumes.bytes_written` (which includes the fixed per-volume metadata
 /// and made every small fresh volume look half dead).
 ///
+/// A volume holding a `range` is a candidate like any other, sized by the
+/// slices it holds (T5.3; ADR-0012 item 288 over item 133).
+///
 /// The caller keeps the `unit_filter.is_none()` gate: this is a volume-level
 /// check and must not start firing for `audit --unit X`.
 fn compaction_findings(conn: &Connection, threshold: f64) -> Result<Vec<AuditFinding>> {

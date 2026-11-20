@@ -3347,6 +3347,32 @@ mod tests {
         assert!(refuse(&none, "SRC", "NEW").contains("no live slices"));
     }
 
+    /// The sentence that says where a rewrite's data went names a volume
+    /// holding it as a fully read back `range` too (T5.3).
+    #[test]
+    fn the_volumes_named_as_holding_the_data_include_a_fully_read_back_range() {
+        let s = scene(1);
+        let other = add_volume(&s.w, "OTHER", "sealed");
+        add_write(&s.w, other, &s.keepsake, &[4, 5], true);
+        s.w.conn
+            .execute(
+                "UPDATE writes SET status = 'range' WHERE volume_id = ?1",
+                params![other],
+            )
+            .unwrap();
+        // The source is retired, as it is when this sentence is said.
+        s.w.conn
+            .execute(
+                "UPDATE volumes SET status = 'retired' WHERE label = 'SRC'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            fully_read_back_holders(&s.w.conn, &[s.keepsake.stage_set_id]).unwrap(),
+            ["OTHER"]
+        );
+    }
+
     /// T5.3 (ADR-0012 item 288 over item 133): a source volume that holds a
     /// range is planned, not refused. Its slices are the range's, the
     /// typed consent names the version and the slices the volume alone
