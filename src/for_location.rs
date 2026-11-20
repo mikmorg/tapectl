@@ -2144,8 +2144,9 @@ mod tests {
             plan.skipped,
             [Skipped {
                 unit: "lost".into(),
-                reason: "live volumes together do not hold every slice of v1, so it cannot be read back"
-                    .into(),
+                reason:
+                    "live volumes together do not hold every slice of v1, so it cannot be read back"
+                        .into(),
             }]
         );
         let paths = TapectlPaths::new(c.tmp.path().join("home"));

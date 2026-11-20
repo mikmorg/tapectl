@@ -1017,19 +1017,6 @@ fn check_location_presence(
         .filter(|s| s.copies == 0)
         .map(|s| s.location.as_str())
         .collect();
-    if missing.is_empty() && !short.is_empty() {
-        let dest = Dest::at(&short[0].location);
-        f.violations.push(AuditFinding {
-            unit: unit.name.clone(),
-            check: "location_presence".into(),
-            message: format!(
-                "has {}{} (policy requires {requires})",
-                policy::coverage::describe_short_locations(&short),
-                policy::coverage::tape_only_note(ctx.config, &unit.status),
-            ),
-            action: additional_copy_action(ctx.conn, unit, &dest)?,
-        });
-    }
     if !missing.is_empty() {
         let location_count = location_count_for_unit(ctx.conn, unit.id)?;
         // The remedy's last step says where the new copy goes. One copy can
@@ -1059,6 +1046,24 @@ fn check_location_presence(
                 },
                 missing.join(", "),
                 crate::render::plural(location_count, "location", "locations"),
+            ),
+            action: additional_copy_action(ctx.conn, unit, &dest)?,
+        });
+    }
+    // The locations that hold some copies but too few are named whether or
+    // not another location holds none: one finding each, so neither speaks
+    // for the other.
+    let thin: Vec<policy::coverage::LocationShort> =
+        short.iter().filter(|s| s.copies > 0).cloned().collect();
+    if !thin.is_empty() {
+        let dest = Dest::at(&thin[0].location);
+        f.violations.push(AuditFinding {
+            unit: unit.name.clone(),
+            check: "location_presence".into(),
+            message: format!(
+                "has {}{} (policy requires {requires})",
+                policy::coverage::describe_short_locations(&thin),
+                policy::coverage::tape_only_note(ctx.config, &unit.status),
             ),
             action: additional_copy_action(ctx.conn, unit, &dest)?,
         });
@@ -5259,6 +5264,31 @@ mod tests {
             );
         }
 
+        /// With one location at no copy and another short but holding some,
+        /// `location_presence` names both: the thin one is not left out for
+        /// the empty one to speak alone.
+        #[test]
+        fn location_presence_names_a_thin_location_beside_an_empty_one() {
+            let conn = setup(&["home-rack", "offsite"]);
+            conn.execute(
+                "UPDATE units SET copies_at_frozen = '{\"garage\":1,\"offsite\":2}'",
+                [],
+            )
+            .unwrap();
+            let findings = location_findings(&conn);
+            let said: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
+            assert!(
+                said.iter()
+                    .any(|m| m.contains("no copy at required location garage")),
+                "{said:?}"
+            );
+            assert!(
+                said.iter()
+                    .any(|m| m.starts_with("has 1 copy at required location offsite, needs 2")),
+                "{said:?}"
+            );
+        }
+
         /// #493 (ADR-0012 items 149, 156 and 160): `location_presence` judges
         /// the resolved `copies_at` map. A dotfile map (frozen in the
         /// catalog: the unit has no path) of `garage = 1, offsite = 2`
@@ -5277,11 +5307,17 @@ mod tests {
             .unwrap();
 
             let findings = location_findings(&conn);
-            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(findings.len(), 2, "{findings:?}");
             assert_eq!(
                 findings[0].message,
                 "no copy at required location garage (policy requires 1 at garage, \
                  2 at offsite; copies are in 2 locations)"
+            );
+            assert_eq!(
+                findings[1].message,
+                "has 1 copy at required location offsite, needs 2 \
+                 (policy requires 1 at garage, 2 at offsite)",
+                "the thin location is named beside the empty one"
             );
             assert!(
                 findings[0]
