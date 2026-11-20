@@ -91,7 +91,7 @@ load and with the write-shaping knobs of one run of the note's §10. OVERWRITES 
 
   TAPECTL_HOME (env)             Required: the throwaway home.
   TAPECTL_BIN (env)              Required: the research build (--features research).
-  DAR_BIN (env)                  dar for the throwaway config. Default: dar on PATH.
+  TAR_BIN (env)                  GNU tar for the throwaway config. Default: tar on PATH.
 USAGE
 }
 
@@ -266,7 +266,7 @@ selected() { [ -z "$ONLY" ] || case " $SELECTED " in *" $1 "*) return 0 ;; *) re
 # ---------- preconditions: nothing below writes the drive until every one holds ----------
 [ -n "$TAPE_DEV" ] || { usage >&2; die "--device is required; there is no default (/dev/nstN numbering moves)"; }
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV does not exist"
-for bin in mt dd sg_read_attr sg_logs python3 flock dar sha256sum awk tee df setsid timeout head; do
+for bin in mt dd sg_read_attr sg_logs python3 flock tar sha256sum awk tee df setsid timeout head; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
 SG_LOGS_HELP="$(sg_logs --help 2>&1 || true)"
@@ -280,8 +280,8 @@ fi
 [ -n "${TAPECTL_BIN:-}" ] || die "TAPECTL_BIN is required: the research build (this script never builds one)"
 [ -x "$TAPECTL_BIN" ] || die "TAPECTL_BIN=$TAPECTL_BIN is not an executable file"
 TAPECTL_BIN="$(readlink -f "$TAPECTL_BIN")"
-: "${DAR_BIN:=$(command -v dar)}"
-[ -x "$DAR_BIN" ] || die "DAR_BIN=$DAR_BIN is not an executable file"
+: "${TAR_BIN:=$(command -v tar)}"
+[ -x "$TAR_BIN" ] || die "TAR_BIN=$TAR_BIN is not an executable file"
 TAPECTL_VERSION="$("$TAPECTL_BIN" --version 2>&1 | sed -n 1p)"
 python3 - "$TAPECTL_VERSION" <<'PY' || die "TAPECTL_BIN reports '$TAPECTL_VERSION': this phase needs tapectl 1.6.0 or later (the trace, the 0x34 decoder)"
 import re, sys
@@ -914,7 +914,7 @@ log "home: $TAPECTL_HOME ($([ "$FRESH" = 1 ] && echo fresh || echo "reused; the 
     echo "drive_serial=$DRIVE_SERIAL"; echo "drive_model=$SYS_MODEL"; echo "cartridge_serial=$SERIAL"
     echo "tapectl=$TAPECTL_BIN"; echo "tapectl_version=$TAPECTL_VERSION"
     echo "tapectl_sha256=$(sha256sum "$TAPECTL_BIN" | awk '{print $1}')"; echo "research_banner=$RESEARCH_BANNER"
-    echo "dar=$("$DAR_BIN" --version 2>&1 | sed -n 1p)"
+    echo "tar=$("$TAR_BIN" --version 2>&1 | sed -n 1p)"
     echo "script_commit=$(git -C "$SCRIPT_DIR" describe --always --dirty 2>/dev/null || echo unknown)"
     echo "home=$TAPECTL_HOME"; echo "home_fresh=$FRESH"; echo "staging=$STAGING_ROOT"; echo "size=$SIZE"
     echo "slice_size=$SLICE_SIZE"; echo "load_file=$LOAD_FILE"; echo "only=$SELECTED"
@@ -929,7 +929,7 @@ if [ "$FRESH" = 1 ]; then
     run escrow 0 tctl key generate --escrow
     chmod 600 "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err"   # they print the escrow secret
     STAGING="$STAGING_ROOT/staging"; mkdir -p "$STAGING"
-    run cfg-dar 0 tctl config set dar.binary "\"$DAR_BIN\""
+    run cfg-tar 0 tctl config set tar.binary "\"$TAR_BIN\""
     run cfg-slice 0 tctl config set defaults.slice_size "\"$SLICE_SIZE\""
     run cfg-copies 0 tctl config set defaults.min_copies 1
     run cfg-staging 0 tctl config set staging.directory "\"$STAGING\""

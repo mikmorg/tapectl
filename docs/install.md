@@ -670,9 +670,7 @@ are not options (`--home X` and `--config X` skip their value), so
 `tapectl-op volume info write` — a volume *labelled* `write` — stays at normal
 priority, as does everything that is not in the list above. `runuser` gives
 tapectl the same user, groups and `HOME` that `sudo -u -H` does, so the command
-finds the same home and the same drive. `volume init` is not in the list: it
-writes the ID thunk and reads the chip, a few seconds of tape contact that
-stream nothing. `tapectl-drive-poll.service` carries the same priority as
+finds the same home and the same drive. `tapectl-drive-poll.service` carries the same priority as
 `Nice=`, `IOSchedulingClass=` and `IOSchedulingPriority=`; systemd applies it as
 root before it drops to `User=`. The audit and backup units are unchanged.
 
@@ -928,16 +926,16 @@ it twice, so a run that stopped is resumed by running `--upgrade` again;
 | Step | What it does | By hand, for reference |
 |---|---|---|
 | 1 | Preflight, always run: no tapectl command or tapectl unit running; the checkout exactly an annotated `v<new>` tag, with no change to a tracked file; `<new>` newer than the installed tapectl; release notes for `<new>` | `tapectl-op status`, `git describe --exact-match` |
-| 2 | Back up the catalog with the OLD binary to `<backup dir>/tapectl-pre-<new>.db` and check the copy (schema and SQLite's integrity check, read-only) | `tapectl-op db backup <backup dir>/tapectl-pre-<new>.db` |
+| 2 | Back up the catalog with the OLD binary to `<backup dir>/tapectl-pre-<new>.db` and check the copy (schema and SQLite's integrity check, read-only). A backup an earlier run took is reused only with its age stated, and, while the old binary is still installed, only if it is under an hour old (`TAPECTL_UPGRADE_BACKUP_MAX_AGE`, in seconds); an older one is replaced by a new copy | `tapectl-op db backup <backup dir>/tapectl-pre-<new>.db` |
 | 3 | Keep the old binary as `/usr/local/bin/tapectl-<old>` | `sudo cp -p /usr/local/bin/tapectl /usr/local/bin/tapectl-<old>` |
-| 4 | Build the release binary from the tag and install it; refuse a binary that is not a build of the tag | `scripts/first-run.sh --from 3 --to 3` |
+| 4 | Build the release binary from the tag and install it; refuse a binary that is not a build of the tag. Steps 4 and 5 refuse to run without step 2's backup and step 3's kept binary (`--from 4` after a run that skipped them is refused) | `scripts/first-run.sh --from 3 --to 3` |
 | 5 | `config check`, the new binary's first open: it applies the migrations, and the schema is printed before and after | `tapectl-op config check` |
 | 6 | Step 14 again: the units, the wrapper and the timers. Each installed file it leaves alone is reported `unchanged` | `scripts/first-run.sh --from 14 --to 14` |
 | 7 | Stop at the "Upgrading" notes of every release after `<old>` up to `<new>`: what only that release asks (a config key, a tool), done by you. Enter goes on | `docs/releases/` |
 | 8 | Look: `status`, `audit`, `report failed-stages` | |
 | 9 | Step 12 again: the rehearsal of the installed binary on the test cartridge, with the drive-poll timer stopped for it and started again | `scripts/first-run.sh --from 12 --to 12` |
 | 10 | Step 9 again: regenerate the Heir Kit, and check that its `tapectl-<new>` is the installed binary and that `COVER.txt` names its sha256 | `scripts/first-run.sh --from 9 --to 9` |
-| 11 | Start `tapectl-backup.service` once, so a copy made by `<new>` lands in the backup directory | `sudo systemctl start tapectl-backup.service` |
+| 11 | Start `tapectl-backup.service` once, so a copy made by `<new>` lands in the backup directory. The step says whether a copy was written, or that the service exited 75 (catalog busy) and wrote none | `sudo systemctl start tapectl-backup.service` |
 | 12 | Tidy: list what earlier runs left behind, by group with its size (candidate build directories `~/tapectl-<version>-<commit>`, older rehearsal homes under the work directory, another Heir Kit under your home, catalog copies in a backup directory the daily backup no longer uses, rollback binaries older than the newest). A group is removed only when you type `remove`, never under `--auto`. The home, the kit directory, the backup directory, the checkout, the installed binary and the newest kept one are never listed | |
 | 13 | Print the rollback | |
 
@@ -962,11 +960,21 @@ refused. (This one's `db import` runs whatever state the catalog is in, §8a.) W
 the catalog recorded after step 2 is lost, and the old binary may refuse a tape
 the new one wrote in between.
 
+The binary alone is not the whole rollback. Step 6 installed `<new>`'s wrappers
+(`/usr/local/lib/tapectl/`, among them the daily backup's), and a wrapper may call
+a spelling `<old>` does not have: `1.8.1` needs `db backup --to FILE`, where later
+releases take the path. After a rollback to `<old>` with `<new>`'s wrapper in place
+every nightly backup fails, in the journal only. So `<old>`'s own step 14 puts its
+wrappers back, from a checkout of `<old>`'s tag, before the timers start again.
+Step 13 prints the commands with your arguments.
+
 ```bash
 sudo systemctl stop tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer
 tapectl-op db import <backup dir>/tapectl-pre-<new>.db
 sudo cp -p /usr/local/bin/tapectl-<old> /usr/local/bin/tapectl
 tapectl-op db fsck
+git checkout v<old>
+bash scripts/first-run.sh <your usual arguments> --tapectl /usr/local/bin/tapectl --skip-build --skip-tests --from 14 --to 14
 sudo systemctl start tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer
 ```
 

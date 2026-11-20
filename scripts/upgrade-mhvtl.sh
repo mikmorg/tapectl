@@ -65,7 +65,7 @@
 #            --keep              (keep the run directory even when green)
 #
 # Needs: mhvtl loaded with at least two cartridges of the drive's generation,
-# sudo without a password, the `tapectl` service user, dar, age, age-keygen,
+# sudo without a password, the `tapectl` service user, GNU tar 1.35 or later, age, age-keygen,
 # lsscsi, mtx, mt, python3, cargo, git, systemd.
 # Exit: 0 green, 1 a check failed (the run directory is kept), 2 a
 # precondition failed (nothing was written).
@@ -131,7 +131,7 @@ for f in /dev/tape/by-id/*XYZZY*-nst; do
 done
 [ "$IS_MHVTL" = 1 ] || die "$DEVICE ($DEV_REAL) is not an mhvtl drive (no /dev/tape/by-id/*XYZZY*-nst names it) — refusing"
 grep -q '^mhvtl ' /proc/modules || die "mhvtl module not loaded — systemctl start mhvtl.target"
-for bin in lsscsi mtx mt dar age age-keygen sha256sum python3 cargo git flock sudo systemctl; do
+for bin in lsscsi mtx mt tar age age-keygen sha256sum python3 cargo git flock sudo systemctl; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
 id "$SVC_USER" >/dev/null 2>&1 || die "no '$SVC_USER' service user — run scripts/first-run.sh --from 5 --to 5 once, or create it"
@@ -298,7 +298,6 @@ OPERATOR="$USER"
 ESCROW_PUBLIC_KEY="$ESCROW_PUB"
 WORK_DIR="$RUN/work"
 STAGING_DIR="$RUN/staging"
-DAR_BIN="$(command -v dar)"
 BACKUP_DIR="$RUN/backups"
 KIT_OUT="$RUN/kit"
 LABEL="$LABEL"

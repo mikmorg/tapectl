@@ -599,7 +599,11 @@ derive_nodes() {
 # step-13 tests (tests/first_run_volume_state.rs) point it at a file of their
 # own, so they never hold the lock a gate on the same host needs.
 TAPE_LOCK="${TAPECTL_TAPE_LOCK:-/tmp/tapectl-tape.lock}"
-tape_lock() { exec 9>"$TAPE_LOCK"; flock -n 9 || die "another process holds the tape lock ($TAPE_LOCK) — a gate, a rehearsal or a fill is using the drive; wait for it"; }
+# A symlink at the fixed name would send `exec 9>` to its target, truncating it as
+# the invoker (#543): a link is refused, never followed. (A directory only the
+# operator and the service user can write would close the name altogether, but
+# every harness takes this path: moving it is one change in all of them.)
+tape_lock() { [ ! -L "$TAPE_LOCK" ] || die "$TAPE_LOCK is a symbolic link: it is not followed. Look at who made it, remove it, and run again"; exec 9>"$TAPE_LOCK"; flock -n 9 || die "another process holds the tape lock ($TAPE_LOCK) — a gate, a rehearsal or a fill is using the drive; wait for it"; }
 # Item 190: step 12 and the drive poll. A poll during the rehearsal records the
 # test cartridge in the PRODUCTION catalog: the rehearsal's homes are throwaway
 # ones, so the production drive lock never sees it. drive_poll_pause refuses
@@ -1008,6 +1012,19 @@ PY
 # installed_is_new: the installed binary is a build of the tag.
 installed_is_new() { case "$("$INSTALL_BIN" --version 2>/dev/null)" in "tapectl $NEW_VER ($TAG, "*) return 0 ;; *) return 1 ;; esac; }
 need_new() { installed_is_new || die "the installed $INSTALL_BIN is not $TAG ($("$INSTALL_BIN" --version 2>/dev/null || echo unreadable)): run --upgrade --from 4"; }
+# need_rollback: steps 4 and 5 replace the binary and migrate the catalog, so the
+# records a rollback stands on must exist first: step 2's backup (a readable
+# file) and step 3's kept binary of the OLD version. `--from 4`, which need_new
+# itself suggests, skips both steps (#543).
+need_rollback() {
+  local _b _kv
+  _b="$(ustate backup)"
+  [ -n "$_b" ] || die "$U_STATE records no backup from step 2: this step replaces the binary or migrates the catalog, and a rollback would have nothing to import. Run --upgrade from step 2 (a plain --upgrade resumes there)"
+  as_svc test -r "$_b" || die "the backup $_b that $U_STATE records is not readable: run --upgrade from step 2"
+  [ -e "$KEEP" ] || die "no kept copy of $OLD_VER at $KEEP (step 3): a rollback would have no binary. Run --upgrade from step 3"
+  _kv="$("$KEEP" --version 2>/dev/null | awk '{ print $2; exit }')"
+  [ "$_kv" = "$OLD_VER" ] || die "$KEEP is tapectl ${_kv:-<unreadable>}, not $OLD_VER: stop and look"
+}
 # upgrade_child N [ARG…]: this script's own step N, with the installed binary and
 # the arguments this run was given (FWD_ARGS). Not through `run`: the child logs
 # its own lines, and its prompts read the terminal.
@@ -1109,10 +1126,28 @@ log "upgrade $OLD_VER -> $NEW_VER ($U_STATE)"
 uhdr 2 "Back up the catalog with the old binary ($OLD_VER)"
 uskip || {
 U_BACKUP="$(ustate backup)"
+# A backup recorded by an earlier run is the rollback step 13 prints, so its age
+# is stated, and while the OLD binary is still installed (step 4 has not run) the
+# catalog may have moved on since: past U_BACKUP_MAX_AGE seconds (an hour, or
+# TAPECTL_UPGRADE_BACKUP_MAX_AGE) it is not reused, and a new one is taken (#543).
+U_BACKUP_MAX_AGE="${TAPECTL_UPGRADE_BACKUP_MAX_AGE:-3600}"
+case "$U_BACKUP_MAX_AGE" in '' | *[!0-9]*) die "TAPECTL_UPGRADE_BACKUP_MAX_AGE must be a number of seconds, got '$U_BACKUP_MAX_AGE'" ;; esac
+U_BACKUP_AGE=""
+if [ -n "$U_BACKUP" ]; then
+  _mt="$(as_svc stat -c %Y "$U_BACKUP" 2>/dev/null)" || die "cannot read the backup $U_BACKUP that $U_STATE records"
+  U_BACKUP_AGE=$(( $(date +%s) - _mt ))
+  [ "$U_BACKUP_AGE" -ge 0 ] || U_BACKUP_AGE=0
+  U_BACKUP_AGE_TEXT="$((U_BACKUP_AGE / 3600)) h $((U_BACKUP_AGE % 3600 / 60)) min"
+  if [ "$INST_VER" = "$OLD_VER" ] && [ "$U_BACKUP_AGE" -gt "$U_BACKUP_MAX_AGE" ]; then
+    note "the backup $U_BACKUP is $U_BACKUP_AGE_TEXT old and $OLD_VER is still installed, so the catalog may have changed since: it is not reused, a new one is taken"
+    U_BACKUP=""
+  fi
+fi
 if [ -n "$U_BACKUP" ]; then
   _facts="$(db_facts "$U_BACKUP")" || die "cannot read the backup $U_BACKUP that $U_STATE records"
   [ "${_facts#* }" = ok ] || die "the backup $U_BACKUP fails SQLite's integrity check"
-  ok "taken already: $U_BACKUP (schema ${_facts%% *}, integrity ok)"
+  ok "taken already: $U_BACKUP ($U_BACKUP_AGE_TEXT old, schema ${_facts%% *}, integrity ok)"
+  [ "$U_BACKUP_AGE" -le "$U_BACKUP_MAX_AGE" ] || note "a rollback to it loses whatever the catalog recorded in those $U_BACKUP_AGE_TEXT"
 else
   [ "$INST_VER" = "$OLD_VER" ] || die "the installed tapectl is $INST_VER, and $U_STATE records no backup taken with $OLD_VER: the catalog may have moved on already. Do not go on without a backup: stop and look"
   { as_svc test -d "$U_BDIR" && as_svc test -w "$U_BDIR"; } || die "$U_RUN_USER cannot write $U_BDIR, the backup directory"
@@ -1147,6 +1182,7 @@ fi
 # ---------------------------------------------------------------- upgrade 4
 uhdr 4 "Build and install $TAG"
 uskip || {
+need_rollback
 if installed_is_new; then ok "installed already: $("$INSTALL_BIN" --version)"
 else
   if [ -n "$NEW_BIN" ]; then
@@ -1175,6 +1211,7 @@ fi
 uhdr 5 "The new binary's first open: the migrations"
 uskip || {
 need_new
+need_rollback
 _before="$(ustate schema_before)"
 [ -n "$_before" ] || { _before="$(db_facts "$CATALOG" version)" || die "cannot read $CATALOG's schema"; }
 run tc config check || die "config check refused (above). A key a release renamed or removed is named there; the release notes say what to do ($U_NOTES, \"Upgrading\"). Fix it, then run --upgrade again"
@@ -1267,8 +1304,20 @@ if [ -n "$HOME_DIR" ]; then
 elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl cat tapectl-backup.service >/dev/null 2>&1; then
   note "tapectl-backup.service is not installed on this host (step 14 installs it): no copy taken"
 elif confirm "Start tapectl-backup.service once now (sudo), so a copy made by $NEW_VER lands in its directory?"; then
+  _t0=$(( $(date +%s) - 1 ))
   run sudo systemctl start tapectl-backup.service || die "tapectl-backup.service failed: journalctl -u tapectl-backup.service -n 30"
-  ok "tapectl-backup.service ran"
+  # The unit has SuccessExitStatus=75 and the wrapper exits 75 after removing its
+  # copy when another command held the catalog, so "started" is not "a copy was
+  # made": say which (#543).
+  _copy="$(as_svc find "$U_BDIR" -maxdepth 1 -type f -name 'tapectl-*.db' -newermt "@$_t0" 2>/dev/null | sort | tail -n 1)"
+  _mrc="$(systemctl show tapectl-backup.service -p ExecMainStatus --value 2>/dev/null || true)"
+  if [ -n "$_copy" ]; then
+    ok "tapectl-backup.service wrote a copy: $_copy"
+  elif [ "$_mrc" = 75 ]; then
+    note "tapectl-backup.service exited 75 (catalog busy: another tapectl command held the catalog) and wrote NO copy; once nothing else is running: sudo systemctl start tapectl-backup.service"
+  else
+    note "tapectl-backup.service started and no new tapectl-*.db appeared in $U_BDIR (service exit status ${_mrc:-unknown}): read journalctl -u tapectl-backup.service -n 30, then sudo systemctl start tapectl-backup.service again"
+  fi
 else
   note "skipped: sudo systemctl start tapectl-backup.service takes one later"
 fi
@@ -1375,13 +1424,20 @@ ok "tidy done"
 uhdr 13 "The rollback"
 _rb="$(ustate backup)"
 explain <<EOF
-Should $NEW_VER have to come out: with the timers stopped, import the backup step 2 took with $OLD_VER while $NEW_VER is still installed, then put the kept binary back and check the catalog with it. In that order: every tapectl command opens the catalog first, and $OLD_VER cannot open one $NEW_VER has migrated, so $OLD_VER's own import would be refused. Whatever the catalog recorded after that backup is lost, and $OLD_VER may refuse a tape $NEW_VER wrote in between.
+Should $NEW_VER have to come out: with the timers stopped, import the backup step 2 took with $OLD_VER while $NEW_VER is still installed, then put the kept binary back and check the catalog with it. In that order: every tapectl command opens the catalog first, and $OLD_VER cannot open one $NEW_VER has migrated, so $OLD_VER's own import would be refused. Whatever the catalog recorded after that backup is lost, and $OLD_VER may refuse a tape $NEW_VER wrote in between. The binary alone is not the whole rollback: step 6 installed $NEW_VER's wrappers (the daily backup's among them), and a wrapper may call a spelling $OLD_VER does not have, so $OLD_VER's own step 14 puts its wrappers back before the timers start again.
 EOF
 _timers="tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer"
 [ -n "$HOME_DIR" ] || printf '     sudo systemctl stop %s\n' "$_timers"
 printf '     %s db import %s\n' "$U_OP" "${_rb:-<the backup from step 2: none is recorded in $U_STATE>}"
 printf '     sudo cp -p %s %s\n' "$KEEP" "$INSTALL_BIN"
 printf '     %s db fsck\n' "$U_OP"
+# The wrappers step 6 installed are $NEW_VER's and may call a spelling $OLD_VER
+# does not have (1.8.1 wants `db backup --to`, 1.9.x takes the path): the binary
+# alone is not the rollback. The OLD checkout's own step 14 puts its wrappers back.
+_rpa=()
+[ "$PROFILE_GIVEN" = 0 ] || _rpa=(--profile "${PROFILE:-none}")
+printf '     git -C %s checkout v%s\n' "$REPO" "$OLD_VER"
+printf '     bash %s/scripts/first-run.sh %s--tapectl %s --skip-build --skip-tests --from 14 --to 14   # v%s'"'"'s wrappers, beside v%s'"'"'s binary\n' "$REPO" "$(printf '%s ' ${_rpa[@]+"${_rpa[@]}"} ${FWD_ARGS[@]+"${FWD_ARGS[@]}"})" "$INSTALL_BIN" "$OLD_VER" "$OLD_VER"
 [ -n "$HOME_DIR" ] || printf '     sudo systemctl start %s\n' "$_timers"
 ustate_set finished "$(date -u +%FT%TZ)"
 ok "upgraded to $TAG: $("$INSTALL_BIN" --version). Log: $LOG; record: $U_STATE"
@@ -1746,7 +1802,13 @@ fi
 # agent helping them) watch sessions with `tapectl status` without sudo. The
 # group reads logs/ and nothing else in the home; the service user must be a
 # member too, so tapectl can give the home and logs/ the group itself.
-if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ]; then
+# Not under --home: the block writes the host-wide pointer /etc/tapectl/home and
+# the group's grants, which a throwaway home must never aim at itself (#543);
+# step 14 treats --home the same way.
+if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ] && [ -n "$HOME_DIR" ]; then
+  note "ops group $OPS_GROUP: not set up for --home $HOME_DIR (the home pointer and the group are the host's, not a throwaway home's)"
+fi
+if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ] && [ -z "$HOME_DIR" ]; then
   explain <<EOF
 THE OPS GROUP. Live progress prints only on the terminal that started a command, and the session logs under $EFFECTIVE_HOME/logs/ belong to $SVC_USER (0700), so your own account cannot see whether a write is running, which phase it is in, or how the last one ended without sudo. With [ops] group = "$OPS_GROUP", every tapectl command run as $SVC_USER keeps the home at 0710 and logs/ at 2750 owned by $OPS_GROUP, and writes each session log 0640: members can run a plain \`tapectl status\` (the pointer /etc/tapectl/home names the home) and read the logs, and open nothing else — every other entry of the home (the catalog, the keys, config.toml, …) is kept closed to the group. Group membership takes effect at the member's next login.
 EOF
