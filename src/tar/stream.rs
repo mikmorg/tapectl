@@ -1440,14 +1440,7 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink("a", r.join("s")).unwrap();
         // A second name of the symbolic link (#581, item 299): `ln -P`.
-        nix::unistd::linkat(
-            None,
-            &r.join("s"),
-            None,
-            &r.join("s-again"),
-            nix::unistd::LinkatFlags::NoSymlinkFollow,
-        )
-        .unwrap();
+        std::fs::hard_link(r.join("s"), r.join("s-again")).unwrap();
         std::fs::write(r.join(&long), b"a long name\n").unwrap();
         std::fs::create_dir_all(r.join(&deep_dir)).unwrap();
         std::fs::write(r.join(&deep), vec![7u8; 1000]).unwrap();
@@ -2263,14 +2256,7 @@ mod tests {
     fn a_hard_link_to_a_symbolic_link_is_read_as_a_link_row() {
         let t = tree();
         std::os::unix::fs::symlink("somewhere", t.root.join("s1")).unwrap();
-        nix::unistd::linkat(
-            None,
-            &t.root.join("s1"),
-            None,
-            &t.root.join("s2"),
-            nix::unistd::LinkatFlags::NoSymlinkFollow,
-        )
-        .unwrap();
+        std::fs::hard_link(t.root.join("s1"), t.root.join("s2")).unwrap();
         let names = ["s1", "s2"];
         let stream = tar_stream(&t, &names, true, true);
         let (_, rec) = read_with(&stream, list_of(&t, &names), true).unwrap();
