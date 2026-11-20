@@ -315,7 +315,7 @@ fn the_counter_sees_an_allocation_inside_the_window() {
     drop(v);
     assert!(quiet < MIB, "nothing allocated, nothing counted: {quiet}");
     assert!(
-        seen >= 5 * MIB && seen < 6 * MIB,
+        (5 * MIB..6 * MIB).contains(&seen),
         "a 5 MiB allocation raises the peak by about 5 MiB: {seen}"
     );
     // The high-water mark survives the free.
