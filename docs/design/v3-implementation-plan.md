@@ -2286,7 +2286,15 @@ on Layout 3. Most of this stage is proof, with the fixes the proof finds.
 
 Waves: T5.1 alone (it touches the write plan); then T5.2 and T5.4; then T5.3 alone (it
 shares `src/cli/audit.rs` and `src/cli/report.rs` with T5.2, and its order of work is a
-safety rule); then T5.5, T5.6, T5.7.
+safety rule); then T5.5, T5.6, T5.7 and T5.8 (T5.8 waits for T5.5 if the doc #543 names
+is one of T5.8's); then T5.9; then T5.10 alone.
+
+The coordinator, at the landings: when T5.4 lands, rehearses the warehouse write-back on
+mhvtl (a volume's files dumped, written back to a blank cartridge one tape file each, then
+`RESTORE.sh --verify` and a restore), since T5.4 wrote it from the format document alone;
+when T5.1's text lands in the guides (T5.8), corrects `docs/coordinator-handoff.md` the same
+way; and when Stage 5 merges `layout-3` to `master`, corrects `CLAUDE.md` where it still
+calls Layout 2 normative and dar a dependency (T6.7 rewrites it for the release).
 
 ### T5.1 Every unit continues at the early warning, and the queue is filled to it (items 246, 288, 289)
 
@@ -2626,7 +2634,12 @@ before it makes a home, shown by a test with a stand-in tar; the quick start's s
 home pointer, the tape lock and `tapectl-op`, as its criteria list them. #545 is the
 coordinator's: the three rulings adjusted while building have their item (261), and the two
 stale texts are corrected.
+Also: `scripts/upgrade-mhvtl.sh` and `scripts/shaping-drive-phase.sh` still set up dar
+(`DAR_BIN`), which T4.15 removed; they follow the tar writer (`--tar`/`TAR_BIN`, as
+`first-run.sh` and the suites do) or drop the dar step. Neither is in the proof chain, so
+`bash -n` and the coordinator's run of each prove them.
 **Fence:** `scripts/first-run.sh`, `scripts/install-systemd.sh`, `scripts/check-tapectl-op.sh`,
+`scripts/upgrade-mhvtl.sh`, `scripts/shaping-drive-phase.sh`,
 `contrib/systemd/tapectl-op.in`, and the doc #543 names as contradicting `tapectl-op`; the
 `tests/first_run_*.rs` pins of a text this task changes.
 **Done when:** each of #543's criteria is met or reported as needing the tape; `bash -n`
@@ -2663,6 +2676,54 @@ size on tape and the early warning's rules hold with slices of unequal size.
 a proof shows: report the defect and the file first.
 **Done when:** each sentence above has a test for each algorithm carried, on real stagings;
 the suite is green.
+
+### T5.8 The guides follow T5.1
+
+**Owner:** worker. T5.1 removed the `cut` unit, `allow_spanning` and `may_span` from the
+binary and from `docs/configuration.md`; the guides still describe them. Every statement of
+them, and of a unit that waits for the next tape because it would not fit, follows items
+288 and 289: a unit continues on the next cartridge at the early warning with no opt-in, a
+set planned after the warning gets no `writes` row and stays staged, and an interrupted set's
+row is a `range`. `docs/lto6-validation-checklist.md` is the real-drive procedure of T6.6:
+its spanning and short-seal steps match `scripts/span-acceptance.sh` and
+`scripts/short-seal-acceptance.sh` as T5.1 left them, and its old-binary step (`OLD_BIN`,
+the Layout 2 write T4.16 dropped from the LBP acceptance) goes. Every command shown passes
+`check-docs.py`; output shown is what the binary prints, run in a temp home.
+**Fence:** `docs/operator-guide.md` (not the warehouse section, T5.4's), `docs/troubleshooting.md`,
+`docs/handoff.md` (its undated text; a dated step's record stays as written),
+`docs/lto6-validation-checklist.md`.
+**Done when:** `grep -n -i "allow_spanning\|may_span\|cut unit\|OLD_BIN"` over the fence
+finds only text that says they are gone; `check-docs.py` reports nothing.
+
+### T5.9 What dar and Layout 2 left in the code
+
+**Owner:** worker. **Depends:** T5.6 and T5.7 have landed (shared files).
+1. #524 criterion 2: the not-initialised message (`src/startup.rs`) does not offer plain
+   `tapectl init` to a reader who came from the Heir Kit's sheet without saying what it
+   mints. Criteria 1 and 3 are checked as T4.14 left them and reported.
+2. `catalogs_dir` (`src/config.rs`, its uses in `src/staging/mod.rs`, and `init` making
+   `catalogs/`) held dar catalogues, which Layout 3 has none of: it goes, unless a reader of
+   Layout 3 still uses it (say which).
+3. Comments and messages that cite `volume-format-v2.md` (`src/volume/restore.rs`,
+   `src/volume/restore/span.rs`'s user-visible text, and any other a grep finds) cite the
+   Layout 3 section that holds the rule, or drop the citation where none does.
+**Fence:** `src/startup.rs`, `src/config.rs` (only `catalogs_dir`), `src/staging/mod.rs`
+(only `catalogs_dir`), the `init` home-making code, the files the grep in 3 names (comments
+and message text only), their tests, the generated pages if a message in them changes.
+**Done when:** a test pins the message of 1 (seen failing first); a new home has no
+`catalogs/`; `grep -rn "volume-format-v2" src/` finds nothing; the suite is green.
+
+### T5.10 The restore's memory (#571)
+
+**Owner:** worker for the measurement; the choice is the CTO's. tapectl's restore holds a
+whole slice's decoded cut in memory (T4.8's reader), so its peak follows `slice_size`.
+Measure it on a real staging at two slice sizes and state it in the docs as a function of
+`slice_size` (or of the largest member). Then STOP: bounding it below `slice_size` (one
+member at a time, a long member streamed by the run mechanism) or accepting the bound with a
+warning from `config check` and the restore when `slice_size` exceeds available memory is
+the CTO's choice (Appendix B), and the build follows it.
+**Fence:** a test of the measurement, `docs/configuration.md`'s `slice_size` row.
+**Done when:** the measurement is a test that states the peak; the choice is with the CTO.
 
 ---
 
@@ -2789,7 +2850,7 @@ coordinator when every task named beside it has landed and the gate has run.
 | #521 | T4.12 (the cartridge at the prompt); its `--swap-tapes` mode is gone (item 255) | #545 | T5.5 |
 | #522 | T4.13 | #546 | T2.6 |
 | #523 | T4.13 | #547 | T4.6 |
-| #524 | T4.14 | #548 | T5.6 (the clock), T6.2, Stage 7 step 4 (the drill) |
+| #524 | T4.14, T5.9 (criterion 2) | #548 | T5.6 (the clock), T6.2, Stage 7 step 4 (the drill) |
 | #525 | T4.10 | #549 | deferred (item 251) |
 | #526 | T4.13 | #550 | T5.2 |
 | #527 | T2.5 | #551 | T6.1 |
@@ -2809,6 +2870,7 @@ coordinator when every task named beside it has landed and the gate has run.
 | #541 | T2.1 | #565 | T0.5, T0.6, T4.0, T4.5, T4.6, T4.8, T4.10, T4.13, T4.14, T4.16, T5.7 |
 | #566 | closed: slices stay (item 282) | #567 | T0.7, T4.2, T4.3, T4.5, T4.6, T4.8 to T4.13, T4.16, T5.1, T5.3 |
 | #569 | T4.17 (item 297) | #570 | T4.5b |
+| #571 | T5.10 (the measurement; the choice is the CTO's) | | |
 
 **ADR-0012's items from 239.**
 
@@ -2884,3 +2946,5 @@ and built where shown.
    document.
 4. Each real-drive run of T6.6, and the tag.
 5. A SERIOUS finding of T6.1 or T6.2, and a finding that asks for a design change.
+6. #571 (T5.10): whether the restore's memory is bounded below `slice_size` or the bound
+   is accepted with a warning, once T5.10 has measured it.
