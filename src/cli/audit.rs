@@ -400,7 +400,7 @@ const CHECKS: &[Check] = &[
         // #548 (D18, ADR-0012 item 247): the heir path is proven by a drill,
         // and a drill is a recorded event (`drill record`). None recorded, or
         // the newest older than `[defaults] drill_interval_days`, is a
-        // warning; a catalog with no sealed volume has nothing to drill.
+        // warning; a catalog whose volumes hold no written bytes has nothing to drill.
         name: "drill_age",
         scope: Scope::Archive {
             run: check_drill_age,
@@ -2129,15 +2129,20 @@ fn check_drill_age(ctx: &Ctx<'_>) -> Result<Findings> {
 }
 
 /// One warning when no heir drill is recorded, or the newest is older than
-/// `interval_days`. Silent when no sealed volume exists: nothing could be
-/// drilled yet. A warning, never a violation (ADR-0004).
+/// `interval_days`. Silent when no volume holds written bytes: nothing
+/// could be drilled yet. A warning, never a violation (ADR-0004).
 fn drill_age_findings(conn: &Connection, interval_days: i64) -> Result<Vec<AuditFinding>> {
-    let sealed: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM volumes v WHERE v.status = 'sealed')",
+    // `coverage` owns every `volumes.status` predicate: a volume that holds
+    // bytes a verify could read is one an heir could drill.
+    let drillable: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM volumes v WHERE {})",
+            policy::coverage::holds_bytes_to_verify("v")
+        ),
         [],
         |r| r.get(0),
     )?;
-    if !sealed {
+    if !drillable {
         return Ok(Vec::new());
     }
     let (newest, age): (Option<String>, Option<i64>) = conn.query_row(

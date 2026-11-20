@@ -188,7 +188,8 @@ else
     FRONT_EST=0
 fi
 : "${WARNING_AT:=$WARNING_AT_MEASURED}"
-# The filler's source: one full slice and a sixteenth, so its slice 1 is a full dar slice.
+# The filler's source: one file of a full slice and a sixteenth, a member larger than slice_size,
+# so it gets a run of slices to itself and its slice 1 is a full slice.
 SIZE_F=$((SLICE_BYTES + SLICE_BYTES / 16))
 # The fill ceiling as the planner computes it, (capacity x 0.97) truncated, less the reserve:
 # a whole unit is committed while the plan's end through it is at or below this.
