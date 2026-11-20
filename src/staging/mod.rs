@@ -7,6 +7,7 @@ pub mod jobs;
 pub mod lock;
 pub(crate) mod pack;
 pub(crate) use files::SLICE_SUFFIX;
+pub(crate) use files::packed_bound;
 #[cfg(test)]
 mod plaintext_audit;
 pub mod release;
@@ -864,27 +865,15 @@ fn stage_create_inner(
     // The config-level check (`Config::load`) sees only `[defaults]` and the
     // file's archive sets; this is the size in force after the unit's
     // dotfile and its archive set's database row have had their say.
-    let (cap_what, cap_bytes) = match packing {
-        None => (
-            format!(
-                "the slice_size in force for unit \"{}\" (its dotfile's [policy], its archive \
-                 set or [defaults])",
-                unit.name
-            ),
-            slice_size,
-        ),
-        Some(p) => (
-            format!(
-                "the slice_size in force for unit \"{}\" (its dotfile's [policy], its archive \
-                 set or [defaults]) plus {}'s stated worst growth ({} bytes)",
-                unit.name,
-                p.algorithm.name(),
-                pack::worst_growth(slice_size)
-            ),
-            files::packed_bound(slice_size),
-        ),
-    };
-    if let Some(problem) = config.slice_cap_problem(&cap_what, cap_bytes) {
+    let cap_what = format!(
+        "the slice_size in force for unit \"{}\" (its dotfile's [policy], its archive set or \
+         [defaults])",
+        unit.name
+    );
+    // #588: the cap and its advice are in terms of `slice_size`; the packed
+    // bound is applied inside.
+    let packed_by = packing.map(|p| p.algorithm.name());
+    if let Some(problem) = config.slice_cap_problem_for(&cap_what, slice_size, packed_by) {
         return Err(TapectlError::Other(format!(
             "{problem} Nothing was staged."
         )));

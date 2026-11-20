@@ -590,6 +590,46 @@ pub fn max_slice_size_within(budget: u64) -> Option<u64> {
     Some(lo)
 }
 
+/// What the cap judges for a `slice_size` of `slice_size` bytes: the slice
+/// itself, or for a packed staging its packed bound (`slice_size` plus the
+/// algorithm's stated worst growth, `volume-format-v3.md` §3.4).
+fn cap_bytes_for(slice_size: u64, packed: bool) -> u64 {
+    if packed {
+        crate::staging::packed_bound(slice_size)
+    } else {
+        slice_size
+    }
+}
+
+/// Whether the cap accepts a `slice_size` of `slice_size` bytes inside `budget`
+/// bytes of tape (a slice plus the seal).
+fn slice_size_fits(slice_size: u64, packed: bool, budget: u64) -> bool {
+    slice_bytes_on_tape(cap_bytes_for(slice_size, packed)) + SEAL_ALLOWANCE_BYTES <= budget
+}
+
+/// The largest `slice_size` an operator can SET that the cap accepts inside
+/// `budget` bytes of tape (#588): a positive multiple of 512 (#562), judged
+/// as the cap judges it (for a packed staging through the packed bound, so
+/// the figure is the `slice_size`, never the bound). `None` when not even 512
+/// bytes fit.
+pub fn max_settable_slice_size_within(budget: u64, packed: bool) -> Option<u64> {
+    if !slice_size_fits(512, packed, budget) {
+        return None;
+    }
+    // The cap is monotone in the size, so the largest multiple of 512 is a
+    // search over the count of 512-byte units.
+    let (mut lo, mut hi) = (1u64, budget / 512 + 1);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if slice_size_fits(mid * 512, packed, budget) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo * 512)
+}
+
 /// The smallest configured post-warning room, and the drive it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostWarningRoom {
@@ -1306,33 +1346,61 @@ impl Config {
     /// slice size the unit's dotfile, archive set and `[defaults]` resolve
     /// to), so the two cannot disagree.
     pub fn slice_cap_problem(&self, what: &str, slice_bytes: u64) -> Option<String> {
+        self.slice_cap_problem_for(what, slice_bytes, None)
+    }
+
+    /// [`Config::slice_cap_problem`] for a `slice_size` of `slice_size` bytes
+    /// cut for a staging that packs with `packed` (an algorithm's name), or
+    /// not (`None`). A packed slice can be larger on tape than its cut, so it
+    /// is held to `slice_size` plus the algorithm's stated worst growth
+    /// (`volume-format-v3.md` §3.4). The advice is the largest `slice_size`
+    /// that is accepted when set (#588): a multiple of 512 that passes this
+    /// same cap.
+    pub fn slice_cap_problem_for(
+        &self,
+        what: &str,
+        slice_size: u64,
+        packed: Option<&str>,
+    ) -> Option<String> {
         let room = self.smallest_post_warning_room()?;
         let half = room.bytes / 2;
-        let needed = slice_bytes_on_tape(slice_bytes) + SEAL_ALLOWANCE_BYTES;
+        let is_packed = packed.is_some();
+        let judged = cap_bytes_for(slice_size, is_packed);
+        let needed = slice_bytes_on_tape(judged) + SEAL_ALLOWANCE_BYTES;
         if needed <= half {
             return None;
         }
         let binary =
             |b: u64| crate::util::format_bytes_binary(i64::try_from(b).unwrap_or(i64::MAX));
-        let advice = match max_slice_size_within(half) {
-            Some(max) => format!("Lower it to at most {} ({max} bytes)", binary(max)),
+        let advice = match max_settable_slice_size_within(half, is_packed) {
+            Some(max) => format!(
+                "Set slice_size = {max} ({}; the largest multiple of 512 bytes that fits)",
+                binary(max)
+            ),
             None => "Even the seal alone does not fit, so no slice size can; check the \
                      measured figure"
                 .to_string(),
         };
+        let growth = match packed {
+            Some(algorithm) => format!(
+                " plus {algorithm}'s stated worst growth ({} bytes) = {judged} bytes",
+                judged - slice_size
+            ),
+            None => String::new(),
+        };
         Some(format!(
-            "{what} = {} ({slice_bytes} bytes) is too large for backends.lto[\"{}\"].\
+            "{what} = {} ({slice_size} bytes){growth} is too large for backends.lto[\"{}\"].\
              post_warning_bytes = {} ({} bytes): a slice (which takes {needed_slice} bytes on \
              tape once age has encrypted it and the writer has padded it to blocks) plus the \
              seal ({seal} bytes allowed) must fit in half of that room, {half} bytes, so a \
              tape can still be sealed after the drive's early warning (ADR-0012 item 100). \
              {advice}, or measure the room again with scripts/lto-profile.sh and correct \
              post_warning_bytes.",
-            binary(slice_bytes),
+            binary(slice_size),
             room.backend,
             room.text,
             room.bytes,
-            needed_slice = slice_bytes_on_tape(slice_bytes),
+            needed_slice = slice_bytes_on_tape(judged),
             seal = SEAL_ALLOWANCE_BYTES,
         ))
     }
@@ -1356,21 +1424,36 @@ impl Config {
         if self.smallest_post_warning_room().is_none() {
             return problems;
         }
-        let mut check = |what: String, text: &str| {
+        // #588: the cap `stage create` applies, so a `slice_size` this check
+        // passes is never refused there: a level that packs is held to the
+        // packed bound.
+        let packs = |c: &str| matches!(c, "gzip" | "xz" | "zstd").then_some(c.to_string());
+        let mut check = |what: String, text: &str, compression: &str| {
             if let Ok(bytes) = crate::staging::parse_size_to_bytes(text) {
                 if bytes > 0 {
-                    if let Some(msg) = self.slice_cap_problem(&what, bytes as u64) {
+                    let packed = packs(compression);
+                    if let Some(msg) =
+                        self.slice_cap_problem_for(&what, bytes as u64, packed.as_deref())
+                    {
                         problems.push(format!("{}: {msg}", path.display()));
                     }
                 }
             }
         };
-        check("defaults.slice_size".to_string(), &self.defaults.slice_size);
+        check(
+            "defaults.slice_size".to_string(),
+            &self.defaults.slice_size,
+            &self.defaults.compression,
+        );
         for (i, as_cfg) in self.archive_sets.iter().enumerate() {
             if let Some(s) = &as_cfg.slice_size {
                 check(
                     format!("archive_sets[{i}] (\"{}\").slice_size", as_cfg.name),
                     s,
+                    as_cfg
+                        .compression
+                        .as_deref()
+                        .unwrap_or(&self.defaults.compression),
                 );
             }
         }
@@ -3546,6 +3629,82 @@ mod tests {
         let ok = "\n[[archive_sets]]\nname = \"bulk\"\nslice_size = \"2G\"\n";
         let cfg = load_text(&room_config(Some("40G"), "1G", ok)).unwrap();
         assert!(cfg.slice_cap_problems(Path::new("config.toml")).is_empty());
+    }
+
+    /// A config with the drive's room and `[defaults]` carrying `slice_size`
+    /// and `compression`.
+    fn cap_config(room: &str, slice_size: &str, compression: &str) -> Config {
+        let text = room_config(Some(room), slice_size, "").replacen(
+            "[defaults]\n",
+            &format!("[defaults]\ncompression = \"{compression}\"\n"),
+            1,
+        );
+        load_text(&text).unwrap()
+    }
+
+    /// The figure `slice_size = N` in a cap message.
+    fn advised(msg: &str) -> u64 {
+        let tail = msg
+            .split("slice_size = ")
+            .last()
+            .filter(|_| msg.contains("Set slice_size = "))
+            .unwrap_or_else(|| panic!("no 'Set slice_size = N' in: {msg}"));
+        tail.split(' ').next().unwrap().parse().unwrap()
+    }
+
+    /// #588: the cap's advice is a value that is accepted when set: the
+    /// figure is a multiple of 512 (#562), it passes the cap itself (for a
+    /// packed staging the figure is the `slice_size`, never the bound), and
+    /// one more block is refused. Three rooms, unpacked and each algorithm.
+    #[test]
+    fn the_caps_advice_is_a_slice_size_that_is_accepted_when_set() {
+        for room in ["40GiB", "10GiB", "3GiB"] {
+            for compression in ["none", "gzip", "xz", "zstd"] {
+                let big = cap_config(room, "100G", compression);
+                let problems = big.slice_cap_problems(Path::new("config.toml"));
+                assert_eq!(problems.len(), 1, "{room} {compression}: {problems:?}");
+                let n = advised(&problems[0]);
+                assert_eq!(slice_size_block_problem(n as i64), None, "{room} {compression}: {n}");
+                let set = cap_config(room, &n.to_string(), compression);
+                assert!(
+                    set.slice_cap_problems(Path::new("config.toml")).is_empty(),
+                    "{room} {compression}: slice_size = {n} is refused again"
+                );
+                let one_more = cap_config(room, &(n + 512).to_string(), compression);
+                assert!(
+                    !one_more
+                        .slice_cap_problems(Path::new("config.toml"))
+                        .is_empty(),
+                    "{room} {compression}: {n} is not the largest"
+                );
+                // The message `stage create` shows is the same function.
+                let algo = (compression != "none").then_some(compression);
+                assert_eq!(set.slice_cap_problem_for("s", n, algo), None);
+                assert!(set.slice_cap_problem_for("s", n + 512, algo).is_some());
+            }
+        }
+    }
+
+    /// #588: `config check` sees what `stage create` sees. The largest
+    /// unpacked `slice_size` is refused once `[defaults] compression` packs,
+    /// and an archive set's own compression is judged too.
+    #[test]
+    fn config_check_applies_the_packed_bound_when_compression_is_set() {
+        let max = max_settable_slice_size_within(10 * (1 << 30) / 2, false).unwrap();
+        let none = cap_config("10GiB", &max.to_string(), "none");
+        assert!(none.slice_cap_problems(Path::new("c.toml")).is_empty());
+        let packed = cap_config("10GiB", &max.to_string(), "zstd");
+        let problems = packed.slice_cap_problems(Path::new("c.toml"));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("zstd's stated worst growth"), "{problems:?}");
+        // An archive set that packs, under defaults that do not.
+        let extra = format!(
+            "\n[[archive_sets]]\nname = \"bulk\"\nslice_size = \"{max}\"\ncompression = \"xz\"\n"
+        );
+        let cfg = load_text(&room_config(Some("10GiB"), "1G", &extra)).unwrap();
+        let problems = cfg.slice_cap_problems(Path::new("c.toml"));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("archive_sets[0]"), "{problems:?}");
     }
 
     /// The seal is accounted: the limit is on slice PLUS seal, so the largest
