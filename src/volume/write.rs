@@ -1034,7 +1034,7 @@ fn volume_media(conn: &Connection, volume_id: i64, label: &str) -> Result<(i64, 
 }
 
 /// What File 0's `[media]` says about the cartridge's identity: the serial
-/// string, and how it was established (`docs/design/volume-format-v2.md`
+/// string, and how it was established (`docs/design/volume-format-v3.md`
 /// §1.1). `None` for the source means UNKNOWN, and the line is then omitted
 /// from the thunk entirely.
 #[derive(Debug, Clone)]
@@ -1728,10 +1728,9 @@ fn write_budget(
     nominal_capacity: i64,
 ) -> Result<WriteBudget> {
     let usable_bytes = backend.fill_budget_bytes(nominal_capacity as u64);
-    // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
-    // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
-    // gone (T10 config cleanup: nothing read it after this path stopped, and
-    // this was that "nothing").
+    // The budget is the fill budget alone, less the ENOSPC buffer: there is
+    // no "manifest reserve", and the old `manifest_reserve` config field is
+    // gone (nothing read it once this path stopped).
     // `.max(0)` dropped (issue #59): a negative value is now rejected by
     // the parser itself, so a successful `Ok` is already non-negative.
     let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
@@ -2220,7 +2219,7 @@ fn build_write_layout(
     let catalog_db_path = catalog_work.path().join("catalog_snapshot.db");
     crate::db::catalog_snapshot::build_catalog_snapshot(conn, stage_set_ids, &catalog_db_path)?;
 
-    // The cross-volume index (`volume-format-v2.md` §1.5, #418 R4): which
+    // The cross-volume index (`volume-format-v3.md` §1.5, #418 R4): which
     // volumes hold which version of each unit, and every path of a tenant's
     // versions. Plaintext, so built beside the `catalog.db` above, in the
     // same tapectl-home work dir, streamed into the envelopes by `build()`
@@ -4171,7 +4170,7 @@ fn finish_session(
             let phase = progress::phase("seal", None);
             // Issue #408: a seal that fails leaves the session `in_progress`
             // (swept to `interrupted`), so `volume resume` writes it again —
-            // except on a full medium (#420, `volume-format-v2.md` §4.3 W6):
+            // except on a full medium (#420, `volume-format-v3.md` §5.2 W6):
             // the hard end inside the seal's blocks, or a refused filemark,
             // is the tape's end where no seal can follow, and the session
             // ABORTS as it does on the hard end inside a slice. Nothing was
@@ -4409,7 +4408,7 @@ fn write_aborted(conn: &Connection, volume_id: i64, label: &str, reason: &str) -
 }
 
 /// Abort a session whose seal could not be written because the medium is
-/// full (#420, `volume-format-v2.md` §4.3 W6; `layout-session.md`'s Aborted
+/// full (#420, `volume-format-v3.md` §5.2 W6; `layout-session.md`'s Aborted
 /// row: "the hard end inside a slice or a seal … a refused filemark"): its
 /// `writes` rows become `aborted`, the `write_aborted` event names the
 /// reason, and the write exits 5. The tape is left unsealed, as on the hard
@@ -5951,7 +5950,7 @@ pub(crate) fn finish_figures_command(label: &str) -> String {
 ///
 /// #420: on a short-sealed volume the figures are the tape's, not the
 /// plan's — only the data slices at or before `volumes.ended_after` are on
-/// it (`volume-format-v2.md` §4.2). Read from the row, so every caller
+/// it (`volume-format-v3.md` §5.1). Read from the row, so every caller
 /// counts the same tape: the seal records it before the confirm, and an
 /// adoption (`adopt_lost`) must record it before calling this.
 pub(crate) fn record_write_bookkeeping(
@@ -6639,7 +6638,7 @@ fn check_fresh_write_contact_on(
 }
 
 /// Verify a volume via the v2 keyless chain walk
-/// (`docs/design/volume-format-v2.md` §5) — the same algorithm
+/// (`docs/design/volume-format-v3.md` §6) — the same algorithm
 /// `session::SealedPending::confirm` runs at seal time and `RESTORE.sh
 /// --verify` reimplements independently in bash
 /// (`docs/design/v2-open-questions.md` §10: "one chain walk, three
@@ -6742,9 +6741,9 @@ pub(crate) fn record_verification_results(
 
 /// The Layout a verify walks: the tape's own plan, rebuilt from its front
 /// index (File 3) as read back, `fi_trimmed` with its NUL padding stripped
-/// (`volume-format-v2.md` §4). File 3's own entry takes its true length from
+/// (`volume-format-v3.md` §5). File 3's own entry takes its true length from
 /// those bytes (the entry omits it, self-referentially, by design); the seal
-/// marker's stays unsized, since the front index gives it none (§3).
+/// marker's stays unsized, since the front index gives it none (§4).
 fn layout_from_front_index(label: &str, block_size: u64, fi_trimmed: &str) -> Result<Layout> {
     let fi_true_len = fi_trimmed.len() as u64;
 
@@ -6801,13 +6800,13 @@ fn layout_from_front_index(label: &str, block_size: u64, fi_trimmed: &str) -> Re
 /// one sum behind a confirm's and a verify's progress total (issue #386)
 /// and a verify's read-error rates (issue #495), so the two cannot drift
 /// (issue #496). Every file of the plan, or — on a tape that sealed short
-/// after `ended_after` (#420, `volume-format-v2.md` §5 step 4) — the files
+/// after `ended_after` (#420, `volume-format-v3.md` §6 step 4) — the files
 /// at or before it and the seal, which is never longer than the plan's.
 ///
 /// An unsized entry is left out. A write session's built Layout sizes every
 /// file, so only a Layout rebuilt from a tape's front index has one: its
 /// seal marker, for which the front index gives no size
-/// (`volume-format-v2.md` §3) — a block or two against the gigabytes of
+/// (`volume-format-v3.md` §4) — a block or two against the gigabytes of
 /// slices. `None` when nothing is sized.
 pub(crate) fn readback_bytes(layout: &Layout, ended_after: Option<u32>) -> Option<u64> {
     let bytes: u64 = layout
@@ -7260,7 +7259,7 @@ fn verify_contacted(
     // recovered by stripping trailing NUL padding — the same trick
     // `volume_identify` already uses for File 0, and the sanctioned
     // cross-tool byte contract for File 3 specifically
-    // (`volume-format-v2.md` §4: "a reader recovering File 3 from a padded
+    // (`volume-format-v3.md` §5: "a reader recovering File 3 from a padded
     // tape read obtains the same bytes by stripping trailing NUL padding").
     // Bounded (issue #400): read no further than `SMALL_FILE_CAP`.
     let fi_raw = crate::store::read_small_bytes(store, 3, "front index")?;
@@ -7295,7 +7294,7 @@ fn verify_contacted(
              again if the front index is unchanged"
         );
     }
-    // #420 (`volume-format-v2.md` §4.2 R1, §5): where the catalog says this
+    // #420 (`volume-format-v3.md` §5.1 R1, §6): where the catalog says this
     // volume's tape ended, read before the session row exists so a bad value
     // records nothing. The walk reads the seal at `ended_after + 1` and
     // no position after it, and checks the seal states the same; NULL is a
@@ -9078,7 +9077,7 @@ pub struct VerifyReport {
 
 impl VerifyReport {
     /// Whether the seal and the catalog disagree about where the tape ended
-    /// (#420, `volume-format-v2.md` §5 step 3): the report holds an
+    /// (#420, `volume-format-v3.md` §6 step 3): the report holds an
     /// [`crate::store::MismatchKind::EndedAfterDisagrees`]. The same test as
     /// [`crate::store::Evidence::ending_disagrees`], over the mismatches the
     /// report carries.
@@ -11177,8 +11176,8 @@ mod tests {
         );
     }
 
-    // ── #420: `volume verify` of a short-sealed tape (`volume-format-v2.md`
-    // §4.2 R1, §5) ──
+    // ── #420: `volume verify` of a short-sealed tape (`volume-format-v3.md`
+    // §5.1 R1, §6) ──
 
     /// A short-sealed v2 tape: File 0 planning 8 files, 1, 2, File 3
     /// planning data slices at 4, 5 and 6 and the seal at 7; the slices at 4
@@ -13982,7 +13981,7 @@ mod tests {
             (ContentUnreadable, false),
             (FrontIndexUnreadable, false),
             (SealUnreadable, false),
-            // #420 (`volume-format-v2.md` §5 step 3): the seal and the
+            // #420 (`volume-format-v3.md` §6 step 3): the seal and the
             // catalog disagree about where the tape ended — inconclusive.
             (EndedAfterDisagrees, false),
         ] {
@@ -18248,7 +18247,7 @@ mod tests {
         assert_eq!(readback_bytes(&layout, Some(2)), Some(7 * bs));
 
         // Issue #495: a verify's Layout is rebuilt from the tape's front
-        // index, which sizes no seal (`volume-format-v2.md` §3). The
+        // index, which sizes no seal (`volume-format-v3.md` §4). The
         // read-error denominator counts every sized file, at or before
         // `ended_after` on a short tape — the same sum as the progress
         // total (#496), which leaves the unsized seal out.
@@ -18262,7 +18261,7 @@ mod tests {
     /// Issue #496: `volume verify`'s progress line showed no total, because
     /// the sum was `None` whenever an entry was unsized, and the Layout a
     /// verify rebuilds from a tape's front index never sizes the seal
-    /// (`volume-format-v2.md` §3). From real front-index bytes, the total is
+    /// (`volume-format-v3.md` §4). From real front-index bytes, the total is
     /// every file the index sizes — File 3 at its own true length — with
     /// the seal left out; and a Layout with nothing sized has none.
     #[test]
@@ -24087,7 +24086,7 @@ mod tests {
             /// The seal's write (the one synchronous filemark) fails with a
             /// drive error; every other write lands.
             SealIo,
-            /// The seal's write fails as a full medium (#420, §4.3 W6: the
+            /// The seal's write fails as a full medium (#420, §5.2 W6: the
             /// hard end inside the seal, or its filemark refused); every
             /// other write lands.
             SealFull,
@@ -24240,7 +24239,7 @@ mod tests {
         }
 
         /// #418 R4, through the real write path: the cross-volume index
-        /// (`volume-format-v2.md` §1.5) reaches the envelopes - this tape and
+        /// (`volume-format-v3.md` §1.5) reaches the envelopes - this tape and
         /// the other sealed one the catalog holds, in the operator's map and
         /// in the tenant's own, with the tenant's paths - and none of it, nor
         /// any path of the archive, is ever in the clear under staging; the
@@ -24548,7 +24547,7 @@ mod tests {
             assert_eq!(code, 5, "{err}");
         }
 
-        /// 5, at the seal (#420, `volume-format-v2.md` §4.3 W6): a full
+        /// 5, at the seal (#420, `volume-format-v3.md` §5.2 W6): a full
         /// medium while the seal is written aborts the session as one inside
         /// a slice does — not the resumable stop (4) any other seal error
         /// is (`exit_4_a_write_stopped_part_way_is_resumable`'s `SealIo`).
