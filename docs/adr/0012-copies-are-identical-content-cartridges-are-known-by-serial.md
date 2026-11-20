@@ -3859,3 +3859,26 @@ symbolic link does" means an ordinary `l` row. volume-format-v3.md §1.6 keeps n
 `l` row ("a symbolic link's target is in the stream, not in the table"), and the format
 document outranks this record, so each name's row is written exactly as any symbolic link's
 is, and the target travels in the stream.
+
+## Amendment, 2026-11-20 (night): two more questions from the T6.1 reads
+
+Ruled 2026-11-20. The fixes of the T6.1 findings raised two points no item decides, and the
+coordinator put them to the CTO as questions 48 and 49, each with a recommendation and the
+reading "ratify" would get (yes to both, as recommended, and nothing else). The CTO ratified
+both.
+
+301. **A flagged heir restore whose tar failed is incomplete** (question 48, #596 heir2-C1).
+     Under RESTORE.sh's `--no-file-check` (D16), a run whose tar exited with a status other
+     than 0 ends "RESTORE INCOMPLETE" with a non-zero exit, as an unflagged run would: the flag
+     skips the checksum check, not tar's own report of failure. It holds for a fresh run, a
+     `--path` run and a repair, and stands beside the strict reading of the flag (no path
+     leaves the damaged-file list under it). A flagged whole restore whose tar exited 0 still
+     ends complete, exit 0.
+302. **A rebuild may promote a row it recorded from an unreadable seal** (question 49, #582).
+     A `catalog rebuild` that reads a tape's seal cleanly may make the tape `sealed`, with its
+     writes and positions as a sealed tape's, only where the rows were written by a rebuild
+     that could not read that seal (its `seal_unreadable` event) and nothing has changed them
+     since. It records an event when it does. It never changes a row an operator or a write
+     produced: the rule "`catalog rebuild` never changes a status it finds" (#158, #360)
+     stands for every other row. This narrows #277's principle to its purpose: an unreadable
+     seal never means "unsealed", and a seal read later finishes the record the rebuild began.
