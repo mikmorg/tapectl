@@ -627,23 +627,9 @@ pub(super) fn run(
         }
     }
     reading.end_run();
-    if let Some(e) = failure {
-        let partial = |what: String| {
-            format!(
-                "{what}. tar was extracting the unit into {} as its slices arrived, so that \
-                 directory may now hold a partial restore: empty it (or restore again with \
-                 --overwrite) before trusting what is there",
-                job.dest.display()
-            )
-        };
-        // A stop by signal (#404) stays one, so it exits as one.
-        return Err(match e {
-            TapectlError::Interrupted(what) => TapectlError::Interrupted(partial(what)),
-            other => TapectlError::Other(partial(other.to_string())),
-        });
-    }
-
-    // tar's own complaints, repeated; never the verdict.
+    // tar's own complaints, repeated; never the verdict. Recorded before a
+    // failure returns too: tar ran and extracted part of the unit, and its
+    // last run is what the `restores` row says (#585).
     let mut tar_said = Vec::new();
     for r in &reading.runs {
         let text = String::from_utf8_lossy(&r.stderr);
@@ -663,6 +649,22 @@ pub(super) fn run(
         progress::log(&format!("tar: {line}"));
     }
     trace.tar = reading.runs.last().cloned();
+    if let Some(e) = failure {
+        let partial = |what: String| {
+            format!(
+                "{what}. tar was extracting the unit into {} as its slices arrived, so that \
+                 directory may now hold a partial restore: empty it (or restore again with \
+                 --overwrite) before trusting what is there",
+                job.dest.display()
+            )
+        };
+        // A stop by signal (#404) stays one, so it exits as one.
+        return Err(match e {
+            TapectlError::Interrupted(what) => TapectlError::Interrupted(partial(what)),
+            other => TapectlError::Other(partial(other.to_string())),
+        });
+    }
+
 
     // Every restored file, hashed on disk (D16).
     let fed: Vec<&Row> = reading.fed.iter().map(|&i| reading.members()[i]).collect();
