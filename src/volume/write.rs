@@ -27619,7 +27619,8 @@ mod tests {
                         .map(|u| u.stage_set_id)
                         .collect();
                     let own = ids[..1].to_vec();
-                    let scope = rewrite_write_scope(if with_staged { None } else { Some(&own[..]) });
+                    let scope =
+                        rewrite_write_scope(if with_staged { None } else { Some(&own[..]) });
                     let mut store = MemStore::new(SBS);
                     let mut slot = ContactSlot::empty();
                     let r = volume_write_contacted(

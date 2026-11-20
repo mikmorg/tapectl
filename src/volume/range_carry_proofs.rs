@@ -36,6 +36,8 @@ struct MemSteps<'a> {
     log: RefCell<Vec<String>>,
     /// The write step fails once, touching nothing (a window left open).
     fail_write: Cell<bool>,
+    /// When the early warning comes on the destination's write.
+    dest_warn: Cell<Warn>,
     /// `(step, slices planned)` at the rehearsal and at the write: what
     /// `volume write` would plan for every staged set, `(unit, slice)`.
     planned: RefCell<Vec<Planned>>,
@@ -69,6 +71,7 @@ impl<'a> MemSteps<'a> {
             source: source.to_string(),
             log: RefCell::new(Vec::new()),
             fail_write: Cell::new(false),
+            dest_warn: Cell::new(Warn::Never),
             planned: RefCell::new(Vec::new()),
         }
     }
@@ -209,7 +212,7 @@ impl RewriteSteps for MemSteps<'_> {
         }
         let mut tapes = self.tapes.borrow_mut();
         let medium = tapes.remove(label).expect("the destination was made");
-        let mut drive = Drive::new(&self.h.conn, label, medium, Warn::Never);
+        let mut drive = Drive::new(&self.h.conn, label, medium, self.dest_warn.get());
         let mut slot = ContactSlot::empty();
         let r = write::volume_write_contacted(
             &self.h.conn,
@@ -312,8 +315,21 @@ struct Ran {
 /// given on the command line. The destination's medium is the source's
 /// cartridge, written again. `fail_write`: the first write step fails.
 fn rewrite_with(h: &mut Home, source: &str, destination: &str, fail_write: bool) -> Ran {
+    rewrite_warning(h, source, destination, fail_write, Warn::Never)
+}
+
+/// [`rewrite_with`], the early warning coming on the destination's write as
+/// `warn` says.
+fn rewrite_warning(
+    h: &mut Home,
+    source: &str,
+    destination: &str,
+    fail_write: bool,
+    warn: Warn,
+) -> Ran {
     let steps = MemSteps::new(h, source);
     steps.fail_write.set(fail_write);
+    steps.dest_warn.set(warn);
     let result = rewrite::rewrite(
         &steps.h.conn,
         &steps.h.config,
@@ -483,11 +499,19 @@ fn the_rehearsal_and_the_post_erase_write_plan_the_same_slices() {
 }
 
 /// The other holder has no full readback (a quick confirm): the rewrite plans
-/// and writes the same run, the erase is reached, and the rewrite stays open
-/// naming what is left, with the slices held. Nothing is refused after the
-/// erase that the rehearsal did not refuse before it.
+/// and writes the same run, the erase is reached, and the rewrite CLOSES: the
+/// hold and the close are tested for each slice the rewrite staged (#579;
+/// `volume-format-v3.md` §5.4), and slices 1 and 2, the only ones it staged,
+/// are on the destination and read back in full. Slice 3 was never the
+/// rewrite's: its holder's quick confirm is not the rewrite's to wait on.
+/// Nothing is refused after the erase that the rehearsal did not refuse
+/// before it.
+///
+/// This test pinned "stays open" (the hold asked every slice of the stage
+/// set); it changes with #579's fix to the per-slice test the normative text
+/// states.
 #[test]
-fn another_holder_without_a_full_readback_leaves_the_rewrite_open_not_refused_after_the_erase() {
+fn another_holder_without_a_full_readback_does_not_hold_the_rewrite_open() {
     let mut h = Home::new(None, 1, "64K");
     h.unit(
         TENANT_ONE,
@@ -501,12 +525,8 @@ fn another_holder_without_a_full_readback_leaves_the_rewrite_open_not_refused_af
     write_full(&mut h, R1[0], Warn::InSlice(B1, 2));
     h.write(R1[1], Warn::Never); // a quick confirm: write_verified = 0
     let ran = rewrite_with(&mut h, R1[0], "RNG-T1R", false);
-    let err = ran.result.expect_err("held open").to_string();
-    assert!(err.contains("took only part of this rewrite"), "{err}");
-    assert!(
-        err.contains("the rest of the staging is on no volume read back in full"),
-        "a range destination did not 'end': {err}"
-    );
+    ran.result
+        .unwrap_or_else(|e| panic!("the rewrite closes: {e}\n{:?}", ran.log));
     assert_eq!(
         ran.log,
         [
@@ -525,6 +545,90 @@ fn another_holder_without_a_full_readback_leaves_the_rewrite_open_not_refused_af
         write::recorded_ranges(&h.conn, "RNG-T1R").unwrap(),
         [range(B1, 1, 2)]
     );
+    assert_eq!(rewrite::holds(&h.conn).unwrap().len(), 0, "no hold is left");
+}
+
+/// The rewrite's stop is reached when a slice IT staged has no holder read
+/// back in full: the destination's tape ends at the early warning inside the
+/// run. The stop names those staged slices, and the remedy it names (an
+/// ordinary `volume write --full-confirm` onto another cartridge, then
+/// `--resume`) closes the rewrite (#579's loop). A source that holds a range,
+/// and one that holds the whole staging, are both in this state.
+#[test]
+fn the_stops_remedy_followed_by_resume_closes_the_rewrite_in_every_state_it_is_reached() {
+    // A source that holds only a range (slices 1-2 of 3; tape 2 holds 3).
+    let mut h = range_only_home();
+    h.volume("RNG-X");
+    let stopped = |h: &mut Home, source: &str, dest: &str, warn: Warn, staged: &str| {
+        let ran = rewrite_warning(h, source, dest, false, warn);
+        let err = ran
+            .result
+            .expect_err("the destination took only part")
+            .to_string();
+        assert!(err.contains("took only part of this rewrite"), "{err}");
+        assert!(err.contains(staged), "names the staged slices left: {err}");
+        assert!(
+            !err.contains("every staged set") && !err.contains("their only copy"),
+            "says only what is true: {err}"
+        );
+        assert!(
+            err.contains("tapectl volume write <LABEL> --init --full-confirm")
+                && err.contains(&format!("tapectl volume rewrite --resume {dest}")),
+            "{err}"
+        );
+        assert_eq!(
+            rewrite::holds(&h.conn).unwrap().len(),
+            1,
+            "the staged slice with no holder keeps the set held"
+        );
+    };
+    stopped(
+        &mut h,
+        R1[0],
+        "RNG-T1R",
+        Warn::InSlice(B1, 1),
+        "staged slice 2",
+    );
+    // The remedy, then the resume.
+    write_full(&mut h, "RNG-X", Warn::Never);
+    let steps = MemSteps::new(&mut h, R1[0]);
+    let r = rewrite::resume(&steps.h.conn, &steps.h.config, &steps, "RNG-T1R", false);
+    let log = steps.log.borrow().clone();
+    h.tapes = steps.tapes.into_inner();
+    r.unwrap_or_else(|e| panic!("resume closes the rewrite: {e}\n{log:?}"));
+    assert_eq!(rewrite::holds(&h.conn).unwrap().len(), 0);
+    let remedy = write::recorded_ranges(&h.conn, "RNG-X").unwrap();
+    assert!(
+        remedy.len() == 1 && remedy[0].last_slice == 2 && remedy[0].first_slice <= 2,
+        "the remedy wrote the slice the destination did not take (a carried run is \
+         re-planned whole, which costs tape and is not wrong): {remedy:?}"
+    );
+
+    // A source that holds the staging whole.
+    let mut h = Home::new(None, 1, "64K");
+    h.unit(
+        TENANT_ONE,
+        B1,
+        files("bravo-reel", &[50_000, 50_000, 50_000], 2),
+    );
+    h.stage(B1);
+    h.volume("WHL-T1");
+    h.volume("WHL-X");
+    write_full(&mut h, "WHL-T1", Warn::Never);
+    stopped(
+        &mut h,
+        "WHL-T1",
+        "WHL-T1R",
+        Warn::InSlice(B1, 2),
+        "staged slice 3",
+    );
+    write_full(&mut h, "WHL-X", Warn::Never);
+    let steps = MemSteps::new(&mut h, "WHL-T1");
+    let r = rewrite::resume(&steps.h.conn, &steps.h.config, &steps, "WHL-T1R", false);
+    let log = steps.log.borrow().clone();
+    h.tapes = steps.tapes.into_inner();
+    r.unwrap_or_else(|e| panic!("resume closes the rewrite: {e}\n{log:?}"));
+    assert_eq!(rewrite::holds(&h.conn).unwrap().len(), 0);
 }
 
 /// The other holder is quarantined: slice 3 then has no live holder and its

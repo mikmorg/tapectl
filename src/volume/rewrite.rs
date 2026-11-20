@@ -46,8 +46,10 @@
 //! release path asks (`staging::clean::clean_staging`, which `stage
 //! clean`, `release_if_covered`, `volume write`/`volume resume` and
 //! `collection run` all end in). A set is held while its rewrite is open
-//! AND no eligible volume carries a fully read back copy of it
-//! ([`coverage::fully_read_back_copy`]) — a fact, so the hold lifts by the
+//! AND a slice of it still staged (one the rewrite staged) has no eligible
+//! volume holding it in a fully read back write
+//! ([`coverage::staged_slices_fully_read_back`]; each slice, not the whole
+//! stage set, `volume-format-v3.md` §5.4) — a fact, so the hold lifts by the
 //! passing readback whichever command ran it, and a crash can leave it
 //! neither stuck on nor lifted early. `volume rewrite --resume NEW` finishes
 //! the rewrite from wherever the catalog says it stopped.
@@ -208,9 +210,10 @@ impl Hold {
 /// as far as retiring the source (`state` past `staged`: until then the
 /// source is intact and the staged slices are a second copy, so a rewrite a
 /// hard kill left at `staged` never blocks a release) AND no eligible volume
-/// carries a completed, fully read back copy of it
-/// ([`coverage::fully_read_back_copy`]). One query, however many candidates
-/// the caller has.
+/// holds every slice of it that is still staged in a write that was fully
+/// read back ([`coverage::staged_slices_fully_read_back`]: each slice the
+/// rewrite staged is tested, not the whole stage set; `volume-format-v3.md`
+/// §5.4, #579). One query, however many candidates the caller has.
 pub fn holds(conn: &Connection) -> Result<HashMap<i64, Hold>> {
     let sql = format!(
         "SELECT prs.stage_set_id, r.id, sv.label, r.destination_label, r.state
@@ -218,7 +221,7 @@ pub fn holds(conn: &Connection) -> Result<HashMap<i64, Hold>> {
          JOIN pending_rewrites r ON r.id = prs.rewrite_id
          JOIN volumes sv ON sv.id = r.source_volume_id
          WHERE r.finished_at IS NULL AND r.state <> 'staged' AND NOT {}",
-        coverage::fully_read_back_copy("prs.stage_set_id")
+        coverage::staged_slices_fully_read_back("prs.stage_set_id")
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -1875,9 +1878,10 @@ struct DestinationFacts {
     status: String,
     /// Writes of the rewrite's sets in a state `volume resume` can continue.
     resumable_writes: i64,
-    /// Every one of the rewrite's sets is done: every slice of it is held in
-    /// a write that was fully read back on an eligible volume, this one or
-    /// another ([`coverage::fully_read_back_copy`]).
+    /// Every one of the rewrite's sets is done: every slice of it that is
+    /// still staged is held in a write that was fully read back on an
+    /// eligible volume, this one or another
+    /// ([`coverage::staged_slices_fully_read_back`]).
     fully_read_back: bool,
     sealed_not_read_back: bool,
     mounted_cartridge: Option<i64>,
@@ -1939,12 +1943,15 @@ fn destination_facts(
             continue;
         }
         // The sealed destination took part of the set (a `range`) or none of
-        // it. Every slice of it held by a fully read back write, here or
-        // elsewhere, is done (the rest was written by another cartridge's
-        // ordinary write); otherwise the rest is the one thing left to write.
+        // it. Every slice the rewrite staged that is held by a fully read
+        // back write, here or elsewhere, is done (the rest was written by
+        // another cartridge's ordinary write); otherwise the staged slices
+        // without such a holder are the one thing left to write (#579, §5.4:
+        // the test is for each slice the rewrite staged, not for the whole
+        // stage set).
         let _ = range;
         let elsewhere: bool = conn.query_row(
-            &format!("SELECT {}", coverage::fully_read_back_copy("?1")),
+            &format!("SELECT {}", coverage::staged_slices_fully_read_back("?1")),
             params![ss],
             |r| r.get(0),
         )?;
@@ -1997,27 +2004,48 @@ fn short_at_the_destination(
                 |r| r.get(0),
             )
             .optional()?;
-        units.push(unit.unwrap_or_else(|| format!("stage set {ss}")));
+        let name = unit.unwrap_or_else(|| format!("stage set {ss}"));
+        // The staged slices of it with no fully read back holder: the ones
+        // that keep the rewrite open (#579).
+        let mut stmt = conn.prepare(&format!(
+            "SELECT hs.slice_number FROM stage_slices hs
+              WHERE hs.stage_set_id = ?1 AND hs.released_at IS NULL
+                AND NOT {} ORDER BY hs.slice_number",
+            coverage::slice_read_back_holder("hs")
+        ))?;
+        let numbers = stmt
+            .query_map(params![ss], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let list = numbers
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        units.push(format!(
+            "{name}: staged {} {list}",
+            if numbers.len() == 1 {
+                "slice"
+            } else {
+                "slices"
+            }
+        ));
     }
     Ok(TapectlError::WriteInterrupted(format!(
         "volume \"{destination}\" took only part of this rewrite: {}, and {} \
-         {} not whole on it: {}. The slices it did not take are not on \"{destination}\"; \
-         their staged slices are their only copy and stay held (nothing releases them, \
-         `--force` included). Write them onto another cartridge with a full readback — \
-         load one and run `tapectl volume write <LABEL> --init --full-confirm` (it writes \
-         every staged set, these among them) — then `tapectl volume rewrite --resume \
-         {destination}` closes the rewrite and releases staging.",
+         {} still staged without a copy read back in full: {}. Those staged slices \
+         are on no volume read back in full, so they stay held (nothing releases them, \
+         `--force` included); a slice the rewrite did not stage never holds it open. \
+         Write them onto another cartridge with a full readback: load one and run \
+         `tapectl volume write <LABEL> --init --full-confirm` (it writes the staged \
+         slices that still need a copy, these among them), then `tapectl volume rewrite \
+         --resume {destination}` closes the rewrite and releases staging.",
         ended_after.map_or_else(
-            || {
-                "it holds the run of slices the source held (a range, by design), and the \
-                 rest of the staging is on no volume read back in full"
-                    .to_string()
-            },
+            || "its plan ended before the end of the run it was given".to_string(),
             |k| format!("its tape ended after file {k}"),
         ),
         crate::render::plural(units.len() as i64, "unit", "units"),
         if units.len() == 1 { "is" } else { "are" },
-        units.join(", ")
+        units.join("; ")
     )))
 }
 

@@ -2641,16 +2641,53 @@ pub fn fully_read_back_copy(stage_set_expr: &str) -> String {
           OR (EXISTS (SELECT 1 FROM stage_slices hs WHERE hs.stage_set_id = {stage_set_expr})
               AND NOT EXISTS (
                   SELECT 1 FROM stage_slices hs WHERE hs.stage_set_id = {stage_set_expr}
-                    AND NOT EXISTS (
-                        SELECT 1 FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
-                         WHERE hw.stage_set_id = hs.stage_set_id AND hw.write_verified = 1
-                           AND {eligible}
-                           AND (hw.status = 'completed'
-                                OR (hw.status = 'range'
-                                    AND EXISTS (SELECT 1 FROM write_positions hp
-                                                 WHERE hp.write_id = hw.id
-                                                   AND hp.stage_slice_id = hs.id
-                                                   AND hp.status = 'written')))))))",
+                    AND NOT {holder})))",
+        eligible = eligible("hv"),
+        holder = slice_read_back_holder("hs")
+    )
+}
+
+/// A SQL boolean expression: every slice of stage set `stage_set_expr` that
+/// is STILL STAGED (`released_at IS NULL`) is held, in a write that was fully
+/// read back, by an [`eligible`] volume ([`slice_read_back_holder`]).
+///
+/// This is `volume rewrite`'s hold and close, tested for each slice the
+/// rewrite staged (`volume-format-v3.md` §5.4, "The hold of a rewrite is
+/// tested for each slice"; `layout-session.md`, "`volume rewrite`'s hold and
+/// close"). A rewrite of a source that holds only a range stages only that
+/// range's slices ([`crate::volume::write::compact_read`]); the rest of the
+/// staging was released and has holders of its own, which are not the
+/// rewrite's to wait on. A slice still staged is one the rewrite staged (or
+/// one still waiting to be written), and the set is held while any of them
+/// lacks a fully read back holder. A slice that is staged but has no
+/// holder counts against the set, so nothing is released on the strength of
+/// an empty test; a set with no staged slice has nothing to hold.
+pub fn staged_slices_fully_read_back(stage_set_expr: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM stage_slices hs
+                      WHERE hs.stage_set_id = {stage_set_expr} AND hs.released_at IS NULL
+                        AND NOT {holder})",
+        holder = slice_read_back_holder("hs")
+    )
+}
+
+/// A SQL boolean expression: the stage slice `slice_alias` (an alias of
+/// `stage_slices` in the caller's query) is held at a `written` position, in a
+/// `completed` or a `range` write that was fully read back, by an
+/// [`eligible`] volume. Embeds `writes`/`volumes` as `hw`/`hv` and
+/// `write_positions` as `hp`.
+pub fn slice_read_back_holder(slice_alias: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
+                  WHERE hw.stage_set_id = {s}.stage_set_id AND hw.write_verified = 1
+                    AND {eligible}
+                    AND (hw.status = 'completed'
+                         OR (hw.status = 'range'
+                             AND EXISTS (SELECT 1 FROM write_positions hp
+                                          WHERE hp.write_id = hw.id
+                                            AND hp.stage_slice_id = {s}.id
+                                            AND hp.status = 'written'))))",
+        s = slice_alias,
         eligible = eligible("hv")
     )
 }
