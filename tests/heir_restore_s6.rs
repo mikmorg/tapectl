@@ -122,6 +122,9 @@ fn a_continuation_with_no_file_check_feeds_the_listed_files_and_claims_no_pass()
         o.stderr.contains("--no-file-check: the restored files"),
         "{all}"
     );
+    // Nothing is checked, so nothing leaves the list: the run is incomplete.
+    assert_eq!(o.code, 1, "{all}");
+    assert_eq!(damaged_list(&dest), vec![victim.to_string()], "{all}");
     assert_eq!(
         std::fs::read(dest.join(victim)).ok().as_ref(),
         Some(want),
@@ -158,6 +161,8 @@ fn a_continuation_with_no_file_check_feeds_the_listed_files_when_a_folder_is_mis
     ]);
     let all = o.all();
     assert!(!all.contains("is here and passes"), "{all}");
+    assert_eq!(o.code, 1, "{all}");
+    assert_eq!(damaged_list(&dest), vec![victim.to_string()], "{all}");
     assert!(dest.join("inner").is_dir(), "the folder is restored: {all}");
     assert_eq!(
         std::fs::read(dest.join(victim)).ok().as_ref(),
@@ -186,12 +191,79 @@ fn a_continuation_with_no_file_check_keeps_what_it_could_not_restore() {
     assert_eq!(o.code, 1, "{all}");
     assert!(!all.contains("RESTORE COMPLETE"), "{all}");
     assert!(!all.contains("is here and passes"), "{all}");
-    // What slice 1 held stays listed; a path this tape holds whole may leave.
+    // Nothing is checked, so no path leaves the list.
     let after = damaged_list(&dest);
-    assert!(after.contains(&"a-symlink".to_string()), "{after:?}\n{all}");
     assert!(
-        after.iter().all(|p| before.contains(p)),
+        before.iter().all(|p| after.contains(p)),
         "{before:?} -> {after:?}\n{all}"
+    );
+}
+
+/// #574 (round 2): the reader's three runs. Run 1 lists the hard-linked name
+/// whose first name is in slice 1; run 2 under `--no-file-check` must not
+/// take it off the list (tar cannot make it); run 3, the repair WITH the
+/// check, on the tape holding slice 1, makes it and is the only verdict.
+#[test]
+fn a_no_file_check_run_never_takes_a_path_off_the_list_and_the_repair_then_completes() {
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let args = ["--restore", "--key", &ka, "--all", "--to", dstr(&dest)];
+    let o = h.run(&args);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let small = "alpha-unit-small.txt".to_string();
+    assert!(damaged_list(&dest).contains(&small), "run 1");
+    let mut again = args.to_vec();
+    again.push("--no-file-check");
+    let o = h.run(&again);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(damaged_list(&dest).contains(&small), "run 2: {all}");
+    assert!(
+        !all.contains("The per-file check below decides"),
+        "no check runs under the flag: {all}"
+    );
+    // Run 3: the repair, with the check, on the tape that holds slice 1.
+    let h1 = Heir::of(&t[0]);
+    let list = dest.join(".tapectl-damaged-files.txt");
+    let o = h1.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dstr(&dest),
+        "--paths-from",
+        dstr(&list),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(dest.join(&small).is_file(), "{all}");
+    assert!(!list.exists(), "{all}");
+}
+
+/// #574 (round 2): a FRESH `--no-file-check` restore from a tape lacking
+/// slice 1 lists the hard-linked name whose first name is in slice 1.
+#[test]
+fn a_fresh_no_file_check_restore_lists_a_hard_link_whose_first_name_was_not_read() {
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--all",
+        "--to",
+        dstr(&dest),
+        "--no-file-check",
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        damaged_list(&dest).contains(&"alpha-unit-small.txt".to_string()),
+        "{}",
+        o.all()
     );
 }
 
@@ -336,4 +408,110 @@ fn rages_words_for_a_foreign_envelope_are_not_damage() {
     // The stand-in really speaks rage's words.
     let o = h.run(&["--list", "--key", &key(&h, Who::TenantA)]);
     assert!(!o.all().contains("DAMAGED"), "{}", o.all());
+}
+
+// ---- the prompt flow after "done" (#576, round 2) ----
+
+/// A refused cartridge stays in the drive and the heir answers `done`: what
+/// the start tape holds is said to be on a tape that is not in the drive,
+/// never "this tape's plan does not hold it" and never sent to --where.
+#[test]
+fn done_with_the_refused_cartridge_still_in_the_drive_names_the_start_tape() {
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    h.shelve_blank("BLANK");
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, _| match k {
+            1 => {
+                h.load("BLANK");
+                Some(String::new())
+            }
+            2 => Some("done".into()),
+            _ => panic!("asked {k} times"),
+        },
+    );
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(all.contains("NOT IN THE DRIVE: slices 2-8 of 8"), "{all}");
+    assert!(all.contains("HEIR02"), "{all}");
+    assert!(
+        all.contains("load HEIR02") || all.contains("Load HEIR02"),
+        "{all}"
+    );
+    assert!(
+        all.contains("NOT ON THIS CARTRIDGE: slices 1 of 8"),
+        "{all}"
+    );
+    for bad in [
+        "slice 2: this tape's plan does not hold it",
+        "No tape the index names holds slice(s) 2",
+        "slices 1-8",
+    ] {
+        assert!(!all.contains(bad), "{bad}: {all}");
+    }
+}
+
+/// The prompt tells the heir to eject the cartridge first; the heir loads
+/// something else (or nothing) and types `done` without pressing ENTER. No
+/// probe ran, yet the start tape's slices are not read from the drive and
+/// called damaged or unreadable.
+#[test]
+fn done_after_the_start_tape_was_ejected_is_not_damage() {
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    h.shelve_blank("BLANK");
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, _| match k {
+            1 => {
+                h.load("BLANK");
+                Some("done".into())
+            }
+            _ => panic!("asked {k} times"),
+        },
+    );
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(all.contains("NOT IN THE DRIVE: slices 2-8 of 8"), "{all}");
+    for bad in [
+        "differs from the front index",
+        "could not be read at file",
+        "manifest and the front index disagree",
+    ] {
+        assert!(!all.contains(bad), "{bad}: {all}");
+    }
+}
+
+// ---- #577 follow-up: the reason of a refused directory ----
+
+/// A non-empty unit directory with no list is not "a list that is not this
+/// unit's": it is said to hold none.
+#[test]
+fn a_complete_sibling_directory_is_refused_for_what_it_is() {
+    let mut shape = Shape::two();
+    shape.units = vec![
+        ("tv/a/s01".into(), heir::TENANT_A, false),
+        ("tv/a/s02".into(), heir::TENANT_A, false),
+    ];
+    shape.copies = 2;
+    let t = Tape::build_series(&shape);
+    let h1 = Heir::of(&t[0]);
+    let ka = key(&h1, Who::TenantA);
+    // Only the first unit's slice is bad; the second unit comes out whole.
+    h1.flip(t[0].slice_positions()[0], 500);
+    let dest = h1.dest("out");
+    let o = h1.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(!dest.join("tv/a/s02/.tapectl-damaged-files.txt").exists());
+    let h2 = Heir::of(&t[1]);
+    let o = h2.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&dest)]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(all.contains("holds no damaged-file list"), "{all}");
+    assert!(!all.contains("not this unit's and version's"), "{all}");
 }
