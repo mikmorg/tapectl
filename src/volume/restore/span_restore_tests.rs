@@ -348,13 +348,6 @@ fn source_files(h: &Home) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Every entry directly under `dir`: empty for a restore that wrote nothing.
-fn entries_in(dir: &Path) -> Vec<std::path::PathBuf> {
-    fs::read_dir(dir)
-        .map(|it| it.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default()
-}
-
 /// `restore unit` of the unit, version 1, from the cartridge in the drive,
 /// named by no `--from`: File 0 says which volume it is.
 fn restore_loaded(
@@ -576,12 +569,15 @@ fn a_restore_may_start_on_a_tape_without_slice_1_and_asks_for_the_holder_of_slic
     assert_eq!(bay.asked_labels(), [A, B]);
 }
 
-/// A version with a slice on no live volume is refused before any prompt,
-/// naming the slices and where the catalog saw them; the dry run says the
-/// same. (The refusal that still holds in the new design: every slice must
-/// be somewhere before a cartridge is asked for.)
+/// A version with a slice on no live volume (D17, item 266; #572): the
+/// restore takes the files the live holders give whole and lists the rest,
+/// naming the slices and where the catalog saw them, with no prompt for a
+/// cartridge that holds nothing. The dry run goes through too. (It replaces
+/// item 131's refusal before the first cartridge, a Layout 2 rule: layout-
+/// session.md "Where a restore starts" and volume-format-v3.md R7 say that
+/// "I do not have it" is an answer.)
 #[test]
-fn a_slice_on_no_live_volume_is_refused_before_any_prompt() {
+fn a_slice_on_no_live_volume_is_listed_and_the_rest_is_restored() {
     let (h, n) = spanned(&[A, B], &[3]);
     // Positive control: with B in service the same restore goes through.
     let mut bay = h.bay(A, &[Reply::Load(B)]);
@@ -601,35 +597,29 @@ fn a_slice_on_no_live_volume_is_refused_before_any_prompt() {
     for needle in [
         slices.as_str(),
         &format!("\"{A}\" planned it, but its tape ended before it"),
-        &format!("\"{B}\" is given up (retired or erased)"),
-        "Nothing was read from tape",
+        &format!("\"{B}\" is given up"),
     ] {
         assert!(err.contains(needle), "{needle}: {err}");
     }
-    assert!(
-        err.contains("catalog rebuild --from-volume") || err.contains("still staged"),
-        "what would bring them back is said: {err}"
-    );
-    assert!(bay.asked.is_empty(), "refused before any prompt");
-    assert!(entries_in(dest.path()).is_empty());
+    assert_what_tape_a_holds_whole(&h, 3, dest.path(), &err);
+    assert!(bay.asked.is_empty(), "no cartridge holds the rest");
 
-    let dest_str = dest.path().to_string_lossy().into_owned();
-    let dry = restore_unit(
+    let dry_dest = TempDir::new().unwrap();
+    let dry_str = dry_dest.path().to_string_lossy().into_owned();
+    restore_unit(
         &h.conn,
         &h.paths,
         &h.config,
         UNIT,
         A,
-        &dest_str,
+        &dry_str,
         "/nonexistent/tapectl-478-nst",
         4096,
         None,
         true,
         &RestoreOptions::default(),
     )
-    .unwrap_err()
-    .to_string();
-    assert!(dry.contains(&slices), "{dry}");
+    .expect("the dry run plans what the tape holds");
 }
 
 /// What a restore of the span, started on A, leaves when B is not given: the

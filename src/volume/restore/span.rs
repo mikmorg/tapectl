@@ -11,8 +11,10 @@
 //!   others are asked for in slice order. Where the other cartridges are not
 //!   offered (nobody at the terminal, or the answer "I do not have it") the
 //!   restore takes the files this tape holds whole and lists the rest.
-//! - **Every slice somewhere.** A version with any slice on no live volume
-//!   is refused, naming the slices and where the catalog last saw them.
+//! - **A slice on no live volume** is not a refusal (item 266 and D17 replace
+//!   item 131's, a Layout 2 rule): it is left out of the plan and listed, with
+//!   where the catalog last saw it ([`Planned::unheld`]), and the restore takes
+//!   the files the live holders give whole and lists the rest.
 //! - **The fewest cartridges, in slice order.** From the start, each next
 //!   cartridge is the holder of the next slice that reads furthest, a live
 //!   volume that holds the version whole first; a quarantined holder only
@@ -111,11 +113,22 @@ struct SliceRow {
     encrypted_bytes: i64,
 }
 
+/// What a restore across cartridges reads, and what no live volume holds.
+pub(super) struct Planned {
+    /// Every slice of the set a live volume holds, in slice order, each with
+    /// the volume and tape file it is read from.
+    pub positions: Vec<WritePositionInfo>,
+    /// The slices on no live volume, each with the words that say so and
+    /// where the catalog last saw it: the reason every file in it is listed.
+    pub unheld: BTreeMap<i64, String>,
+}
+
 /// Plan the restore of `stage_set_id` (`unit_name` version `version`) that
 /// starts on the volume `start_label`, which holds `start`: its written
-/// slices of the set, a range, in tape order. Returns every slice of the set,
-/// in slice order, each with the volume and tape file it is read from; or
-/// the refusal, before any cartridge is asked for. See the module doc.
+/// slices of the set, a range, in tape order. Returns the slices of the set a
+/// live volume holds, in slice order, each with the volume and tape file it
+/// is read from, and the others by number with their reason (item 266, D17).
+/// See the module doc.
 pub(super) fn plan_across(
     conn: &Connection,
     unit_name: &str,
@@ -123,7 +136,7 @@ pub(super) fn plan_across(
     stage_set_id: i64,
     start_label: &str,
     start: Vec<WritePositionInfo>,
-) -> Result<Vec<WritePositionInfo>> {
+) -> Result<Planned> {
     if start.is_empty() {
         return Err(TapectlError::Other(format!(
             "no data for unit \"{unit_name}\" on volume \"{start_label}\""
@@ -145,21 +158,17 @@ pub(super) fn plan_across(
         by_slice.entry(h.slice_number).or_default().push(h.holder);
     }
 
-    // Every slice somewhere, before anything else is said.
+    // A slice on no live volume is listed, not refused (item 266, D17).
     let missing: Vec<i64> = slices
         .iter()
         .map(|s| s.number)
         .filter(|n| !on_start.contains_key(n) && !by_slice.contains_key(n))
         .collect();
-    if !missing.is_empty() {
-        return Err(missing_refusal(
-            conn,
-            unit_name,
-            version,
-            stage_set_id,
-            &missing,
-        )?);
-    }
+    let unheld = if missing.is_empty() {
+        BTreeMap::new()
+    } else {
+        unheld_reasons(conn, unit_name, version, stage_set_id, &missing)?
+    };
 
     let n = slices.len() as i64;
     let row = |number: i64| slices.iter().find(|s| s.number == number);
@@ -183,6 +192,11 @@ pub(super) fn plan_across(
             last
         };
         let whole = |volume_id: i64| by_volume[&volume_id].len() as i64 == n;
+        // A slice on no live volume is skipped: it is in `unheld`.
+        if candidates.is_empty() {
+            next += 1;
+            continue;
+        }
         let Some(pick) = candidates.iter().min_by_key(|h| {
             (
                 h.standing != Standing::InService,
@@ -191,29 +205,16 @@ pub(super) fn plan_across(
                 h.volume_id,
             )
         }) else {
-            // The missing check above makes this unreachable; said by name
-            // rather than read past.
-            return Err(missing_refusal(
-                conn,
-                unit_name,
-                version,
-                stage_set_id,
-                &[next],
-            )?);
+            next += 1;
+            continue;
         };
         let last = reach(pick.volume_id);
         let held = &by_volume[&pick.volume_id];
         for number in next..=last {
             let (Some(s), Some(h)) = (row(number), held.get(&number)) else {
-                // `reach` counts only slices the volume holds; said by name
-                // rather than planned around if a catalog ever disagrees.
-                return Err(missing_refusal(
-                    conn,
-                    unit_name,
-                    version,
-                    stage_set_id,
-                    &[number],
-                )?);
+                // `reach` counts only slices the volume holds, so this is a
+                // slice the stage set has no row for: nothing to plan.
+                continue;
             };
             plan.push(WritePositionInfo {
                 stage_set_id,
@@ -228,7 +229,10 @@ pub(super) fn plan_across(
         }
         next = last + 1;
     }
-    Ok(plan)
+    Ok(Planned {
+        positions: plan,
+        unheld,
+    })
 }
 
 /// The stage set's slices, in slice order.
@@ -252,23 +256,25 @@ fn slices_of(conn: &Connection, stage_set_id: i64) -> Result<Vec<SliceRow>> {
     Ok(rows)
 }
 
-/// The refusal for a version with slices on no live volume (ADR-0012 items
-/// 89 and 131): which slices, where the catalog last saw them, and what
-/// would bring them back.
-fn missing_refusal(
+/// The reason a version's slices on no live volume give for the files in
+/// them (item 266, D17; item 89's facts, no longer a refusal): which slices,
+/// where the catalog last saw them, and what would bring them back. The one
+/// text is every missing slice's. It holds no parenthesis: a listed file is
+/// `path (reason)` and a reader splits the line at the last one.
+fn unheld_reasons(
     conn: &Connection,
     unit_name: &str,
     version: i64,
     stage_set_id: i64,
     missing: &[i64],
-) -> Result<TapectlError> {
+) -> Result<BTreeMap<i64, String>> {
     let traces = slice_holders::traces_of_set(conn, stage_set_id)?;
     // What each volume the catalog saw a missing slice on says of it, in
     // volume order of first mention.
     let mut seen: Vec<(String, String, Vec<i64>)> = Vec::new();
     for t in traces.iter().filter(|t| missing.contains(&t.slice_number)) {
         let why = if t.given_up {
-            "is given up (retired or erased)".to_string()
+            "is given up, retired or erased".to_string()
         } else if t.position_status == "pending" {
             "planned it, but its tape ended before it".to_string()
         } else if t.write_status != "completed" && t.write_status != "range" {
@@ -299,7 +305,7 @@ fn missing_refusal(
             " Where the catalog saw them: {}.",
             seen.iter()
                 .map(|(label, why, numbers)| format!(
-                    "\"{label}\" {why} ({})",
+                    "\"{label}\" {why} for {}",
                     numbers_phrase(numbers)
                 ))
                 .collect::<Vec<_>>()
@@ -327,13 +333,14 @@ fn missing_refusal(
         " A tape this catalog does not know that holds them is brought into it by `tapectl \
          catalog rebuild --from-volume`."
     };
-    Ok(TapectlError::Other(format!(
-        "unit \"{unit_name}\" version {version} cannot be restored: {} of it {} on no live \
-         volume, and a restore of a version held across cartridges needs every slice, in slice \
-         order (volume-format-v3.md §5.3 R7).{saw}{next} Nothing was read from tape.",
+    let text = format!(
+        "unit \"{unit_name}\" version {version}: {} of it {} on no live volume, so the files \
+         in {} are left out.{saw}{next}",
         numbers_phrase(missing),
         if missing.len() == 1 { "is" } else { "are" },
-    )))
+        if missing.len() == 1 { "it" } else { "them" },
+    );
+    Ok(missing.iter().map(|&n| (n, text.clone())).collect())
 }
 
 /// What a restore across cartridges says when nobody is at the terminal to

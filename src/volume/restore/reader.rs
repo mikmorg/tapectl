@@ -68,6 +68,9 @@ pub(super) struct Job<'a> {
     /// The slices to read, in slice order, each with the volume it is read
     /// from.
     pub positions: &'a [WritePositionInfo],
+    /// Slices on no live volume, by number, each with its reason (D17, item
+    /// 266): not in `positions`, and the files in them are listed.
+    pub unheld: &'a BTreeMap<i64, String>,
     /// Each slice's offset in the stream: the sum of the `size_bytes` of the
     /// slices before it.
     pub offsets: &'a BTreeMap<i64, u64>,
@@ -269,9 +272,14 @@ impl<'j, 'a> Reading<'j, 'a> {
 
     /// The slice a member's bytes are in, as the plan has it.
     fn why_slice(&self, n: u64) -> String {
-        self.unavailable.get(&n).cloned().unwrap_or_else(|| {
-            format!("slice {n} was not read: it is on a cartridge this restore was not given")
-        })
+        let unheld = i64::try_from(n).ok().and_then(|n| self.job.unheld.get(&n));
+        self.unavailable
+            .get(&n)
+            .or(unheld)
+            .cloned()
+            .unwrap_or_else(|| {
+                format!("slice {n} was not read: it is on a cartridge this restore was not given")
+            })
     }
 
     /// Hand `bytes` to tar, starting a run if none is open. `Ok(false)`:
@@ -664,7 +672,6 @@ pub(super) fn run(
             other => TapectlError::Other(partial(other.to_string())),
         });
     }
-
 
     // Every restored file, hashed on disk (D16).
     let fed: Vec<&Row> = reading.fed.iter().map(|&i| reading.members()[i]).collect();

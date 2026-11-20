@@ -698,25 +698,37 @@ pub fn run(
             };
             let report = match label {
                 Some(label) => {
-                    let names = if units.is_empty() {
-                        volume::restore::units_on_volume(conn, label)?
-                    } else {
-                        units.clone()
-                    };
-                    let requests = volume::restore::unit_requests(&names, to)?;
                     let device = crate::cli::read_device(config, device.as_deref())?;
-                    volume::restore::restore_units(
-                        conn,
-                        paths,
-                        config,
-                        label,
-                        &requests,
-                        &options,
-                        *fail_fast,
-                        &device,
-                        DEFAULT_BLOCK_SIZE,
-                        *dry_run,
-                    )?
+                    if units.is_empty() {
+                        // Every unit the volume holds (#573): one that cannot
+                        // be planned is listed as failed, the rest restored.
+                        volume::restore::restore_every_unit(
+                            conn,
+                            paths,
+                            config,
+                            label,
+                            to,
+                            &options,
+                            *fail_fast,
+                            &device,
+                            DEFAULT_BLOCK_SIZE,
+                            *dry_run,
+                        )?
+                    } else {
+                        let requests = volume::restore::unit_requests(units, to)?;
+                        volume::restore::restore_units(
+                            conn,
+                            paths,
+                            config,
+                            label,
+                            &requests,
+                            &options,
+                            *fail_fast,
+                            &device,
+                            DEFAULT_BLOCK_SIZE,
+                            *dry_run,
+                        )?
+                    }
                 }
                 None => {
                     let device = crate::cli::read_device(config, device.as_deref())?;
@@ -1012,14 +1024,20 @@ fn no_volume_dry_run(command: &str) -> TapectlError {
 pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<String> {
     let mut lines = Vec::with_capacity(report.units.len() + 1);
     for u in &report.units {
-        let what = format!(
-            "\"{}\" v{} ({}) to {}",
-            u.unit_name,
-            u.version,
-            crate::render::plural(u.slices as i64, "slice", "slices"),
-            u.destination
-        );
+        // A unit that could not be planned has no version (0) and no slices.
+        let what = if u.version > 0 {
+            format!(
+                "\"{}\" v{} ({}) to {}",
+                u.unit_name,
+                u.version,
+                crate::render::plural(u.slices as i64, "slice", "slices"),
+                u.destination
+            )
+        } else {
+            format!("\"{}\" to {}", u.unit_name, u.destination)
+        };
         lines.push(match (&u.error, u.attempted, report.dry_run) {
+            (Some(e), false, true) => format!("would not restore {what}: {e}"),
             (_, _, true) => format!("would restore {what}"),
             (None, true, false) => format!("restored {what}"),
             (Some(e), _, false) => format!("FAILED {what}: {e}"),

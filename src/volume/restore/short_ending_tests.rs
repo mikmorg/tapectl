@@ -89,24 +89,67 @@ fn a_whole_unit_restores_from_a_short_tape() {
 }
 
 /// Item 288: the unit the early warning interrupted is a range on the tape
-/// (its first slice is there) and is refused as a whole-unit restore, naming
-/// the slice no live volume holds (R7); a unit planned after the warning has
-/// no row, so the tape names no data of it: refused by name before any slice
-/// is read, with the tape untouched.
+/// (its first slice is there). A restore of it takes the files the tape holds
+/// whole and lists the rest, naming the slice no live volume holds and where
+/// the catalog saw it (D17, item 266; #572): it is not refused before the
+/// tape. A unit planned after the warning has no row, so the tape names no
+/// data of it: refused by name before any slice is read, with the tape
+/// untouched.
 #[test]
 fn the_unit_the_tape_ended_in_is_a_range_and_one_after_it_has_no_data_there() {
     let mut t = short_tape::short_tape();
-    // bravo: a range of one slice; its version needs every slice, and slice
-    // 2 is on no live volume.
-    let err = select_write_positions(&t.conn, "bravo", LABEL, None)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains(
-            "unit \"bravo\" version 1 cannot be restored: slice 2 of it is on no live volume"
-        ),
-        "{err}"
+    // bravo: a range of one slice, and slice 2 of it is on no live volume. It is
+    // selected, with the one slice the tape holds.
+    let selection = select_write_positions(&t.conn, "bravo", LABEL, None).unwrap();
+    assert_eq!(
+        selection
+            .positions
+            .iter()
+            .map(|wp| wp.slice_number)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "only the slice a live volume holds is planned"
     );
+
+    assert_eq!(
+        selection.unheld.keys().copied().collect::<Vec<_>>(),
+        vec![2],
+        "the slice on no live volume is listed, with its reason"
+    );
+
+    // Through the store seam: the files slice 1 holds whole are restored and
+    // the rest are listed with where the catalog saw them.
+    let dest = TempDir::new().unwrap();
+    let dest_str = dest.path().to_string_lossy().to_string();
+    let err = restore_unit_from_store(
+        &t.conn,
+        &t.paths,
+        &Config::default(),
+        "bravo",
+        LABEL,
+        1,
+        RestoreTarget::Unit {
+            dest_dir: &dest_str,
+        },
+        &RestoreOptions::default(),
+        &mut t.store,
+        site(Operation::RestoreUnit),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
+    assert!(err.contains("slice 2 of it is on no live volume"), "{err}");
+    let got = files_under(dest.path());
+    let want = expected(&t, "bravo");
+    assert!(
+        !got.is_empty() && got.len() < want.len(),
+        "some files, not all: {} of {}",
+        got.len(),
+        want.len()
+    );
+    for g in &got {
+        assert!(want.contains(g), "{} is restored byte for byte", g.0);
+    }
 
     // charlie (nothing of it on the tape) has no data there.
     let err = select_write_positions(&t.conn, "charlie", LABEL, None)
@@ -116,8 +159,6 @@ fn the_unit_the_tape_ended_in_is_a_range_and_one_after_it_has_no_data_there() {
         err.contains("no data for unit \"charlie\" on volume"),
         "{err}"
     );
-
-    // Through the store seam: refused, and nothing restored.
     let dest = TempDir::new().unwrap();
     let dest_str = dest.path().to_string_lossy().to_string();
     let err = restore_unit_from_store(
@@ -141,6 +182,77 @@ fn the_unit_the_tape_ended_in_is_a_range_and_one_after_it_has_no_data_there() {
 
     // The positive control: a whole unit selects.
     assert!(select_write_positions(&t.conn, "alpha", LABEL, None).is_ok());
+}
+
+/// #572 and #573: `restore volume` with no unit named is the disaster
+/// recovery command. The default set holds the range unit `bravo`; it must
+/// restore `alpha` whole and `bravo`'s whole files, and list what it could
+/// not, per unit. And a unit that cannot be planned at all (here, `alpha`'s
+/// directory is not empty) is listed as failed without refusing the others.
+#[test]
+fn restore_volume_with_no_unit_named_restores_what_it_can_and_lists_the_rest() {
+    let mut t = short_tape::short_tape();
+    let dest = TempDir::new().unwrap();
+    // `alpha` cannot be planned: its destination is not empty.
+    fs::create_dir_all(dest.path().join("alpha")).unwrap();
+    fs::write(dest.path().join("alpha").join("stray"), b"x").unwrap();
+    let report = restore_units_from_loaded_store(
+        &t.conn,
+        &t.paths,
+        &Config::default(),
+        &[],
+        &dest.path().to_string_lossy(),
+        &RestoreOptions::default(),
+        false,
+        &mut t.store,
+        site(Operation::RestoreVolume),
+    )
+    .expect("the units it can restore are restored");
+    let by_name = |n: &str| {
+        report
+            .units
+            .iter()
+            .find(|u| u.unit_name == n)
+            .unwrap_or_else(|| panic!("{n} is in the report: {report:?}"))
+    };
+    let alpha = by_name("alpha");
+    assert!(!alpha.attempted, "{alpha:?}");
+    assert!(
+        alpha.error.as_deref().unwrap().contains("it is not empty"),
+        "{alpha:?}"
+    );
+    let bravo = by_name("bravo");
+    assert!(bravo.attempted, "{bravo:?}");
+    let why = bravo.error.as_deref().unwrap();
+    assert!(why.contains("INCOMPLETE"), "{why}");
+    assert!(why.contains("slice 2 of it is on no live volume"), "{why}");
+    assert_eq!(report.failed(), 2, "{report:?}");
+    let got = files_under(&dest.path().join("bravo"));
+    assert!(!got.is_empty(), "bravo's whole files are restored");
+    for g in &got {
+        assert!(expected(&t, "bravo").contains(g));
+    }
+
+    // With the stray file gone, alpha is restored whole beside bravo.
+    fs::remove_dir_all(dest.path().join("alpha")).unwrap();
+    fs::remove_dir_all(dest.path().join("bravo")).unwrap();
+    let report = restore_units_from_loaded_store(
+        &t.conn,
+        &t.paths,
+        &Config::default(),
+        &[],
+        &dest.path().to_string_lossy(),
+        &RestoreOptions::default(),
+        false,
+        &mut t.store,
+        site(Operation::RestoreVolume),
+    )
+    .unwrap();
+    assert_eq!(report.failed(), 1, "only bravo is short: {report:?}");
+    assert_eq!(
+        files_under(&dest.path().join("alpha")),
+        expected(&t, "alpha")
+    );
 }
 
 /// `restore volume` with no unit named takes every unit the tape holds a

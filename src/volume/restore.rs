@@ -1506,6 +1506,9 @@ pub(crate) struct RestorePlan {
     pub(crate) bytes: i64,
     /// `restore file`: the size of the file asked for.
     pub(crate) file_size: Option<i64>,
+    /// The slices of the version no live volume holds, by number, each with
+    /// its reason ([`RestoreSelection::unheld`]).
+    pub(crate) unheld: std::collections::BTreeMap<i64, String>,
 }
 
 /// What the catalog records of one staging that a read needs: its slice
@@ -1667,6 +1670,7 @@ pub(crate) fn plan_restore(
         positions,
         bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
         file_size,
+        unheld: selection.unheld.clone(),
     })
 }
 
@@ -1739,6 +1743,7 @@ fn restore_planned(
         slice_size: facts.slice_size,
         compression: facts.compression,
         positions: &plan.positions,
+        unheld: &plan.unheld,
         offsets: &facts.offsets,
         identities,
         tar_binary: &config.tar.binary,
@@ -1974,7 +1979,69 @@ pub fn restore_units(
     block_size: usize,
     dry_run: bool,
 ) -> Result<UnitsReport> {
-    let planned = plan_units(conn, config, volume_label, requests, options)?;
+    restore_set(
+        conn,
+        paths,
+        config,
+        volume_label,
+        requests,
+        options,
+        fail_fast,
+        device,
+        block_size,
+        dry_run,
+        false,
+    )
+}
+
+/// [`restore_units`] for every unit the volume holds (`restore volume` with
+/// no unit named, #573): a unit that cannot be planned is listed as failed
+/// with its reason, and the others are restored.
+#[allow(clippy::too_many_arguments)]
+pub fn restore_every_unit(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    volume_label: &str,
+    dest_root: &str,
+    options: &RestoreOptions,
+    fail_fast: bool,
+    device: &str,
+    block_size: usize,
+    dry_run: bool,
+) -> Result<UnitsReport> {
+    let names = units_on_volume(conn, volume_label)?;
+    let requests = unit_requests(&names, dest_root)?;
+    restore_set(
+        conn,
+        paths,
+        config,
+        volume_label,
+        &requests,
+        options,
+        fail_fast,
+        device,
+        block_size,
+        dry_run,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_set(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    volume_label: &str,
+    requests: &[UnitRequest],
+    options: &RestoreOptions,
+    fail_fast: bool,
+    device: &str,
+    block_size: usize,
+    dry_run: bool,
+    every_unit: bool,
+) -> Result<UnitsReport> {
+    let planned = plan_set(conn, volume_label, requests, options, every_unit)?;
     if dry_run {
         return Ok(UnitsReport {
             volume_label: volume_label.to_string(),
@@ -2119,7 +2186,13 @@ fn restore_units_from_loaded_bay(
             unit_names.to_vec()
         };
         let requests = unit_requests(&names, dest_root)?;
-        plan_units(conn, config, &found.label, &requests, options)
+        plan_set(
+            conn,
+            &found.label,
+            &requests,
+            options,
+            unit_names.is_empty(),
+        )
     })();
     let planned = match planned {
         Ok(planned) => planned,
@@ -2150,9 +2223,32 @@ struct PlannedUnit {
     dest_dir: String,
     scratch: PathBuf,
     plan: RestorePlan,
+    /// Why the unit could not be planned, when the set was asked for with no
+    /// unit named (#573): it is listed as failed, with this, and is never
+    /// read. `None` for every unit that has a plan.
+    refusal: Option<String>,
 }
 
 impl PlannedUnit {
+    /// A unit of a default set that could not be planned: nothing of it is
+    /// read, and the rest of the set is restored beside it.
+    fn refused(req: &UnitRequest, version: i64, why: &TapectlError) -> PlannedUnit {
+        PlannedUnit {
+            unit: req.unit.clone(),
+            version,
+            dest_dir: req.dest_dir.clone(),
+            scratch: PathBuf::new(),
+            plan: RestorePlan {
+                stage_set_id: 0,
+                positions: Vec::new(),
+                bytes: 0,
+                file_size: None,
+                unheld: Default::default(),
+            },
+            refusal: Some(why.to_string()),
+        }
+    }
+
     fn target(&self) -> RestoreTarget<'_> {
         RestoreTarget::Unit {
             dest_dir: &self.dest_dir,
@@ -2169,6 +2265,10 @@ impl PlannedUnit {
     }
 
     fn outcome(&self, error: Option<String>, attempted: bool) -> UnitOutcome {
+        let (error, attempted) = match &self.refusal {
+            Some(why) => (Some(why.clone()), false),
+            None => (error, attempted),
+        };
         UnitOutcome {
             unit_name: self.unit.clone(),
             version: self.version,
@@ -2186,12 +2286,28 @@ impl PlannedUnit {
 
 /// [`restore_units`]'s half before the tape: every unit planned and
 /// checked, the set's space checked, the units sorted into tape order.
+#[cfg(test)]
 fn plan_units(
     conn: &Connection,
     _config: &Config,
     volume_label: &str,
     requests: &[UnitRequest],
     options: &RestoreOptions,
+) -> Result<Vec<PlannedUnit>> {
+    plan_set(conn, volume_label, requests, options, false)
+}
+
+/// [`plan_units`], and with `every_unit` (`restore volume` with no unit
+/// named, #573) a unit that cannot be planned is not a refusal of the whole
+/// command: it is listed as failed, with its reason, and the others are
+/// planned and restored. A set the operator named is refused whole, as
+/// before: they asked for each of those units.
+fn plan_set(
+    conn: &Connection,
+    volume_label: &str,
+    requests: &[UnitRequest],
+    options: &RestoreOptions,
+    every_unit: bool,
 ) -> Result<Vec<PlannedUnit>> {
     if requests.is_empty() {
         return Err(TapectlError::Other("no unit to restore".into()));
@@ -2233,31 +2349,50 @@ fn plan_units(
     let mut planned = Vec::with_capacity(requests.len());
     let mut needs = Vec::new();
     for req in requests {
-        let unit = queries::get_unit_by_name(conn, &req.unit)?
-            .ok_or_else(|| TapectlError::UnitNotFound(req.unit.clone()))?;
-        queries::get_tenant_by_id(conn, unit.tenant_id)?
-            .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
-        // A version this tape holds only a range of is planned across the
-        // cartridges as `restore unit` plans it (item 266, D17): with the
-        // others offered it goes on across them, and without them it takes
-        // the files this tape holds whole and lists the rest.
-        let selection = select(conn, &req.unit, volume_label, req.version)?;
-        let target = RestoreTarget::Unit {
-            dest_dir: &req.dest_dir,
-        };
-        let scratch = scratch_dir(Path::new(&req.dest_dir), options.scratch.as_deref());
-        let plan = plan_restore(conn, &selection, target)?;
-        preflight_checks(conn, &req.unit, &selection, target, &scratch, options)?;
-        if let Some(n) = space_needs(Path::new(&req.dest_dir), &scratch, plan.bytes, None) {
-            needs.extend(n);
+        // Which version a unit that cannot be planned is listed under: the
+        // one asked for, else the one selected, else none (0).
+        let mut version = req.version.unwrap_or(0);
+        let one = (|| -> Result<(PlannedUnit, Option<Vec<SpaceNeed>>)> {
+            let unit = queries::get_unit_by_name(conn, &req.unit)?
+                .ok_or_else(|| TapectlError::UnitNotFound(req.unit.clone()))?;
+            queries::get_tenant_by_id(conn, unit.tenant_id)?
+                .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
+            // A version this tape holds only a range of is planned across the
+            // cartridges as `restore unit` plans it (item 266, D17): with the
+            // others offered it goes on across them, and without them it takes
+            // the files this tape holds whole and lists the rest.
+            let selection = select(conn, &req.unit, volume_label, req.version)?;
+            version = selection.version;
+            let target = RestoreTarget::Unit {
+                dest_dir: &req.dest_dir,
+            };
+            let scratch = scratch_dir(Path::new(&req.dest_dir), options.scratch.as_deref());
+            let plan = plan_restore(conn, &selection, target)?;
+            preflight_checks(conn, &req.unit, &selection, target, &scratch, options)?;
+            let n = space_needs(Path::new(&req.dest_dir), &scratch, plan.bytes, None);
+            Ok((
+                PlannedUnit {
+                    unit: req.unit.clone(),
+                    version: selection.version,
+                    dest_dir: req.dest_dir.clone(),
+                    scratch,
+                    plan,
+                    refusal: None,
+                },
+                n,
+            ))
+        })();
+        match one {
+            Ok((unit, n)) => {
+                needs.extend(n.into_iter().flatten());
+                planned.push(unit);
+            }
+            Err(e) if every_unit => {
+                warn!(unit = %req.unit, error = %e, "unit cannot be planned, and is listed");
+                planned.push(PlannedUnit::refused(req, version, &e));
+            }
+            Err(e) => return Err(e),
         }
-        planned.push(PlannedUnit {
-            unit: req.unit.clone(),
-            version: selection.version,
-            dest_dir: req.dest_dir.clone(),
-            scratch,
-            plan,
-        });
     }
     if options.no_space_check {
         info!("disk space not checked (--no-space-check)");
@@ -2341,6 +2476,13 @@ fn restore_units_in_contact(
     for p in planned {
         if stopped {
             units.push(p.outcome(None, false));
+            continue;
+        }
+        // Planned to a refusal (#573): listed, never read.
+        if p.refusal.is_some() {
+            warn!(unit = %p.unit, "unit not restored: it could not be planned");
+            units.push(p.outcome(None, false));
+            stopped = fail_fast;
             continue;
         }
         let started_at = restore_record::now_sqlite();
@@ -2553,6 +2695,11 @@ pub struct RestoreSelection {
     /// is read from ([`WritePositionInfo::volume_id`]): this volume's range
     /// first, then the other cartridges in slice order ([`span`]).
     pub positions: Vec<WritePositionInfo>,
+    /// The slices of the version no live volume holds (D17, item 266; only
+    /// a version this volume holds a range of has any), each with the words
+    /// that say so and where the catalog last saw it. They are not in
+    /// `positions`: the files in them are left out and listed.
+    pub unheld: std::collections::BTreeMap<i64, String>,
 }
 
 /// Select the ONE snapshot version of `unit_name` to restore from
@@ -2588,10 +2735,11 @@ pub struct RestoreSelection {
 ///
 /// **A version this volume holds a range of** (#478, `volume-format-v3.md`
 /// §5.3) is named on the tape as a cut one is, and is then planned across
-/// cartridges ([`span::plan_across`]): this volume must hold its slice 1,
-/// every slice must be on a live volume, and the positions returned are
-/// every slice of the version, from the fewest cartridges in slice order.
-/// Either refusal comes before any cartridge is asked for. A version held
+/// cartridges ([`span::plan_across`]): the positions returned are every slice
+/// of the version a live volume holds, from the fewest cartridges in slice
+/// order, and the slices no live volume holds are listed in
+/// [`RestoreSelection::unheld`] (item 266, D17: the restore takes what the
+/// live holders give whole and lists the rest). A version held
 /// whole costs the statements it did in 1.6.0 (`catalog_budget`'s
 /// `RestoreSelect`).
 pub fn select_write_positions(
@@ -2778,23 +2926,25 @@ fn select(
             wp.slice_number, wp.position
         )));
     }
-    let positions = if status == "range" {
-        span::plan_across(
+    let (positions, unheld) = if status == "range" {
+        let planned = span::plan_across(
             conn,
             unit_name,
             version,
             stage_set_id,
             volume_label,
             positions,
-        )?
+        )?;
+        (planned.positions, planned.unheld)
     } else {
-        positions
+        (positions, Default::default())
     };
     Ok(RestoreSelection {
         version,
         stage_set_id,
         versions_on_volume,
         positions,
+        unheld,
     })
 }
 
