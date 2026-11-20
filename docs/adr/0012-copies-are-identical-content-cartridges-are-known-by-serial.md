@@ -3824,3 +3824,32 @@ task that builds it, T5.11):
 - *T5.6's `volumes.restore_sh_sha256`* (the sha256 of the RESTORE.sh a volume carries, copied
   by `drill record`) was put to the CTO beside question 45 as a determination they may
   overrule, and was not overruled. It stays a determination, not a ruling.
+
+## Amendment, 2026-11-20 (evening): two questions from the T6.1 reads
+
+Ruled 2026-11-20. Stage 6's adversarial reads (#551; the issues under `review-2026-11-20`)
+found two points no item decides, and the coordinator put them to the CTO as questions 46
+and 47, each with a recommendation and the reading "ratify" would get. The CTO chose each
+recommendation.
+
+299. **Two hard-linked names of one symbolic link are archived** (question 46, #581). Each name
+     gets its own `l` row in the file table, with its link target's text, as any symbolic link
+     does. The stream keeps the member GNU tar writes for the second name (a hard-link member
+     naming the first), and the stream's check accepts that member when the first name is a
+     listed symbolic link of the same inode. No schema change. A slice read alone that holds
+     the second name and not the first cannot make that name: item 293's limit, and the name
+     is listed for the repair. Tested 2026-11-20 with GNU tar 1.35: the whole stream restores
+     both names, linked; the second name's member alone fails on that name only.
+
+300. **Item 86 binds a carried run in both directions** (question 47, #590). A run written to
+     a cartridge must be of the generation of every range of the same version it adjoins: the
+     range that ends just before it and the range that begins just after it. A compaction or
+     rewrite that would leave one version's slices on two generations is refused, naming the
+     volumes that hold the adjoining ranges and their generation; moving a spanning version
+     to a new generation means carrying all its tapes into the same destination.
+
+**A determination, not a ruling, said so that it can be corrected** (the coordinator's, from
+#572): D17 (item 290) and item 266 replace item 131's "a version with any slice on no live
+volume is refused before the first cartridge is asked for". A restore from a tape that holds
+a range takes the files that tape holds whole and lists the rest, also when the rest is on no
+live volume, naming where the catalog last saw it.
