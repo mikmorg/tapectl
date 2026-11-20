@@ -41,11 +41,7 @@ pub const UNIT_FILES: [&str; 4] = [
 /// The tools tapectl and the tapes' RESTORE.sh run, each with its
 /// Debian/Ubuntu package. `tar` is not here: the writer's floor ([`tar_floor`])
 /// checks it, before anything is made.
-const TOOLS: &[(&str, &str)] = &[
-    ("sg_logs", "sg3-utils"),
-    ("age", "age"),
-    ("mt", "mt-st"),
-];
+const TOOLS: &[(&str, &str)] = &[("sg_logs", "sg3-utils"), ("age", "age"), ("mt", "mt-st")];
 
 /// Where the Quick start page is read.
 pub const QUICK_START_URL: &str =
