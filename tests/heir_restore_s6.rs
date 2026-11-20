@@ -300,3 +300,36 @@ fn a_later_run_finds_the_list_of_a_unit_with_a_hierarchical_name() {
     }
 }
 
+// ---- #578 ----
+
+/// #578: `rage` linked as `age` says `No matching keys found` for an envelope
+/// the key is not for. That is "not for this key", never damage.
+#[test]
+fn rages_words_for_a_foreign_envelope_are_not_damage() {
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::heir_age_binary();
+    h.put_tool(
+        "age",
+        &format!(
+            "#!/bin/bash\nerr=$(mktemp)\n{real} \"$@\" 2>\"$err\"\nrc=$?\nsed 's/no identity matched any of the file.s recipients/Error: No matching keys found/' \"$err\" >&2\nrm -f \"$err\"\nexit $rc\n",
+            real = real.display()
+        ),
+    );
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--unit",
+        heir::UNIT_A,
+        "--to",
+        dstr(&dest),
+    ]);
+    let all = o.all();
+    assert!(!all.contains("DAMAGED"), "{all}");
+    assert_eq!(o.code, 0, "{all}");
+    // The stand-in really speaks rage's words.
+    let o = h.run(&["--list", "--key", &key(&h, Who::TenantA)]);
+    assert!(!o.all().contains("DAMAGED"), "{}", o.all());
+}

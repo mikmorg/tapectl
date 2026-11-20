@@ -386,6 +386,14 @@ is_full_text() {
   return 1
 }
 
+# Does age's text say the file is not sealed to the key given? Go age says
+# "no identity matched any of the file's recipients"; rage (the Rust age
+# crate) says "No matching keys found". Anything else, after a key matched,
+# is damage (#578).
+not_a_recipient() { # <age's words>
+  printf '%s' "$1" | grep -i -e 'no identity matched' -e 'no matching keys found' >/dev/null 2>&1
+}
+
 free_kb() { # <directory>: free KiB, or nothing when df cannot say
   { df -Pk -- "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; } || true
 }
@@ -989,7 +997,7 @@ backup_of() {
 
 # Try one envelope file. Echo-free: results in globals.
 #   0  opened, extracted into $WORK/env.<primary>
-#   2  not for the key given (age: no identity matched)
+#   2  not for the key given (age: no identity matched; rage: No matching keys found)
 #   3  damaged or unreadable
 try_envelope_at() { # <position of this copy> <primary position> <true bytes> <hash>
   local pos=$1 primary=$2 size=$3 hash=$4 dir="$WORK/env.$2" arc="" trc="" text
@@ -1024,7 +1032,7 @@ try_envelope_at() { # <position of this copy> <primary position> <true bytes> <h
   arc=$(cat "$WORK/age.rc" 2>/dev/null || echo 1)
   trc=$(cat "$WORK/tar.rc" 2>/dev/null || echo 1)
   text="$(cat "$WORK/age.err" "$WORK/tar.err" 2>/dev/null || true)"
-  if [ "$arc" != 0 ] && printf '%s' "$text" | grep -i 'no identity matched' >/dev/null 2>&1; then
+  if [ "$arc" != 0 ] && not_a_recipient "$text"; then
     rm -rf "$dir"
     return 2
   fi
@@ -1675,7 +1683,7 @@ prepare_slice() { # <slice number>
     feeder_fatal "writing slice $k into the work directory failed: $(printf '%s' "$text" | head -n 1). The work directory $WORK is full or not writable. Nothing on the tape is wrong: free space there or give --work DIR on a larger disk."
   fi
   if [ "$arc" != 0 ]; then
-    if printf '%s' "$text" | grep -i 'no identity matched' >/dev/null 2>&1; then
+    if not_a_recipient "$text"; then
       why="no key given opens it (a slice can be sealed to an older key than the envelope: give each key with --key)"
     else
       why="age could not decrypt it: $(printf '%s' "$text" | head -n 1 | head -c 100)"
