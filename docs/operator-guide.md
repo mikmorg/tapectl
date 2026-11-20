@@ -2408,14 +2408,14 @@ tapectl does not run any of step 2 for you — it produces the bytes and records
 the result.
 
 > [!NOTE]
-> Every `tapectl`, `age`, `dar`, `tr` and `sha256sum` invocation in this
-> section and the next was run against a real dumped volume, and the outputs
-> quoted are the real ones. The `rclone` and `aws` lines were **not** run when
-> this was written — they are transcribed from vendor documentation and are
-> the one part of this procedure to re-check against your own installed
-> version before you rely on it. Do a dry run against a scratch bucket before
-> your first real deposit; `rclone copy --dry-run` will tell you if a flag has
-> moved.
+> The `rclone` and `aws` lines were **not** run when this was written — they
+> are transcribed from vendor documentation and are the part of this procedure
+> to re-check against your own installed version before you rely on it. Do a
+> dry run against a scratch bucket before your first real deposit; `rclone copy
+> --dry-run` will tell you if a flag has moved. The way back (the last part of
+> this section) is the Layout 3 heir path of `docs/design/volume-format-v3.md`
+> §7.2 applied to the dumped files; it was written from that text and is the
+> second thing to rehearse, on a small volume, before you rely on a deposit.
 
 **1. Dump the sealed volume to a directory.** `restore raw-volume` reads a
 tape using only what is on the tape itself, verifies every file against the
@@ -2525,11 +2525,11 @@ rclone copy s3:my-archive-bucket/MHVTLR3/ /recover/MHVTLR3/ \
 
 # Then thaw the slices and wait.
 aws s3api restore-object --bucket my-archive-bucket \
-  --key MHVTLR3/0008_data_slice.bin \
+  --key MHVTLR3/0010_data_slice.bin \
   --restore-request Days=7,GlacierJobParameters={Tier=Standard}
 # ... repeat per slice, then poll:
 aws s3api head-object --bucket my-archive-bucket \
-  --key MHVTLR3/0008_data_slice.bin --query Restore
+  --key MHVTLR3/0010_data_slice.bin --query Restore
 ```
 
 Once `Restore` reports `ongoing-request="false"`, download normally.
@@ -2541,52 +2541,103 @@ tape block**, so it has a large tail of NUL padding — strip it before reading:
 tr -d '\0' < /recover/MHVTLR3/0003_front_index.bin | less
 ```
 
-Content files (envelopes, slices) are dumped at their exact length and need no
-stripping. Only the front index and seal marker carry padding, because they
-are the two files that cannot carry their own hash.
+Each line gives a file's position, type and `size_bytes`, and for every file but
+the front index and the seal marker its `sha256_encrypted`
+(`volume-format-v3.md` §4). Content files (envelopes, slices) are dumped at
+their exact length (`size_bytes`) and need no stripping. Only the front index
+and the seal marker carry padding, because they are the two files that cannot
+carry their own hash. Check each file you fetched against its
+`sha256_encrypted` (`sha256sum`) before you trust it; a deposit that does not
+match was damaged in the cloud or in transit.
 
 **3. Open an envelope by trial decryption.** Try each key you hold against
-each envelope; the one that works is yours. A tenant key opens only that
-tenant's envelope, and the operator key opens every one:
+each `tenant_envelope`; the one that works is yours. A tenant key opens only
+that tenant's envelopes, and the operator key opens every one. An envelope is
+an age-encrypted tar (§1, §7.2 step 4):
 
 ```bash
+mkdir -p /recover/env
 age -d -i ~/.tapectl/keys/YOURKEY.age.key \
-  < /recover/MHVTLR3/0004_tenant_envelope.bin | tar -xv
+  < /recover/MHVTLR3/0004_tenant_envelope.bin | tar -x -C /recover/env
 ```
 
-You get `MANIFEST.toml`, `RECOVERY.md`, and the dar catalogs.
+"No identity matched" means the key is not a recipient of that envelope; try
+the next one. Any other failure after a key matched means the envelope is
+damaged, so use the `tenant_envelope_backup` file the front index lists with
+the same `sha256_encrypted`. You get `MANIFEST.toml`, `RECOVERY.md`, `index/`
+and, for a tenant, `tables/`: for each unit's staging, its **file table**
+(`tables/<uuid8>_v<version>_s<stage_set_id>.tsv`: every member of the unit
+with its slice, its offsets in the stream and its sha256) and its id map
+(§1.6, §1.9).
 
 **4. Map slices using MANIFEST.toml — not the filename order.** Each unit's
-`[[units.slices]]` block gives both `number` (dar's slice number) and
-`tape_position` (which dumped file holds it). **These are not the same, and
-slices do not start at position 0** — on a real volume they typically start
-after the envelopes. Decrypt each slice into a working directory named by its
-`number`:
+`[[units]]` block lists every slice of the staging as `[[units.slices]]`, with
+`number` (the slice's place in the unit's tar stream) and, only for a slice
+this tape holds, `tape_position` (which dumped file holds it). **These are not
+the same, and slices do not start at position 0** — on a real volume they
+start after the envelopes. A unit may continue on another cartridge; a slice
+with no `tape_position` is on another deposit (§1, §5.3):
 
 ```toml
 [[units.slices]]
 number = 1
-tape_position = 8
+tape_position = 10
+size_bytes = 268435456
+encrypted_bytes = 268436120
 sha256_plain = "0c507128…"
+sha256_encrypted = "9ad1e0b3…"
 ```
 
+A slice is the unit's tar stream cut at a member's start, optionally
+compressed alone (the unit's block says `compression = "gzip"`, `"xz"` or
+`"zstd"` when it is), then age-encrypted alone (§3.4). Undo it in the reverse
+order for each slice, and check the two hashes. Plain slice, no `compression`:
+
 ```bash
-mkdir -p /recover/dar
+mkdir -p /recover/stream
+sha256sum /recover/MHVTLR3/0010_data_slice.bin        # = sha256_encrypted
 age -d -i ~/.tapectl/keys/YOURKEY.age.key \
-  < /recover/MHVTLR3/0008_data_slice.bin > /recover/dar/restore.1.dar
-# verify against sha256_plain from the manifest:
-sha256sum /recover/dar/restore.1.dar
+  < /recover/MHVTLR3/0010_data_slice.bin > /recover/stream/slice.0001
+sha256sum /recover/stream/slice.0001                  # = sha256_plain
 ```
 
-**5. Extract.** dar takes the base name, with no `.N.dar` suffix:
+For a compressed unit, put the matching `gzip -dc`, `xz -dc` or `zstd -dc` between
+`age` and the file; `sha256_plain` is of the result, so a decompressor that
+exits 0 after writing wrong bytes (BusyBox's `unxz` does) is caught by it.
+
+**5. Extract.** The slices of one unit, joined in `number` order, are the
+unit's tar stream (§3.3). Give them to one `tar` run into an empty directory;
+tar needs no list and no key:
 
 ```bash
-dar -x /recover/dar/restore -R /destination -O -Q
+mkdir -p /destination
+cat /recover/stream/slice.0001 /recover/stream/slice.0002 \
+  | tar -x -f - -C /destination --numeric-owner --preserve-permissions \
+        --xattrs --acls
 ```
 
-This whole path was verified end-to-end against a real dumped volume: the
-decrypted slice matched its manifest `sha256_plain`, and the extraction was
-`diff -r`-identical to the original source tree.
+**6. Check what you got.** tar's exit status is not the verdict (a BusyBox tar
+exits 0 with files missing). The proof is each regular file's sha256 against
+the file table's `sha256` column (§1.6, §7); a file that fails, or is missing,
+is damaged, and a slice that failed in step 4 is the reason, named by the
+table's `slice` column. A slice you could not fetch or that fails its hash is
+left out, never replaced by zeros, and the members in it are the ones lost
+(§7.1); restore those paths from a tape or another deposit that holds them.
+
+**The shorter way, if you have a drive.** `RESTORE.sh` does all of steps 3 to 6
+(trial decryption, the slice hash checks, one tar run, the per-file check), but
+it reads a tape in a drive, not a directory, and tapectl has no command that
+restores from a directory of dumped files. A deposit is the tape's files
+byte for byte, so it can be written back to a blank cartridge (fixed 512 KiB
+blocks, `volume-format-v3.md` §8): `mt -f /dev/nst0 setblk 524288`, `mt -f
+/dev/nst0 rewind`, then for each file in position order, `dd
+if=NNNN_type.bin of=/dev/nst0 bs=512k conv=sync` (closing the non-rewinding
+device after each `dd` writes its filemark; the front index and the seal
+marker are already full blocks, and `conv=sync` pads the others with zeros as
+the writer did). Then `RESTORE.sh --verify` reads every file against the
+front index with no key, and `RESTORE.sh --restore --key KEY --to DIR --all`
+is the heir's restore (§7.4). This write-back was not run when this was
+written; take the manual path above if you cannot rehearse it.
 
 ### Asking for warehouse copies by policy
 
