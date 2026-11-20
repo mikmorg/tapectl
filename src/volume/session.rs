@@ -7872,7 +7872,12 @@ mod tests {
             };
             let mut padded = file0.into_bytes();
             padded.resize(BS as usize, 0);
-            store.files[0] = padded;
+            if store.files.is_empty() {
+                store.files.push(padded);
+                store.syncs.push(false);
+            } else {
+                store.files[0] = padded;
+            }
 
             let quarantined = match interrupted
                 .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
