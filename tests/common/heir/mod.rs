@@ -1188,6 +1188,20 @@ impl Heir {
         writeln!(ops, "swap").unwrap();
     }
 
+    /// The bay is emptied (the cartridge was ejected and none loaded): every
+    /// `mt` and `dd` finds no cartridge, the head is nowhere.
+    pub fn empty_bay(&self) {
+        let r = self.root.path();
+        let _ = fs::remove_file(r.join("files"));
+        fs::write(r.join("state/pos"), "0").unwrap();
+        use std::io::Write;
+        let mut ops = fs::OpenOptions::new()
+            .append(true)
+            .open(r.join("state/ops"))
+            .unwrap();
+        writeln!(ops, "swap").unwrap();
+    }
+
     /// The name of the cartridge in the drive.
     pub fn loaded(&self) -> String {
         fs::read_link(self.root.path().join("files"))

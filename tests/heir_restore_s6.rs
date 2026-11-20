@@ -224,6 +224,9 @@ fn a_no_file_check_run_never_takes_a_path_off_the_list_and_the_repair_then_compl
         !all.contains("The per-file check below decides"),
         "no check runs under the flag: {all}"
     );
+    // The positive control: tar did end non-zero, and the flag's line says so.
+    assert!(all.contains("tar ended with status"), "{all}");
+    assert!(all.contains("--no-file-check: no check runs"), "{all}");
     // Run 3: the repair, with the check, on the tape that holds slice 1.
     let h1 = Heir::of(&t[0]);
     let list = dest.join(".tapectl-damaged-files.txt");
@@ -461,29 +464,38 @@ fn done_with_the_refused_cartridge_still_in_the_drive_names_the_start_tape() {
 #[test]
 fn done_after_the_start_tape_was_ejected_is_not_damage() {
     let t = span2();
-    let h = Heir::of_series(&[&t[1], &t[0]]);
-    h.shelve_blank("BLANK");
-    let dest = h.dest("out");
-    let ka = key(&h, Who::TenantA);
-    let o = h.run_prompted(
-        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
-        |k, _| match k {
-            1 => {
-                h.load("BLANK");
-                Some("done".into())
-            }
-            _ => panic!("asked {k} times"),
-        },
-    );
-    let all = o.all();
-    assert_eq!(o.code, 1, "{all}");
-    assert!(all.contains("NOT IN THE DRIVE: slices 2-8 of 8"), "{all}");
-    for bad in [
-        "differs from the front index",
-        "could not be read at file",
-        "manifest and the front index disagree",
-    ] {
-        assert!(!all.contains(bad), "{bad}: {all}");
+    for empty in [false, true] {
+        let h = Heir::of_series(&[&t[1], &t[0]]);
+        h.shelve_blank("BLANK");
+        let dest = h.dest("out");
+        let ka = key(&h, Who::TenantA);
+        let o = h.run_prompted(
+            &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+            |k, _| match k {
+                1 => {
+                    if empty {
+                        h.empty_bay();
+                    } else {
+                        h.load("BLANK");
+                    }
+                    Some("done".into())
+                }
+                _ => panic!("asked {k} times"),
+            },
+        );
+        let all = o.all();
+        assert_eq!(o.code, 1, "empty={empty}: {all}");
+        assert!(
+            all.contains("NOT IN THE DRIVE: slices 2-8 of 8"),
+            "empty={empty}: {all}"
+        );
+        for bad in [
+            "differs from the front index",
+            "could not be read at file",
+            "manifest and the front index disagree",
+        ] {
+            assert!(!all.contains(bad), "empty={empty} {bad}: {all}");
+        }
     }
 }
 
@@ -514,4 +526,177 @@ fn a_complete_sibling_directory_is_refused_for_what_it_is() {
     assert_eq!(o.code, 1, "{all}");
     assert!(all.contains("holds no damaged-file list"), "{all}");
     assert!(!all.contains("not this unit's and version's"), "{all}");
+}
+
+// ---- round 3 ----
+
+fn sibling_pair() -> Vec<Tape> {
+    let mut shape = Shape::two();
+    shape.units = vec![
+        ("tv/a/s01".into(), heir::TENANT_A, false),
+        ("tv/a/s02".into(), heir::TENANT_A, false),
+    ];
+    shape.copies = 2;
+    Tape::build_series(&shape)
+}
+
+/// heir2-1: a start tape whose File 0 states no uuid is still the cartridge
+/// in the drive after `done`: its slices are restored.
+#[test]
+fn done_on_a_start_tape_whose_file_0_has_no_uuid_still_restores_what_it_holds() {
+    let t = span2();
+    let base = Heir::of_series(&[&t[1], &t[0]]);
+    let want_dest = base.dest("out");
+    let ka = key(&base, Who::TenantA);
+    base.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&want_dest)]);
+    let want_tree = heir::tree(&want_dest);
+    assert!(!want_tree.is_empty());
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let text = String::from_utf8_lossy(&t[1].files[0]).into_owned();
+    let text = text.trim_end_matches('\0');
+    assert!(text.lines().any(|l| l.trim_start().starts_with("uuid")));
+    let edited: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("uuid"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    h.replace(0, edited.as_bytes());
+    let dest = h.dest("out");
+    let o = h.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&dest)]);
+    let all = o.all();
+    assert!(!all.contains("NOT IN THE DRIVE"), "{all}");
+    assert_eq!(heir::tree(&dest), want_tree, "{all}");
+}
+
+/// heir2-2: the remedy the refusal names works and ends in a continuation.
+#[test]
+fn the_refusal_of_a_sibling_names_a_command_that_continues_the_damaged_unit() {
+    let t = sibling_pair();
+    let h1 = Heir::of(&t[0]);
+    let ka = key(&h1, Who::TenantA);
+    h1.flip(t[0].slice_positions()[0], 500);
+    let dest = h1.dest("out");
+    let o = h1.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let h2 = Heir::of(&t[1]);
+    let o = h2.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&dest)]);
+    let all = o.all();
+    let remedy = format!("--unit tv/a/s01 --to {}/tv/a/s01", dstr(&dest));
+    assert!(all.contains(&remedy), "{remedy}: {all}");
+    let unit_dir = dest.join("tv/a/s01");
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--unit",
+        "tv/a/s01",
+        "--to",
+        dstr(&unit_dir),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(all.contains("this run adds to it"), "{all}");
+    assert!(!unit_dir.join(".tapectl-damaged-files.txt").exists());
+}
+
+/// heir2-3: once the start tape is not in the drive the next prompt names it.
+#[test]
+fn the_prompt_names_the_start_tape_once_another_cartridge_was_taken() {
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, text| match k {
+            1 => {
+                h.load("HEIR01");
+                Some(String::new())
+            }
+            2 => {
+                let after = &text[text.rfind("needs slice 2").expect("slice 2 prompt")..];
+                assert!(
+                    after.contains("tape HEIR02 (cartridge serial")
+                        && after.contains("the tape this restore started on"),
+                    "{after}"
+                );
+                Some("done".into())
+            }
+            _ => panic!("asked {k} times"),
+        },
+    );
+    let all = o.all();
+    assert!(all.contains("NOT IN THE DRIVE: slices 2-8 of 8"), "{all}");
+    assert!(
+        !all.contains("No tape the index names holds slice(s) 2"),
+        "{all}"
+    );
+    assert!(!all.contains("NOT ON THIS CARTRIDGE: slices 2"), "{all}");
+}
+
+/// heir2-4: quit stops; nothing after the prompt is fetched or fed, and
+/// nothing is called damage.
+#[test]
+fn quit_stops_reading() {
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    h.shelve_blank("BLANK");
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, _| match k {
+            1 => {
+                h.load("BLANK");
+                Some("quit".into())
+            }
+            _ => panic!("asked {k} times"),
+        },
+    );
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(all.contains("RESTORE STOPPED"), "{all}");
+    for bad in ["could not be read", "differs from the front index"] {
+        assert!(!all.contains(bad), "{bad}: {all}");
+    }
+    assert!(
+        h.reads_by_cartridge().last().unwrap().is_empty(),
+        "{:?}",
+        h.reads_by_cartridge()
+    );
+}
+
+/// heir2-5: a checked continuation removes every listed path that passes,
+/// fed or not, and keeps the one that still fails.
+#[test]
+fn a_checked_continuation_removes_every_listed_path_that_passes() {
+    let mut shape = Shape::two();
+    shape.copies = 2;
+    let t = Tape::build_series(&shape);
+    let h1 = Heir::of(&t[0]);
+    let kb = key(&h1, Who::TenantB);
+    let dest = h1.dest("out");
+    let o = h1.run(&["--restore", "--key", &kb, "--to", dstr(&dest)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    std::fs::remove_file(dest.join("inner/mid-1.dat")).unwrap();
+    write_list(
+        &t[0],
+        heir::UNIT_B,
+        &dest,
+        &["notes.txt", "inner/mid-1.dat"],
+    );
+    // The second copy is damaged in every slice, so the missing file cannot
+    // come back; notes.txt is whole on disk.
+    let h2 = Heir::of(&t[1]);
+    for p in t[1].slice_positions() {
+        h2.flip(p, 500);
+    }
+    let o = h2.run(&["--restore", "--key", &kb, "--to", dstr(&dest)]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert_eq!(
+        damaged_list(&dest),
+        vec!["inner/mid-1.dat".to_string()],
+        "{all}"
+    );
 }
