@@ -3664,7 +3664,11 @@ mod tests {
                 let problems = big.slice_cap_problems(Path::new("config.toml"));
                 assert_eq!(problems.len(), 1, "{room} {compression}: {problems:?}");
                 let n = advised(&problems[0]);
-                assert_eq!(slice_size_block_problem(n as i64), None, "{room} {compression}: {n}");
+                assert_eq!(
+                    slice_size_block_problem(n as i64),
+                    None,
+                    "{room} {compression}: {n}"
+                );
                 let set = cap_config(room, &n.to_string(), compression);
                 assert!(
                     set.slice_cap_problems(Path::new("config.toml")).is_empty(),
@@ -3696,7 +3700,10 @@ mod tests {
         let packed = cap_config("10GiB", &max.to_string(), "zstd");
         let problems = packed.slice_cap_problems(Path::new("c.toml"));
         assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("zstd's stated worst growth"), "{problems:?}");
+        assert!(
+            problems[0].contains("zstd's stated worst growth"),
+            "{problems:?}"
+        );
         // An archive set that packs, under defaults that do not.
         let extra = format!(
             "\n[[archive_sets]]\nname = \"bulk\"\nslice_size = \"{max}\"\ncompression = \"xz\"\n"

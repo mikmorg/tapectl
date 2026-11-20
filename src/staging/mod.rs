@@ -6,8 +6,8 @@ mod files;
 pub mod jobs;
 pub mod lock;
 pub(crate) mod pack;
-pub(crate) use files::SLICE_SUFFIX;
 pub(crate) use files::packed_bound;
+pub(crate) use files::SLICE_SUFFIX;
 #[cfg(test)]
 mod plaintext_audit;
 pub mod release;
