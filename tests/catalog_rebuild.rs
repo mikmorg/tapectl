@@ -2012,6 +2012,34 @@ fn a_rebuilt_volume_is_dated_by_its_own_file_0_and_seal_marker() {
     assert_eq!(report.load_count_at_write, None);
 }
 
+/// #548 (D18): a rebuilt volume row names the script its tape carries at
+/// file 2, read from the front index entry the rebuild already holds (no
+/// extra tape read), so a drill on a rebuilt catalog is not blind.
+#[test]
+fn a_rebuilt_volume_records_the_script_its_front_index_names() {
+    use sha2::{Digest, Sha256};
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    // File 2 is RESTORE.sh, zero-padded to the store's block on the store.
+    let script = tapectl::volume::heir::RESTORE_SH.as_bytes();
+    assert_eq!(&vol.store.files[2][..script.len()], script);
+    let want = format!("{:x}", Sha256::digest(&vol.store.files[2][..script.len()]));
+
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    let got: Option<String> = conn
+        .query_row(
+            "SELECT restore_sh_sha256 FROM volumes WHERE label = ?1",
+            rusqlite::params![LABEL],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(got, Some(want));
+}
+
 /// The control: a tape whose File 0 carries no `created_at` and which has
 /// no seal marker still rebuilds — the dates are simply absent (`created_at`
 /// falls back to the row's own default, the rebuild time), never invented.

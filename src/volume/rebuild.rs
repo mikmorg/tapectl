@@ -1936,6 +1936,10 @@ struct TapeDates {
     sealed_at: Option<String>,
     load_count_at_write: Option<i64>,
     data_files: i64,
+    /// The front index's `sha256_encrypted` for the `restore_sh` entry (an
+    /// unencrypted file: the hash of the script itself). Read from the index
+    /// the rebuild already holds; no tape read (#548, D18).
+    restore_sh_sha256: Option<String>,
 }
 
 /// What `volume-format-v2.md` §1.2 rule 6 found at the end of a tape and
@@ -2170,6 +2174,15 @@ fn tape_dates(
                 ) && ended_after.is_none_or(|k| i64::from(e.position) <= i64::from(k))
             })
             .count() as i64,
+        restore_sh_sha256: entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    crate::volume::layout_model::ZoneKind::from_type_label(&e.type_label),
+                    Some(crate::volume::layout_model::ZoneKind::RestoreSh)
+                )
+            })
+            .and_then(|e| e.sha256_encrypted.clone()),
     }
 }
 
@@ -2308,9 +2321,9 @@ fn insert_all(
                 "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
                                       capacity_bytes, mam_capacity_bytes, has_manifest, status,
                                       created_at, first_write, sealed_at, last_write,
-                                      num_data_files, ended_after)
+                                      num_data_files, ended_after, restore_sh_sha256)
                  VALUES (?1, ?2, 'lto', ?3, ?4, ?5, ?6, 1, ?10,
-                         COALESCE(?7, datetime('now')), ?7, ?8, ?8, ?9, ?11)",
+                         COALESCE(?7, datetime('now')), ?7, ?8, ?8, ?9, ?11, ?12)",
                 params![
                     label,
                     uuid,
@@ -2323,6 +2336,7 @@ fn insert_all(
                     if sealed { dates.data_files } else { 0 },
                     if sealed { "sealed" } else { "initialized" },
                     ended_after,
+                    dates.restore_sh_sha256,
                 ],
             )?;
             report.volume_inserted = true;
