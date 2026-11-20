@@ -26,10 +26,10 @@
 //! Hard links (item 256): the list holds every name; the stream holds the
 //! first name with its data and each later name as a link member with
 //! none. The link's row is kind `h` with its target's size and sha256
-//! (§1.6). To find them without holding a row for every file, the reader
+//! (§1.6); a later name of a symbolic link is an `l` row (item 299). To find them without holding a row for every file, the reader
 //! remembers only the files the list marks [`Listed::linked`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
 
@@ -85,7 +85,8 @@ pub struct Listed {
     pub acl: AclOnDisk,
     /// The file had more than one name (a link count over 1): its size and
     /// sha256 are remembered, for a later name that the stream holds as a
-    /// link to it. A link to a file not so marked is refused.
+    /// link to it. A link to a file not so marked is refused. A symbolic
+    /// link with more than one name is marked too (item 299).
     pub linked: bool,
 }
 
@@ -291,6 +292,7 @@ where
         rules,
         ids: Some(ids),
         linked: HashMap::new(),
+        linked_symlinks: HashSet::new(),
         held: Vec::new(),
         members: 0,
     };
@@ -321,6 +323,9 @@ struct Reader<R, I, L> {
     ids: Option<idmap::Collector<L>>,
     /// The files marked `linked`: their size and sha256.
     linked: HashMap<String, (u64, [u8; 32])>,
+    /// The symbolic links marked `linked` (item 299): a later name of one is
+    /// a hard-link member that the list holds as `l`.
+    linked_symlinks: HashSet<String>,
     /// The current member's header blocks, held until its own header.
     held: Vec<u8>,
     members: u64,
@@ -476,9 +481,10 @@ fn names_entry(name: &[u8], path: &str, kind: Kind) -> bool {
 /// Whether a member of `kind` may stand for a listed entry of `listed`:
 /// the same kind, or a hard link for a listed file (the list holds every
 /// name of a linked file as a file; the stream holds the later names as
-/// links, item 256).
+/// links, item 256), or a hard link for a listed symbolic link (the second
+/// name of one, item 299).
 fn kind_fits(kind: Kind, listed: Kind) -> bool {
-    kind == listed || (kind == Kind::HardLink && listed == Kind::File)
+    kind == listed || (kind == Kind::HardLink && matches!(listed, Kind::File | Kind::Symlink))
 }
 
 impl<R, I, L> Reader<R, I, L>
@@ -818,14 +824,26 @@ where
                 .clone()
                 .unwrap_or_else(|| header.linkname().to_vec());
             let link = shown_path(&link);
-            match self.linked.get(&link) {
-                Some((size, sha)) => target = Some((link, *size, *sha)),
-                None => {
+            if listed.kind == Kind::Symlink {
+                // The second name of a symbolic link: its first name is a
+                // listed symbolic link of the same inode (item 299).
+                if !self.linked_symlinks.contains(&link) {
                     return Err(self.refuse(
                         Rule::LinkTarget,
                         path,
-                        format!("its target {link:?} is not a file listed earlier"),
-                    ))
+                        format!("its target {link:?} is not a symbolic link listed earlier"),
+                    ));
+                }
+            } else {
+                match self.linked.get(&link) {
+                    Some((size, sha)) => target = Some((link, *size, *sha)),
+                    None => {
+                        return Err(self.refuse(
+                            Rule::LinkTarget,
+                            path,
+                            format!("its target {link:?} is not a file listed earlier"),
+                        ))
+                    }
                 }
             }
         }
@@ -912,6 +930,17 @@ where
                     link: None,
                 }
             }
+            // The second name of a symbolic link: an `l` row (item 299).
+            Kind::HardLink if listed.kind == Kind::Symlink => Row {
+                kind: Kind::Symlink,
+                slice,
+                start,
+                end,
+                size: 0,
+                sha256: None,
+                path: listed.path,
+                link: None,
+            },
             Kind::HardLink => {
                 let (link, size, sha) = target.expect("a hard link's target was found");
                 Row {
@@ -925,16 +954,21 @@ where
                     link: Some(link),
                 }
             }
-            _ => Row {
-                kind,
-                slice,
-                start,
-                end,
-                size: 0,
-                sha256: None,
-                path: listed.path,
-                link: None,
-            },
+            _ => {
+                if kind == Kind::Symlink && listed.linked {
+                    self.linked_symlinks.insert(listed.path.clone());
+                }
+                Row {
+                    kind,
+                    slice,
+                    start,
+                    end,
+                    size: 0,
+                    sha256: None,
+                    path: listed.path,
+                    link: None,
+                }
+            }
         };
         self.members += 1;
         sink.row(row).map_err(StreamError::Sink)
@@ -1152,7 +1186,7 @@ mod tests {
                 access: has_xattr(&p, "system.posix_acl_access"),
                 default: has_xattr(&p, "system.posix_acl_default"),
             },
-            linked: ft.is_file() && md.nlink() > 1,
+            linked: (ft.is_file() || ft.is_symlink()) && md.nlink() > 1,
         }
     }
 
@@ -1405,6 +1439,15 @@ mod tests {
         )
         .unwrap();
         std::os::unix::fs::symlink("a", r.join("s")).unwrap();
+        // A second name of the symbolic link (#581, item 299): `ln -P`.
+        nix::unistd::linkat(
+            None,
+            &r.join("s"),
+            None,
+            &r.join("s-again"),
+            nix::unistd::LinkatFlags::NoSymlinkFollow,
+        )
+        .unwrap();
         std::fs::write(r.join(&long), b"a long name\n").unwrap();
         std::fs::create_dir_all(r.join(&deep_dir)).unwrap();
         std::fs::write(r.join(&deep), vec![7u8; 1000]).unwrap();
@@ -1440,6 +1483,7 @@ mod tests {
             "empty".into(),
             "p".into(),
             "s".into(),
+            "s-again".into(),
             long,
             deep_dir,
             deep,
@@ -1505,6 +1549,11 @@ mod tests {
         assert_eq!(rec.row(".").kind, Kind::Folder);
         assert_eq!(rec.row("p").kind, Kind::Fifo);
         assert_eq!(rec.row("s").kind, Kind::Symlink);
+        // The second name of a symbolic link is an `l` row (item 299), though
+        // tar wrote a hard-link member for it.
+        let again = rec.row("s-again");
+        assert_eq!(again.kind, Kind::Symlink);
+        assert_eq!((again.size, again.sha256, &again.link), (0, None, &None));
         assert_eq!(rec.row("empty").kind, Kind::Folder);
         // Each row's table text is accepted by the file table's own chain.
         let mut chain = crate::volume::filetable::Chain::default();
@@ -2205,6 +2254,42 @@ mod tests {
             Rule::LinkTarget,
             Some("b"),
         );
+    }
+
+    /// The second name of a hard-linked symbolic link (#581, item 299): the
+    /// member is a hard link, the list says `l`; accepted only when the first
+    /// name is a listed symbolic link marked linked.
+    #[test]
+    fn a_hard_link_to_a_symbolic_link_is_read_as_a_link_row() {
+        let t = tree();
+        std::os::unix::fs::symlink("somewhere", t.root.join("s1")).unwrap();
+        nix::unistd::linkat(
+            None,
+            &t.root.join("s1"),
+            None,
+            &t.root.join("s2"),
+            nix::unistd::LinkatFlags::NoSymlinkFollow,
+        )
+        .unwrap();
+        let names = ["s1", "s2"];
+        let stream = tar_stream(&t, &names, true, true);
+        let (_, rec) = read_with(&stream, list_of(&t, &names), true).unwrap();
+        assert_eq!(rec.row("s1").kind, Kind::Symlink);
+        assert_eq!(rec.row("s2").kind, Kind::Symlink);
+        // The first name not marked linked: the member's target is unknown.
+        let mut list = list_of(&t, &names);
+        list[0].linked = false;
+        assert_refused(read_with(&stream, list, true), Rule::LinkTarget, Some("s2"));
+        // A regular file's name does not stand as the target of a link
+        // listed as a symbolic link.
+        std::fs::write(t.root.join("f"), b"1").unwrap();
+        std::fs::hard_link(t.root.join("f"), t.root.join("g")).unwrap();
+        let names = ["f", "g"];
+        let stream = tar_stream(&t, &names, true, true);
+        let mut list = list_of(&t, &names);
+        list[1].kind = Kind::Symlink;
+        list[1].size = 0;
+        assert_refused(read_with(&stream, list, true), Rule::LinkTarget, Some("g"));
     }
 
     /// What cannot be read as GNU tar's pax: a record that does not parse,

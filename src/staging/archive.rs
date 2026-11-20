@@ -170,7 +170,8 @@ pub(crate) fn scan(conn: &Connection, snapshot_id: i64, root: &Path, unit: &str)
         entries.push(Entry {
             listed: Listed {
                 size: if now == Kind::File { meta.len() } else { 0 },
-                linked: now == Kind::File && std::os::unix::fs::MetadataExt::nlink(&meta) > 1,
+                linked: matches!(now, Kind::File | Kind::Symlink)
+                    && std::os::unix::fs::MetadataExt::nlink(&meta) > 1,
                 path,
                 kind: now,
                 acl,
