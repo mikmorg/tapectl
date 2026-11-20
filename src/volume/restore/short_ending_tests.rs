@@ -1,5 +1,5 @@
 //! #420: restore through tapectl from a tape that ended early
-//! (`volume-format-v2.md` §4.2 R3-R5; `volume-format-v3.md` §5), on the shared
+//! (`volume-format-v3.md` §5.1 R3-R5; `volume-format-v3.md` §5), on the shared
 //! fixture (`short_tape`): `alpha` whole, `bravo` a range with its first slice
 //! on the tape, `charlie` planned and not written (no row). The units are staged by the real `stage create`
 //! and the tape is written by the real session; a restore reads the unit's
@@ -192,7 +192,7 @@ fn restore_volume_takes_every_unit_the_tape_has_a_written_slice_of() {
     assert!(err.contains("holds no unit with written slices"), "{err}");
 }
 
-/// The repair source (#480, §4.2 R5; ADR-0012 item 288): a range's `written`
+/// The repair source (#480, §5.1 R5; ADR-0012 item 288): a range's `written`
 /// slices are a source, the one at `ended_after` included (it is on the tape
 /// and hashes right); a unit planned after the warning has no write, so
 /// nothing of it is one; and a completed write's slice recorded past its own

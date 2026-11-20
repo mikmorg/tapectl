@@ -1341,7 +1341,7 @@ impl RangeHolding {
 /// name, in version and slice order: the same population as
 /// [`copies_rows`]' tape list (a current version, an in-service volume, a
 /// unit `active` or `tape_only`), each with the run of slices its range
-/// `written` (#478; `volume-format-v2.md` §4.4). `report copies` prints them
+/// `written` (#478; `volume-format-v3.md` §5.3). `report copies` prints them
 /// under the unit, so a tape in the list that holds only part of a version
 /// says which part.
 pub(crate) fn range_holdings_by_unit(

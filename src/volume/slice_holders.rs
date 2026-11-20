@@ -6,7 +6,7 @@
 //! read from any other cartridge whose write holds a slice with that hash:
 //! matched by the hash, never by position or number. From 1.7.0 (#478) a
 //! holder is a `completed` write or a `range` write with the slice
-//! `written` (item 101 sees ranges; `volume-format-v2.md` §4.4 R8), so the
+//! `written` (item 101 sees ranges; `volume-format-v3.md` §5.3 R8), so the
 //! same answer serves a damaged slice and a version read across cartridges.
 //!
 //! "Held" and "live" are `policy::coverage`'s predicates, composed here and
@@ -42,7 +42,7 @@ pub enum Standing {
 /// (#478, item 121). This says so in the query too, so a catalog that broke
 /// that (which `audit` names) sends no read past the seal of the other tape:
 /// tapectl takes `ended_after` from the catalog, which recorded the tape's
-/// seal when it sealed or was rebuilt (`volume-format-v2.md` §4.2 R1 and
+/// seal when it sealed or was rebuilt (`volume-format-v3.md` §5.1 R1 and
 /// R5). A set the tape was planned to take and did not has no write, so none
 /// of it is a source (ADR-0012 item 288).
 const ON_TAPE: &str = "(v.ended_after IS NULL OR CAST(wp.position AS INTEGER) <= v.ended_after)";

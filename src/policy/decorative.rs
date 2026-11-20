@@ -41,8 +41,8 @@
 //!
 //! - `backends.lto[].block_size` — the write path's block size is a FORMAT
 //!   CONSTANT (512 KiB: `collection::plan::BLOCK_SIZE`,
-//!   `cli::volume::DEFAULT_BLOCK_SIZE`, `docs/design/volume-format-v2.md`
-//!   §1/D7). `src/volume/layout.rs` bakes it into the on-tape recovery text
+//!   `cli::volume::DEFAULT_BLOCK_SIZE`, `docs/design/volume-format-v3.md`
+//!   §8/D7). `src/volume/layout.rs` bakes it into the on-tape recovery text
 //!   an heir reads, so a per-drive value could only ever disagree with the
 //!   tape it was written to.
 //! - `backends.lto[].hardware_compression` — `TapeStore::open`

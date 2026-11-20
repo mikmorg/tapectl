@@ -251,12 +251,12 @@ struct SealedIndex {
     sealed_at: String,
     front_index_sha256: String,
     /// `Some(K)` when the tape sealed short (#420): only files 0 to K are on
-    /// it (`volume-format-v2.md` §4.2).
+    /// it (`volume-format-v3.md` §5.1).
     ended_after: Option<u32>,
 }
 
 /// Condition 1's second half: File 0's own layout pointers name the front
-/// index and the planned seal; the seal is located by `volume-format-v2.md`
+/// index and the planned seal; the seal is located by `volume-format-v3.md`
 /// §1.2 rule 6 (at that pointer, or as the last file on a tape that ended
 /// early, #420), parses, is one this tapectl may read and rule 6 accepts
 /// where it lies, and its `front_index_sha256` is the hash of File 3's true
@@ -492,7 +492,7 @@ fn staging_name(conn: &Connection, stage_set_id: i64) -> Result<String> {
 /// Condition 3 for one write (#478; ADR-0012 items 121, 130 and 288):
 /// the row says what the tape holds of its stage set. The slices its rows
 /// plan (its `write_positions`) must be one unbroken run in slice order at
-/// consecutive tape positions (`volume-format-v2.md` §4.4: "a volume holds at
+/// consecutive tape positions (`volume-format-v3.md` §5.3: "a volume holds at
 /// most one unbroken range of a stage set"), and the row's status must be the
 /// split confirm makes, by confirm's own derivation
 /// ([`crate::volume::session::span_split`]): of every slice of the set, those

@@ -3337,7 +3337,7 @@ pub fn run(
             } else {
                 plan_span_preview(conn, config, generation.as_deref(), device.as_deref())
             };
-            // The cross-volume index (#418 R4, `volume-format-v2.md` §1.5)
+            // The cross-volume index (#418 R4, `volume-format-v3.md` §1.5)
             // every envelope of a tape written from this will carry.
             let index = if rows.is_empty() {
                 None
@@ -5532,7 +5532,7 @@ fn plan_index_line(index: i64) -> String {
     )
 }
 
-/// The size, in bytes, of the cross-volume index (`volume-format-v2.md`
+/// The size, in bytes, of the cross-volume index (`volume-format-v3.md`
 /// §1.5) that a write of everything now staged would put in each copy of the
 /// envelopes, before tar and age overhead: the real generator, run into a sink
 /// ([`crate::volume::index::measure`]), so every listed version's paths are
@@ -5915,7 +5915,7 @@ mod tests {
         );
     }
 
-    /// #420 (`volume-format-v2.md` §5 step 3): when the seal and the catalog
+    /// #420 (`volume-format-v3.md` §6 step 3): when the seal and the catalog
     /// disagree about where the tape ended, the verify is inconclusive, so
     /// no line says "proves the medium is bad" and `--json` says
     /// `proves_medium_bad: false` for every mismatch — even a content hash

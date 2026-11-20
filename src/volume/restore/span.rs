@@ -330,7 +330,7 @@ fn missing_refusal(
     Ok(TapectlError::Other(format!(
         "unit \"{unit_name}\" version {version} cannot be restored: {} of it {} on no live \
          volume, and a restore of a version held across cartridges needs every slice, in slice \
-         order (volume-format-v2.md §4.4 R7).{saw}{next} Nothing was read from tape.",
+         order (volume-format-v3.md §5.3 R7).{saw}{next} Nothing was read from tape.",
         numbers_phrase(missing),
         if missing.len() == 1 { "is" } else { "are" },
     )))

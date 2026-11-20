@@ -1,4 +1,4 @@
-//! The cross-volume index (`docs/design/volume-format-v2.md` §1.5, ADR-0012
+//! The cross-volume index (`docs/design/volume-format-v3.md` §1.5, ADR-0012
 //! items 78-80, #418 R4): which volumes hold which version of each unit and,
 //! for a tenant, every path of those versions. Written into the envelopes by
 //! `volume::build`, read by `RESTORE.sh` and, as a to-do list, by `catalog
@@ -285,7 +285,7 @@ fn write_units_row<W: Write + ?Sized>(
     field(w, &r.unit_uuid)?;
     write!(w, "{}\t", r.version)?;
     // The run of the slices this volume holds (§1.5): 1..=num_slices for a
-    // whole version, a range's own run (1.7.0, §4.4). A stage set with none
+    // whole version, a range's own run (1.7.0, §5.3). A stage set with none
     // recorded has no run and no size to state, and a run the catalog does
     // not know is not stated either (an empty field is "not known").
     if r.num_slices > 0 {

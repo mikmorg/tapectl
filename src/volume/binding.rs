@@ -1891,7 +1891,7 @@ impl File0Facts {
     /// `None` means UNKNOWN and MUST NOT be read as `"mam"`: every tape
     /// written before the field existed omits it, and defaulting would make
     /// all of them falsely attest a chip-verified serial
-    /// (`volume-format-v2.md` §1.1).
+    /// (`volume-format-v3.md` §1.1).
     fn chip_serial(&self) -> Option<&str> {
         let media = self.media.as_ref()?;
         match media.cartridge_identity_source.as_deref() {
@@ -4917,7 +4917,7 @@ mod tests {
             assert!(err.contains("SER-2"), "{err}");
         }
 
-        /// `volume-format-v2.md` §1.1: an absent `cartridge_identity_source`
+        /// `volume-format-v3.md` §1.1: an absent `cartridge_identity_source`
         /// means UNKNOWN and must never be read as `"mam"`. Every tape
         /// written before #192 omits it, and defaulting would make all of
         /// them falsely attest a chip-verified serial — and here, refuse.

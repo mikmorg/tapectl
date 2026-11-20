@@ -631,7 +631,7 @@ fn open_output(out_path: &Path) -> Result<Connection> {
 /// about 100 rows/s, so ~5 hours for L6-0001's ~181k `files` rows.
 ///
 /// Nothing pins this file's bytes; `read` and `catalog rebuild` read it by
-/// content, and `volume-format-v2.md` §1.4 specifies its shape.
+/// content, and `volume-format-v3.md` §1.4 specifies its shape.
 pub(crate) fn fill(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Result<()> {
     let tx = out.unchecked_transaction()?;
     tx.execute_batch(SCHEMA)?;

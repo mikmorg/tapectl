@@ -2491,8 +2491,8 @@ pub struct RestoreSelection {
 /// keeps the last block), which is equally arbitrary; any deterministic
 /// choice of ONE set matches it in what matters.
 ///
-/// **A version this volume holds a range of** (#478, `volume-format-v2.md`
-/// §4.4) is named on the tape as a cut one is, and is then planned across
+/// **A version this volume holds a range of** (#478, `volume-format-v3.md`
+/// §5.3) is named on the tape as a cut one is, and is then planned across
 /// cartridges ([`span::plan_across`]): this volume must hold its slice 1,
 /// every slice must be on a live volume, and the positions returned are
 /// every slice of the version, from the fewest cartridges in slice order.
@@ -2664,7 +2664,7 @@ fn select(
     };
     let (version, stage_set_id, ended_after) = (*version, *stage_set_id, *ended_after);
     let positions = get_write_positions(conn, stage_set_id, volume_label)?;
-    // R3 (`volume-format-v2.md` §4.2): nothing past where the tape ended is
+    // R3 (`volume-format-v3.md` §5.1): nothing past where the tape ended is
     // read. A completed write holds every slice at or before it by
     // construction (confirm, rebuild and adoption all split the rows so, and
     // `audit` names a catalog that does not); refused here rather than read

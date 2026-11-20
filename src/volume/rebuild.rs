@@ -22,7 +22,7 @@
 //! The `catalog.db` is read in the one shape this tapectl writes; a file of
 //! any other shape (those written before 1.1.0 among them) is refused,
 //! naming what was found (`db::ontape_catalog::check_shape`,
-//! `volume-format-v2.md` §1.4; ADR-0012 item 258(d)).
+//! `volume-format-v3.md` §1.4; ADR-0012 item 258(d)).
 //!
 //! # What it deliberately does not do
 //!
@@ -263,7 +263,7 @@ pub struct RebuildReport {
     /// catalog holds as `sealed` is told apart from one under `initialized`.
     pub found_volume_status: Option<String>,
 
-    // --- where the tape ended (#420, `volume-format-v2.md` §4.2) -------------
+    // --- where the tape ended (#420, `volume-format-v3.md` §5.1) -------------
     //
     // A 1.6.0 tape may end early, at a short seal; the seal is found by §1.2
     // rule 6 and trusted over the plan.
@@ -308,7 +308,7 @@ pub struct RebuildReport {
     pub versions_promoted: Vec<String>,
     /// The spannable versions on this tape that some slice of is still on
     /// no tape this catalog records, after this run: the to-do list's span
-    /// half (item 130, `volume-format-v2.md` §1.5). Each names the missing
+    /// half (item 130, `volume-format-v3.md` §1.5). Each names the missing
     /// slices and the volumes this tape's cross-volume index says hold them.
     /// Such a version stays `staged` and reads 0 copies until they are
     /// rebuilt (item 128).
@@ -417,7 +417,7 @@ pub struct RebuildReport {
     /// `[media]` records an empty `cartridge_serial` (a write with nothing to
     /// attest), or a non-empty serial with no `cartridge_identity_source`
     /// (the writer omits it when the volume's binding recorded none —
-    /// UNKNOWN, and never assumed to be `"mam"`; `volume-format-v2.md` §1.1).
+    /// UNKNOWN, and never assumed to be `"mam"`; `volume-format-v3.md` §1.1).
     /// A File 0 with no `[media]` table is refused, never inserted.
     /// `None` whenever a cartridge WAS resolved (bound, registered, or
     /// refused outright).
@@ -436,7 +436,7 @@ pub struct RebuildReport {
     /// unaffected.
     pub sets_without_table: Vec<String>,
 
-    // --- the cross-volume index (#418 R4, `volume-format-v2.md` §1.5) -------
+    // --- the cross-volume index (#418 R4, `volume-format-v3.md` §1.5) -------
     //
     // A to-do list, never a source of rows: ADR-0001 has a claim about a tape
     // need contact with that tape, and this tape's index is a claim about
@@ -509,7 +509,7 @@ pub struct IndexedUnit {
 }
 
 /// A spannable set this tape holds as a range (#478, ADR-0012 item 121;
-/// `volume-format-v2.md` §4.4): the run of its stage set's slices on the tape.
+/// `volume-format-v3.md` §5.3): the run of its stage set's slices on the tape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuiltRange {
     pub unit: String,
@@ -861,7 +861,7 @@ fn rebuild_contacted(
     let media = format::parse_id_thunk_media(&thunk_text).map_err(|e| {
         TapectlError::Other(format!(
             "this tape's File 0 has no readable [media] table ({e}), which every tape this \
-             tapectl writes carries (volume-format-v2.md §1.1): this tapectl does not read \
+             tapectl writes carries (volume-format-v3.md §1.1): this tapectl does not read \
              it. RESTORE.sh (tape file 2) with a tenant key or the escrow key still restores \
              what opens"
         ))
@@ -948,7 +948,7 @@ fn rebuild_contacted(
     // and after the envelopes (the seal marker is the last file, so reading
     // it earlier would pass the head over the slices twice; `volume::
     // cost_budget` pins the motion). The same read dates the tape (#305).
-    // #420: located by `volume-format-v2.md` §1.2 rule 6, so a tape that
+    // #420: located by `volume-format-v3.md` §1.2 rule 6, so a tape that
     // ended early is read as sealed at its short seal, with `ended_after`.
     let LocatedSeal {
         verdict: seal,
@@ -957,7 +957,7 @@ fn rebuild_contacted(
     } = read_seal(store, &pointers, &thunk_text, &fi, &ident.label);
     if let format::SealVerdict::Refused(why) = &seal {
         // Before the transaction, as every other reader of a tape refuses
-        // one it must not interpret (`volume-format-v2.md` §1.2 rule 1).
+        // one it must not interpret (`volume-format-v3.md` §1.2 rule 1).
         return Err(TapectlError::Other(why.clone()));
     }
     let dates = tape_dates(&thunk_text, &entries, &seal, ended_after);
@@ -979,11 +979,11 @@ fn rebuild_contacted(
     let missing: Vec<&str> = [
         (
             operator.catalog_db.is_none(),
-            "catalog.db (volume-format-v2.md §1.4)",
+            "catalog.db (volume-format-v3.md §1.4)",
         ),
         (
             operator.index_units.is_none(),
-            "cross-volume index (index/units.tsv, volume-format-v2.md §1.5)",
+            "cross-volume index (index/units.tsv, volume-format-v3.md §1.5)",
         ),
     ]
     .into_iter()
@@ -1275,8 +1275,8 @@ fn is_this_tape(row: &crate::volume::index::UnitsRow, this_label: &str, this_uui
         || (!row.volume_uuid.is_empty() && row.volume_uuid == this_uuid)
 }
 
-/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v2.md`
-/// §1.5 and §4.4): for each spannable set on this tape, the slices no tape
+/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v3.md`
+/// §1.5 and §5.3): for each spannable set on this tape, the slices no tape
 /// this catalog records holds after this rebuild, and the volumes this tape's
 /// index (`index`, its rows) names as holding them. A version with such a
 /// slice stays `staged` and reads 0 copies until they are rebuilt (item 128).
@@ -1420,11 +1420,11 @@ fn attest_escrow(
     // head and rewinds for one behind it). The manifest lists units in the
     // order they were laid out, so this is normally that order already.
     //
-    // #420 (`volume-format-v2.md` §4.2 R3): on a tape that ended early no
+    // #420 (`volume-format-v3.md` §5.1 R3): on a tape that ended early no
     // position after `ended_after` is read. A unit whose first slice lies
     // past it is not on this tape at all, and stays unknown here.
     //
-    // #478 (ADR-0012 items 125 and 130, `volume-format-v2.md` §4.4 R6): a
+    // #478 (ADR-0012 items 125 and 130, `volume-format-v3.md` §5.3 R6): a
     // slice with no `tape_position` (a range's slice planned on another
     // tape) is not on this tape either, so the slice read is the lowest-
     // numbered one THIS tape holds: slice 1 for a whole unit and for a range
@@ -1519,7 +1519,7 @@ fn attest_escrow(
 /// The operator envelope failing to open is the one case worth a specific
 /// diagnosis, because it is what a tenant key looks like from here.
 ///
-/// Every envelope has a backup copy (`volume-format-v2.md` §1.3: the
+/// Every envelope has a backup copy (`volume-format-v3.md` §1.3: the
 /// operator's since v2's first write, each tenant's since 1.1.0), the same
 /// bytes under the same front-index hash. A backup is opened only when the
 /// envelope it copies could not be — it did not read, did not match the
@@ -1543,7 +1543,7 @@ fn attest_escrow(
 /// `{:04}_{}.bin` shape `raw::dump` uses, so renaming the zone updates this
 /// message instead of silently re-breaking it.
 fn tenant_key_refusal_message() -> String {
-    // Position 2 is fixed by the format itself (`volume-format-v2.md`: 0 ID
+    // Position 2 is fixed by the format itself (`volume-format-v3.md` §1: 0 ID
     // thunk, 1 system guide, 2 RESTORE.sh, 3 front index) and is pinned by
     // `tests/on_tape_golden.rs`, so it is a literal. The LABEL is the half
     // that drifted, so it is derived.
@@ -1573,7 +1573,7 @@ fn tenant_key_refusal_message() -> String {
 }
 
 /// The front-index kinds that are envelopes: every primary and its backup
-/// (`volume-format-v2.md` §1.3).
+/// (`volume-format-v3.md` §1.3).
 fn is_envelope_label(label: &str) -> bool {
     matches!(
         label,
@@ -1942,7 +1942,7 @@ struct TapeDates {
     restore_sh_sha256: Option<String>,
 }
 
-/// What `volume-format-v2.md` §1.2 rule 6 found at the end of a tape and
+/// What `volume-format-v3.md` §1.2 rule 6 found at the end of a tape and
 /// accepts as its seal, judged against the front index beside it (#420): the
 /// one judgement `catalog rebuild`, the adoption of a lost write
 /// ([`crate::volume::adopt_lost`]) and `restore raw-volume` share, so the
@@ -1955,8 +1955,8 @@ pub(crate) struct LocatedSeal {
     /// Where the seal was read: the planned position, or the last file on a
     /// medium that ends before it. `None` when no file was there at all.
     pub position: Option<u32>,
-    /// `Some(K)` for an accepted SHORT seal at K+1 (§4.1): every planned
-    /// position after K is not on the tape (§4.2). `None` for a full seal,
+    /// `Some(K)` for an accepted SHORT seal at K+1 (§5): every planned
+    /// position after K is not on the tape (§5.1). `None` for a full seal,
     /// and for no seal.
     pub ended_after: Option<u32>,
 }
@@ -1971,14 +1971,14 @@ impl LocatedSeal {
     }
 }
 
-/// Find the seal by `volume-format-v2.md` §1.2 rule 6 ([`crate::store::
+/// Find the seal by `volume-format-v3.md` §1.2 rule 6 ([`crate::store::
 /// locate_seal`]: at `planned`, File 0's `[layout] seal_marker`, or, on a
 /// medium that ends before it, the last file), judge it against the front
 /// index (`front_index` = File 3's true bytes, at `front_index_position`) by
 /// [`format::judge_seal`], and accept it as rule 6 does:
 ///
 /// - **at the planned position**, a seal whose `file_count` is the plan's
-///   (`planned + 1`): the full seal (§4.1 "Classification");
+///   (`planned + 1`): the full seal (§5 "Classification");
 /// - **before it**, on every Layout 3 tape (`volume-format-v3.md` §1.2 rule
 ///   6, D1: no `requires` entry), a seal that keeps §5's parse rules (it
 ///   parsed) and states `file_count = N` for the N files on the medium. Its
@@ -2096,7 +2096,7 @@ pub(crate) fn locate_and_judge_seal(
     }
 }
 
-/// Read the seal marker (issue #458): located by `volume-format-v2.md` §1.2
+/// Read the seal marker (issue #458): located by `volume-format-v3.md` §1.2
 /// rule 6 from File 0's `[layout]` pointer, and judged by
 /// [`locate_and_judge_seal`] against the front index already in hand (`fi`,
 /// as read, block padding included).
@@ -2937,7 +2937,7 @@ enum Written {
     Aborted,
 }
 
-/// Whether `slice` is on this tape (`volume-format-v2.md` §4.2 R3, §4.4 R6):
+/// Whether `slice` is on this tape (`volume-format-v3.md` §5.1 R3, §5.3 R6):
 /// it has a `tape_position` (a range's slice planned on another tape has
 /// none, ADR-0012 item 125), at or before a short seal's `ended_after`.
 fn slice_on_tape(slice: &envelope::ManifestSlice, ended_after: Option<i64>) -> bool {
@@ -3075,7 +3075,7 @@ fn ensure_position(
     // On an unsealed one the manifest and the front index are the PLAN —
     // envelopes precede the slices — so the position is recorded `pending`,
     // with nothing measured on the volume, not `written`. So is a position
-    // after a short seal's `ended_after` (#420, §4.2): not on this tape,
+    // after a short seal's `ended_after` (#420, §5.1): not on this tape,
     // `pending` as the session that wrote the tape left it.
     if laid_down {
         tx.execute(
@@ -3437,7 +3437,7 @@ enum RebuildIdentity {
     Operator(String),
     /// No identity this rebuild can safely assume, with the reason so the
     /// operator-facing warning can say which. Never treated as `Mam`:
-    /// `docs/design/volume-format-v2.md` §1.1 forbids defaulting an absent
+    /// `docs/design/volume-format-v3.md` §1.1 forbids defaulting an absent
     /// `cartridge_identity_source` to `"mam"`.
     Unknown(String),
 }

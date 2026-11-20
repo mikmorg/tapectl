@@ -95,7 +95,7 @@ pub(crate) fn record_after_verify(
     if written == 0 || begun_here != written {
         return Ok(None);
     }
-    // #420 (`volume-format-v2.md` §4.2): where a short tape ended. The
+    // #420 (`volume-format-v3.md` §5.1): where a short tape ended. The
     // front index is the plan; only its slices at or before `ended_after`
     // are on the tape, and the verify read only those.
     let ended_after: Option<i64> = conn.query_row(

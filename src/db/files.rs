@@ -82,7 +82,7 @@ impl FileKind {
     /// (`is_directory` only) can say: a directory or not. Not-a-directory is
     /// read as `Regular` (#381): those generations carry no other type.
     /// Generation 3 (1.1.0, ADR-0012 2026-10-12 item 48) records the kind
-    /// itself (`volume-format-v2.md` §1.4).
+    /// itself (`volume-format-v3.md` §1.4).
     pub fn from_is_directory(is_directory: bool) -> Self {
         if is_directory {
             FileKind::Dir

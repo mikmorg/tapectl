@@ -2657,7 +2657,7 @@ pub fn fully_read_back_copy(stage_set_expr: &str) -> String {
 
 // ── The cross-volume index's versions and holders (ADR-0012 items 78-80) ──
 
-/// The volumes the cross-volume index (`volume-format-v2.md` §1.5) names as
+/// The volumes the cross-volume index (`volume-format-v3.md` §1.5) names as
 /// holding a version: sealed, and neither retired nor erased, **whatever
 /// their condition**. A volume has one `status`, so `sealed` alone says
 /// "sealed and unretired"; a verify-quarantined volume (`observed_condition`,
@@ -2714,10 +2714,10 @@ pub struct IndexThisTape<'a> {
 
 /// One stage set a write carries, and the run of its slices this tape's plan
 /// holds: what the `this-tape` row of the index says in `first_slice` and
-/// `last_slice` (`volume-format-v2.md` §1.5; ADR-0012 item 126). A whole set
+/// `last_slice` (`volume-format-v3.md` §1.5; ADR-0012 item 126). A whole set
 /// is the run 1 to its number of slices; a spannable set's range is the one
 /// unbroken run this tape plans (item 122), which the seal's `ended_after`
-/// may end sooner (§4.4).
+/// may end sooner (§5.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexRun {
     pub stage_set_id: i64,
@@ -2797,7 +2797,7 @@ pub fn index_versions(
     index_versions_for_runs(conn, this, &IndexRun::whole_sets(write_stage_sets))
 }
 
-/// **The** cross-volume index query (ADR-0012 item 80, `volume-format-v2.md`
+/// **The** cross-volume index query (ADR-0012 item 80, `volume-format-v3.md`
 /// §1.5): every version the index lists, with each volume that holds it.
 ///
 /// The versions are every CURRENT version with at least one `completed` or
@@ -2810,7 +2810,7 @@ pub fn index_versions(
 /// carries, with the run its plan holds (§1.5 "Ranges", 1.7.0; ADR-0012 items
 /// 121, 126 and 141). A holder of a range is listed with its run and is no
 /// copy on its own (item 127): the index never joins runs, a reader takes a
-/// slice from another tape only by its hash (§4.4 R8). A spanning version is
+/// slice from another tape only by its hash (§5.3 R8). A spanning version is
 /// current only once every slice of a stage set of it is on a sealed volume
 /// (item 128), so until then it is listed only by a write that carries it.
 /// Unsealed, retired and erased volumes hold nothing here, and a reclaimable

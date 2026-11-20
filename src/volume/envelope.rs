@@ -258,7 +258,7 @@ pub fn open_envelope(
     // to unwrap is, to age 0.11, a stanza for someone else, so a damaged
     // header comes back as `NoMatchingKeys`. Only bytes that match the front
     // index make "not a recipient" an answer about the key rather than the
-    // tape (`volume-format-v2.md` §1.3: a copy that "does not match the
+    // tape (`volume-format-v3.md` §1.3: a copy that "does not match the
     // front index's hash" turns the reader to its backup, as RESTORE.sh's
     // `try_envelope` does).
     if let Some(expected) = &entry.sha256_encrypted {

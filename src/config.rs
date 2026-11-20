@@ -625,7 +625,7 @@ impl LtoBackendConfig {
     }
 
     /// The **plan bound** for a volume of `capacity_bytes` (ADR-0012 item 113;
-    /// `volume-format-v2.md` §4.3, the closing paragraph): how far a plan may
+    /// `volume-format-v3.md` §5.2, the closing paragraph): how far a plan may
     /// reach past the fill ceiling. `Some(capacity_bytes)` — 100% of the
     /// cartridge's nominal capacity, the figure decided at `volume init`
     /// (ADR-0010), never a figure of this drive's — when this drive declares

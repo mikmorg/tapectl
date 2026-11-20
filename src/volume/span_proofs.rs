@@ -1609,7 +1609,7 @@ fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
     }
 }
 
-// ── the isolation scan (`volume-format-v2.md` §2) ──
+// ── the isolation scan (`volume-format-v3.md` §2) ──
 
 /// Everything the isolation invariant says no plaintext file may reveal,
 /// for `h`: tenant, unit and file names, each file's sha256 and each
@@ -1713,7 +1713,7 @@ fn scan_every_tape(h: &Home) {
     }
 }
 
-/// The isolation scan (`volume-format-v2.md` §2, §4.4: nothing new is
+/// The isolation scan (`volume-format-v3.md` §2, §5.3: nothing new is
 /// readable without a key) over every raw tape image of item 93's span:
 /// no tenant, unit or file name, no plaintext hash, no key, and no other
 /// tape's label is anywhere on a tape in the clear, File 1, the front index

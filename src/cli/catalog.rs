@@ -351,8 +351,8 @@ fn display_warehouse(v: &[String]) -> String {
 /// serve a restore (issue #57). From 1.7.0 (#478, ADR-0012 items 121 and
 /// 127) a `range` write is listed too, with the run it holds (`Holds`): a
 /// spanning version's holders are its whole copies and its ranges, and a
-/// restore of it reads the ranges in slice order (`volume-format-v2.md`
-/// §4.4).
+/// restore of it reads the ranges in slice order (`volume-format-v3.md`
+/// §5.3).
 ///
 /// Extracted from the `Locate` arm so it is directly testable, mirroring the
 /// `copies_rows`/`dirty_rows` split in `src/cli/report.rs` rather than
@@ -1385,7 +1385,7 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
 }
 
 /// What `catalog rebuild` prints for a tape that sealed short (#420,
-/// `volume-format-v2.md` §4.2): where it ended, the units it cut, and an
+/// `volume-format-v3.md` §5.1): where it ended, the units it cut, and an
 /// ending this catalog recorded differently. Empty for a full seal that
 /// agrees with the catalog.
 fn short_tape_lines(report: &RebuildReport) -> Vec<String> {
@@ -1395,7 +1395,7 @@ fn short_tape_lines(report: &RebuildReport) -> Vec<String> {
         lines.push(format!(
             "  note: volume \"{label}\" is SEALED SHORT: the drive's early warning ended it \
              after tape file {k}, and every file its plan lists after that is not on it \
-             (volume-format-v2.md §4.2)"
+             (volume-format-v3.md §5.1)"
         ));
         // #478: a unit whose other slices are planned on other tapes is said
         // apart from one this tape was to hold whole. Its version restores
@@ -1622,7 +1622,7 @@ fn refused_error(report: &RebuildReport) -> Option<TapectlError> {
 }
 
 /// What `catalog rebuild` says of the spannable sets on the tape (#478,
-/// ADR-0012 items 121 and 128; `volume-format-v2.md` §4.4): each one the tape
+/// ADR-0012 items 121 and 128; `volume-format-v3.md` §5.3): each one the tape
 /// holds as a range, with its run, and each version the run made current.
 /// Not under the short-seal lines: a range can end a tape that sealed full
 /// (the tail of a span). Empty for a tape with no spannable set.
@@ -1634,7 +1634,7 @@ fn range_lines(report: &RebuildReport) -> Vec<String> {
             "  note: volume \"{}\" holds a RANGE of each of these spanning units, not the \
              whole of it: {}. Recorded \"range\": a range is not a copy on its own, its slices \
              count one by one, and a restore needs the unit's other slices from the tapes \
-             that hold them (volume-format-v2.md §4.4)",
+             that hold them (volume-format-v3.md §5.3)",
             report.label,
             ranges.join(", ")
         ));
@@ -1649,7 +1649,7 @@ fn range_lines(report: &RebuildReport) -> Vec<String> {
     lines
 }
 
-/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v2.md`
+/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v3.md`
 /// §1.5): each spanning version some slices of which are on no tape this
 /// catalog records, the slices, and the tapes this tape's index names for
 /// them. Like [`index_lines`], it lists and never adds. Empty when every

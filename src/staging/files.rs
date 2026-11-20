@@ -28,7 +28,7 @@
 //!
 //! | Path under staging | Created by | Contents |
 //! |---|---|---|
-//! | `sessions/<label>-<uuid>/` ID thunk, system guide, `RESTORE.sh`, front index, seal marker | `volume::build` (`materialize`) | the public zones written to tape in plaintext; no names, by the isolation invariant (`volume-format-v2.md` §2) |
+//! | `sessions/<label>-<uuid>/` ID thunk, system guide, `RESTORE.sh`, front index, seal marker | `volume::build` (`materialize`) | the public zones written to tape in plaintext; no names, by the isolation invariant (`volume-format-v3.md` §2) |
 //! | `sessions/<label>-<uuid>/layout.json` | `volume::build` | the Layout: positions, sizes, ciphertext hashes, staging paths of `.age` slices |
 //! | `sessions/<label>-<uuid>/` tenant and operator envelopes, operator envelope backup | `volume::build` (`materialize_envelope_streaming`; the backup is a byte copy) | age ciphertext, encrypted as the tar is built |
 //! | `clone-<label>-<unit uuid>/slice_<id>.dat`, `compact-<label>/slice_<id>.dat` | `volume read-slices`, `volume compact-read` | `.age` slices copied off tape: ciphertext |
