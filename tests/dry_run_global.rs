@@ -448,7 +448,7 @@ unit_depth = 1
 
 /// Instance 1 of issue #230, and the worst of the four: `main.rs` never
 /// handed `cli::collection::run` the global flag, so `collection run
-/// --dry-run` staged an entire batch (dar + age, hours and a tape's worth of
+/// --dry-run` staged an entire batch (tar + age, hours and a tape's worth of
 /// staging disk) and then WROTE A REAL TAPE. ADR-0003 makes a sealed volume
 /// immutable, so the cartridge is consumed and nothing about it is
 /// reversible.
@@ -1361,7 +1361,7 @@ fn key_import_dry_run_inserts_nothing() {
     );
 }
 
-/// A home holding one unit, `u1`, with one written slice on the sealed
+/// A home holding one unit, `u1`, staged for real, with its slices written on the sealed
 /// volume `L6-0001` — the catalog rows a restore's dry run reads, and no
 /// tape. Returns the home and a root for the destination.
 fn home_with_one_written_unit() -> (TempDir, TempDir) {
@@ -1385,6 +1385,7 @@ fn home_with_one_written_unit() -> (TempDir, TempDir) {
         ],
     );
     ok(home.path(), &["snapshot", "create", "u1"]);
+    ok(home.path(), &["stage", "create", "u1"]);
 
     let conn = db(home.path());
     let unit_id: i64 = conn
@@ -1405,20 +1406,16 @@ fn home_with_one_written_unit() -> (TempDir, TempDir) {
     )
     .unwrap();
     let volume_id = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
-        rusqlite::params![snapshot_id],
-    )
-    .unwrap();
-    let stage_set_id = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
-                                    sha256_plain, sha256_encrypted)
-         VALUES (?1, 1, 100, 116, ?2, ?3)",
-        rusqlite::params![stage_set_id, "a".repeat(64), "b".repeat(64)],
-    )
-    .unwrap();
-    let stage_slice_id = conn.last_insert_rowid();
+    // The staging is real (`stage create`): a restore plans from its file
+    // table, which only staging writes (invariant 8). Only the write rows,
+    // which need a tape, are made by hand.
+    let stage_set_id: i64 = conn
+        .query_row(
+            "SELECT id FROM stage_sets WHERE snapshot_id = ?1",
+            rusqlite::params![snapshot_id],
+            |r| r.get(0),
+        )
+        .unwrap();
     conn.execute(
         "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
          VALUES (?1, ?2, ?3, 'completed')",
@@ -1426,12 +1423,22 @@ fn home_with_one_written_unit() -> (TempDir, TempDir) {
     )
     .unwrap();
     let write_id = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
-         VALUES (?1, ?2, '0', 'written')",
-        rusqlite::params![write_id, stage_slice_id],
-    )
-    .unwrap();
+    let slice_ids: Vec<i64> = conn
+        .prepare("SELECT id FROM stage_slices WHERE stage_set_id = ?1 ORDER BY slice_number")
+        .unwrap()
+        .query_map(rusqlite::params![stage_set_id], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(!slice_ids.is_empty(), "stage create made no slice");
+    for (i, stage_slice_id) in slice_ids.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+             VALUES (?1, ?2, ?3, 'written')",
+            rusqlite::params![write_id, stage_slice_id, (i + 5).to_string()],
+        )
+        .unwrap();
+    }
     drop(conn);
     (home, root)
 }
@@ -1658,29 +1665,17 @@ fn db_fsck_repair_dry_run_does_not_repair() {
 /// is useless for the exact case the repair path exists to serve. Builds
 /// the identical fixture `tests/cli_smoke.rs`'s
 /// `issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open`
-/// uses: a database stopped two migrations short of head, carrying one
-/// dangling `units.tenant_id`.
+/// uses: a catalog carrying one dangling `units.tenant_id`, one migration
+/// short of head through the debug build's test-only pending migration
+/// (`db::PENDING_TEST_MIGRATION_ENV`).
 #[test]
 fn db_fsck_repair_dry_run_is_reachable_on_a_database_ordinary_open_refuses() {
     let home = TempDir::new().unwrap();
     ok(home.path(), &["init"]);
 
     let db_path = home.path().join(".tapectl").join("tapectl.db");
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
-    }
-
     {
-        use rusqlite_migration::{Migrations, M};
-        let mut conn = rusqlite::Connection::open(&db_path).expect("open fixture db");
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        Migrations::new(vec![
-            M::up(include_str!("../src/db/migrations/001_initial.sql")),
-            M::up(include_str!("../src/db/migrations/002_fts5_catalog.sql")),
-        ])
-        .to_latest(&mut conn)
-        .expect("migrate fixture db to 002");
-
+        let conn = rusqlite::Connection::open(&db_path).expect("open the catalog");
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         conn.execute(
             "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
@@ -1691,7 +1686,13 @@ fn db_fsck_repair_dry_run_is_reachable_on_a_database_ordinary_open_refuses() {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
     }
 
-    let out = run_tapectl(home.path(), &["db", "fsck", "--repair", "--dry-run"]);
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["db", "fsck", "--repair", "--dry-run"])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env(tapectl::db::PENDING_TEST_MIGRATION_ENV, "1")
+        .output()
+        .expect("failed to spawn tapectl binary");
     assert!(
         matches!(out.status.code(), Some(0) | Some(1)),
         "a dry run must still be reachable on a database ordinary `db::open` refuses: \
@@ -1705,10 +1706,8 @@ fn db_fsck_repair_dry_run_is_reachable_on_a_database_ordinary_open_refuses() {
         "a dry run must not repair even on the orphan-blocked path: {text}"
     );
 
-    // Bypass `tapectl::db::open` deliberately — this database is still two
-    // migrations short of head, and re-opening it the ordinary way could
-    // itself run `migrate()`, which is exactly what this fixture must NOT
-    // have happened.
+    // Read raw: re-opening it the ordinary way runs `migrate()`, which this
+    // fixture must not have had.
     let raw = rusqlite::Connection::open(&db_path).expect("reopen fixture db raw");
     let n: i64 = raw
         .query_row(
@@ -1720,6 +1719,13 @@ fn db_fsck_repair_dry_run_is_reachable_on_a_database_ordinary_open_refuses() {
     assert_eq!(
         n, 1,
         "a dry run repaired (deleted) the orphan row it should only have previewed"
+    );
+    let version: i64 = raw
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 1,
+        "the dry run left the catalog one migration behind"
     );
 }
 
@@ -1768,7 +1774,7 @@ fn db_import_dry_run_does_not_overwrite() {
 /// 1.9.0): no destination directory, no MANIFEST.toml/SHA256SUMS/
 /// RECOVERY.md. The `stage_sets`/`stage_slices` chain is fabricated
 /// directly, the same way `restore_unit_dry_run_reports_a_preview_via_the_
-/// shared_arg_id` above fabricates its write-position chain — a real `dar`
+/// shared_arg_id` above fabricates its write-position chain — a real `tar`
 /// stage is not needed because the dry branch returns before the encrypted
 /// slice at `staging_path` is ever opened.
 #[test]
@@ -1813,7 +1819,7 @@ fn export_dry_run_creates_no_destination_directory() {
     // fail that copy with an unrelated I/O error instead of demonstrating
     // the actual defect (a real destination directory and its contents
     // getting written under `--dry-run`).
-    let slice_path = root.path().join("slice.1.dar.age");
+    let slice_path = root.path().join("slice.1.tar.age");
     std::fs::write(&slice_path, vec![0u8; 116]).unwrap();
     conn.execute(
         "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,

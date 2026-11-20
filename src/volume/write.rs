@@ -30,7 +30,7 @@ use super::format;
 use super::layout;
 use super::layout_model::{
     CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, Placed, Placement,
-    PlanClass, PlanItem, PlanSplit, SliceCheck, ZoneKind,
+    PlanClass, PlanItem, SliceCheck, ZoneKind,
 };
 use super::loaded;
 use super::session::{
@@ -1034,7 +1034,7 @@ fn volume_media(conn: &Connection, volume_id: i64, label: &str) -> Result<(i64, 
 }
 
 /// What File 0's `[media]` says about the cartridge's identity: the serial
-/// string, and how it was established (`docs/design/volume-format-v2.md`
+/// string, and how it was established (`docs/design/volume-format-v3.md`
 /// §1.1). `None` for the source means UNKNOWN, and the line is then omitted
 /// from the thunk entirely.
 #[derive(Debug, Clone)]
@@ -1432,7 +1432,7 @@ pub(crate) fn volume_write_contacted<'c>(
     // The write's staged-data facts, from the catalog and the disk alone
     // (issues #402, #445): shared with `volume write --init`, which asks
     // them BEFORE it initialises a cartridge ([`write_catalog_preflight_in`]).
-    let batch = checked_staged_units(conn, scope.spanning(config), scope.only())?;
+    let batch = checked_staged_units(conn, config, scope.only())?;
     // Issue #201: say what is about to happen before anything below touches
     // a backend, a MAM, or the drive. See `announce_staged_selection`'s doc
     // comment for why this is stderr and why it changes no selection logic.
@@ -1482,7 +1482,14 @@ pub(crate) fn volume_write_contacted<'c>(
     // consulted for it again. Reading `backends.lto[].nominal_capacity` here
     // is exactly how issue #141 planned an LTO-5 cartridge as 2.5 TB.
     let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
-    let budget = write_budget(backend, nominal_capacity)?;
+    let mut budget = write_budget(backend, nominal_capacity)?;
+    if !scope.may_plan_past_the_ceiling() {
+        // A rewrite plans under the fill ceiling and never past it (item
+        // 142's reason stands: it may hold a unit's only copy): its plan
+        // stops at the last slice that fits, and what the tape does not
+        // take stays staged and held (item 289, D20).
+        budget.plan_bound_bytes = None;
+    }
     // ADR-0012 item 86 (X19): a run that continues a span goes only onto the
     // generation of the range it continues. From the catalog alone, before
     // the drive is touched.
@@ -1590,7 +1597,6 @@ pub(crate) fn volume_write_contacted<'c>(
             nominal_capacity,
             budget,
             batch,
-            stage_set_ids,
             session,
         },
         &det,
@@ -1722,10 +1728,9 @@ fn write_budget(
     nominal_capacity: i64,
 ) -> Result<WriteBudget> {
     let usable_bytes = backend.fill_budget_bytes(nominal_capacity as u64);
-    // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
-    // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
-    // gone (T10 config cleanup: nothing read it after this path stopped, and
-    // this was that "nothing").
+    // The budget is the fill budget alone, less the ENOSPC buffer: there is
+    // no "manifest reserve", and the old `manifest_reserve` config field is
+    // gone (nothing read it once this path stopped).
     // `.max(0)` dropped (issue #59): a negative value is now rejected by
     // the parser itself, so a successful `Ok` is already non-negative.
     let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
@@ -1737,100 +1742,53 @@ fn write_budget(
     })
 }
 
-/// The refusal of a plan that commits nothing (ADR-0012 item 113, the
-/// coordinator's ruling): every staged unit is planned past the fill
-/// ceiling, so the tape may end before any of them. `None` when at least one
-/// unit is committed, or there is nothing to plan. Mostly unreachable: `stage
-/// create` refuses a unit above an empty tape's fill ceiling.
-fn past_ceiling_refusal(label: &str, split: &PlanSplit, units: &[BuildUnit]) -> Option<String> {
-    (split.committed == 0 && split.units > 0).then(|| commits_nothing(label, units))
-}
-
-/// [`past_ceiling_refusal`] of a span tape's plan, read from its placement
-/// (`layout-session.md` "The plan order"): refused when no unit is committed
-/// and no unit that may span is planned. A unit that may span is never a
-/// plan that commits nothing: the slices before the drive's early warning
-/// stay on the tape as a range of it (ADR-0012 items 84 and 123), which is
-/// how item 94's set larger than one tape is planned on a tape of its own.
-fn placed_past_ceiling_refusal(
-    label: &str,
-    plan: &SpanPlan,
-    units: &[BuildUnit],
-) -> Option<String> {
-    let placed = &plan.placement.placed;
-    let committed = placed.contains(&Placed::Committed);
-    let span_planned = units
-        .iter()
-        .zip(placed)
-        .any(|(u, p)| u.span.is_some() && matches!(p, Placed::PastCeiling | Placed::Tail));
-    (!units.is_empty() && !committed && !span_planned).then(|| commits_nothing(label, units))
-}
-
-/// The words of [`past_ceiling_refusal`].
+/// The refusal of a plan that puts nothing on the tape (ADR-0012 items 113
+/// and 289): on a drive that declares no `post_warning_bytes` the plan stops
+/// at the fill ceiling, and not even the first slice of the first set fits
+/// under it once the volume's own files are counted. Mostly unreachable:
+/// `stage create` and the capacity gate see a slice larger than a tape first.
 fn commits_nothing(label: &str, units: &[BuildUnit]) -> String {
     format!(
-        "volume \"{label}\": no staged unit fits within the fill ceiling, so this write would \
-         commit nothing: every one of {} is planned past it, and the tape may end before \
-         any of them (ADR-0012 item 113). Nothing was written and no session was recorded. \
-         A unit must fit under the ceiling of the cartridge it is written to",
-        unit_names(units)
+        "volume \"{label}\": no staged slice fits within the fill ceiling of this cartridge \
+         once the volume's own files are counted, so this write would put nothing on it: \
+         {} wait{}. Nothing was written and no session was recorded. A slice must fit under \
+         the ceiling of the cartridge it is written to (ADR-0012 items 113 and 289)",
+        unit_names(units),
+        if units.len() == 1 { "s" } else { "" },
     )
 }
 
-/// The units a write plans past the fill ceiling, named before the tape
-/// moves (ADR-0012 item 113): "the tape may end before them". `None` when
-/// none is, as on every write whose drive declares no `post_warning_bytes`.
-fn past_ceiling_notice(label: &str, split: &PlanSplit, units: &[BuildUnit]) -> Option<String> {
-    past_ceiling_sentence(label, &units[split.past_ceiling()])
-}
-
-/// The words of [`past_ceiling_notice`], for whole units `past`.
-fn past_ceiling_sentence<'u>(
-    label: &str,
-    past: impl IntoIterator<Item = &'u BuildUnit>,
-) -> Option<String> {
-    let past: Vec<&BuildUnit> = past.into_iter().collect();
-    (!past.is_empty()).then(|| {
-        format!(
-            "volume \"{label}\": {} planned past the fill ceiling; the tape may end before them. \
-             The drive declares post_warning_bytes, so the plan reaches toward the cartridge's \
-             nominal capacity (ADR-0012 item 113): a unit the tape ends before is cut, stays \
-             staged, and is written whole onto another cartridge by the next `tapectl volume \
-             write`",
-            unit_names(past)
-        )
-    })
-}
-
-/// What a span tape's plan says before the tape moves (`layout-session.md`
-/// "The plan order"), from the built Layout's own placement: the whole units
-/// planned past the fill ceiling ([`past_ceiling_notice`]'s words), each unit
-/// that may span and is planned past the ceiling (the early warning, not the
-/// plan, ends it on this tape: items 84 and 123), and the units that wait
-/// for the next tape.
+/// What a tape's plan says before the tape moves (`layout-session.md` "The
+/// plan order"), from the built Layout's own placement: the units planned
+/// past the fill ceiling (the early warning, not the plan, ends them on this
+/// tape: items 288 and 289), the unit a drive with no `post_warning_bytes`
+/// plans only up to the fill ceiling, and the units that wait for the next
+/// tape.
 fn span_plan_notices(label: &str, plan: &SpanPlan, units: &[BuildUnit]) -> Vec<String> {
-    let placed = |want: fn(&BuildUnit, Placed) -> bool| -> Vec<&BuildUnit> {
-        units
-            .iter()
-            .zip(&plan.placement.placed)
-            .filter(|(u, p)| want(u, **p))
-            .map(|(u, _)| u)
-            .collect()
-    };
-    let whole_past = placed(|u, p| u.span.is_none() && p == Placed::PastCeiling);
-    let spans_past =
-        placed(|u, p| u.span.is_some() && matches!(p, Placed::PastCeiling | Placed::Tail));
-    let mut notices: Vec<String> = past_ceiling_sentence(label, whole_past)
-        .into_iter()
+    let past: Vec<&BuildUnit> = units
+        .iter()
+        .zip(&plan.placement.placed)
+        .filter(|(_, p)| matches!(p, Placed::PastCeiling | Placed::Tail))
+        .map(|(u, _)| u)
         .collect();
-    if !spans_past.is_empty() {
+    let mut notices = Vec::new();
+    if !past.is_empty() {
         notices.push(format!(
-            "volume \"{label}\": {} may span, and the plan takes it past the fill ceiling to its \
-             end: the drive's early warning, not the plan, ends it on this tape (ADR-0012 items \
-             84 and 123). The slices written before the warning stay here as a range of it, and \
-             an ordinary `tapectl volume write` onto another cartridge of the same generation \
-             continues it",
-            unit_names(spans_past)
+            "volume \"{label}\": {} planned past the fill ceiling, to its end: the drive's \
+             early warning, not the plan, ends it on this tape (ADR-0012 items 288 and 289). \
+             The slices written before the warning stay here as a range of it, and an ordinary \
+             `tapectl volume write` onto another cartridge of the same generation continues it",
+            unit_names(past)
+        ));
+    }
+    for cut in &plan.stops_short {
+        notices.push(format!(
+            "volume \"{label}\": {} is planned only up to the fill ceiling, {}: the drive \
+             declares no post_warning_bytes, so the plan ends at the last slice that fits \
+             (ADR-0012 item 289). The rest stays staged, and an ordinary `tapectl volume write` \
+             onto another cartridge of the same generation continues it",
+            cut.unit,
+            slice_run(cut.first, cut.last),
         ));
     }
     if let Some(waiting) = waiting_notice(label, &plan.deferred) {
@@ -1839,18 +1797,21 @@ fn span_plan_notices(label: &str, plan: &SpanPlan, units: &[BuildUnit]) -> Vec<S
     notices
 }
 
-/// The units a span tape's plan left for a later tape, named (ADR-0012
-/// items 83, 94 and 95; X12, X13): not on this tape, still staged, and
-/// written by the next `volume write` onto another cartridge. `None` when
-/// none waits.
+/// The units a tape's plan left for a later tape, named (ADR-0012 items 288
+/// and 289): not on this tape, still staged, and written by the next `volume
+/// write` onto another cartridge. `None` when none waits.
 fn waiting_notice(label: &str, deferred: &[BuildUnit]) -> Option<String> {
     (!deferred.is_empty()).then(|| {
+        let one = deferred.len() == 1;
         format!(
-            "volume \"{label}\": {} waits for the next tape: the plan holds a unit that may span \
-             and gives it the room these would take, so they are not on this tape and stay staged \
-             (ADR-0012 items 83, 94 and 95). The next `tapectl volume write` onto another \
-             cartridge writes them",
-            unit_names(deferred)
+            "volume \"{label}\": {} planned and not written: the plan ends before {}, so {} not \
+             on this tape and {} staged (ADR-0012 items 288 and 289). The next `tapectl volume \
+             write` onto another cartridge writes {}",
+            unit_names(deferred),
+            if one { "it" } else { "them" },
+            if one { "it is" } else { "they are" },
+            if one { "stays" } else { "stay" },
+            if one { "it" } else { "them" },
         )
     })
 }
@@ -1864,51 +1825,38 @@ fn unit_names<'u>(units: impl IntoIterator<Item = &'u BuildUnit>) -> String {
         .join(", ")
 }
 
-/// What the plan of a span tape decided (`layout-session.md` "The plan
-/// order"; ADR-0012 items 83, 94, 95, 122 and 123): the built Layout's own
-/// placement of its units, the authority every notice reads, and the units
-/// the plan left for a later tape.
+/// A set a plan with no bound ends inside: its slices `first` to `last`
+/// (of the run this tape would take) are planned, and the rest of the run is
+/// not.
+struct StopsShort {
+    unit: String,
+    first: i64,
+    last: i64,
+}
+
+/// What the plan of a tape decided (`layout-session.md` "The plan order";
+/// ADR-0012 items 122, 288 and 289): the built Layout's own placement of its
+/// units, the authority every notice reads, and the units the plan left for a
+/// later tape.
 struct SpanPlan {
-    /// [`build::BuiltLayout::place`] of the built units: none deferred or
-    /// refused, in the built order.
+    /// [`build::BuiltLayout::place`] of the built units: none deferred, in
+    /// the built order.
     placement: Placement,
-    /// The units not on this tape, in the order the plan took them: whole
-    /// units an owed run or a spannable set leaves no room for, and sets
-    /// queued after the span's tail (X12, X13). They stay staged.
+    /// The units not on this tape, in the order the plan took them: sets
+    /// queued after the plan's tail, and a tail on a drive with no plan
+    /// bound that not even its first slice fits. They stay staged.
     deferred: Vec<BuildUnit>,
+    /// The set a plan with no `post_warning_bytes` ended inside, at the
+    /// last of its slices that fits the fill ceiling.
+    stops_short: Vec<StopsShort>,
 }
 
-/// Where a class goes in the plan order: owed runs, whole units, spannable
-/// sets ([`CapacityBudget::place`]).
-fn plan_rank(class: PlanClass) -> u8 {
-    match class {
-        PlanClass::Owed => 0,
-        PlanClass::Whole => 1,
-        PlanClass::Spannable => 2,
-    }
-}
-
-/// The order a span tape's plan takes `units` in, as indices: grouped by
-/// class as [`CapacityBudget::place`] groups them (owed runs, whole units,
-/// spannable sets), the caller's order within each, except that a spannable
-/// set larger than one tape (its slices, block-padded, more than `room`: the
-/// plan bound less the volume's own files) goes ahead of those that fit, so
-/// item 94's early start is not deferred behind a fitting set's tail (X13,
-/// the coordinator's ruling). `room` `None` (no plan bound) groups only.
-fn take_in_plan_order(
-    units: &[BuildUnit],
-    classes: &[PlanClass],
-    room: Option<u64>,
-    block_size: u64,
-) -> Vec<usize> {
-    let larger_than_tape = |u: &BuildUnit| {
-        room.is_some_and(|room| room > 0 && padded_slice_bytes(u, block_size) > room)
-    };
-    let mut order: Vec<usize> = (0..units.len()).collect();
-    order.sort_by_key(|&i| {
-        let first = classes[i] == PlanClass::Spannable && larger_than_tape(&units[i]);
-        (plan_rank(classes[i]), !first)
-    });
+/// The order a tape's plan takes a batch in, as indices: owed runs first,
+/// then the queue, the caller's order within each ([`CapacityBudget::place`]).
+fn take_in_plan_order(classes: &[PlanClass]) -> Vec<usize> {
+    let rank = |class: PlanClass| u8::from(class != PlanClass::Owed);
+    let mut order: Vec<usize> = (0..classes.len()).collect();
+    order.sort_by_key(|&i| rank(classes[i]));
     order
 }
 
@@ -1922,12 +1870,12 @@ fn padded_slice_bytes(unit: &BuildUnit, block_size: u64) -> u64 {
         .sum()
 }
 
-/// What `volume plan` shows of a write's plan when a staged set may span
-/// (#478): one write of everything staged, planned as `volume write` plans
-/// it ([`find_staged_data`], [`take_in_plan_order`],
-/// [`CapacityBudget::place`]) on the slices' sizes alone, the volume's own
-/// files not counted, as `volume plan`'s other figures are estimates.
-/// `units[i]` and `classes[i]` are the placement's caller's units.
+/// What `volume plan` shows of a write's plan (#478): one write of
+/// everything staged, planned as `volume write` plans it
+/// ([`find_staged_data`], [`take_in_plan_order`], [`CapacityBudget::place`])
+/// on the slices' sizes alone, the volume's own files not counted, as
+/// `volume plan`'s other figures are estimates. `units[i]` and `classes[i]`
+/// are the placement's caller's units.
 pub(crate) struct PlanPreview {
     pub units: Vec<BuildUnit>,
     pub classes: Vec<PlanClass>,
@@ -1935,10 +1883,9 @@ pub(crate) struct PlanPreview {
 }
 
 /// [`PlanPreview`] of everything staged against a fill budget of
-/// `available_bytes` and the plan bound `plan_bound_bytes`; `None` when no
-/// staged set may span, so the plan is 1.6.0's. A refusal the plan of a span
-/// raises from the catalog (a released slice it would plan, a policy that
-/// cannot be resolved) is the `Err`.
+/// `available_bytes` and the plan bound `plan_bound_bytes`; `None` when
+/// nothing is staged. A refusal the plan raises from the catalog (a released
+/// slice it would plan, a policy that cannot be resolved) is the `Err`.
 pub(crate) fn plan_preview(
     conn: &Connection,
     config: &Config,
@@ -1946,11 +1893,11 @@ pub(crate) fn plan_preview(
     plan_bound_bytes: Option<u64>,
     block_size: u64,
 ) -> Result<Option<PlanPreview>> {
-    let batch = find_staged_data(conn, Spanning::ByPolicy(config), None)?;
-    if !batch.spans() {
+    let batch = find_staged_data(conn, config, None)?;
+    if batch.is_empty() {
         return Ok(None);
     }
-    let order = take_in_plan_order(&batch.units, &batch.classes, plan_bound_bytes, block_size);
+    let order = take_in_plan_order(&batch.classes);
     let units: Vec<BuildUnit> = order.iter().map(|&i| batch.units[i].clone()).collect();
     let classes: Vec<PlanClass> = order.iter().map(|&i| batch.classes[i]).collect();
     let items: Vec<PlanItem> = units
@@ -1975,25 +1922,22 @@ pub(crate) fn plan_preview(
     }))
 }
 
-/// [`build_write_layout`] for a batch that holds a set whose write may span
-/// (`layout-session.md` "The plan order"). The plan order is decided BEFORE
-/// the build, because a deferred unit must not reach the envelopes, the
-/// on-tape `catalog.db`, the index or `plan()`'s rows, and the build reads
-/// it back:
+/// The one planner of a write (`layout-session.md` "The plan order"; ADR-0012
+/// items 122, 288 and 289, D20). The plan order is decided BEFORE the build,
+/// because a deferred unit must not reach the envelopes, the on-tape
+/// `catalog.db`, the index or `plan()`'s rows, and the build reads it back:
 ///
-/// 1. A probe build of every candidate, grouped by class (owed runs, whole
-///    units, spannable sets; the caller's order within each), gives the
-///    volume's own files: an upper bound on the plan's content, since leaving
-///    a unit out only shrinks what the envelopes hold (the coordinator's
-///    ruling). Not on their bytes to the block: a build of fewer units can
-///    land up to one block per file above the probe (#491, step 4).
-/// 2. Spannable sets larger than one tape (more than the plan bound less
-///    those files) are taken ahead of those that fit, so item 94's early
-///    start is not deferred behind a fitting set's tail (X13).
-/// 3. [`CapacityBudget::place`] on those sizes. A refusal (item 123's
-///    `post_warning_bytes`, or whole units the plan cannot hold) is the
-///    pre-write validation's refusal, before any byte is written.
-/// 4. The units it places, in its order, deferred ones dropped, are built
+/// 1. A probe build of every candidate, owed runs first and the caller's
+///    order within each class, gives the volume's own files: an upper bound
+///    on the plan's content, since leaving a unit out only shrinks what the
+///    envelopes hold (the coordinator's ruling). Not on their bytes to the
+///    block: a build of fewer units can land up to one block per file above
+///    the probe (#491, step 4).
+/// 2. [`CapacityBudget::place`] on those sizes. On a drive with no plan
+///    bound the set that carries the plan past the fill ceiling is planned
+///    as the longest prefix of its slices that fits ([`Placement::tail_room`],
+///    less the drift a rebuild allows), and deferred when not even one does.
+/// 3. The units it places, in its order, deferred ones dropped, are built
 ///    (the probe stands when that is what it built), and the built Layout's
 ///    placement is read back ([`read_back_span_plan`]): it must place every
 ///    unit as the plan did, on the built bytes or, when those exceed the
@@ -2010,16 +1954,13 @@ fn build_span_layout(
     operator_public_keys: Vec<String>,
     escrow_public_key: Option<String>,
     session_dir: &Path,
-    fill_ceiling: f64,
-    nominal_capacity: i64,
 ) -> Result<(build::BuiltLayout, BuildInputs, SpanPlan)> {
     let label = w.label;
     let block_size = w.block_size;
-    let bound = w.plan_bound_bytes;
     let StagedBatch { units, classes } = batch;
 
-    // 1. The probe, grouped by class (the caller's order within each).
-    let grouped = take_in_plan_order(&units, &classes, None, block_size);
+    // 1. The probe, owed runs first (the caller's order within each class).
+    let grouped = take_in_plan_order(&classes);
     let probe_classes: Vec<PlanClass> = grouped.iter().map(|&i| classes[i]).collect();
     let probe_units: Vec<BuildUnit> = grouped.iter().map(|&i| units[i].clone()).collect();
     let probe_ids: Vec<i64> = probe_units.iter().map(|u| u.stage_set_id).collect();
@@ -2034,51 +1975,67 @@ fn build_span_layout(
         escrow_public_key.clone(),
         session_dir,
     )?;
-
-    // 2. Larger-than-tape spannable sets first (X13).
     let fixed = probe.layout.fixed_on_tape_bytes();
-    let room = bound.map(|b| b.saturating_sub(fixed));
-    let taken = take_in_plan_order(&probe_inputs.units, &probe_classes, room, block_size);
-    let ordered: Vec<BuildUnit> = taken
-        .iter()
-        .map(|&i| probe_inputs.units[i].clone())
-        .collect();
-    let ordered_classes: Vec<PlanClass> = taken.iter().map(|&i| probe_classes[i]).collect();
 
-    // 3. The plan order.
-    let planned = probe.place(&ordered, &ordered_classes);
-    if !planned.is_ok() {
-        let _ = fs::remove_dir_all(session_dir);
-        let note = crate::volume::layout_model::capacity_refusal_note(
-            &planned.errors,
-            fill_ceiling,
-            nominal_capacity as u64,
-        );
-        return Err(TapectlError::Other(format!(
-            "volume \"{label}\" failed pre-write validation: {}",
-            planned
-                .errors
-                .iter()
-                .map(|e| e.to_string())
-                .chain(note)
-                .collect::<Vec<_>>()
-                .join("; ")
-        )));
-    }
-    let final_units: Vec<BuildUnit> = planned.order.iter().map(|&i| ordered[i].clone()).collect();
-    let final_classes: Vec<PlanClass> = planned.order.iter().map(|&i| ordered_classes[i]).collect();
-    let deferred: Vec<BuildUnit> = planned
+    // 2. The plan order.
+    let ordered = probe_inputs.units.clone();
+    let planned = probe.place(&ordered, &probe_classes);
+    let mut final_units: Vec<BuildUnit> =
+        planned.order.iter().map(|&i| ordered[i].clone()).collect();
+    let mut final_classes: Vec<PlanClass> =
+        planned.order.iter().map(|&i| probe_classes[i]).collect();
+    let mut deferred: Vec<BuildUnit> = planned
         .deferred()
         .iter()
         .map(|&i| ordered[i].clone())
         .collect();
+    let mut stops_short = Vec::new();
+    if let (Some(room), Some(last)) = (planned.tail_room, final_units.last_mut()) {
+        // No plan bound: the tail is planned up to the fill ceiling. Its
+        // slices are a prefix of the run it would take, short of the room by
+        // what a rebuild of the files may drift.
+        let drift = capacity_numbers(&probe.layout).map_or(0, |n| n.margin);
+        let mut room = room.saturating_sub(drift);
+        let all = last.slices.len();
+        let mut keep = 0;
+        for slice in &last.slices {
+            let bytes = crate::volume::layout_model::pad_to_blocks(
+                slice.encrypted_bytes.max(0) as u64,
+                block_size,
+            );
+            if bytes > room {
+                break;
+            }
+            room -= bytes;
+            keep += 1;
+        }
+        if keep < all {
+            let first = last.slices.first().map_or(0, |s| s.slice_number);
+            if keep == 0 {
+                let dropped = final_units.pop().expect("the tail was just read");
+                final_classes.pop();
+                deferred.insert(0, dropped);
+            } else {
+                last.slices.truncate(keep);
+                stops_short.push(StopsShort {
+                    unit: format!("\"{}\" v{}", last.unit_name, last.snapshot_version),
+                    first,
+                    last: last.slices.last().map_or(first, |s| s.slice_number),
+                });
+            }
+        }
+    }
+    if final_units.is_empty() {
+        let _ = fs::remove_dir_all(session_dir);
+        return Err(TapectlError::Other(commits_nothing(label, &deferred)));
+    }
 
-    // 4. The build, and its read-back.
+    // 3. The build, and its read-back.
     let probe_stands = final_units.len() == probe_inputs.units.len()
         && final_units
             .iter()
             .zip(&probe_inputs.units)
-            .all(|(a, b)| a.stage_set_id == b.stage_set_id);
+            .all(|(a, b)| a.stage_set_id == b.stage_set_id && a.slices.len() == b.slices.len());
     let (built, inputs) = if probe_stands {
         (probe, probe_inputs)
     } else {
@@ -2103,8 +2060,8 @@ fn build_span_layout(
             return Err(TapectlError::Other(format!(
                 "volume \"{label}\": internal error: the built Layout does not place its units \
                  as the plan made before the build did ({why}). Nothing was written and no \
-                 session was recorded. Report this: the plan order of a tape that holds a unit \
-                 that may span disagrees with itself"
+                 session was recorded. Report this: the plan order of a tape disagrees with \
+                 itself"
             )));
         }
     };
@@ -2114,6 +2071,7 @@ fn build_span_layout(
         SpanPlan {
             placement,
             deferred,
+            stops_short,
         },
     ))
 }
@@ -2261,7 +2219,7 @@ fn build_write_layout(
     let catalog_db_path = catalog_work.path().join("catalog_snapshot.db");
     crate::db::catalog_snapshot::build_catalog_snapshot(conn, stage_set_ids, &catalog_db_path)?;
 
-    // The cross-volume index (`volume-format-v2.md` §1.5, #418 R4): which
+    // The cross-volume index (`volume-format-v3.md` §1.5, #418 R4): which
     // volumes hold which version of each unit, and every path of a tenant's
     // versions. Plaintext, so built beside the `catalog.db` above, in the
     // same tapectl-home work dir, streamed into the envelopes by `build()`
@@ -2287,6 +2245,10 @@ fn build_write_layout(
         &index_runs(&units),
         &catalog_work.path().join("index"),
     )?;
+    // Each staging's file table and id map (§1.6; ADR-0012 items 265, 276):
+    // plaintext, so beside the index in the same work dir, streamed into the
+    // tenant envelopes by `build()` and removed with `catalog_work`.
+    let tables = generate_tables(conn, &units, &catalog_work.path().join("tables"))?;
 
     let inputs = BuildInputs {
         label: label.to_string(),
@@ -2310,6 +2272,7 @@ fn build_write_layout(
         escrow_public_key,
         catalog_db_path: Some(catalog_db_path),
         index: Some(index),
+        tables: Some(tables),
     };
 
     let built = build::build_with_plan_bound(&inputs, plan_bound_bytes, session_dir)?;
@@ -2366,36 +2329,27 @@ fn read_back_span_plan(
 }
 
 /// `Ok` when `placement` places every one of `units` in their order, none
-/// deferred or refused; otherwise how it does not, in the words of
+/// deferred; otherwise how it does not, in the words of
 /// [`build_span_layout`]'s refusal.
 fn placement_is_the_plan(
     placement: &Placement,
     units: &[BuildUnit],
 ) -> std::result::Result<(), String> {
     let in_order: Vec<usize> = (0..units.len()).collect();
-    let disagrees: Vec<&BuildUnit> = units
+    let deferred: Vec<&BuildUnit> = units
         .iter()
         .zip(&placement.placed)
-        .filter(|(_, p)| matches!(p, Placed::Deferred | Placed::Refused))
+        .filter(|(_, p)| matches!(p, Placed::Deferred))
         .map(|(u, _)| u)
         .collect();
-    if placement.is_ok() && placement.order == in_order && disagrees.is_empty() {
+    if placement.order == in_order && deferred.is_empty() {
         return Ok(());
     }
-    Err(format!(
-        "{}; {}",
-        if disagrees.is_empty() {
-            "a unit moved".to_string()
-        } else {
-            format!("{} no longer fit", unit_names(disagrees.iter().copied()))
-        },
-        placement
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; "),
-    ))
+    Err(if deferred.is_empty() {
+        "a unit moved".to_string()
+    } else {
+        format!("{} no longer fit", unit_names(deferred.iter().copied()))
+    })
 }
 
 /// `slices 1-2`, or `slice 3` for a run of one: a range as a message names it.
@@ -2408,9 +2362,9 @@ pub(crate) fn slice_run(first: i64, last: i64) -> String {
 }
 
 /// The run of each unit's slices this tape's plan holds, as the index's
-/// `this-tape` rows state it (`volume-format-v2.md` §1.5; ADR-0012 item
-/// 126): a whole unit is its whole set, and a unit whose write may span is
-/// the run [`BuildUnit::slices`] plans, by slice number.
+/// `this-tape` rows state it (`volume-format-v3.md` §1.5; ADR-0012 item
+/// 126): the run [`BuildUnit::slices`] plans, by slice number; a unit built
+/// without its span (a test's) is its whole set.
 fn index_runs(units: &[BuildUnit]) -> Vec<coverage::IndexRun> {
     units
         .iter()
@@ -2457,7 +2411,7 @@ impl CapacityNumbers {
     /// reserve against the budget.
     ///
     /// The fill ceiling's figures, never a plan bound (ADR-0012 item 113): a
-    /// rewrite may hold a unit's only copy, and a cut there leaves it none.
+    /// rewrite may hold a unit's only copy.
     pub fn fits(&self) -> bool {
         self.staged + self.generated + self.margin + self.reserve <= self.available
     }
@@ -2472,8 +2426,8 @@ impl CapacityNumbers {
              envelopes with the catalogues, the cross-volume index and catalog.db, their \
              backups, the seal, block padding) take {}, plus {} of margin for what only the \
              real volume decides and {} of end-of-tape reserve: {} in all, against the {} the \
-             cartridge may take ({}% of its {} capacity). A unit is never split, so there is \
-             no smaller write of this data; compact onto a larger generation, or raise the \
+             cartridge may take ({}% of its {} capacity). A rewrite writes what it staged \
+             onto one cartridge, so there is no smaller write of this data; compact onto a larger generation, or raise the \
              ceiling with --fill-ceiling if you know the cartridge takes it",
             fmt(self.staged as i64),
             fmt(self.generated as i64),
@@ -2570,9 +2524,9 @@ pub(crate) fn rehearse_write_capacity(
         enospc_buffer,
         ..
     } = write_budget(backend, volume.capacity_bytes)?;
-    // A rewrite never spans (ADR-0012 item 142): its rehearsal plans the
-    // batch as its write will, every set whole.
-    let units = checked_staged_units(conn, Spanning::Never, only)?.units;
+    // A rewrite plans under the fill ceiling (ADR-0012 item 142): its
+    // rehearsal refuses a batch that does not fit it whole, before the erase.
+    let units = checked_staged_units(conn, config, only)?.units;
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let SessionKeys {
         keys,
@@ -2599,8 +2553,7 @@ pub(crate) fn rehearse_write_capacity(
             usable_bytes,
             enospc_buffer,
             // Never past the fill ceiling (ADR-0012 item 113, the
-            // coordinator's ruling): the rewrite may hold a unit's only copy,
-            // and a cut there would leave it with none.
+            // coordinator's ruling): the rewrite may hold a unit's only copy.
             plan_bound_bytes: None,
             nominal_capacity: volume.capacity_bytes,
             mam_capacity: 0,
@@ -2659,7 +2612,6 @@ struct StagedWrite<'a> {
     budget: WriteBudget,
     /// The staged batch, each set with its plan class (#478).
     batch: StagedBatch,
-    stage_set_ids: Vec<i64>,
     session: SessionKeys,
 }
 
@@ -2705,7 +2657,6 @@ fn volume_write_in_contact<'c>(
                 post_warning_bytes,
             },
         batch,
-        stage_set_ids,
         session:
             SessionKeys {
                 keys,
@@ -2800,9 +2751,9 @@ fn volume_write_in_contact<'c>(
 
     // The Layout is built by `build_write_layout`, the one place a write's
     // Layout is made -- `volume rewrite`'s capacity rehearsal (issue #483)
-    // calls the same function before it erases anything. A batch holding a
-    // set whose write may span is planned first (#478, `build_span_layout`);
-    // any other is built as it was in 1.6.0.
+    // calls the same function before it erases anything. Every write is
+    // planned first by `build_span_layout`, the one planner (ADR-0012 items
+    // 288 and 289).
     let phase = progress::phase("build", None);
     let write_build = WriteBuild {
         label,
@@ -2822,34 +2773,16 @@ fn volume_write_in_contact<'c>(
         mam_loads: mam.load_count.unwrap_or(0),
         cartridge_identity,
     };
-    let (built, inputs, span_plan) = if batch.spans() {
-        let (built, inputs, plan) = build_span_layout(
-            conn,
-            paths,
-            write_build,
-            batch,
-            tenants,
-            operator_public_keys,
-            escrow_public_key,
-            &session_dir,
-            backend.fill_ceiling,
-            nominal_capacity,
-        )?;
-        (built, inputs, Some(plan))
-    } else {
-        let (built, inputs) = build_write_layout(
-            conn,
-            paths,
-            write_build,
-            batch.units,
-            &stage_set_ids,
-            tenants,
-            operator_public_keys,
-            escrow_public_key,
-            &session_dir,
-        )?;
-        (built, inputs, None)
-    };
+    let (built, inputs, span_plan) = build_span_layout(
+        conn,
+        paths,
+        write_build,
+        batch,
+        tenants,
+        operator_public_keys,
+        escrow_public_key,
+        &session_dir,
+    )?;
     phase.done();
     // ADR-0012 item 215: what this write asks for once its tape is sealed,
     // into the session directory `build` just made, beside its frozen
@@ -2918,37 +2851,13 @@ fn volume_write_in_contact<'c>(
         }
     }
 
-    // ADR-0012 item 113: with the drive's plan bound, the units after the
-    // prefix that fits the fill ceiling are planned past it. The pre-flight
-    // above refused a plan beyond the bound (`PlanBoundExceeded`), never
-    // trimming it; here a plan whose every unit is past the ceiling is
-    // refused too (a tape that can only end cut is not a plan), and the
-    // units past it are named before the tape moves. Without a bound the
-    // split is the whole plan, committed, and this says nothing.
-    //
-    // #478: a span tape's plan is read from its own placement instead
-    // (`build_span_layout`'s read-back): the same refusal, and the notices
-    // name the whole units past the ceiling, the units that may span past it
-    // (the early warning ends them here), and the units that wait for the
-    // next tape.
-    match &span_plan {
-        None => {
-            let split = built.split(&inputs.units);
-            if let Some(refusal) = past_ceiling_refusal(label, &split, &inputs.units) {
-                return Err(TapectlError::Other(refusal));
-            }
-            if let Some(notice) = past_ceiling_notice(label, &split, &inputs.units) {
-                eprintln!("{notice}");
-            }
-        }
-        Some(plan) => {
-            if let Some(refusal) = placed_past_ceiling_refusal(label, plan, &inputs.units) {
-                return Err(TapectlError::Other(refusal));
-            }
-            for notice in span_plan_notices(label, plan, &inputs.units) {
-                eprintln!("{notice}");
-            }
-        }
+    // ADR-0012 items 113, 288 and 289: the plan is read from its own
+    // placement (`build_span_layout`'s read-back). The notices name the sets
+    // planned past the fill ceiling (the early warning ends them here), the
+    // set a drive with no `post_warning_bytes` plans only up to the ceiling,
+    // and the sets that wait for the next tape.
+    for notice in span_plan_notices(label, &span_plan, &inputs.units) {
+        eprintln!("{notice}");
     }
 
     // The tape device opens HERE and not a line earlier (the pre-flight
@@ -3073,15 +2982,73 @@ fn volume_write_in_contact<'c>(
         Some(config.defaults.verify_interval_days),
     )?;
     // #478: the units the plan left for a later tape, named once the write
-    // is done as the cut units are (`layout-session.md` "The plan order"):
-    // still staged, and written by the next `volume write`.
-    if let Some(waiting) = span_plan
-        .as_ref()
-        .and_then(|plan| waiting_notice(label, &plan.deferred))
-    {
+    // is done (`layout-session.md` "The plan order"): still staged, and
+    // written by the next `volume write`.
+    if let Some(waiting) = waiting_notice(label, &span_plan.deferred) {
         eprintln!("{waiting}");
     }
     Ok(layout_snapshot)
+}
+
+/// Test seam for integration tests (tests/restore_memory.rs, #571): `volume init` over any
+/// Store. Production code goes through volume_init / volume_init_barcoded.
+#[doc(hidden)]
+pub fn volume_init_over_store_for_tests(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    barcode: Option<&str>,
+    store: &mut dyn Store,
+) -> Result<()> {
+    let mut slot = ContactSlot::empty();
+    let r = volume_init_contacted_barcoded(
+        conn,
+        config,
+        label,
+        device,
+        block_size,
+        false,
+        None,
+        barcode,
+        None,
+        &mut slot,
+        ContactStore::Injected(store),
+    );
+    slot.finish_result(r).map(|_| ())
+}
+
+/// Test seam for integration tests (tests/restore_memory.rs, #571): `volume write` over any
+/// Store. Production code goes through volume_write / volume_write_scoped.
+#[doc(hidden)]
+pub fn volume_write_over_store_for_tests(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    store: &mut dyn Store,
+) -> Result<()> {
+    let mut slot = ContactSlot::empty();
+    let r = volume_write_contacted(
+        conn,
+        paths,
+        config,
+        label,
+        device,
+        block_size,
+        false,
+        false,
+        false,
+        false,
+        true,
+        &mut slot,
+        ContactStore::Injected(store),
+        None,
+    );
+    slot.finish_result(r).map(|_| ())
 }
 
 /// Resume an interrupted write session for `label` — the cross-process half
@@ -4264,7 +4231,7 @@ fn finish_session(
             let phase = progress::phase("seal", None);
             // Issue #408: a seal that fails leaves the session `in_progress`
             // (swept to `interrupted`), so `volume resume` writes it again —
-            // except on a full medium (#420, `volume-format-v2.md` §4.3 W6):
+            // except on a full medium (#420, `volume-format-v3.md` §5.2 W6):
             // the hard end inside the seal's blocks, or a refused filemark,
             // is the tape's end where no seal can follow, and the session
             // ABORTS as it does on the hard end inside a slice. Nothing was
@@ -4502,7 +4469,7 @@ fn write_aborted(conn: &Connection, volume_id: i64, label: &str, reason: &str) -
 }
 
 /// Abort a session whose seal could not be written because the medium is
-/// full (#420, `volume-format-v2.md` §4.3 W6; `layout-session.md`'s Aborted
+/// full (#420, `volume-format-v3.md` §5.2 W6; `layout-session.md`'s Aborted
 /// row: "the hard end inside a slice or a seal … a refused filemark"): its
 /// `writes` rows become `aborted`, the `write_aborted` event names the
 /// reason, and the write exits 5. The tape is left unsealed, as on the hard
@@ -4513,7 +4480,7 @@ fn write_aborted(conn: &Connection, volume_id: i64, label: &str, reason: &str) -
 /// `in_progress` or `interrupted`, the set [`precontact_refusal`] calls one
 /// write session: the volume's session lock is held, and a write refuses
 /// while another session on the volume is unresolved, so there is no other.
-/// No `cut` row exists before a confirm, and `completed` ones are never
+/// No `range` row exists before a confirm, and `completed` ones are never
 /// touched. The same rows `session::mark_writes` would move, for the one
 /// path where `ReadyToSeal::seal` has consumed the session's own ids.
 fn abort_unsealed_session(
@@ -4918,7 +4885,8 @@ fn finish_confirm(
             }
             // #420 (`layout-session.md`, "After a short seal"): a short seal
             // is a success and exits 0; the operator is told where the tape
-            // ended, which units it cut, and what writes them. On stderr,
+            // ended, which units it holds as a range or planned and did not
+            // write, and what continues them. On stderr,
             // like every other line this layer prints, so `--json` stdout
             // stays one document.
             if let Some(report) = sealed.short_ending_report() {
@@ -5679,8 +5647,8 @@ fn full_seal_range_report(sealed: &session::SealedSession) -> Option<String> {
 
 /// The `write_completed` event's `details` (#420, #478; `layout-session.md`
 /// "Confirm of a short ending"): [`session::SealedSession::write_completed_details`],
-/// which names the short ending and the cut units and, from 1.7.0, the range
-/// units with their slice runs. `None` on a full seal with no range, whose
+/// which names the short ending and the units planned and not written, and
+/// the range units with their slice runs. `None` on a full seal with no range, whose
 /// event is what it was before 1.6.0. Shared with the adoption of a lost write
 /// (`adopt_lost::record_adoption`), which writes the same event.
 pub(crate) fn write_completed_details(sealed: &session::SealedSession) -> Option<String> {
@@ -5696,9 +5664,6 @@ pub(crate) fn write_completed_details(sealed: &session::SealedSession) -> Option
 pub struct RecordedEnding {
     /// `volumes.ended_after`: the short seal's K, `None` on a full seal.
     pub ended_after: Option<i64>,
-    /// The units whose `writes` rows on the volume are `cut`, in plan order
-    /// (the order the session inserted its rows): empty on a full seal.
-    pub cut_units: Vec<String>,
     /// The units whose `writes` rows on the volume are `range`, in plan
     /// order, with their runs ([`recorded_ranges`]).
     pub range_units: Vec<RecordedRange>,
@@ -5731,21 +5696,8 @@ pub fn recorded_ending(conn: &Connection, label: &str) -> Result<RecordedEnding>
         )
         .optional()?
         .flatten();
-    let cut_units = conn
-        .prepare(
-            "SELECT u.name FROM writes w
-             JOIN volumes v ON v.id = w.volume_id
-             JOIN stage_sets ss ON ss.id = w.stage_set_id
-             JOIN snapshots s ON s.id = ss.snapshot_id
-             JOIN units u ON u.id = s.unit_id
-             WHERE v.label = ?1 AND w.status = 'cut'
-             ORDER BY w.id",
-        )?
-        .query_map(params![label], |r| r.get(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(RecordedEnding {
         ended_after,
-        cut_units,
         range_units: recorded_ranges(conn, label)?,
         deferred_units: waiting_units(conn, label)?,
         keep_together: keep_together(conn, label)?,
@@ -5826,16 +5778,16 @@ pub fn copy_summary(conn: &Connection, label: &str) -> Result<CopySummary> {
 }
 
 /// The units a write of the volume labelled `label` was planned to carry:
-/// those with a `completed`, `range` or `cut` write on it, in id order. The
-/// cut ones are still owed a copy, so the next command a write ends with
-/// judges them too (ADR-0012 item 216).
+/// those with a `completed` or `range` write on it, in id order. A range is
+/// still owed the rest of its slices, so the next command a write ends with
+/// judges it too (ADR-0012 item 216).
 pub fn units_planned_onto(conn: &Connection, label: &str) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT sn.unit_id FROM writes w
            JOIN volumes v ON v.id = w.volume_id
            JOIN stage_sets ss ON ss.id = w.stage_set_id
            JOIN snapshots sn ON sn.id = ss.snapshot_id
-          WHERE v.label = ?1 AND w.status IN ('completed', 'range', 'cut')
+          WHERE v.label = ?1 AND w.status IN ('completed', 'range')
           ORDER BY sn.unit_id",
     )?;
     let ids = stmt
@@ -6059,7 +6011,7 @@ pub(crate) fn finish_figures_command(label: &str) -> String {
 ///
 /// #420: on a short-sealed volume the figures are the tape's, not the
 /// plan's — only the data slices at or before `volumes.ended_after` are on
-/// it (`volume-format-v2.md` §4.2). Read from the row, so every caller
+/// it (`volume-format-v3.md` §5.1). Read from the row, so every caller
 /// counts the same tape: the seal records it before the confirm, and an
 /// adoption (`adopt_lost`) must record it before calling this.
 pub(crate) fn record_write_bookkeeping(
@@ -6091,14 +6043,22 @@ pub(crate) fn record_write_bookkeeping(
     // this runs after confirm, hours after the session started, and
     // stamping it now made it the same instant as `last_write`.
     // `last_write` stays the completion.
+    // The script this tape carries at file 2: the hash the layout already
+    // computed when it built the entry, never a second hash of the constant.
+    let restore_sh_sha256: Option<&str> = layout
+        .entries
+        .iter()
+        .find(|e| matches!(e.kind, ZoneKind::RestoreSh))
+        .and_then(|e| e.sha256.as_deref());
     conn.execute(
         "UPDATE volumes SET bytes_written = ?1, num_data_files = ?2, has_manifest = 1,
+         restore_sh_sha256 = COALESCE(?4, restore_sh_sha256),
          first_write = COALESCE(first_write,
                                 (SELECT MIN(started_at) FROM writes WHERE volume_id = ?3),
                                 datetime('now')),
          last_write = datetime('now')
          WHERE id = ?3",
-        params![bytes_written, num_data_files, volume_id],
+        params![bytes_written, num_data_files, volume_id, restore_sh_sha256],
     )?;
     Ok(())
 }
@@ -6583,6 +6543,18 @@ fn decide_fresh_write_contact_on(
                  volume first, then `tapectl cartridge erase` reads it, asks for its label and \
                  erases it. {NEVER_DEGAUSS}"
         ))),
+        // `volume-format-v3.md` §7.6 (ADR-0012 item 269; #560): a tapectl
+        // volume of another layout. Its seal was not read, so whether it is
+        // sealed is not known, and it is not a mismatch `--force` may
+        // overwrite either: like a sealed volume, only `cartridge erase` and
+        // the typed label reach it. No `allow_overwrite` is consulted.
+        ContactOutcome::OtherLayout(other) => Err(TapectlError::Other(format!(
+            "refusing to write volume \"{label}\" (uuid {volume_uuid}): the loaded cartridge \
+             holds a volume of another layout: {}. Nothing was written, and --force cannot \
+             override this. If the cartridge is to be reused, `tapectl cartridge erase` reads \
+             it, asks for its label and erases it. {NEVER_DEGAUSS}",
+            other.sentence()
+        ))),
         ContactOutcome::IdentityMismatch { found } => {
             let found_desc = describe_file0_identity(found.as_ref());
             if allow_overwrite {
@@ -6727,7 +6699,7 @@ fn check_fresh_write_contact_on(
 }
 
 /// Verify a volume via the v2 keyless chain walk
-/// (`docs/design/volume-format-v2.md` §5) — the same algorithm
+/// (`docs/design/volume-format-v3.md` §6) — the same algorithm
 /// `session::SealedPending::confirm` runs at seal time and `RESTORE.sh
 /// --verify` reimplements independently in bash
 /// (`docs/design/v2-open-questions.md` §10: "one chain walk, three
@@ -6830,9 +6802,9 @@ pub(crate) fn record_verification_results(
 
 /// The Layout a verify walks: the tape's own plan, rebuilt from its front
 /// index (File 3) as read back, `fi_trimmed` with its NUL padding stripped
-/// (`volume-format-v2.md` §4). File 3's own entry takes its true length from
+/// (`volume-format-v3.md` §5). File 3's own entry takes its true length from
 /// those bytes (the entry omits it, self-referentially, by design); the seal
-/// marker's stays unsized, since the front index gives it none (§3).
+/// marker's stays unsized, since the front index gives it none (§4).
 fn layout_from_front_index(label: &str, block_size: u64, fi_trimmed: &str) -> Result<Layout> {
     let fi_true_len = fi_trimmed.len() as u64;
 
@@ -6889,13 +6861,13 @@ fn layout_from_front_index(label: &str, block_size: u64, fi_trimmed: &str) -> Re
 /// one sum behind a confirm's and a verify's progress total (issue #386)
 /// and a verify's read-error rates (issue #495), so the two cannot drift
 /// (issue #496). Every file of the plan, or — on a tape that sealed short
-/// after `ended_after` (#420, `volume-format-v2.md` §5 step 4) — the files
+/// after `ended_after` (#420, `volume-format-v3.md` §6 step 4) — the files
 /// at or before it and the seal, which is never longer than the plan's.
 ///
 /// An unsized entry is left out. A write session's built Layout sizes every
 /// file, so only a Layout rebuilt from a tape's front index has one: its
 /// seal marker, for which the front index gives no size
-/// (`volume-format-v2.md` §3) — a block or two against the gigabytes of
+/// (`volume-format-v3.md` §4) — a block or two against the gigabytes of
 /// slices. `None` when nothing is sized.
 pub(crate) fn readback_bytes(layout: &Layout, ended_after: Option<u32>) -> Option<u64> {
     let bytes: u64 = layout
@@ -7348,7 +7320,7 @@ fn verify_contacted(
     // recovered by stripping trailing NUL padding — the same trick
     // `volume_identify` already uses for File 0, and the sanctioned
     // cross-tool byte contract for File 3 specifically
-    // (`volume-format-v2.md` §4: "a reader recovering File 3 from a padded
+    // (`volume-format-v3.md` §5: "a reader recovering File 3 from a padded
     // tape read obtains the same bytes by stripping trailing NUL padding").
     // Bounded (issue #400): read no further than `SMALL_FILE_CAP`.
     let fi_raw = crate::store::read_small_bytes(store, 3, "front index")?;
@@ -7383,7 +7355,7 @@ fn verify_contacted(
              again if the front index is unchanged"
         );
     }
-    // #420 (`volume-format-v2.md` §4.2 R1, §5): where the catalog says this
+    // #420 (`volume-format-v3.md` §5.1 R1, §6): where the catalog says this
     // volume's tape ended, read before the session row exists so a bad value
     // records nothing. The walk reads the seal at `ended_after + 1` and
     // no position after it, and checks the seal states the same; NULL is a
@@ -7844,7 +7816,7 @@ pub(crate) fn live_recovery_slices(
          JOIN stage_slices ss ON ss.id = wp.stage_slice_id
          JOIN stage_sets sts ON sts.id = w.stage_set_id
          JOIN snapshots s ON s.id = sts.snapshot_id
-         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
+         WHERE w.volume_id = ?1 AND w.status IN ('completed', 'range') AND wp.status = 'written'
            AND s.status NOT IN ('reclaimable', 'purged')
          ORDER BY CAST(wp.position AS INTEGER)",
     )?;
@@ -8106,11 +8078,6 @@ fn read_slices_contacted(
     // wanted — a `reclaimable` or `purged` one is the operator's "drop this
     // when the volume is compacted", and reading it back to write it again
     // would undo that.
-    //
-    // #420: never a `cut` write's (`volume-format-v2.md` §4.2: no reader
-    // restores a cut unit from the tape that cut it). Its slices before the
-    // short seal are on the tape and recorded `written`, but they are part
-    // of a unit, and staging them would promote a set that is not whole.
     let mut stmt = conn.prepare(
         "SELECT wp.position, wp.sha256_on_volume,
                 ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id,
@@ -8121,7 +8088,6 @@ fn read_slices_contacted(
          JOIN stage_sets sts ON sts.id = w.stage_set_id
          JOIN snapshots sn ON sn.id = sts.snapshot_id
          WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'
-           AND w.status <> 'cut'
            AND CASE WHEN ?3 IS NULL THEN sn.status NOT IN ('reclaimable', 'purged')
                     ELSE sn.version = ?3 END
          ORDER BY CAST(wp.position AS INTEGER)",
@@ -8134,33 +8100,6 @@ fn read_slices_contacted(
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if source_slices.is_empty() {
-        // #420: a unit the tape's short seal cut is named as cut, with where
-        // the tape ended: its slices are not on this tape whole.
-        let cut: Option<Option<i64>> = conn
-            .query_row(
-                "SELECT v.ended_after FROM writes w
-                 JOIN volumes v ON v.id = w.volume_id
-                 JOIN stage_sets sts ON sts.id = w.stage_set_id
-                 JOIN snapshots sn ON sn.id = sts.snapshot_id
-                 WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND w.status = 'cut'
-                   AND (?3 IS NULL OR sn.version = ?3)
-                 LIMIT 1",
-                params![from_vol_id, unit.id, version],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(ended_after) = cut {
-            return Err(TapectlError::Other(format!(
-                "unit \"{unit_name}\"{} is not on volume \"{from_label}\" whole: the tape sealed \
-                 short{} and the unit was cut (volume-format-v2.md §4.2), so no slice of it is \
-                 read from this tape. It is still staged, or written whole on another \
-                 cartridge: `tapectl unit info {unit_name}` says where",
-                version.map(|v| format!(" version {v}")).unwrap_or_default(),
-                ended_after
-                    .map(|k| format!(" after tape file {k}"))
-                    .unwrap_or_default(),
-            )));
-        }
         let message = match version {
             Some(v) => {
                 format!("no slices for unit \"{unit_name}\" version {v} on volume \"{from_label}\"")
@@ -8173,8 +8112,7 @@ fn read_slices_contacted(
                      JOIN writes w ON w.id = wp.write_id
                      JOIN stage_sets sts ON sts.id = w.stage_set_id
                      JOIN snapshots sn ON sn.id = sts.snapshot_id
-                     WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'
-                       AND w.status <> 'cut'",
+                     WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'",
                     params![from_vol_id, unit.id],
                     |row| row.get(0),
                 )?;
@@ -8398,46 +8336,6 @@ pub struct StagedSlice {
     pub prior: Option<String>,
 }
 
-/// Refuse `command` on the volume labelled `label` when it holds a range
-/// (1.7.0, #478; `layout-session.md` "From 1.7.0", ADR-0012 item 133):
-/// `volume rewrite` and compaction (`compact-read`, `compact-finish`, and
-/// `volume compact` through them) refuse such a volume, naming each range,
-/// its unit, version and the run of slices the volume holds. `why` says why
-/// the command does not carry a range; `outcome` what was left as it was.
-///
-/// Catalog only, so every caller asks it before the tape is read and before
-/// anything is staged or changed. Any `range` row the volume holds refuses,
-/// whatever its version's status: carrying a range forward is its own design
-/// and nothing needs it yet (item 133).
-pub(crate) fn refuse_range_holder(
-    conn: &Connection,
-    label: &str,
-    command: &str,
-    why: &str,
-    outcome: &str,
-) -> Result<()> {
-    let ranges = recorded_ranges(conn, label)?;
-    if ranges.is_empty() {
-        return Ok(());
-    }
-    let named: Vec<String> = ranges.iter().map(RecordedRange::describe).collect();
-    let holds = if ranges.len() == 1 {
-        "a range, one run of the slices of a unit that spans cartridges"
-    } else {
-        "ranges, each one run of the slices of a unit that spans cartridges"
-    };
-    Err(TapectlError::Other(format!(
-        "{command} refused: volume \"{label}\" holds {holds}: {}. {why} {outcome}",
-        named.join(", ")
-    )))
-}
-
-/// Why compaction does not carry a range ([`refuse_range_holder`]).
-pub(crate) const COMPACTION_CARRIES_NO_RANGE: &str =
-    "Compaction carries a volume's live units to another tape whole, and a range is not a \
-     whole unit: carrying one forward is its own design, not built in 1.7.0 (ADR-0012 item \
-     133).";
-
 /// Compact-read: read live encrypted slices from a volume to staging.
 /// "Live" means the snapshot is NOT reclaimable or purged.
 ///
@@ -8509,17 +8407,6 @@ fn compact_read_contacted(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
-    // 1.7.0 (#478, X25; ADR-0012 item 133): a volume holding a range is
-    // refused by name from the catalog, before File 0 or a slice is read and
-    // before anything is staged. `volume compact` reads through here too.
-    refuse_range_holder(
-        conn,
-        label,
-        "volume compact-read",
-        COMPACTION_CARRIES_NO_RANGE,
-        "Nothing was read or staged.",
-    )?;
-
     // Corroborate at contact (ADR-0012, issue #193). `compact-read` is a
     // contact issue #193 did not name — it reads slices off a tape by
     // position exactly as `read-slices` does, and is wired with it. Like it,
@@ -8538,6 +8425,8 @@ fn compact_read_contacted(
             "no live slices on volume \"{label}\""
         )));
     }
+
+    refuse_runs_that_do_not_join(conn, label, &live_slices)?;
 
     let staging_dir = &config.staging.directory;
     let compact_dir = std::path::Path::new(staging_dir).join(format!("compact-{label}"));
@@ -8558,22 +8447,24 @@ fn compact_read_contacted(
     // Restore stage_sets status so find_staged_data() picks them up.
     // Guard: only promote sets that were previously successfully staged.
     //
-    // Issue #474: and only sets every slice of which was read and verified
-    // THIS run. A set with a skipped slice (or one with a slice this volume
-    // does not hold) promoted to `staged` is a set `volume write` refuses to
-    // write — its skipped slice has no staged file (#402) — and the remedy it
-    // then names is a read from this same volume. It stays as it was
-    // (`cleaned`), and the slices that were read for it are taken back.
+    // Issue #474: and only sets every slice of which the volume holds was
+    // read and verified THIS run. A set with a skipped slice promoted to
+    // `staged` is a set `volume write` refuses to write — its skipped slice
+    // has no staged file (#402) — and the remedy it then names is a read from
+    // this same volume. It stays as it was (`cleaned`), and the slices that
+    // were read for it are taken back. A range holds a run of its set, never
+    // all of it (item 122): what the volume holds of the set is what must have
+    // been read (ADR-0012 item 288 over item 133), and the slices it does not
+    // hold are staged by whatever holds them (T5.3).
     let decided = (|| -> Result<(Vec<i64>, std::collections::BTreeSet<i64>)> {
         let mut left_alone = tally.skipped_sets.clone();
         let mut whole = Vec::new();
         for (ss_id, read) in &tally.read_per_set {
-            let recorded: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = ?1",
-                params![ss_id],
-                |row| row.get(0),
-            )?;
-            if tally.skipped_sets.contains(ss_id) || *read != recorded {
+            let held = live_slices
+                .iter()
+                .filter(|s| s.stage_set_id == *ss_id)
+                .count() as i64;
+            if tally.skipped_sets.contains(ss_id) || *read != held {
                 left_alone.insert(*ss_id);
             } else {
                 whole.push(*ss_id);
@@ -8608,8 +8499,9 @@ fn compact_read_contacted(
             )
         } else {
             format!(
-                "compact-read \"{label}\": {} stage set(s) have slices this volume does not \
-                 hold — investigate before proceeding with compact-write.",
+                "compact-read \"{label}\": {} stage set(s) were not read in full from the \
+                 slices this volume holds of them — investigate before proceeding with \
+                 compact-write.",
                 left_alone.len(),
             )
         };
@@ -8653,6 +8545,62 @@ fn compact_read_contacted(
             })
             .collect(),
     })
+}
+
+/// Refuse, before anything is read, a read that would leave one staging with
+/// runs of slices that do not join (T5.3; ADR-0012 item 122): the slices
+/// `live` holds of a set, with those of it already staged (another source's
+/// compact-read, a `read-slices`), must be one unbroken run, because a
+/// destination holds at most one unbroken range of a stage set and writes the
+/// run it was staged as. Names the staging.
+fn refuse_runs_that_do_not_join(
+    conn: &Connection,
+    label: &str,
+    live: &[RecoverySlice],
+) -> Result<()> {
+    let sets: std::collections::BTreeSet<i64> = live.iter().map(|s| s.stage_set_id).collect();
+    for set in sets {
+        let mut numbers: std::collections::BTreeSet<i64> = conn
+            .prepare(
+                "SELECT slice_number FROM stage_slices
+                 WHERE stage_set_id = ?1 AND staging_path IS NOT NULL",
+            )?
+            .query_map(params![set], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for s in live.iter().filter(|s| s.stage_set_id == set) {
+            numbers.insert(conn.query_row(
+                "SELECT slice_number FROM stage_slices WHERE id = ?1",
+                params![s.slice_id],
+                |r| r.get(0),
+            )?);
+        }
+        let (Some(first), Some(last)) = (numbers.iter().next(), numbers.iter().next_back()) else {
+            continue;
+        };
+        if (last - first + 1) as usize == numbers.len() {
+            continue;
+        }
+        let (unit, version): (String, i64) = conn.query_row(
+            "SELECT u.name, s.version FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id WHERE ss.id = ?1",
+            params![set],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        return Err(TapectlError::Other(format!(
+            "volume compact-read refused: with the slices of \"{label}\", the staging of \
+             \"{unit}\" v{version} would hold slices {} that do not join into one unbroken \
+             run, and a volume holds at most one unbroken range of a stage set (ADR-0012 item \
+             122). Compact the volume that holds the slices between them in the same \
+             destination, or write what is staged first. Nothing was read or staged.",
+            numbers
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// What [`compact_read_into`] read.
@@ -8863,9 +8811,10 @@ pub struct CompactFinishReport {
 /// Tier 1 (ADR-0004) is unchanged and never gates: evidence age for the
 /// units that DO retain coverage is shown at the moment consent is asked.
 ///
-/// Before the gates (1.7.0, #478): a volume holding a range is refused by
-/// name, as `compact-read` refuses it ([`refuse_range_holder`], ADR-0012
-/// item 133), so no gate is asked about it.
+/// Gate 1 asks [`coverage::sole_slices`], which reads a `range` write on
+/// both sides (T5.3; ADR-0012 item 288 over item 133): a volume holding a
+/// range is retired only when every slice of that range is held by another
+/// eligible volume.
 pub fn compact_finish(
     conn: &Connection,
     config: &crate::config::Config,
@@ -8890,40 +8839,21 @@ pub fn compact_finish(
         &format!("retire volume \"{label}\" (compact-finish)"),
     )?;
 
-    // 1.7.0 (#478, X25; ADR-0012 item 133): as `compact-read`, a volume
-    // holding a range is refused by name before anything is retired.
-    // `volume compact`'s step 3 is this function.
-    refuse_range_holder(
-        conn,
-        label,
-        "volume compact-finish",
-        COMPACTION_CARRIES_NO_RANGE,
-        "Nothing was changed.",
-    )?;
-
-    // Guard: verify all live slices exist on at least one other volume
-    let mut stmt = conn.prepare(
-        "SELECT u.name, sl.slice_number
-         FROM write_positions wp
-         JOIN writes w ON w.id = wp.write_id
-         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-         JOIN stage_sets sts ON sts.id = sl.stage_set_id
-         JOIN snapshots s ON s.id = sts.snapshot_id
-         JOIN units u ON u.id = s.unit_id
-         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
-           AND s.status NOT IN ('reclaimable', 'purged')
-           AND NOT EXISTS (
-             SELECT 1 FROM write_positions wp2
-             JOIN writes w2 ON w2.id = wp2.write_id
-             WHERE wp2.stage_slice_id = wp.stage_slice_id
-               AND w2.volume_id != ?1
-               AND w2.status = 'completed'
-               AND wp2.status = 'written'
-           )",
-    )?;
-    let unprotected: Vec<(String, i64)> = stmt
-        .query_map(params![vol_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Guard: every live slice the volume holds, a range's included, is held
+    // by another eligible volume (T5.3; ADR-0012 item 288 over item 133).
+    // `sole_slices` is the one reading of that, shared with `volume rewrite`:
+    // a `completed` write or a `range` elsewhere counts, a volume that is
+    // retired, erased or quarantined does not.
+    let sole = coverage::sole_slices(conn, vol_id)?;
+    let mut unprotected: Vec<(String, i64)> = Vec::new();
+    for s in &sole {
+        let number: i64 = conn.query_row(
+            "SELECT slice_number FROM stage_slices WHERE id = ?1",
+            params![s.stage_slice_id],
+            |r| r.get(0),
+        )?;
+        unprotected.push((s.unit_name.clone(), number));
+    }
 
     if !unprotected.is_empty() {
         let examples: Vec<String> = unprotected
@@ -9208,7 +9138,7 @@ pub struct VerifyReport {
 
 impl VerifyReport {
     /// Whether the seal and the catalog disagree about where the tape ended
-    /// (#420, `volume-format-v2.md` §5 step 3): the report holds an
+    /// (#420, `volume-format-v3.md` §6 step 3): the report holds an
     /// [`crate::store::MismatchKind::EndedAfterDisagrees`]. The same test as
     /// [`crate::store::Evidence::ending_disagrees`], over the mismatches the
     /// report carries.
@@ -9240,13 +9170,18 @@ impl VerifyReport {
 /// init` (issue #445).
 fn checked_staged_units(
     conn: &Connection,
-    spanning: Spanning<'_>,
+    config: &Config,
     only: Option<&[i64]>,
 ) -> Result<StagedBatch> {
-    let batch = find_staged_data(conn, spanning, only)?;
     // Issue #402: every staged set whole, on disk, before anything below
     // touches a backend, a MAM or the drive.
     check_staged_slices(conn, only)?;
+    let batch = find_staged_data(conn, config, only)?;
+    // Item 265 (#557): every unit's file table in the catalog, before
+    // anything below touches a backend, a MAM or the drive.
+    #[cfg(test)]
+    fixture_file_tables(conn);
+    check_file_tables(conn, &batch.units)?;
     if batch.is_empty() {
         return Err(TapectlError::Other(
             "no staged data to write — run `tapectl stage create` first".into(),
@@ -9318,10 +9253,9 @@ pub(crate) fn write_catalog_preflight(
 /// anything: the write that follows the erase must not be able to refuse for
 /// a reason the catalog and the disk already knew.
 ///
-/// The batch is planned as the write plans it ([`StagedScope::spanning`]), so
-/// a refusal the plan of a span raises from the catalog alone (a released
-/// slice the tape would plan, a unit whose policy cannot be resolved) is
-/// raised here too. Item 86's generation refusal needs the volume, which
+/// The batch is planned as the write plans it ([`find_staged_data`]), so a
+/// refusal the plan raises from the catalog alone (a released slice the tape
+/// would plan, a unit whose policy cannot be resolved) is raised here too. Item 86's generation refusal needs the volume, which
 /// does not exist yet: the write raises it.
 pub(crate) fn write_catalog_preflight_in(
     conn: &Connection,
@@ -9330,7 +9264,7 @@ pub(crate) fn write_catalog_preflight_in(
     allow_missing_escrow: bool,
     scope: &StagedScope,
 ) -> Result<()> {
-    let batch = checked_staged_units(conn, scope.spanning(config), scope.only())?;
+    let batch = checked_staged_units(conn, config, scope.only())?;
     let stage_set_ids = batch.stage_set_ids();
     let session = assemble_keys_for_units(conn, &batch.units, &stage_set_ids)?;
     // The write's `validate` also checks keys, escrow and per-set escrow
@@ -9364,29 +9298,14 @@ pub(crate) fn write_catalog_preflight_in(
     Ok(())
 }
 
-/// Whether a write may plan a staged set to span cartridges (#478;
-/// `layout-session.md` "Spanning", "The frozen flag").
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Spanning<'a> {
-    /// By each unit's resolved policy (`allow_spanning`: dotfile, archive
-    /// set, `[defaults]`), and always for a stage set that already has a
-    /// `range` row, whatever the key now says, so a span in progress can
-    /// always finish (ADR-0012 item 121, X17).
-    ByPolicy(&'a Config),
-    /// Never: `volume rewrite` plans every write with `may_span` unset, so a
-    /// spannable unit it carries is planned whole and is cut, as in 1.6.0, if
-    /// the early warning comes (ADR-0012 item 142, X20).
-    Never,
-}
-
-/// Which staged sets a write takes ([`volume_write_scoped`]), and with them
-/// whether it may plan a set to span ([`Spanning`]).
+/// Which staged sets a write takes ([`volume_write_scoped`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagedScope {
-    /// Every `staged` set: an ordinary `volume write`, spanning by policy.
+    /// Every `staged` set: an ordinary `volume write`.
     Every,
     /// `volume rewrite`'s own stage sets (issue #483), and nothing else that
-    /// happens to be staged. A rewrite never spans (ADR-0012 item 142).
+    /// happens to be staged. A rewrite plans under the fill ceiling and never
+    /// past it (ADR-0012 items 142 and 289).
     Rewrite(Vec<i64>),
     /// `volume write --for-location X` (#493, ADR-0012 item 151): the staged
     /// sets that still have need at X, chosen by `for_location`. Planned by
@@ -9404,12 +9323,11 @@ impl StagedScope {
         }
     }
 
-    /// The write's spanning rule: by policy, except for a rewrite.
-    pub(crate) fn spanning<'c>(&self, config: &'c Config) -> Spanning<'c> {
-        match self {
-            StagedScope::Rewrite(_) => Spanning::Never,
-            StagedScope::Every | StagedScope::ForLocation(_) => Spanning::ByPolicy(config),
-        }
+    /// Whether the write's plan may reach past the fill ceiling to the
+    /// cartridge's nominal capacity (D20): every write but a rewrite's, which
+    /// may hold a unit's only copy (ADR-0012 item 142).
+    pub(crate) fn may_plan_past_the_ceiling(&self) -> bool {
+        !matches!(self, StagedScope::Rewrite(_))
     }
 }
 
@@ -9526,12 +9444,6 @@ pub(crate) struct StagedBatch {
 }
 
 impl StagedBatch {
-    /// The batch holds a set whose write may span: the write is planned by
-    /// [`CapacityBudget::place`] rather than 1.6.0's split.
-    fn spans(&self) -> bool {
-        self.units.iter().any(|u| u.span.is_some())
-    }
-
     fn is_empty(&self) -> bool {
         self.units.is_empty()
     }
@@ -9542,16 +9454,15 @@ impl StagedBatch {
     }
 }
 
-/// One `stage_slices` row of a set whose write may span.
+/// One `stage_slices` row of a staged set.
 struct SpanRow {
     slice: SpanSlice,
     staging_path: Option<String>,
 }
 
-/// How a set whose write may span is planned on this tape (`layout-session.md`
-/// "What the plan works from" and "The plan order"; ADR-0012 items 122 and
-/// 127; X16-X18): every slice of the set is in its span, and the slices this
-/// tape plans are
+/// How a stage set is planned on a tape (`layout-session.md` "What the plan
+/// works from" and "The plan order"; ADR-0012 items 122, 127 and 288; X16-X18):
+/// every slice of the set is in its span, and the slices this tape plans are
 ///
 /// - **an owed run** ([`PlanClass::Owed`]) when the set has a `range` row on
 ///   a sealed volume and slices still owed (a slice is owed while its copies,
@@ -9559,10 +9470,9 @@ struct SpanRow {
 ///   lowest owed slice to the highest, inclusive, so a slice between them
 ///   that is not owed is written too (a volume holds one unbroken run of a
 ///   set, item 122);
-/// - otherwise **the whole set** ([`PlanClass::Spannable`]): a set with no
+/// - otherwise **the whole set** ([`PlanClass::Queued`]): a set with no
 ///   range yet, and a set whose every slice already meets the floor (kept
-///   staged, say by `--keep-staging`), which a write copies again as 1.6.0
-///   copies a kept whole unit again.
+///   staged, say by `--keep-staging`), which a write copies again.
 ///
 /// A slice this tape plans whose staged file was released is refused, never
 /// skipped (X18), naming `volume read-slices --from` (#402's shape).
@@ -9577,7 +9487,7 @@ fn plan_span_set(
     let rows: Vec<SpanRow> = conn
         .prepare(
             "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
-                    sha256_encrypted, staging_path
+                    sha256_encrypted, staging_path, continues
              FROM stage_slices WHERE stage_set_id = ?1
              ORDER BY slice_number",
         )?
@@ -9590,32 +9500,57 @@ fn plan_span_set(
                     encrypted_bytes: row.get(3)?,
                     sha256_plain: row.get(4)?,
                     sha256_encrypted: row.get(5)?,
+                    continues: row.get(7)?,
                 },
                 staging_path: row.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    // The volumes this write carries a run FROM (a `volume rewrite`'s source,
+    // a compaction's): the volumes whose `compact-LABEL` staging directory
+    // holds this set's staged slices. A set is planned as if they hold
+    // nothing, so the run they hold is owed and the one Owed branch plans it
+    // (T5.3; ADR-0012 items 106 and 288). The rewrite's rehearsal (source
+    // still sealed), its write after the erase (source retired) and
+    // `compact-write` (source still sealed) therefore plan the same slices.
+    let sources = carrying_sources(conn, &rows)?;
     let span_in_progress: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM writes w JOIN volumes v ON v.id = w.volume_id
                         WHERE w.stage_set_id = ?1 AND w.status = 'range'
-                          AND v.status = 'sealed')",
-        params![stage_set_id],
+                          AND (v.status = 'sealed'
+                               OR v.id IN (SELECT value FROM json_each(?2))))",
+        params![
+            stage_set_id,
+            serde_json::to_string(&sources.iter().map(|(id, _)| id).collect::<Vec<_>>())
+                .expect("ids serialize")
+        ],
         |r| r.get(0),
     )?;
     let floor = coverage::copy_floor(config, min_copies, &unit.status);
-    let owed: Vec<i64> = if span_in_progress {
-        coverage::slice_copies(conn, stage_set_id)?
-            .into_iter()
-            .filter(|s| s.copies < floor)
-            .map(|s| s.slice_number)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut owed: Vec<i64> = Vec::new();
+    if span_in_progress {
+        for s in coverage::slice_copies(conn, stage_set_id)? {
+            let mut copies = s.copies;
+            let mut carried = false;
+            for (volume_id, label) in &sources {
+                if source_holds(conn, *volume_id, s.stage_slice_id)? {
+                    carried |= rows
+                        .iter()
+                        .any(|r| r.slice.slice_id == s.stage_slice_id && r.staging_path.is_some());
+                    if coverage::counts_as_copy(conn, label)? {
+                        copies -= 1;
+                    }
+                }
+            }
+            if copies < floor || carried {
+                owed.push(s.slice_number);
+            }
+        }
+    }
     let (class, run) = match (owed.iter().min(), owed.iter().max()) {
         (Some(&first), Some(&last)) => (PlanClass::Owed, Some((first, last))),
-        _ => (PlanClass::Spannable, None),
+        _ => (PlanClass::Queued, None),
     };
     let in_run = |n: i64| run.is_none_or(|(first, last)| (first..=last).contains(&n));
 
@@ -9638,12 +9573,58 @@ fn plan_span_set(
             sha256_plain: row.slice.sha256_plain.clone(),
             sha256_encrypted: row.slice.sha256_encrypted.clone(),
             staging_path: PathBuf::from(path),
+            continues: row.slice.continues,
         });
     }
     let span = UnitSpan {
         slices: rows.into_iter().map(|r| r.slice).collect(),
     };
     Ok((planned, span, class))
+}
+
+/// The volumes a staged set is being carried from: the label of each
+/// `compact-LABEL` directory that holds one of its staged slices (what
+/// `compact-read`, and so `volume rewrite`, stage into), as `(volume id,
+/// label)`, for the volumes that exist.
+fn carrying_sources(conn: &Connection, rows: &[SpanRow]) -> Result<Vec<(i64, String)>> {
+    let mut labels = std::collections::BTreeSet::new();
+    for row in rows {
+        let dir = row
+            .staging_path
+            .as_deref()
+            .and_then(|p| Path::new(p).parent())
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str());
+        if let Some(label) = dir.and_then(|n| n.strip_prefix("compact-")) {
+            labels.insert(label.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    for label in labels {
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = id {
+            out.push((id, label));
+        }
+    }
+    Ok(out)
+}
+
+/// `volume_id` holds a written position of the slice in a `completed` or
+/// `range` write.
+fn source_holds(conn: &Connection, volume_id: i64, slice_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM write_positions wp JOIN writes w ON w.id = wp.write_id
+                        WHERE w.volume_id = ?1 AND wp.stage_slice_id = ?2
+                          AND w.status IN ('completed', 'range') AND wp.status = 'written')",
+        params![volume_id, slice_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// The refusal of a slice this tape plans whose staged file was released
@@ -9684,8 +9665,8 @@ fn released_slice_refusal(
         }
     };
     Ok(format!(
-        "refusing to write: \"{}\" v{version} (stage set {stage_set_id}) may span, and this \
-         tape plans its slice {}, whose staged file was released from staging. A range is one \
+        "refusing to write: \"{}\" v{version} (stage set {stage_set_id}) is planned on this \
+         tape with its slice {}, whose staged file was released from staging. A range is one \
          unbroken run of a unit's slices, so the slice is never skipped. Nothing was written \
          and the drive was not touched. Stage it again, then write: {remedy}",
         unit.name, slice.slice_number
@@ -9695,27 +9676,26 @@ fn released_slice_refusal(
 /// Gather the staged batch as `BuildUnit`s, ready for `build::build`, each
 /// with its [`PlanClass`]. `ORDER BY u.name` stays — the alphabetical
 /// (next-fit) ordering ruled in sheet §7 (`docs/design/v2-open-questions.md`);
-/// `build()` never reorders its input, and the plan order of a span tape
+/// `build()` never reorders its input, and the plan order of a tape
 /// (`CapacityBudget::place`) groups the units by class in this order.
 ///
-/// A unit that may not span is today's: its staged slices, the block
-/// 1.6.0 wrote, [`PlanClass::Whole`]. A set whose write may span
-/// ([`Spanning`]) gets every slice of it in [`BuildUnit::span`] and the
-/// slices this tape plans in [`BuildUnit::slices`] ([`plan_span_set`]).
-/// Deciding that resolves each unit's policy, and a unit whose policy cannot
-/// be resolved refuses the write by name (issue #105's rule).
+/// Every set gets every slice of it in [`BuildUnit::span`] and the slices
+/// this tape plans in [`BuildUnit::slices`] ([`plan_span_set`]; ADR-0012 item
+/// 288: every set may continue on the next cartridge). Deciding that
+/// resolves each unit's policy (its copy floor), and a unit whose policy
+/// cannot be resolved refuses the write by name (issue #105's rule).
 ///
 /// `only` narrows the selection to those stage sets (`volume rewrite`, issue
 /// #483); `None` is every `staged` set. The order is the query's own either
 /// way: a scope drops sets from the list, it never reorders it.
 fn find_staged_data(
     conn: &Connection,
-    spanning: Spanning<'_>,
+    config: &Config,
     only: Option<&[i64]>,
 ) -> Result<StagedBatch> {
     let mut stmt = conn.prepare(
         "SELECT ss.id, ss.snapshot_id, u.name, u.uuid, u.tenant_id,
-                ss.dar_version, ss.dar_command, ss.catalog_path, s.version
+                ss.tar_version, ss.stream_bytes, ss.compression, s.version
          FROM stage_sets ss
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN units u ON u.id = s.unit_id
@@ -9730,7 +9710,7 @@ fn find_staged_data(
         String,
         i64,
         Option<String>,
-        Option<String>,
+        Option<i64>,
         Option<String>,
         i64,
     );
@@ -9754,64 +9734,23 @@ fn find_staged_data(
     }
 
     let mut batch = StagedBatch::default();
-    for (ss_id, snap_id, name, uuid, tenant_id, dar_ver, dar_cmd, catalog_path, snap_ver) in rows {
-        if let Spanning::ByPolicy(config) = spanning {
-            let unit = queries::get_unit_by_uuid(conn, &uuid)?
-                .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
-            let policy = crate::policy::resolve(conn, config, &unit)?;
-            let has_range: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM writes WHERE stage_set_id = ?1 AND status = 'range')",
-                params![ss_id],
-                |r| r.get(0),
-            )?;
-            if policy.allow_spanning || has_range {
-                let (slices, span, class) = plan_span_set(
-                    conn,
-                    config,
-                    ss_id,
-                    &unit,
-                    policy.copy_floor_base(),
-                    snap_ver,
-                )?;
-                if !slices.is_empty() {
-                    batch.units.push(BuildUnit {
-                        stage_set_id: ss_id,
-                        snapshot_id: snap_id,
-                        unit_name: name,
-                        unit_uuid: uuid,
-                        tenant_id,
-                        dar_version: dar_ver,
-                        dar_command: dar_cmd,
-                        catalog_path,
-                        snapshot_version: snap_ver,
-                        slices,
-                        span: Some(span),
-                    });
-                    batch.classes.push(class);
-                }
-                continue;
-            }
-        }
-        let mut slice_stmt = conn.prepare(
-            "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path
-             FROM stage_slices WHERE stage_set_id = ?1 AND staging_path IS NOT NULL
-             ORDER BY slice_number",
+    for (ss_id, snap_id, name, uuid, tenant_id, tar_version, stream_bytes, compression, snap_ver) in
+        rows
+    {
+        // §3.5: only a compressed staging names its algorithm.
+        let compression = compression.filter(|c| c != "none");
+        let stream_bytes = stream_bytes.unwrap_or(0);
+        let unit = queries::get_unit_by_uuid(conn, &uuid)?
+            .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
+        let policy = crate::policy::resolve(conn, config, &unit)?;
+        let (slices, span, class) = plan_span_set(
+            conn,
+            config,
+            ss_id,
+            &unit,
+            policy.copy_floor_base(),
+            snap_ver,
         )?;
-        let slices: Vec<BuildSlice> = slice_stmt
-            .query_map(params![ss_id], |row| {
-                let staging_path: String = row.get(6)?;
-                Ok(BuildSlice {
-                    slice_id: row.get(0)?,
-                    slice_number: row.get(1)?,
-                    size_bytes: row.get(2)?,
-                    encrypted_bytes: row.get(3)?,
-                    sha256_plain: row.get(4)?,
-                    sha256_encrypted: row.get(5)?,
-                    staging_path: PathBuf::from(staging_path),
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
         if !slices.is_empty() {
             batch.units.push(BuildUnit {
                 stage_set_id: ss_id,
@@ -9819,14 +9758,14 @@ fn find_staged_data(
                 unit_name: name,
                 unit_uuid: uuid,
                 tenant_id,
-                dar_version: dar_ver,
-                dar_command: dar_cmd,
-                catalog_path,
+                tar_version,
+                stream_bytes,
+                compression,
                 snapshot_version: snap_ver,
                 slices,
-                span: None,
+                span: Some(span),
             });
-            batch.classes.push(PlanClass::Whole);
+            batch.classes.push(class);
         }
     }
     Ok(batch)
@@ -9955,50 +9894,170 @@ fn render_staged_selection(label: &str, units: &[BuildUnit]) -> String {
 /// tape or even names a drive.
 fn announce_staged_selection(label: &str, units: &[BuildUnit]) {
     eprint!("{}", render_staged_selection(label, units));
-    eprint!("{}", render_catalogue_warnings(units));
 }
 
-/// A warning for each selected unit whose dar catalogue is not on disk
-/// (issue #473): `catalog_path` NULL (a stage set `catalog rebuild` made
-/// before it put catalogues back) or no `<stem>.<n>.dar` beside it (the
-/// file was removed). `build` packs the catalogue into the envelopes when it
-/// finds one and silently packs nothing otherwise, while the volume's
-/// RECOVERY.md says every unit's envelope holds it; the operator learns here,
-/// before the tape is touched, that this volume's copy of the unit cannot
-/// list or select files with RESTORE.sh. A warning, not a refusal: the
-/// archive itself is whole and restores as a unit. Empty when every unit has
-/// its catalogue.
-///
-/// A pure function for the reason [`render_staged_selection`] is one.
-fn render_catalogue_warnings(units: &[BuildUnit]) -> String {
-    let missing: Vec<&BuildUnit> = units
-        .iter()
-        .filter(|u| {
-            !u.catalog_path
-                .as_deref()
-                .is_some_and(super::envelope::catalogue_on_disk)
-        })
-        .collect();
+/// The units `volume write` would put on a tape (every staged set, in its
+/// order, each refused as the write refuses it before contact: #402's check
+/// and item 265's), as `build` takes them, planned as a write plans a batch
+/// under the default configuration. Public for the keyless acceptance suite
+/// (`tests/format_v3.rs`), which builds a tape from the real staging as
+/// `volume write` does: with these, [`generate_tables`], the index and the
+/// on-tape `catalog.db`.
+pub fn staged_build_units(conn: &Connection) -> Result<Vec<BuildUnit>> {
+    Ok(checked_staged_units(conn, &Config::default(), None)?.units)
+}
+
+/// The units `volume write` would put on a tape under `config`, as a real
+/// write plans them: a set that has a range on an earlier tape gets the run
+/// of slices it still owes, from the `range` rows earlier tapes' confirms
+/// recorded. Public for the heir's suite (`tests/heir_restore.rs`), which
+/// writes a unit across cartridges with tapectl's own planner (T4.12).
+pub fn staged_build_units_spanning(conn: &Connection, config: &Config) -> Result<Vec<BuildUnit>> {
+    Ok(checked_staged_units(conn, config, None)?.units)
+}
+
+/// Refuse the write, by name, when a selected unit's file table is not in
+/// the catalog (ADR-0012 item 265, #557; `volume-format-v3.md` §1.6): every
+/// tenant envelope carries, for each staging the tape's plan holds a slice
+/// of, that staging's whole table and id map, from the catalog database,
+/// and a tape is never written without one. Before contact, beside #402's
+/// check: the tape has not moved. The message names each unit and says to
+/// stage it again.
+fn check_file_tables(conn: &Connection, units: &[BuildUnit]) -> Result<()> {
+    let mut missing = String::new();
+    for u in units {
+        if !crate::db::stage_files::exists(conn, u.stage_set_id)? {
+            missing.push_str(&format!(
+                "\n  {} v{} (stage set {})",
+                u.unit_name, u.snapshot_version, u.stage_set_id
+            ));
+        }
+    }
     if missing.is_empty() {
-        return String::new();
+        return Ok(());
     }
-    let mut out = String::from(
-        "warning: no dar catalogue on disk for these units, so the envelopes on this volume \
-         will carry none for them: RESTORE.sh `--list` will show no files and `--path` cannot \
-         pick any (whole-unit restore is unaffected):\n",
-    );
-    for u in missing {
-        out.push_str(&format!(
-            "  {} v{} (stage set {})\n",
-            u.unit_name, u.snapshot_version, u.stage_set_id
-        ));
+    Err(TapectlError::Other(format!(
+        "refusing to write: the catalog holds no file table for these units, and every \
+         tape carries the file table of each unit it holds (volume-format-v3.md §1.6). \
+         Stage each version again (`tapectl stage create`) and write that. Nothing was \
+         written and the drive was not touched:{missing}"
+    )))
+}
+
+/// Test support, for the write-path fixtures that make a stage set by hand
+/// (fake slice bytes of a calibrated size, no tar stream): give every stage
+/// set that has slices, no file table and no `tar_command` (which `stage
+/// create` always records, so no real staging is touched) one, derived from its
+/// `stage_slices` rows — one regular-file member per slice, as long as the
+/// slice's cut, in slice order — through `db::stage_files::insert`, and the
+/// stream's length as the sum when the set records none. Called, under
+/// `cfg(test)` only, where the write selects its units
+/// ([`checked_staged_units`]), so that item 265's refusal
+/// ([`check_file_tables`]) does not turn every such fixture away (some
+/// 140 tests of the write path); nothing asserts on these rows, and it is
+/// one line to drop once those fixtures stage for real. What a tape carries of a
+/// real staging's table is proven from real stagings
+/// (`layout_3_tables_tests`, `tests/format_v3.rs`).
+#[cfg(test)]
+pub(crate) fn fixture_file_tables(conn: &Connection) {
+    let sets: Vec<i64> = conn
+        .prepare(
+            "SELECT ss.id FROM stage_sets ss
+              WHERE ss.tar_command IS NULL
+                AND EXISTS (SELECT 1 FROM stage_slices sl WHERE sl.stage_set_id = ss.id)
+                AND NOT EXISTS (SELECT 1 FROM stage_files f WHERE f.stage_set_id = ss.id)
+              ORDER BY ss.id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for id in sets {
+        let slices: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT slice_number, size_bytes FROM stage_slices WHERE stage_set_id = ?1
+                  ORDER BY slice_number",
+            )
+            .unwrap()
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut start = 0u64;
+        let rows: Vec<crate::volume::filetable::Row> = slices
+            .iter()
+            .map(|&(n, size)| {
+                let len = (size.max(1) as u64).div_ceil(512) * 512;
+                let row = crate::volume::filetable::Row {
+                    kind: crate::volume::filetable::Kind::File,
+                    slice: n as u64,
+                    start,
+                    end: start + len,
+                    size: len.saturating_sub(512),
+                    sha256: Some([n as u8; 32]),
+                    path: format!("fixture-slice-{n}.bin"),
+                    link: None,
+                };
+                start += len;
+                row
+            })
+            .collect();
+        crate::db::stage_files::insert(conn, id, rows.into_iter().map(Ok)).unwrap();
+        conn.execute(
+            "UPDATE stage_sets SET stream_bytes = ?1 WHERE id = ?2 AND stream_bytes IS NULL",
+            params![start as i64, id],
+        )
+        .unwrap();
     }
-    out.push_str(
-        "  to give a unit one: load a cartridge that carries it and run `tapectl catalog \
-         rebuild --from-volume --key <operator or escrow key>`, or stage the version again \
-         from source\n",
-    );
-    out
+}
+
+/// Write each unit's file table and id map as the format's text
+/// (`volume-format-v3.md` §1.6, D4, D5) into `dir`, from the catalog
+/// database, for `build()` to stream into the tenant envelopes. The table is
+/// streamed row by row from `stage_files` into the text and never held (a
+/// million members is about 121 MB). Plaintext: `dir` is in the tapectl
+/// home's work dir, never under staging. A unit with no table is refused
+/// here too ([`check_file_tables`] refuses it first, before contact).
+pub fn generate_tables(
+    conn: &Connection,
+    units: &[BuildUnit],
+    dir: &Path,
+) -> Result<std::collections::HashMap<i64, build::StagingTables>> {
+    fs::create_dir_all(dir)?;
+    let mut query = crate::db::stage_files::Query::new(conn)?;
+    let mut out = std::collections::HashMap::new();
+    for u in units {
+        if out.contains_key(&u.stage_set_id) {
+            continue;
+        }
+        check_file_tables(conn, std::slice::from_ref(u))?;
+        let stream_bytes: Option<i64> = conn.query_row(
+            "SELECT stream_bytes FROM stage_sets WHERE id = ?1",
+            params![u.stage_set_id],
+            |r| r.get(0),
+        )?;
+        let stream_bytes = u64::try_from(stream_bytes.unwrap_or(-1)).map_err(|_| {
+            TapectlError::Other(format!(
+                "{} v{} (stage set {}): the catalog records no stream length for its file \
+                 table; stage the version again",
+                u.unit_name, u.snapshot_version, u.stage_set_id
+            ))
+        })?;
+        let tables = build::StagingTables {
+            file_table: dir.join(format!("s{}.tsv", u.stage_set_id)),
+            id_map: dir.join(format!("s{}.ids.tsv", u.stage_set_id)),
+        };
+        let mut w = std::io::BufWriter::new(fs::File::create(&tables.file_table)?);
+        crate::volume::filetable::write(&mut w, stream_bytes, query.rows(u.stage_set_id)?)?;
+        std::io::Write::flush(&mut w)?;
+        let ids = crate::db::stage_ids::load(conn, u.stage_set_id)?;
+        let mut w = std::io::BufWriter::new(fs::File::create(&tables.id_map)?);
+        crate::idmap::write(&mut w, &ids)?;
+        std::io::Write::flush(&mut w)?;
+        out.insert(u.stage_set_id, tables);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -10233,13 +10292,13 @@ mod tests {
             assert_eq!(status_of(&conn, "L6-SRC"), "retired");
         }
 
-        /// 1.7.0 (#478, X25; ADR-0012 item 133): a source that also holds a
-        /// range of another unit is refused by name before any gate, and
-        /// `--force`/`--yes` does not reach past it; nothing is retired and
-        /// no event is logged. Positive control: the same catalog without
-        /// the range retires with no consent, as the test above.
+        /// T5.3 (ADR-0012 item 288 over item 133): a source that also holds a
+        /// range of another unit is retired only when every slice of the
+        /// range is held by another eligible volume. Held by none, tier 3
+        /// refuses outright whatever `--yes` says, nothing is retired and no
+        /// event is logged; held elsewhere as a range, it retires.
         #[test]
-        fn a_volume_holding_a_range_is_refused_by_name_whatever_yes_says() {
+        fn a_range_slice_with_no_other_holder_refuses_compact_finish_whatever_yes_says() {
             let conn = setup(true);
             conn.execute_batch(
                 "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
@@ -10256,8 +10315,8 @@ mod tests {
                      JOIN units u ON u.id = s.unit_id,
                      (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3) n
                      WHERE u.name = 'spanner';
-                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                     SELECT ss.id, ss.snapshot_id, v.id, 'range', 1
+                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT ss.id, ss.snapshot_id, v.id, 'range'
                      FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
                      JOIN units u ON u.id = s.unit_id, volumes v
                      WHERE u.name = 'spanner' AND v.label = 'L6-SRC';
@@ -10275,14 +10334,14 @@ mod tests {
                 .unwrap();
 
             let err = compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
-                .expect_err("a range is refused before any gate");
-            assert_eq!(
-                err.to_string(),
-                "volume compact-finish refused: volume \"L6-SRC\" holds a range, one run of \
-                 the slices of a unit that spans cartridges: \"spanner\" v3 (slices 1-2). \
-                 Compaction carries a volume's live units to another tape whole, and a range \
-                 is not a whole unit: carrying one forward is its own design, not built in \
-                 1.7.0 (ADR-0012 item 133). Nothing was changed."
+                .expect_err("a range slice no other volume holds is refused outright");
+            let text = err.to_string();
+            assert!(
+                text.contains(
+                    "cannot retire \"L6-SRC\": 2 live slice(s) have no copy on another volume"
+                ) && text.contains("spanner slice 1")
+                    && text.contains("spanner slice 2"),
+                "{text}"
             );
             assert_eq!(status_of(&conn, "L6-SRC"), "sealed");
             let after: i64 = conn
@@ -10290,14 +10349,28 @@ mod tests {
                 .unwrap();
             assert_eq!(after, events, "nothing was logged");
 
+            // Another eligible volume holds the same two slices as a range of
+            // its own: a copy elsewhere, so the gate passes.
             conn.execute_batch(
-                "DELETE FROM write_positions WHERE write_id IN
-                     (SELECT id FROM writes WHERE status = 'range');
-                 DELETE FROM writes WHERE status = 'range';",
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                     VALUES ('L6-OTH', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed');
+                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT w.stage_set_id, w.snapshot_id, v.id, 'range'
+                     FROM writes w, volumes v
+                     WHERE w.status = 'range' AND w.volume_id <> v.id AND v.label = 'L6-OTH';
+                 INSERT INTO write_positions (write_id, stage_slice_id, position, status,
+                                              sha256_on_volume)
+                     SELECT ow.id, wp.stage_slice_id, wp.position, 'written', wp.sha256_on_volume
+                     FROM write_positions wp JOIN writes sw ON sw.id = wp.write_id
+                     JOIN volumes sv ON sv.id = sw.volume_id AND sv.label = 'L6-SRC'
+                     JOIN volumes ov ON ov.label = 'L6-OTH'
+                     JOIN writes ow ON ow.volume_id = ov.id AND ow.stage_set_id = sw.stage_set_id
+                     WHERE sw.status = 'range' AND wp.status = 'written';",
             )
             .unwrap();
-            compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", false)
-                .expect("without the range, no gate");
+            compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
+                .expect("a range held elsewhere as a range is a copy");
             assert_eq!(status_of(&conn, "L6-SRC"), "retired");
         }
 
@@ -10449,7 +10522,7 @@ mod tests {
             volume_id,
             label: label.to_string(),
             ending: session::Ending::Full,
-            cut_units: Vec::new(),
+            unwritten_units: Vec::new(),
             range_units: Vec::new(),
         }
     }
@@ -10861,7 +10934,7 @@ mod tests {
     #[test]
     fn the_copy_summary_counts_what_the_volume_holds() {
         use crate::staging::release::fixtures::{
-            add_write, cut_from, range_on, staged_span, staged_version, tenant, unit,
+            add_write, range_on, sealed_short_without, staged_span, staged_version, tenant, unit,
         };
         let conn = crate::db::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -10881,7 +10954,7 @@ mod tests {
         let (span, _) = staged_span(&conn, b, 1, "staged", dir.path(), 3);
         range_on(&conn, &span, "V-SUM", 1..=1);
         let cut = staged_version(&conn, c, 1, "staged", dir.path(), 0);
-        cut_from(&conn, &cut, "V-SUM", 13);
+        sealed_short_without(&conn, &cut, "V-SUM", 13);
         conn.execute(
             "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
              SELECT id, 'full', 'passed' FROM volumes WHERE label = 'V-SUM'",
@@ -10913,7 +10986,12 @@ mod tests {
             quick.line(),
             "sealed and confirmed: 1 unit, 1 slice, 12.3 GiB; quick readback passed"
         );
-        assert_eq!(units_planned_onto(&conn, "V-SUM").unwrap(), [a, b, c]);
+        assert_eq!(
+            units_planned_onto(&conn, "V-SUM").unwrap(),
+            [a, b],
+            "c was planned and not written: no row"
+        );
+        let _ = c;
         assert_eq!(copy_summary(&conn, "V-NONE").unwrap().units, 0);
     }
 
@@ -11159,8 +11237,8 @@ mod tests {
         );
     }
 
-    // ── #420: `volume verify` of a short-sealed tape (`volume-format-v2.md`
-    // §4.2 R1, §5) ──
+    // ── #420: `volume verify` of a short-sealed tape (`volume-format-v3.md`
+    // §5.1 R1, §6) ──
 
     /// A short-sealed v2 tape: File 0 planning 8 files, 1, 2, File 3
     /// planning data slices at 4, 5 and 6 and the seal at 7; the slices at 4
@@ -13964,7 +14042,7 @@ mod tests {
             (ContentUnreadable, false),
             (FrontIndexUnreadable, false),
             (SealUnreadable, false),
-            // #420 (`volume-format-v2.md` §5 step 3): the seal and the
+            // #420 (`volume-format-v3.md` §6 step 3): the seal and the
             // catalog disagree about where the tape ended — inconclusive.
             (EndedAfterDisagrees, false),
         ] {
@@ -14291,7 +14369,7 @@ mod tests {
     /// the read goes on. A one-byte filler there is no File 0 at all, which
     /// the contact now refuses (#476: claims that do not parse).
     fn claims_only_file0() -> Vec<u8> {
-        b"[volume]\nmagic = \"tapectl-volume-v2\"\nlayout_version = 2\nrequires = []\n".to_vec()
+        b"[volume]\nmagic = \"tapectl-volume-v3\"\nlayout_version = 3\nrequires = []\n".to_vec()
     }
 
     /// The filler file at `position` of a fixture tape: File 0 states a
@@ -15157,7 +15235,7 @@ mod tests {
             .unwrap();
         }
 
-        let units = find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), None)
+        let units = find_staged_data(&conn, &Config::default(), None)
             .unwrap()
             .units;
         assert_eq!(units.len(), 2);
@@ -15214,7 +15292,7 @@ mod tests {
             ids.insert(name, ss_id);
         }
         let names = |only: Option<&[i64]>| -> Vec<String> {
-            find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), only)
+            find_staged_data(&conn, &Config::default(), only)
                 .unwrap()
                 .units
                 .into_iter()
@@ -15271,24 +15349,27 @@ mod tests {
             params![ss_id],
         )
         .unwrap();
-        let mut config = Config::default();
-        config.defaults.allow_spanning = true;
+        let config = Config::default();
         let ids = [ss_id];
         let classes = |scope: StagedScope| -> Vec<PlanClass> {
-            find_staged_data(&conn, scope.spanning(&config), scope.only())
+            find_staged_data(&conn, &config, scope.only())
                 .unwrap()
                 .classes
         };
-        assert_eq!(classes(StagedScope::Every), [PlanClass::Spannable]);
+        assert_eq!(classes(StagedScope::Every), [PlanClass::Queued]);
         assert_eq!(
             classes(StagedScope::ForLocation(ids.to_vec())),
-            [PlanClass::Spannable],
-            "a write for a location plans a set that may span by policy"
+            [PlanClass::Queued],
+            "a write for a location plans a set like any ordinary write"
         );
         assert_eq!(
             classes(StagedScope::Rewrite(ids.to_vec())),
-            [PlanClass::Whole],
-            "a rewrite never spans (item 142)"
+            [PlanClass::Queued]
+        );
+        assert!(StagedScope::Every.may_plan_past_the_ceiling());
+        assert!(
+            !StagedScope::Rewrite(ids.to_vec()).may_plan_past_the_ceiling(),
+            "a rewrite plans under the fill ceiling (item 142)"
         );
         assert!(
             classes(StagedScope::ForLocation(Vec::new())).is_empty(),
@@ -15509,13 +15590,13 @@ mod tests {
         )
         .unwrap();
 
-        let units = find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), None)
-            .unwrap()
-            .units;
-        assert!(
-            units.is_empty(),
-            "a stage_set with no on-disk slices must not surface as staged data"
-        );
+        // Every unit is planned through its slice list now (item 288), and a
+        // set with no on-disk slice is refused by #402's check, never
+        // surfaced as staged data.
+        let err = checked_staged_units(&conn, &Config::default(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not whole on disk"), "{err}");
     }
 
     // --- issue #115: recorded recipients vs the CURRENT escrow ------------
@@ -15629,27 +15710,22 @@ mod tests {
     }
 
     /// Make every envelope of a write heavier, without touching what
-    /// generates them (#491): the catalog's first stage set gets a dar
-    /// catalogue of `bytes` bytes under `dir`, which the tenant's envelope
-    /// and the operator's both pack (`catalogs/`) and their RECOVERY.md then
-    /// names (#449). Nothing when `bytes` is 0.
-    fn grow_envelopes(conn: &Connection, dir: &Path, bytes: usize) {
+    /// generates them (#491): the catalog's first stage set's version gets
+    /// one more path, `bytes` long, which the tenant's envelope carries in
+    /// `index/paths.tsv` and the operator's in `catalog.db` (Layout 3 has no
+    /// per-unit catalogue to grow them with, §9). Nothing when `bytes` is 0.
+    fn grow_envelopes(conn: &Connection, _dir: &Path, bytes: usize) {
         if bytes == 0 {
             return;
         }
-        fs::create_dir_all(dir).unwrap();
-        fs::write(dir.join("grown.1.dar"), vec![0x5a; bytes]).unwrap();
-        let stem = dir.join("grown").to_string_lossy().into_owned();
-        assert!(
-            crate::volume::envelope::catalogue_on_disk(&stem),
-            "positive control: the build finds the catalogue"
-        );
-        conn.execute(
-            "UPDATE stage_sets SET catalog_path = ?1
-             WHERE id = (SELECT MIN(id) FROM stage_sets)",
-            params![stem],
-        )
-        .unwrap();
+        let snapshot: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = (SELECT MIN(id) FROM stage_sets)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::db::files::fixture::insert(conn, snapshot, &"g".repeat(bytes), 0, "regular", None);
     }
 
     /// The verdict list `assemble_session_keys` hands `validate`, for the
@@ -15702,7 +15778,7 @@ mod tests {
 
         let (tenant_id, stage_set_id) = seed_escrow_check_fixture(&conn);
         let tmp = tempfile::TempDir::new().unwrap();
-        let slice = tmp.path().join("p.dar.age");
+        let slice = tmp.path().join("p.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -15744,7 +15820,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("p.dar.age") || err.to_lowercase().contains("missing"),
+            err.contains("p.tar.age") || err.to_lowercase().contains("missing"),
             "the staged-slice check refused: {err}"
         );
         std::fs::write(&slice, b"0123456789").unwrap();
@@ -16311,7 +16387,7 @@ mod tests {
     fn volume_write_refuses_a_partially_cleaned_stage_set_before_touching_the_device() {
         let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
         let dir = tempfile::TempDir::new().unwrap();
-        let present = dir.path().join("photos.1.dar.age");
+        let present = dir.path().join("photos.1.tar.age");
         std::fs::write(&present, b"ciphertext one").unwrap();
         conn.execute(
             "UPDATE stage_sets SET num_slices = 2 WHERE id = ?1",
@@ -16333,13 +16409,10 @@ mod tests {
         )
         .unwrap();
 
-        // Positive control: the selection really does hand `build` a
-        // one-slice unit — the defect this gate exists for.
-        let units = find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), None)
-            .unwrap()
-            .units;
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].slices.len(), 1, "only the path-bearing slice");
+        // Positive control: the plan itself refuses a slice it would take
+        // that has no staged file, never skipping it (X18), so the unit is
+        // never handed to `build` as a one-slice unit.
+        assert!(find_staged_data(&conn, &Config::default(), None).is_err());
 
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = TapectlPaths::new(tmp.path().join("home"));
@@ -16388,8 +16461,8 @@ mod tests {
     fn volume_write_refuses_a_stage_set_whose_slice_files_are_missing_or_short() {
         let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
         let dir = tempfile::TempDir::new().unwrap();
-        let gone = dir.path().join("photos.1.dar.age");
-        let short = dir.path().join("photos.2.dar.age");
+        let gone = dir.path().join("photos.1.tar.age");
+        let short = dir.path().join("photos.2.tar.age");
         std::fs::write(&short, b"short").unwrap();
         conn.execute(
             "UPDATE stage_sets SET num_slices = 2 WHERE id = ?1",
@@ -16434,7 +16507,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("not whole on disk"), "{msg}");
         assert!(
-            msg.contains("slice 1:") && msg.contains("photos.1.dar.age"),
+            msg.contains("slice 1:") && msg.contains("photos.1.tar.age"),
             "names the missing file: {msg}"
         );
         assert!(
@@ -16825,65 +16898,6 @@ mod tests {
     // ── issue #201: `volume write` announces the staged sets it is about
     // to write ──
 
-    fn unit_with_catalogue(
-        name: &str,
-        stage_set_id: i64,
-        version: i64,
-        catalog_path: Option<String>,
-    ) -> BuildUnit {
-        BuildUnit {
-            stage_set_id,
-            snapshot_id: stage_set_id,
-            unit_name: name.to_string(),
-            unit_uuid: format!("{name}-uuid"),
-            tenant_id: 1,
-            dar_version: None,
-            dar_command: None,
-            catalog_path,
-            snapshot_version: version,
-            slices: Vec::new(),
-            span: None,
-        }
-    }
-
-    /// Issue #473: a unit whose dar catalogue is not on disk (no
-    /// `catalog_path`, or no `<stem>.<n>.dar` beside it) is named before the
-    /// tape is touched, because `build` packs a catalogue only if it finds
-    /// one; a unit that has it is not mentioned, and a clean selection says
-    /// nothing at all.
-    #[test]
-    fn render_catalogue_warnings_names_exactly_the_units_with_no_catalogue_on_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let present = dir.path().join("aaaa1111_v1");
-        fs::write(dir.path().join("aaaa1111_v1.1.dar"), b"catalogue").unwrap();
-        let gone = dir.path().join("cccc3333_v1");
-        let has = unit_with_catalogue("alpha", 1, 1, Some(present.to_string_lossy().into()));
-        let none = unit_with_catalogue("beta", 2, 2, None);
-        let removed = unit_with_catalogue("gamma", 3, 1, Some(gone.to_string_lossy().into()));
-
-        assert_eq!(
-            render_catalogue_warnings(std::slice::from_ref(&has)),
-            "",
-            "a unit with its catalogue is not mentioned"
-        );
-        let warning = render_catalogue_warnings(&[has, none, removed]);
-        assert!(
-            warning.starts_with("warning: no dar catalogue on disk"),
-            "{warning}"
-        );
-        assert!(warning.contains("\n  beta v2 (stage set 2)\n"), "{warning}");
-        assert!(
-            warning.contains("\n  gamma v1 (stage set 3)\n"),
-            "{warning}"
-        );
-        assert!(!warning.contains("alpha"), "{warning}");
-        assert!(
-            warning.contains("catalog rebuild --from-volume")
-                && warning.contains("stage the version again"),
-            "it names the way out: {warning}"
-        );
-    }
-
     /// Exact text, multi-unit multi-version — issue #201's first acceptance
     /// property. Pinned, not `contains`-checked: a silently reworded
     /// announcement is exactly the kind of drift a substring match would
@@ -16899,12 +16913,13 @@ mod tests {
                 unit_name: "alpha-collection".to_string(),
                 unit_uuid: "u1".to_string(),
                 tenant_id: 1,
-                dar_version: None,
-                dar_command: None,
-                catalog_path: None,
+                tar_version: None,
+                stream_bytes: 0,
+                compression: None,
                 snapshot_version: 3,
                 slices: vec![
                     BuildSlice {
+                        continues: false,
                         slice_id: 1,
                         slice_number: 1,
                         size_bytes: 50 * 1024 * 1024,
@@ -16914,6 +16929,7 @@ mod tests {
                         staging_path: PathBuf::from("/tmp/a1"),
                     },
                     BuildSlice {
+                        continues: false,
                         slice_id: 2,
                         slice_number: 2,
                         size_bytes: 30 * 1024 * 1024,
@@ -16931,11 +16947,12 @@ mod tests {
                 unit_name: "zeta-notes".to_string(),
                 unit_uuid: "u2".to_string(),
                 tenant_id: 1,
-                dar_version: None,
-                dar_command: None,
-                catalog_path: None,
+                tar_version: None,
+                stream_bytes: 0,
+                compression: None,
                 snapshot_version: 1,
                 slices: vec![BuildSlice {
+                    continues: false,
                     slice_id: 3,
                     slice_number: 1,
                     size_bytes: 5 * 1024 * 1024,
@@ -16974,11 +16991,12 @@ mod tests {
             unit_name: "solo".to_string(),
             unit_uuid: "u1".to_string(),
             tenant_id: 1,
-            dar_version: None,
-            dar_command: None,
-            catalog_path: None,
+            tar_version: None,
+            stream_bytes: 0,
+            compression: None,
             snapshot_version: 1,
             slices: vec![BuildSlice {
+                continues: false,
                 slice_id: 1,
                 slice_number: 1,
                 size_bytes: 1024 * 1024,
@@ -17058,7 +17076,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // A real slice file at its recorded size: issue #402's on-disk
         // check runs before backend resolution.
-        let slice = tmp.path().join("x.dar.age");
+        let slice = tmp.path().join("x.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -17144,7 +17162,7 @@ mod tests {
         )
         .unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
-        let slice = tmp.path().join("x.dar.age");
+        let slice = tmp.path().join("x.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -17209,7 +17227,7 @@ mod tests {
         )
         .unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
-        let slice = tmp.path().join("x.dar.age");
+        let slice = tmp.path().join("x.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -17869,7 +17887,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // A real 10-byte slice file: issue #402's on-disk check runs before
         // the generation check this test is about.
-        let slice = tmp.path().join("tapectl-gencheck-slice.dar.age");
+        let slice = tmp.path().join("tapectl-gencheck-slice.tar.age");
         std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
@@ -17961,7 +17979,7 @@ mod tests {
                 (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
                  sha256_encrypted, staging_path)
              VALUES (?1, 1, 10, 10, 'p', 'e',
-                     '/nonexistent/tapectl-resume-gencheck-slice.dar.age')",
+                     '/nonexistent/tapectl-resume-gencheck-slice.tar.age')",
             params![stage_set_id],
         )
         .unwrap();
@@ -18290,7 +18308,7 @@ mod tests {
         assert_eq!(readback_bytes(&layout, Some(2)), Some(7 * bs));
 
         // Issue #495: a verify's Layout is rebuilt from the tape's front
-        // index, which sizes no seal (`volume-format-v2.md` §3). The
+        // index, which sizes no seal (`volume-format-v3.md` §4). The
         // read-error denominator counts every sized file, at or before
         // `ended_after` on a short tape — the same sum as the progress
         // total (#496), which leaves the unsized seal out.
@@ -18304,7 +18322,7 @@ mod tests {
     /// Issue #496: `volume verify`'s progress line showed no total, because
     /// the sum was `None` whenever an entry was unsized, and the Layout a
     /// verify rebuilds from a tape's front index never sizes the seal
-    /// (`volume-format-v2.md` §3). From real front-index bytes, the total is
+    /// (`volume-format-v3.md` §4). From real front-index bytes, the total is
     /// every file the index sizes — File 3 at its own true length — with
     /// the seal left out; and a Layout with nothing sized has none.
     #[test]
@@ -18355,6 +18373,48 @@ mod tests {
             e.size_bytes = None;
         }
         assert_eq!(readback_bytes(&unsized_only, None), None);
+    }
+
+    /// #548 (D18): the volume's row records the sha256 of the RESTORE.sh its
+    /// own layout carries at file 2, so a drill can name the script the
+    /// tape holds, not the one the running binary would write.
+    #[test]
+    fn record_write_bookkeeping_records_the_script_the_layout_carries() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('BKSCRIPT', 'lto', 'lto0', 1000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let layout = Layout {
+            label: "BKSCRIPT".to_string(),
+            volume_uuid: "u".to_string(),
+            media_type: "LTO-6".to_string(),
+            block_size: 4096,
+            budget: CapacityBudget {
+                available_bytes: 0,
+                reserve_bytes: 0,
+                plan_bound_bytes: None,
+                span_tail_from: None,
+            },
+            entries: vec![LayoutEntry {
+                position: 2,
+                kind: ZoneKind::RestoreSh,
+                size_bytes: Some(10),
+                sha256: Some("ab".repeat(32)),
+                source: ContentSource::Generated,
+            }],
+        };
+        record_write_bookkeeping(&conn, 1, &layout, 4096).unwrap();
+        let got: Option<String> = conn
+            .query_row(
+                "SELECT restore_sh_sha256 FROM volumes WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(got, Some("ab".repeat(32)));
     }
 
     /// Issue #392: `first_write` was stamped when the write session
@@ -19148,6 +19208,75 @@ mod tests {
             check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, Some(5), true).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("ADR-0003"), "expected ADR citation in: {msg}");
+    }
+
+    /// `volume-format-v3.md` §7.6 (item 269; #560), the fresh-write check on
+    /// recorded bytes: another layout's File 0 and seal in front of a write,
+    /// with and without `--force`. Refused both ways, naming the layout and
+    /// the label, and the tape is exactly as it was.
+    #[test]
+    fn check_fresh_write_contact_a_tape_of_another_layout_refuses_even_with_force() {
+        use crate::volume::format::foreign_layouts as f;
+        for (n, file0, seal) in [
+            (
+                2,
+                f::LAYOUT_2_FILE_0.to_string(),
+                f::LAYOUT_2_SEAL.to_string(),
+            ),
+            (4, f::layout_4_file_0(), f::layout_4_seal()),
+        ] {
+            for force in [false, true] {
+                let mut store = MemStore::new(FW_BS as usize);
+                let mut f0 = file0.clone().into_bytes();
+                f0.resize(FW_BS as usize, 0);
+                fw_put_file(&mut store, 0, f0);
+                let mut sl = seal.clone().into_bytes();
+                sl.resize(FW_BS as usize, 0);
+                fw_put_file(&mut store, 5, sl);
+                let before = store.files.clone();
+                let err = check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, None, force)
+                    .unwrap_err();
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains(&format!("volume of Layout {n}"))
+                        && msg.contains("label \"L6-0001\"")
+                        && msg.contains("RESTORE.sh in its own file 2")
+                        && msg.contains("--force cannot override")
+                        && msg.contains("tapectl cartridge erase"),
+                    "layout {n}, force={force}: {msg}"
+                );
+                assert_eq!(store.files, before, "nothing was written");
+            }
+        }
+    }
+
+    /// `volume identify` names a volume of another layout, as a note
+    /// and not a contradiction (it reports, it does not refuse), whether or
+    /// not the catalog has ever heard of its uuid.
+    #[test]
+    fn identify_names_a_tapectl_volume_of_another_layout() {
+        use crate::volume::format::foreign_layouts as f;
+        for (n, file0) in [
+            (2, f::LAYOUT_2_FILE_0.to_string()),
+            (4, f::layout_4_file_0()),
+        ] {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = MemStore::new(FW_BS as usize);
+            let mut f0 = file0.into_bytes();
+            f0.resize(FW_BS as usize, 0);
+            fw_put_file(&mut store, 0, f0);
+            let id = identify_contacted(&conn, &mut store, None).expect("identify answers");
+            assert!(id.contradiction.is_none(), "{:?}", id.contradiction);
+            let note = id.catalog_note.expect("a note names it");
+            assert!(
+                note.contains(&format!("volume of Layout {n}"))
+                    && note.contains("label \"L6-0001\"")
+                    && note.contains("the tapectl that wrote it"),
+                "{note}"
+            );
+            // The text itself is still printed as File 0 reads.
+            assert!(id.text.contains("TAPECTL ARCHIVAL VOLUME"));
+        }
     }
 
     #[test]
@@ -20219,12 +20348,12 @@ mod tests {
 
         /// How a 1.6.0 File 0 states what it requires (ADR-0012 item 111):
         /// one feature, which this tapectl knows.
-        const STATED: &str = "\nrequires = [\"short-seal\"]\n";
+        const STATED: &str = "\nrequires = []\n";
         const UNKNOWN: &str = "\nrequires = [\"unknown-feature\"]\n";
 
         /// [`loaded_fixture`] with File 0's `requires` line replaced by `to`
         /// (`STATED` leaves the tape as written — the positive control, which
-        /// also proves the fixture states `requires = ["short-seal"]`).
+        /// also proves the fixture states `requires = []`, D1).
         fn fixture(label: &str, to: &str) -> (Connection, i64, FakeTape) {
             let (conn, volume_id, fake) = loaded_fixture(label);
             let old = fake.state().files[0].clone();
@@ -20420,10 +20549,9 @@ mod tests {
             let (conn, volume_id, fake) = fixture("RQ-VS", STATED);
             let seal_position = fake.state().files.len() - 1;
             let old = fake.state().files[seal_position].clone();
-            // The seal states 1.6.0's line once its generator writes 1.6.0
-            // seals, and 1.5.0's `requires = []` before (ADR-0012 item 111).
+            // The seal states Layout 3's `requires = []` (D1).
             let text = String::from_utf8_lossy(&old).to_string();
-            let stated = [STATED, "\nrequires = []\n"]
+            let stated = [STATED]
                 .into_iter()
                 .find(|s| text.contains(s))
                 .expect("the seal states requires");
@@ -20517,47 +20645,6 @@ mod tests {
             );
         }
 
-        /// #420 (`volume-format-v2.md` §4.2: no reader restores a cut unit
-        /// from the tape that cut it): the same unit, its write `cut` by a
-        /// short seal, is refused by name — though its slice is on the tape
-        /// and recorded `written` — and no slice is read or staged. The
-        /// test above is the positive control: the same tape, `completed`.
-        #[test]
-        fn read_slices_never_reads_a_unit_its_tapes_short_seal_cut() {
-            let (conn, _, fake) = fixture("RQ-RSCUT", STATED);
-            conn.execute_batch(
-                "UPDATE writes SET status = 'cut';
-                 UPDATE volumes SET ended_after = 4, sealed_at = datetime('now');",
-            )
-            .unwrap();
-            let mut store = fake_store(&fake);
-            let tmp = tempfile::TempDir::new().unwrap();
-            let config = config_with_staging(tmp.path());
-            let err = read_slices(
-                &conn,
-                &config,
-                "RQ-RSCUT",
-                "lv-unit",
-                None,
-                &mut store,
-                site(Operation::VolumeReadSlices),
-            )
-            .unwrap_err()
-            .to_string();
-            assert!(err.contains("\"lv-unit\""), "{err}");
-            assert!(err.contains("sealed short after tape file 4"), "{err}");
-            assert!(err.contains("cut"), "{err}");
-            assert!(
-                !fake.ops().contains(&Op::Read(4)),
-                "the slice was not read: {:?}",
-                fake.ops()
-            );
-            let staged: Option<String> = conn
-                .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
-                .unwrap();
-            assert!(staged.is_none(), "nothing was staged: {staged:?}");
-        }
-
         // ── volume compact-read ──
 
         #[test]
@@ -20617,14 +20704,8 @@ mod tests {
         }
     }
 
-    /// 1.7.0 (#478, X25; `layout-session.md` "From 1.7.0", ADR-0012 item
-    /// 133): compaction refuses a volume that holds a range, by name.
-    /// `volume compact` runs `compact_read` as its step 1 and
-    /// `compact_finish` as its step 3 (pinned by `cli::volume`'s
-    /// `run_routes_to_through_the_swap_unconditionally` and
-    /// `the_compact_arm_routes_step_3_through_the_outcome`; `run` itself
-    /// refuses before step 1 under `cfg(test)`, which has no terminal), so
-    /// these two refusals are its refusal too.
+    /// T5.3 (ADR-0012 item 288 over item 133): `compact-read` carries a
+    /// volume that holds a range.
     mod compaction_of_a_range {
         use super::*;
         use crate::tape::fake::Op;
@@ -20633,62 +20714,31 @@ mod tests {
         /// in it, its slice 1 at file 4 written.
         fn range_fixture(label: &str) -> (Connection, i64, crate::tape::fake::FakeTape) {
             let (conn, volume_id, fake) = loaded_fixture(label);
-            conn.execute("UPDATE writes SET status = 'range', may_span = 1", [])
+            conn.execute("UPDATE writes SET status = 'range'", [])
                 .unwrap();
             (conn, volume_id, fake)
         }
 
-        /// The refusal, read from the catalog: the store is asked nothing
-        /// past the open's rewind (no File 0, no slice), nothing is staged
-        /// and no compact directory is made. The contact is recorded
-        /// `failed`, as every refusal of a loaded tape's read is. Positive
-        /// control: the same tape with the write `completed` reads its slice.
+        /// T5.3 (ADR-0012 item 288 over item 133): `compact-read` of a volume
+        /// holding only a range reads the slices the volume holds, stages
+        /// them, and promotes the set to `staged`: what must have been read
+        /// is what the volume holds of it, not every slice of the set.
         #[test]
-        fn compact_read_refuses_a_volume_holding_a_range_before_reading_anything() {
-            let (conn, volume_id, fake) = range_fixture("RG-CR");
+        fn compact_read_of_a_volume_holding_a_range_stages_the_slices_it_holds() {
+            let (conn, _volume_id, fake) = range_fixture("RG-CR");
+            // The set has a second slice no volume in this fixture holds.
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           sha256_plain, encrypted_bytes, sha256_encrypted)
+                 SELECT stage_set_id, 2, 10, 'p2', 10, 'e2' FROM stage_slices LIMIT 1",
+                [],
+            )
+            .unwrap();
             let mut store = fake_store(&fake);
-            let opened = fake.ops();
-            assert_eq!(opened, [Op::Rewind], "the store's open rewinds");
             let tmp = tempfile::TempDir::new().unwrap();
             let mut config = Config::default();
             config.staging.directory = tmp.path().to_string_lossy().into_owned();
 
-            let err = compact_read(
-                &conn,
-                &config,
-                "RG-CR",
-                &mut store,
-                site(Operation::VolumeCompactRead),
-            )
-            .expect_err("a volume holding a range")
-            .to_string();
-            assert_eq!(
-                err,
-                "volume compact-read refused: volume \"RG-CR\" holds a range, one run of the \
-                 slices of a unit that spans cartridges: \"lv-unit\" v1 (slice 1). Compaction \
-                 carries a volume's live units to another tape whole, and a range is not a \
-                 whole unit: carrying one forward is its own design, not built in 1.7.0 \
-                 (ADR-0012 item 133). Nothing was read or staged."
-            );
-            assert_eq!(fake.ops(), opened, "nothing was read from the tape");
-            let staged: Option<String> = conn
-                .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
-                .unwrap();
-            assert!(staged.is_none(), "nothing was staged: {staged:?}");
-            assert_eq!(
-                fs::read_dir(tmp.path()).unwrap().count(),
-                0,
-                "no compact directory was made"
-            );
-            let contacts = contact_rows(&conn);
-            assert_eq!(contacts.len(), 1, "{contacts:?}");
-            assert_eq!(contacts[0].0, "volume compact-read");
-            assert_eq!(contacts[0].1, Some(volume_id));
-            assert_eq!(contacts[0].2.as_deref(), Some("failed"));
-
-            conn.execute("UPDATE writes SET status = 'completed'", [])
-                .unwrap();
-            let mut store = fake_store(&fake);
             let report = compact_read(
                 &conn,
                 &config,
@@ -20696,9 +20746,18 @@ mod tests {
                 &mut store,
                 site(Operation::VolumeCompactRead),
             )
-            .expect("the same tape, its write whole");
+            .expect("a range's slices are read");
             assert_eq!(report.slices_read, 1);
             assert!(fake.ops().contains(&Op::Read(4)), "{:?}", fake.ops());
+            assert_eq!(report.staged_sets.len(), 1, "the set is promoted");
+            let staged: Vec<Option<String>> = conn
+                .prepare("SELECT staging_path FROM stage_slices ORDER BY slice_number")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(staged[0].is_some() && staged[1].is_none(), "{staged:?}");
         }
     }
 
@@ -22298,7 +22357,7 @@ mod tests {
         ///
         /// The batch's staging loop is driven to its `(false, "staged")`
         /// no-op arm — an empty source directory matching a snapshot with no
-        /// file rows — so no `dar` runs and the loop reaches `volume_write`
+        /// file rows — so no `tar` runs and the loop reaches `volume_write`
         /// with the fixture's own staged data, exactly as a real run does
         /// once its units are already staged.
         #[test]
@@ -24088,7 +24147,7 @@ mod tests {
             /// The seal's write (the one synchronous filemark) fails with a
             /// drive error; every other write lands.
             SealIo,
-            /// The seal's write fails as a full medium (#420, §4.3 W6: the
+            /// The seal's write fails as a full medium (#420, §5.2 W6: the
             /// hard end inside the seal, or its filemark refused); every
             /// other write lands.
             SealFull,
@@ -24241,7 +24300,7 @@ mod tests {
         }
 
         /// #418 R4, through the real write path: the cross-volume index
-        /// (`volume-format-v2.md` §1.5) reaches the envelopes - this tape and
+        /// (`volume-format-v3.md` §1.5) reaches the envelopes - this tape and
         /// the other sealed one the catalog holds, in the operator's map and
         /// in the tenant's own, with the tenant's paths - and none of it, nor
         /// any path of the archive, is ever in the clear under staging; the
@@ -24549,7 +24608,7 @@ mod tests {
             assert_eq!(code, 5, "{err}");
         }
 
-        /// 5, at the seal (#420, `volume-format-v2.md` §4.3 W6): a full
+        /// 5, at the seal (#420, `volume-format-v3.md` §5.2 W6): a full
         /// medium while the seal is written aborts the session as one inside
         /// a slice does — not the resumable stop (4) any other seal error
         /// is (`exit_4_a_write_stopped_part_way_is_resumable`'s `SealIo`).
@@ -26937,15 +26996,16 @@ mod tests {
                 assert_eq!(seal.ended_after, Some(u64::from(B_FIRST)));
                 assert_eq!(seal.file_count as u32, B_FIRST + 2);
 
-                // The catalog: sealed, ended_after K, `a` the copy, `b` and
-                // `c` cut.
+                // The catalog: sealed, ended_after K, `a` the copy, `b` a range
+                // of the slice that reached the tape and `c`, planned and not
+                // written, with no row (item 288).
                 assert_eq!(
                     volume_row(&f, "SE-1"),
                     ("sealed".into(), true, Some(i64::from(B_FIRST)))
                 );
                 assert_eq!(
                     writes_of(&f, "SE-1"),
-                    pairs(&[("a", "completed"), ("b", "cut"), ("c", "cut")])
+                    pairs(&[("a", "completed"), ("b", "range")])
                 );
                 let warned = events(&f, "SE-1", "write_early_warning");
                 assert_eq!(warned.len(), 1, "{warned:?}");
@@ -26959,7 +27019,8 @@ mod tests {
                     serde_json::json!({
                         "ending": "short",
                         "ended_after": 9,
-                        "cut_units": ["b", "c"],
+                        "unwritten_units": ["c"],
+                        "range_units": [{"unit": "b", "first_slice": 1, "last_slice": 1}],
                     })
                 );
                 // The figures count what is on the tape: `a`'s slice and
@@ -26974,9 +27035,27 @@ mod tests {
                     .unwrap();
                 assert_eq!(figures, (2 * 3 * SBS as i64, 2));
 
+                // #548 (D18): the row names the script the tape carries at
+                // file 2, the hash of those bytes on the store.
+                let script = &store.inner.files[2];
+                let want = crate::volume::heir::RESTORE_SH.as_bytes();
+                assert_eq!(&script[..want.len()], want, "file 2 is RESTORE.sh");
+                let recorded: Option<String> = f
+                    .conn
+                    .query_row(
+                        "SELECT restore_sh_sha256 FROM volumes WHERE label = 'SE-1'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    recorded,
+                    Some(format!("{:x}", sha2::Sha256::digest(&script[..want.len()])))
+                );
+
                 // The release `volume write` runs after it: `a` has its one
-                // copy and is released; `b` and `c` are cut, so they are no
-                // copy and keep their staging, named as cut on SE-1.
+                // copy and is released; `b` is a range and `c` has no row, so
+                // they keep their staging.
                 let release = crate::cli::volume::release_staging_after_write(
                     &f.conn, &f.config, "SE-1", false,
                 );
@@ -26986,43 +27065,50 @@ mod tests {
                 );
                 assert_eq!(stage_set_status(&f, "a"), "cleaned");
                 for unit in ["b", "c"] {
-                    let set = stage_set_of(&f, unit);
                     assert_eq!(stage_set_status(&f, unit), "staged", "{unit}");
-                    assert_eq!(
-                        release_blocker(&f.conn, set).unwrap(),
-                        ReleaseBlocker::Cut {
-                            volume_label: Some("SE-1".into())
-                        },
-                        "{unit}"
-                    );
                 }
+                assert_eq!(
+                    release_blocker(&f.conn, stage_set_of(&f, "c")).unwrap(),
+                    ReleaseBlocker::NeverWritten,
+                    "c was planned and not written: no row (item 288)"
+                );
 
                 // The next ordinary `volume write`, onto another cartridge,
-                // writes the cut units whole, and seals full.
+                // continues `b` from its owed slice and writes `c`, and seals
+                // full.
                 let mut next = MemStore::new(SBS);
                 let (r, code) = write(&f, "SE-2", &mut next, false);
-                r.expect("the cut units are written whole on the next cartridge");
+                r.expect("the rest is written on the next cartridge");
                 assert_eq!(code, 0);
                 assert_eq!(
                     writes_of(&f, "SE-2"),
-                    pairs(&[("b", "completed"), ("c", "completed")])
+                    pairs(&[("b", "range"), ("c", "completed")])
                 );
                 assert_eq!(volume_row(&f, "SE-2"), ("sealed".into(), true, None));
+                let details: serde_json::Value = serde_json::from_str(
+                    events(&f, "SE-2", "write_completed")[0]
+                        .1
+                        .as_deref()
+                        .expect("a full seal holding a range names it"),
+                )
+                .unwrap();
                 assert_eq!(
-                    events(&f, "SE-2", "write_completed"),
-                    vec![(None, None)],
-                    "a full seal's event is what it was before 1.6.0"
+                    details,
+                    serde_json::json!({
+                        "ending": "full",
+                        "range_units": [{"unit": "b", "first_slice": 2, "last_slice": 2}],
+                    })
                 );
                 assert_eq!(
                     release_blocker(&f.conn, stage_set_of(&f, "b")).unwrap(),
                     ReleaseBlocker::None,
-                    "b is written whole elsewhere: its cut row no longer holds it"
+                    "b's range blocks nothing (a range row is terminal)"
                 );
             }
 
             /// The same short ending under `--full-confirm`: the integrity
             /// tier walks files 0 to K and the short seal, reads no position
-            /// after it, and passes — the copy is `a`, `b` and `c` are cut,
+            /// after it, and passes — the copy is `a`, `b` is a range and `c` has no row,
             /// and the readback is recorded as the full one it was.
             #[test]
             fn a_full_confirm_of_a_short_seal_walks_through_ended_after_and_passes() {
@@ -27037,7 +27123,7 @@ mod tests {
                 );
                 assert_eq!(
                     writes_of(&f, "SE-F"),
-                    pairs(&[("a", "completed"), ("b", "cut"), ("c", "cut")])
+                    pairs(&[("a", "completed"), ("b", "range")])
                 );
                 let sessions: Vec<(String, String)> = f
                     .conn
@@ -27329,7 +27415,7 @@ mod tests {
                 usable: u64,
                 bound: Option<u64>,
             ) -> (build::BuiltLayout, tempfile::TempDir) {
-                let units = checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None)
+                let units = checked_staged_units(&f.conn, &f.config, None)
                     .unwrap()
                     .units;
                 let ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
@@ -27454,7 +27540,7 @@ mod tests {
             }
 
             /// The body of the two tests above, with the envelopes grown by
-            /// a dar catalogue of `catalogue_bytes`.
+            /// a catalogue of `catalogue_bytes`.
             fn plans_past_the_ceiling_and_names_the_units(catalogue_bytes: usize) {
                 let mut f = fixture(WIDE_ABC, &["SE-P"]);
                 grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
@@ -27467,19 +27553,13 @@ mod tests {
                 budget(&mut f, "SE-P", capacity, fill, true);
 
                 let (layout, _dir) = built(&f, "SE-P", fill, Some(capacity));
-                let units = checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None)
+                let units = checked_staged_units(&f.conn, &f.config, None)
                     .unwrap()
                     .units;
-                let split = layout.split(&units);
-                assert_eq!((split.committed, split.planned, split.units), (1, 3, 3));
-                assert!(past_ceiling_refusal("SE-P", &split, &units).is_none());
-                let notice = past_ceiling_notice("SE-P", &split, &units).expect("named");
-                assert!(
-                    notice.starts_with(
-                        "volume \"SE-P\": \"b\" v1, \"c\" v1 planned past the fill ceiling; the \
-                         tape may end before them."
-                    ),
-                    "{notice}"
+                let p = layout.place(&units, &[PlanClass::Queued; 3]);
+                assert_eq!(
+                    p.placed,
+                    vec![Placed::Committed, Placed::PastCeiling, Placed::PastCeiling]
                 );
 
                 let mut store = MemStore::new(SBS);
@@ -27493,12 +27573,16 @@ mod tests {
                 assert_eq!(volume_row(&f, "SE-P"), ("sealed".into(), true, None));
             }
 
-            /// Without `post_warning_bytes`, the same batch on the same
-            /// volume is refused at the fill ceiling exactly as before 1.6.0:
-            /// today's refusal, byte for byte, given the figure the build
-            /// counted. Nothing is written and no session is planned.
+            /// Without `post_warning_bytes` the plan ends at the fill ceiling
+            /// (item 289, D20): the same batch on the same volume is NOT
+            /// refused. `a` is committed, and the set that carries the plan
+            /// past the ceiling is planned as the longest prefix of its
+            /// slices that fits (a range), or deferred when not even one
+            /// does; nothing of `c` is on the tape. The write exits 0, the
+            /// rows are `completed` for `a` and no row for a set none of
+            /// which reached the tape, and the rest stays staged.
             #[test]
-            fn without_post_warning_bytes_the_same_write_is_refused_with_todays_text() {
+            fn without_post_warning_bytes_the_write_ends_at_the_fill_ceiling_and_continues() {
                 let mut f = fixture(WIDE_ABC, &["SE-N"]);
                 let fixed = wide_fixed(&f, "SE-N");
                 let fill = fixed + 2 * WIDE_PADDED;
@@ -27507,62 +27591,32 @@ mod tests {
 
                 let mut store = MemStore::new(SBS);
                 let (r, code) = write(&f, "SE-N", &mut store, false);
-                let msg = r.unwrap_err().to_string();
-                let needed: u64 = msg
-                    .split("the layout needs ")
-                    .nth(1)
-                    .and_then(|t| t.split(' ').next())
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or_else(|| panic!("no figure in: {msg}"));
-                let available = f.config.backends.lto[0].fill_budget_bytes(capacity);
-                let expected = format!(
-                    "volume \"SE-N\" failed pre-write validation: {}; {}",
-                    crate::volume::layout_model::LayoutError::CapacityExceeded {
-                        needed,
-                        reserve: 0,
-                        available,
-                    },
-                    crate::volume::layout_model::capacity_refusal_note(
-                        &[crate::volume::layout_model::LayoutError::CapacityExceeded {
-                            needed,
-                            reserve: 0,
-                            available,
-                        }],
-                        f.config.backends.lto[0].fill_ceiling,
-                        capacity,
-                    )
-                    .unwrap(),
+                r.expect("a plan that ends at the ceiling is written");
+                assert_eq!(code, 0);
+                let rows = writes_of(&f, "SE-N");
+                assert_eq!(
+                    rows[0],
+                    ("a".to_string(), "completed".to_string()),
+                    "{rows:?}"
                 );
-                assert_eq!(msg, expected);
-                assert_eq!(code, 2);
-                assert!(store.files.is_empty(), "nothing was written");
-                assert!(writes_of(&f, "SE-N").is_empty(), "no session was planned");
+                assert!(
+                    rows.iter().all(|(u, _)| u != "c"),
+                    "nothing of c reached the tape: {rows:?}"
+                );
+                assert_eq!(stage_set_status(&f, "c"), "staged");
+                // The tape ends by its plan at the ceiling: the figure the
+                // build counted fits the fill budget exactly as before 1.6.0.
+                let layout = f.config.backends.lto[0].fill_budget_bytes(capacity);
+                assert!(layout >= fill);
             }
 
-            /// Units beyond the plan bound are refused, never trimmed (the
-            /// coordinator's ruling on item 113): the whole capacity holds
-            /// `a` and `b` but not `c`, and the write refuses by the bound.
+            /// With a bound the plan may reach the nominal capacity: a plan
+            /// whose end is beyond it is not refused or trimmed (item 289):
+            /// the set that crosses is planned to its end, and the drive's
+            /// early warning ends the tape inside it.
             #[test]
-            fn a_plan_beyond_the_bound_is_refused_not_trimmed() {
-                refused_by_the_bound_not_trimmed(0);
-            }
-
-            /// #491's positive control: the same refusal however heavy the
-            /// envelopes are ([`grow_envelopes`]).
-            #[test]
-            fn a_plan_beyond_the_bound_is_refused_however_heavy_the_envelopes() {
-                for bytes in [512, 2048, 4096, 4608] {
-                    refused_by_the_bound_not_trimmed(bytes);
-                }
-            }
-
-            /// The body of the two tests above, with the envelopes grown by
-            /// a dar catalogue of `catalogue_bytes`. The bound sits half a
-            /// slice past `b`'s end on the probe, more than the drift
-            /// ([`wide_fixed`]) either side.
-            fn refused_by_the_bound_not_trimmed(catalogue_bytes: usize) {
+            fn a_plan_beyond_the_bound_is_planned_to_its_end() {
                 let mut f = fixture(WIDE_ABC, &["SE-B"]);
-                grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
                 let fixed = wide_fixed(&f, "SE-B");
                 let fill = fixed + 2 * WIDE_PADDED;
                 let capacity = fixed + 3 * WIDE_PADDED + WIDE_PADDED / 2;
@@ -27570,48 +27624,20 @@ mod tests {
 
                 let mut store = MemStore::new(SBS);
                 let (r, code) = write(&f, "SE-B", &mut store, false);
-                let msg = r.unwrap_err().to_string();
-                assert!(msg.contains("failed pre-write validation"), "{msg}");
-                assert!(msg.contains("nominal capacity"), "{msg}");
-                assert!(msg.contains("ADR-0012 item 113"), "{msg}");
-                assert!(
-                    !msg.contains("--fill-ceiling"),
-                    "raising the ceiling cannot help: {msg}"
+                r.expect("the tail is planned to its end, and nothing here ends the tape early");
+                assert_eq!(code, 0);
+                assert_eq!(
+                    writes_of(&f, "SE-B"),
+                    pairs(&[("a", "completed"), ("b", "completed"), ("c", "completed")])
                 );
-                assert_eq!(code, 2);
-                assert!(store.files.is_empty(), "nothing was written");
-                assert!(writes_of(&f, "SE-B").is_empty(), "no session was planned");
             }
 
-            /// A plan whose every unit is past the fill ceiling commits
-            /// nothing, and is refused (the coordinator's ruling: a tape that
-            /// can only end cut is not a plan), before the tape moves.
+            /// A plan whose every unit is past the fill ceiling is planned
+            /// all the same when the bound holds it (item 289): the tape may
+            /// end inside any of them, each a range then.
             #[test]
-            fn a_plan_that_commits_no_unit_is_refused() {
-                commits_no_unit_and_is_refused(0);
-            }
-
-            /// #491's positive control: the same refusal however heavy the
-            /// envelopes are, so wherever their sizes fall against a block
-            /// ([`grow_envelopes`]; 512 bytes was enough to break the figures
-            /// this test used to place).
-            #[test]
-            fn a_plan_that_commits_no_unit_is_refused_however_heavy_the_envelopes() {
-                for bytes in [512, 2048, 4096, 4608] {
-                    commits_no_unit_and_is_refused(bytes);
-                }
-            }
-
-            /// The body of the two tests above, with the envelopes grown by
-            /// a dar catalogue of `catalogue_bytes`. The fill budget sits half
-            /// a slice past the probe's files ([`wide_fixed`]), which leaves
-            /// the drift on both sides: the real files still fit under the
-            /// ceiling (else the refusal is the capacity gate's, not this one)
-            /// and `a` still does not (else it is committed and the write goes
-            /// ahead).
-            fn commits_no_unit_and_is_refused(catalogue_bytes: usize) {
+            fn a_plan_that_commits_no_unit_is_planned_within_the_bound() {
                 let mut f = fixture(WIDE_ABC, &["SE-0"]);
-                grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
                 let fixed = wide_fixed(&f, "SE-0");
                 let fill = fixed + WIDE_PADDED / 2;
                 let capacity = fixed + 6 * WIDE_PADDED;
@@ -27619,12 +27645,12 @@ mod tests {
 
                 let mut store = MemStore::new(SBS);
                 let (r, code) = write(&f, "SE-0", &mut store, false);
-                let msg = r.unwrap_err().to_string();
-                assert!(msg.contains("would commit nothing"), "{msg}");
-                assert!(msg.contains("\"a\" v1, \"b\" v1, \"c\" v1"), "{msg}");
-                assert_eq!(code, 2);
-                assert!(store.files.is_empty(), "nothing was written");
-                assert!(writes_of(&f, "SE-0").is_empty(), "no session was planned");
+                r.expect("within the bound");
+                assert_eq!(code, 0);
+                assert_eq!(
+                    writes_of(&f, "SE-0"),
+                    pairs(&[("a", "completed"), ("b", "completed"), ("c", "completed")])
+                );
             }
             // ── #478: a write that plans, writes and reports a span ──
 
@@ -27646,26 +27672,101 @@ mod tests {
                 /// `b` of three slices, alone.
                 const B3: &[(&str, &[usize])] = &[("b", &[SLICE, SLICE, SLICE])];
 
-                /// `unit`'s dotfile says `allow_spanning = value` (ADR-0012
-                /// item 82: the unit's own layer of the policy).
-                fn dotfile(f: &Fixture, unit: &str, value: bool) {
-                    let dir = f._tmp.path().join("sources").join(unit);
-                    fs::create_dir_all(&dir).unwrap();
-                    fs::write(
-                        dir.join(".tapectl-unit.toml"),
-                        format!("[policy]\nallow_spanning = {value}\n"),
-                    )
-                    .unwrap();
-                    f.conn
-                        .execute(
-                            "UPDATE units SET current_path = ?2 WHERE name = ?1",
-                            params![unit, dir.to_string_lossy()],
+                // ── T5.1 Done when (ADR-0012 items 288, 289; D19, D20) ──
+
+                /// Done when 1: a unit interrupted by the test hook's early
+                /// warning has a `range` row and no `cut` row, and the next
+                /// write lays its owed slices first.
+                #[test]
+                fn dw_an_interrupted_unit_has_a_range_row_no_cut_row_and_its_owed_slices_come_first(
+                ) {
+                    let f = fixture(A_B3_C, &["DW-1", "DW-2"]);
+                    let mut store = ArmedAt::new(10, warning);
+                    write(&f, "DW-1", &mut store, false)
+                        .0
+                        .expect("a short seal is a success");
+                    let rows = writes_of(&f, "DW-1");
+                    assert!(
+                        rows.contains(&("b".to_string(), "range".to_string())),
+                        "{rows:?}"
+                    );
+                    assert!(rows.iter().all(|(_, s)| s != "cut"), "{rows:?}");
+                    let cut: i64 = f
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM writes WHERE status = 'cut'",
+                            [],
+                            |r| r.get(0),
                         )
                         .unwrap();
+                    assert_eq!(cut, 0);
+
+                    let mut next = MemStore::new(SBS);
+                    write(&f, "DW-2", &mut next, false)
+                        .0
+                        .expect("the next write continues it");
+                    assert!(
+                        position_of(&f, "DW-2", "b", 3) < position_of(&f, "DW-2", "c", 1),
+                        "the owed slice is laid before the queue"
+                    );
                 }
 
-                fn allow_spanning(f: &Fixture, unit: &str) {
-                    dotfile(f, unit, true);
+                /// Done when 2: a batch queued to fill ends a full tape with one
+                /// unit across its end: exactly one `range` row, and it is the
+                /// unit last on the tape.
+                #[test]
+                fn dw_a_queue_filled_to_the_warning_ends_the_tape_with_one_unit_across_its_end() {
+                    let f = fixture(A_B3_C, &["DW-3"]);
+                    let mut store = ArmedAt::new(10, warning);
+                    write(&f, "DW-3", &mut store, false).0.expect("seals short");
+                    let rows = writes_of(&f, "DW-3");
+                    let ranges: Vec<_> = rows.iter().filter(|(_, s)| s == "range").collect();
+                    assert_eq!(ranges.len(), 1, "{rows:?}");
+                    assert_eq!(ranges[0].0, "b", "{rows:?}");
+                    assert!(
+                        position_of(&f, "DW-3", "a", 1) < position_of(&f, "DW-3", "b", 1),
+                        "the whole unit before the one across the end"
+                    );
+                }
+
+                /// Done when 3: on a drive without `post_warning_bytes` the tape
+                /// ends by its plan at the ceiling and the rest continues.
+                #[test]
+                fn dw_without_post_warning_bytes_the_tape_ends_at_the_ceiling_and_the_rest_continues(
+                ) {
+                    let mut f = fixture(
+                        &[("a", &[WIDE_SLICE]), ("b", &[WIDE_SLICE; 3])],
+                        &["DW-4", "DW-5"],
+                    );
+                    let fixed = wide_fixed(&f, "DW-4");
+                    budget(
+                        &mut f,
+                        "DW-4",
+                        fixed + 6 * WIDE_PADDED,
+                        fixed + 2 * WIDE_PADDED,
+                        false,
+                    );
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "DW-4", &mut store, false)
+                        .0
+                        .expect("the plan ends at the ceiling and is written");
+                    let rows = writes_of(&f, "DW-4");
+                    assert_eq!(
+                        rows[0],
+                        ("a".to_string(), "completed".to_string()),
+                        "{rows:?}"
+                    );
+                    assert_eq!(stage_set_status(&f, "b"), "staged");
+
+                    let mut next = MemStore::new(SBS);
+                    write(&f, "DW-5", &mut next, false)
+                        .0
+                        .expect("the rest continues on the next cartridge");
+                    assert!(
+                        writes_of(&f, "DW-5").iter().any(|(u, _)| u == "b"),
+                        "{:?}",
+                        writes_of(&f, "DW-5")
+                    );
                 }
 
                 /// [`write`], scoped to `only` as `volume rewrite` scopes it
@@ -27701,19 +27802,6 @@ mod tests {
                         }
                     };
                     (r, code)
-                }
-
-                /// `writes.may_span` of `unit`'s write on `label`.
-                fn may_span(f: &Fixture, label: &str, unit: &str) -> bool {
-                    f.conn
-                        .query_row(
-                            "SELECT w.may_span FROM writes w
-                             JOIN volumes v ON v.id = w.volume_id
-                             WHERE v.label = ?1 AND w.stage_set_id = ?2",
-                            params![label, stage_set_of(f, unit)],
-                            |r| r.get(0),
-                        )
-                        .unwrap()
                 }
 
                 /// `unit`'s snapshot status.
@@ -27806,33 +27894,29 @@ mod tests {
                 fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
                     let mut f = fixture(A_B3_C, &["SP-1", "SP-2", "SP-3"]);
                     f.config.defaults.min_copies = 2;
-                    allow_spanning(&f, "b");
 
-                    // Tape 1: a at 8, c at 9, b last at 10-12; the warning in
-                    // b's second slice (11).
-                    let mut store = ArmedAt::new(11, warning);
+                    // Tape 1: the queue in name order, a at 8 and b at 9-11; the
+                    // warning in b's second slice (10); c is planned after it
+                    // and not written.
+                    let mut store = ArmedAt::new(10, warning);
                     let (r, code) = write(&f, "SP-1", &mut store, false);
                     r.expect("tape 1 seals short");
                     assert_eq!(code, 0);
                     assert_eq!(
                         [
                             position_of(&f, "SP-1", "a", 1),
-                            position_of(&f, "SP-1", "c", 1),
                             position_of(&f, "SP-1", "b", 1),
                         ],
-                        [8, 9, 10],
-                        "whole units first, the spannable set last (item 83)"
+                        [8, 9],
+                        "the queue in the order taken (item 289)"
                     );
-                    assert_eq!(volume_row(&f, "SP-1"), ("sealed".into(), true, Some(11)));
+                    assert_eq!(volume_row(&f, "SP-1"), ("sealed".into(), true, Some(10)));
                     assert_eq!(
                         writes_of(&f, "SP-1"),
-                        pairs(&[("a", "completed"), ("b", "range"), ("c", "completed")])
+                        pairs(&[("a", "completed"), ("b", "range")]),
+                        "c was planned and not written: no row"
                     );
-                    assert!(may_span(&f, "SP-1", "b") && !may_span(&f, "SP-1", "a"));
-                    assert_eq!(
-                        requires_line(&store.inner.files),
-                        "requires = [\"short-seal\", \"spanning\"]"
-                    );
+                    assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert_eq!(
                         snapshot_status(&f, "b"),
                         "staged",
@@ -27919,7 +28003,6 @@ mod tests {
                 #[test]
                 fn a_continuation_onto_another_generation_is_refused_naming_both() {
                     let f = fixture(B3, &["SG-1", "SG-5", "SG-6"]);
-                    allow_spanning(&f, "b");
                     f.conn
                         .execute(
                             "UPDATE volumes SET media_type = 'LTO-5',
@@ -27963,32 +28046,33 @@ mod tests {
                     assert_eq!(tapes, ["SG-1", "SG-6"]);
                 }
 
-                /// Item 123: on a drive with no `post_warning_bytes`, a unit
-                /// that may span and would pass the fill ceiling is refused,
-                /// and the refusal names the key; nothing is written. Positive
-                /// control: with the key it is planned past the ceiling, and
-                /// this medium takes it whole.
+                /// Item 289, D20: on a drive with no `post_warning_bytes` a unit
+                /// that would pass the fill ceiling is NOT refused (the refusal
+                /// naming the key is gone): the plan ends at the ceiling, `a` is
+                /// committed and `b` is planned only as the slices that fit, or
+                /// not at all, and the rest stays staged. Positive control: with
+                /// the key it is planned past the ceiling, and this medium takes
+                /// it whole.
                 #[test]
-                fn without_post_warning_bytes_a_span_past_the_ceiling_is_refused_naming_the_key() {
-                    span_past_the_ceiling_is_refused_naming_the_key(0);
+                fn without_post_warning_bytes_a_span_past_the_ceiling_ends_at_the_ceiling() {
+                    span_past_the_ceiling_ends_at_the_ceiling(0);
                 }
 
-                /// #491's positive control: the same refusal and write however
+                /// #491's positive control: the same plan and write however
                 /// heavy the envelopes are ([`grow_envelopes`]).
                 #[test]
-                fn a_span_past_the_ceiling_is_refused_however_heavy_the_envelopes() {
+                fn a_span_past_the_ceiling_ends_at_it_however_heavy_the_envelopes() {
                     for bytes in [512, 2048, 4096, 4608] {
-                        span_past_the_ceiling_is_refused_naming_the_key(bytes);
+                        span_past_the_ceiling_ends_at_the_ceiling(bytes);
                     }
                 }
 
                 /// The body of the two tests above, with the envelopes grown
-                /// by a dar catalogue of `catalogue_bytes`. Every figure is
+                /// by a catalogue of `catalogue_bytes`. Every figure is
                 /// placed from [`wide_fixed`], a slice or more from its edge.
-                fn span_past_the_ceiling_is_refused_naming_the_key(catalogue_bytes: usize) {
+                fn span_past_the_ceiling_ends_at_the_ceiling(catalogue_bytes: usize) {
                     let mut f =
                         fixture(&[("a", &[WIDE_SLICE]), ("b", &[WIDE_SLICE; 3])], &["SN-1"]);
-                    allow_spanning(&f, "b");
                     grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
                     let fixed = wide_fixed(&f, "SN-1");
                     budget(
@@ -28001,75 +28085,78 @@ mod tests {
 
                     let mut store = MemStore::new(SBS);
                     let (r, code) = write(&f, "SN-1", &mut store, false);
-                    let err = r.unwrap_err().to_string();
-                    assert!(
-                        err.starts_with(
-                            "volume \"SN-1\" failed pre-write validation: capacity exceeded: a \
-                             unit that allows spanning would pass the fill ceiling"
-                        ),
-                        "{err}"
+                    r.expect("the plan ends at the ceiling and is written");
+                    assert_eq!(code, 0);
+                    let rows = writes_of(&f, "SN-1");
+                    assert_eq!(
+                        rows[0],
+                        ("a".to_string(), "completed".to_string()),
+                        "{rows:?}"
                     );
-                    assert!(err.contains("post_warning_bytes"), "{err}");
-                    assert!(err.contains("ADR-0012 item 123"), "{err}");
-                    assert_eq!(code, 2);
-                    assert!(store.files.is_empty(), "nothing was written");
-                    assert!(writes_of(&f, "SN-1").is_empty(), "no session was planned");
+                    assert!(
+                        rows.iter().all(|(u, s)| u != "b" || s == "range"),
+                        "b is never whole on this tape: {rows:?}"
+                    );
+                    assert_eq!(stage_set_status(&f, "b"), "staged", "the rest stays staged");
 
+                    // With the key: planned past the ceiling, whole on a
+                    // medium that takes it.
+                    let mut f2 =
+                        fixture(&[("a", &[WIDE_SLICE]), ("b", &[WIDE_SLICE; 3])], &["SN-2"]);
+                    grow_envelopes(&f2.conn, &f2._tmp.path().join("catalogue"), catalogue_bytes);
+                    let fixed = wide_fixed(&f2, "SN-2");
                     budget(
-                        &mut f,
-                        "SN-1",
+                        &mut f2,
+                        "SN-2",
                         fixed + 6 * WIDE_PADDED,
                         fixed + 2 * WIDE_PADDED,
                         true,
                     );
                     let mut store = MemStore::new(SBS);
-                    write(&f, "SN-1", &mut store, false)
+                    write(&f2, "SN-2", &mut store, false)
                         .0
                         .expect("planned past the ceiling");
                     assert_eq!(
-                        writes_of(&f, "SN-1"),
+                        writes_of(&f2, "SN-2"),
                         pairs(&[("a", "completed"), ("b", "completed")])
                     );
                 }
 
-                /// Item 142 (X20): a write scoped as `volume rewrite` scopes it
-                /// plans a unit that allows spanning whole and never makes a
-                /// range: the early warning in it cuts it, as in 1.6.0, with
-                /// `may_span` unset and File 0 stating `short-seal` alone.
-                /// Positive control: the same write unscoped makes a range.
+                /// Items 142 and 289: a write scoped as `volume rewrite` scopes it
+                /// plans under the fill ceiling and never past it, and when the
+                /// early warning comes in a unit the unit is a range, as for
+                /// any write (there is no `cut` unit), with File 0 stating
+                /// `requires = []`. The rewrite's hold and close are slice by
+                /// slice (`rewrite::holds`).
                 #[test]
-                fn a_rewrite_scoped_write_never_makes_a_range() {
+                fn a_rewrite_scoped_write_leaves_a_range_when_the_warning_comes() {
                     let f = fixture(B3, &["SR-1", "SR-2"]);
-                    allow_spanning(&f, "b");
                     let b = stage_set_of(&f, "b");
 
                     let mut store = ArmedAt::new(9, warning);
                     let (r, code) = write_scoped(&f, "SR-1", &mut store, Some(&[b]));
                     r.expect("a short seal is a success");
                     assert_eq!(code, 0);
-                    assert_eq!(writes_of(&f, "SR-1"), pairs(&[("b", "cut")]));
-                    assert!(!may_span(&f, "SR-1", "b"));
+                    assert_eq!(writes_of(&f, "SR-1"), pairs(&[("b", "range")]));
+                    assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert_eq!(
-                        requires_line(&store.inner.files),
-                        "requires = [\"short-seal\"]"
+                        recorded_ranges(&f.conn, "SR-1").unwrap(),
+                        [range("b", 1, 2)]
                     );
-                    assert!(recorded_ranges(&f.conn, "SR-1").unwrap().is_empty());
 
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SR-2", &mut store, false).0.expect("seals short");
                     assert_eq!(writes_of(&f, "SR-2"), pairs(&[("b", "range")]));
-                    assert!(may_span(&f, "SR-2", "b"));
                 }
 
                 /// #493 (ADR-0012 items 151 and 159): a write scoped as `volume
                 /// write --for-location` scopes it writes only its sets and plans
                 /// them by policy, so a unit that allows spanning makes a range
-                /// where a rewrite's scope (above) would cut it; a staged set
+                /// like any other write; a staged set
                 /// outside the scope is left staged, untouched.
                 #[test]
                 fn a_for_location_scoped_write_spans_by_policy_and_leaves_the_rest_staged() {
                     let f = fixture(&[("a", &[SLICE]), ("b", &[SLICE, SLICE, SLICE])], &["SL-1"]);
-                    allow_spanning(&f, "b");
                     let b = stage_set_of(&f, "b");
 
                     let mut store = ArmedAt::new(9, warning);
@@ -28092,7 +28179,6 @@ mod tests {
                     );
                     slot.finish_result(r).expect("a short seal is a success");
                     assert_eq!(writes_of(&f, "SL-1"), pairs(&[("b", "range")]));
-                    assert!(may_span(&f, "SL-1", "b"));
                     let a_status: String = f
                         .conn
                         .query_row(
@@ -28113,7 +28199,6 @@ mod tests {
                 #[test]
                 fn an_owed_slice_released_from_staging_is_refused_naming_read_slices() {
                     let mut f = fixture(B3, &["SX-1", "SX-2"]);
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SX-1", &mut store, false)
                         .0
@@ -28188,10 +28273,11 @@ mod tests {
                 }
 
                 /// The body of the two tests above, with the envelopes grown
-                /// by a dar catalogue of `catalogue_bytes`. The fill budget
-                /// sits half a slice past `a` on the probe ([`wide_fixed`]):
-                /// `a` under it and `c` past it, whichever way the write's
-                /// own build drifts.
+                /// by a catalogue of `catalogue_bytes`. The fill budget
+                /// sits half a slice past `a` on the probe ([`wide_fixed`]) and
+                /// the bound half a slice short of `b`'s end: `b` carries the
+                /// plan past the bound, is the tape's last unit, and `c` after
+                /// it waits, whichever way the write's own build drifts.
                 fn whole_units_the_span_leaves_no_room_for_wait(catalogue_bytes: usize) {
                     let mut f = fixture(
                         &[
@@ -28201,13 +28287,12 @@ mod tests {
                         ],
                         &["SD-1", "SD-2"],
                     );
-                    allow_spanning(&f, "b");
                     grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
                     let fixed = wide_fixed(&f, "SD-1");
                     budget(
                         &mut f,
                         "SD-1",
-                        fixed + 5 * WIDE_PADDED,
+                        fixed + 7 * WIDE_PADDED / 2,
                         fixed + 3 * WIDE_PADDED / 2,
                         true,
                     );
@@ -28237,25 +28322,18 @@ mod tests {
 
                 // ── #491: the read-back of a span plan built again ──
 
-                /// `units` staged on "SR-1", those in `spannable` allowed to
-                /// span, the envelopes grown by `catalogue_bytes`
-                /// ([`grow_envelopes`]): the batch in its plan order (whole
-                /// units, then the spannable sets, each in name order, so the
-                /// whole units are named first), the write's own build of it,
-                /// and that build's files that are not slices. The build's
-                /// budget is the test's to place.
+                /// `units` staged on "SR-1", the envelopes grown by
+                /// `catalogue_bytes` ([`grow_envelopes`]): the batch in its
+                /// plan order (the queue in name order), the write's own
+                /// build of it, and that build's files that are not slices.
+                /// The build's budget is the test's to place.
                 fn read_back_case(
                     units: &[(&str, &[usize])],
-                    spannable: &[&str],
                     catalogue_bytes: usize,
                 ) -> (StagedBatch, build::BuiltLayout, tempfile::TempDir, u64) {
                     let f = fixture(units, &["SR-1"]);
-                    for name in spannable {
-                        allow_spanning(&f, name);
-                    }
                     grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
-                    let batch =
-                        checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None).unwrap();
+                    let batch = checked_staged_units(&f.conn, &f.config, None).unwrap();
                     let (built, dir) = built(&f, "SR-1", u64::MAX / 4, None);
                     let fixed = built.layout.fixed_on_tape_bytes();
                     (batch, built, dir, fixed)
@@ -28271,47 +28349,29 @@ mod tests {
                         .capacity_errors_against(built.layout.budget.available_bytes)
                 }
 
-                /// The false refusal (#491): a rebuild of fewer units holds no
-                /// more content than the probe the plan was made on, but its
-                /// files can land a block above the probe's (tar pads each
-                /// member to 512 bytes, so a dropped unit's text can shrink
-                /// nothing, and every envelope gets a fresh random grease
-                /// stanza in its age header). Here the probe was one block
-                /// lighter. Items 83 and 95: the whole units `a` and `b` fill
-                /// the fill ceiling exactly on the probe's bytes, and `c`, a
-                /// spannable set that fits one tape (four slices past the
-                /// probe's files), goes last and is the tail by crossing the
-                /// bound. On the built bytes `b` ends a block past the
-                /// ceiling, so the build's own placement defers it and step 4
-                /// used to refuse ("internal error") a Layout the capacity gate
-                /// accepts. Within the drift (one block per generated file),
-                /// the plan's own bytes are read instead. Positive control: a
-                /// probe lighter than that drift allows is a defect, and still
-                /// refused.
+                /// A rebuild a block heavier than the probe (#491): a unit the
+                /// plan had under the ceiling ends a block past it on the
+                /// built bytes. Every unit is one class now (item 289), so the
+                /// plan only ever defers a set after its tail, and a build whose
+                /// own placement agrees with the plan's order is read back as it
+                /// stands: `a` is committed, `b` past the ceiling and `c`, the
+                /// last, the tail by crossing the bound.
                 #[test]
-                fn a_rebuild_a_block_heavier_than_the_probe_is_read_back_on_the_plans_bytes() {
+                fn a_rebuild_a_block_heavier_than_the_probe_is_read_back_as_the_build_places_it() {
                     for bytes in [0, 512, 2048, 4096, 4608] {
                         let (batch, mut built, _dir, fixed) = read_back_case(
                             &[("a", &[SLICE]), ("b", &[SLICE]), ("c", &[SLICE; 3])],
-                            &["c"],
                             bytes,
                         );
-                        assert_eq!(
-                            batch.classes,
-                            [PlanClass::Whole, PlanClass::Whole, PlanClass::Spannable]
-                        );
+                        assert_eq!(batch.classes, [PlanClass::Queued; 3]);
                         let planned = fixed - SBS as u64;
                         built.layout.budget.plan_bound_bytes = Some(planned + 4 * PADDED);
                         built.layout.budget.available_bytes = planned + 2 * PADDED;
-                        assert!(
-                            3 * PADDED <= built.layout.budget.plan_bound_bytes.unwrap() - fixed,
-                            "positive control: `c` fits one tape on the built bytes too"
-                        );
 
                         let own = built.place(&batch.units, &batch.classes);
                         assert_eq!(
                             own.placed,
-                            [Placed::Committed, Placed::Deferred, Placed::Tail],
+                            [Placed::Committed, Placed::PastCeiling, Placed::Tail],
                             "the build's own bytes push `b` off the ceiling"
                         );
                         assert!(
@@ -28319,25 +28379,11 @@ mod tests {
                             "the Layout fits: {:?}",
                             gate(&built)
                         );
-
                         let plan =
                             read_back_span_plan(&built, &batch.units, &batch.classes, planned)
                                 .unwrap_or_else(|why| panic!("{bytes} bytes: {why}"));
-                        assert_eq!(
-                            plan.placed,
-                            [Placed::Committed, Placed::Committed, Placed::Tail]
-                        );
+                        assert_eq!(plan.placed, own.placed);
                         assert_eq!(plan.order, [0, 1, 2]);
-
-                        let margin = capacity_numbers(&built.layout).unwrap().margin;
-                        let why = read_back_span_plan(
-                            &built,
-                            &batch.units,
-                            &batch.classes,
-                            fixed - margin - SBS as u64,
-                        )
-                        .expect_err("a drift past the margin is not one");
-                        assert!(why.starts_with("\"b\" v1 no longer fit"), "{why}");
                     }
                 }
 
@@ -28353,7 +28399,6 @@ mod tests {
                     for bytes in [0, 512, 2048, 4096, 4608] {
                         let (batch, mut built, _dir, fixed) = read_back_case(
                             &[("a", &[SLICE]), ("b", &[SLICE; 3]), ("c", &[SLICE])],
-                            &["b", "c"],
                             bytes,
                         );
                         let planned = fixed - SBS as u64;
@@ -28385,34 +28430,27 @@ mod tests {
                     }
                 }
 
-                /// With `allow_spanning` off at every layer (the dotfile says
-                /// false, `[defaults]` is false), a write is 1.6.0's: the same
-                /// plan order, rows, File 0, `write_completed` event and
-                /// recorded ending as [`an_early_warning_mid_unit_seals_short_exits_0_and_the_next_write_takes_the_cut_units`],
-                /// and nothing that names a range, a deferral or a span.
+                /// A short seal under the one rule (item 288): the same plan
+                /// order, rows, `write_completed` event and recorded ending for
+                /// every unit, none of which opts in to anything. `b`, the unit
+                /// the warning interrupted, is a range of the slices on the
+                /// tape; `c`, planned after the warning and not written, has no
+                /// row and is named as unwritten.
                 #[test]
-                fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
+                fn a_short_seal_records_a_range_and_no_row_for_the_unwritten() {
                     let f = fixture(ABC, &["S0-1"]);
-                    dotfile(&f, "b", false);
-                    let batch =
-                        checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None).unwrap();
-                    assert!(!batch.spans());
-                    assert!(batch.classes.iter().all(|c| *c == PlanClass::Whole));
+                    let batch = checked_staged_units(&f.conn, &f.config, None).unwrap();
+                    assert!(batch.classes.iter().all(|c| *c == PlanClass::Queued));
 
                     let mut store = ArmedAt::new(B_FIRST, warning);
                     write(&f, "S0-1", &mut store, false).0.expect("seals short");
                     assert_eq!(position_of(&f, "S0-1", "b", 1), B_FIRST);
                     assert_eq!(
                         writes_of(&f, "S0-1"),
-                        pairs(&[("a", "completed"), ("b", "cut"), ("c", "cut")])
+                        pairs(&[("a", "completed"), ("b", "range")])
                     );
-                    for unit in ["a", "b", "c"] {
-                        assert!(!may_span(&f, "S0-1", unit), "{unit}");
-                    }
-                    assert_eq!(
-                        requires_line(&store.inner.files),
-                        "requires = [\"short-seal\"]"
-                    );
+                    assert_eq!(stage_set_status(&f, "c"), "staged");
+                    assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert_eq!(
                         events(&f, "S0-1", "write_completed"),
                         vec![(
@@ -28421,7 +28459,10 @@ mod tests {
                                 serde_json::json!({
                                     "ending": "short",
                                     "ended_after": B_FIRST,
-                                    "cut_units": ["b", "c"],
+                                    "unwritten_units": ["c"],
+                                    "range_units": [
+                                        {"unit": "b", "first_slice": 1, "last_slice": 1}
+                                    ],
                                 })
                                 .to_string()
                             )
@@ -28431,7 +28472,8 @@ mod tests {
                         recorded_ending(&f.conn, "S0-1").unwrap(),
                         RecordedEnding {
                             ended_after: Some(i64::from(B_FIRST)),
-                            cut_units: vec!["b".into(), "c".into()],
+                            range_units: vec![range("b", 1, 1)],
+                            deferred_units: vec!["c".into()],
                             ..RecordedEnding::default()
                         }
                     );
@@ -28445,7 +28487,6 @@ mod tests {
                 #[test]
                 fn a_write_that_releases_part_of_a_span_names_the_released_and_kept_slices() {
                     let f = fixture(B3, &["SL-1", "SL-2"]);
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SL-1", &mut store, false)
                         .0
@@ -28555,20 +28596,15 @@ mod tests {
                 #[test]
                 fn a_full_verify_marks_a_range_write_verified_and_a_quick_one_does_not() {
                     let f = fixture(A_B3_C, &["SV-1"]);
-                    allow_spanning(&f, "b");
-                    let mut store = ArmedAt::new(11, warning);
+                    let mut store = ArmedAt::new(10, warning);
                     write(&f, "SV-1", &mut store, false)
                         .0
                         .expect("tape 1 seals short");
                     assert_eq!(
                         writes_of(&f, "SV-1"),
-                        pairs(&[("a", "completed"), ("b", "range"), ("c", "completed")])
+                        pairs(&[("a", "completed"), ("b", "range")])
                     );
-                    let none = vec![
-                        ("a".to_string(), false),
-                        ("b".to_string(), false),
-                        ("c".to_string(), false),
-                    ];
+                    let none = vec![("a".to_string(), false), ("b".to_string(), false)];
                     assert_eq!(verified(&f, "SV-1"), none, "a quick confirm");
 
                     verify(&f, "SV-1", &mut store, Tier::Navigable);
@@ -28577,11 +28613,7 @@ mod tests {
                     verify(&f, "SV-1", &mut store, Tier::Integrity);
                     assert_eq!(
                         verified(&f, "SV-1"),
-                        [
-                            ("a".to_string(), true),
-                            ("b".to_string(), true),
-                            ("c".to_string(), true),
-                        ],
+                        [("a".to_string(), true), ("b".to_string(), true),],
                         "the full readback read the range too"
                     );
                 }
@@ -28596,7 +28628,6 @@ mod tests {
                 #[test]
                 fn read_slices_from_a_range_tape_restages_its_released_slices() {
                     let mut f = fixture(B3, &["SQ-1", "SQ-2"]);
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SQ-1", &mut store, false)
                         .0
@@ -28647,29 +28678,29 @@ mod tests {
                 #[test]
                 fn a_full_verify_records_the_figures_of_a_tape_holding_a_range() {
                     let f = fixture(A_B3_C, &["SG-1", "SG-2"]);
-                    allow_spanning(&f, "b");
-                    let mut tape1 = ArmedAt::new(11, warning);
+                    let mut tape1 = ArmedAt::new(10, warning);
                     write(&f, "SG-1", &mut tape1, false)
                         .0
                         .expect("tape 1 seals short");
-                    // a and c have their copy: the release cleans them.
-                    for unit in ["a", "c"] {
-                        f.conn
-                            .execute(
-                                "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
-                                params![stage_set_of(&f, unit)],
-                            )
-                            .unwrap();
-                    }
+                    // a has its copy: the release cleans it.
+                    f.conn
+                        .execute(
+                            "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                            params![stage_set_of(&f, "a")],
+                        )
+                        .unwrap();
                     let mut tape2 = MemStore::new(SBS);
                     write(&f, "SG-2", &mut tape2, false)
                         .0
                         .expect("tape 2 continues it");
-                    assert_eq!(writes_of(&f, "SG-2"), pairs(&[("b", "range")]));
+                    assert_eq!(
+                        writes_of(&f, "SG-2"),
+                        pairs(&[("b", "range"), ("c", "completed")])
+                    );
 
                     for (label, store, slices) in [
-                        ("SG-1", &mut tape1 as &mut dyn Store, 4),
-                        ("SG-2", &mut tape2 as &mut dyn Store, 1),
+                        ("SG-1", &mut tape1 as &mut dyn Store, 3),
+                        ("SG-2", &mut tape2 as &mut dyn Store, 2),
                     ] {
                         let written = figures(&f, label);
                         assert_eq!(written, (slices * PADDED as i64, slices), "{label}");
@@ -28713,7 +28744,6 @@ mod tests {
                 fn the_402_remedy_for_a_missing_slice_of_a_span_names_the_range_holding_it() {
                     let mut f = fixture(B3, &["SM-1", "SM-2"]);
                     f.config.defaults.min_copies = 2;
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SM-1", &mut store, false)
                         .0
@@ -28765,7 +28795,6 @@ mod tests {
                 #[test]
                 fn the_402_remedy_names_each_range_holding_a_missing_slice() {
                     let f = fixture(B3, &["SM-1", "SM-2"]);
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SM-1", &mut store, false)
                         .0
@@ -28799,19 +28828,20 @@ mod tests {
                 /// The units of a hand-made span plan, `a` whole, `b` may span
                 /// (slices 1-3), `c` whole.
                 fn plan_units() -> Vec<BuildUnit> {
-                    let unit = |name: &str, slices: &[i64], span: bool| BuildUnit {
+                    let unit = |name: &str, slices: &[i64]| BuildUnit {
                         stage_set_id: 1,
                         snapshot_id: 1,
                         unit_name: name.into(),
                         unit_uuid: name.into(),
                         tenant_id: 1,
-                        dar_version: None,
-                        dar_command: None,
-                        catalog_path: None,
+                        tar_version: None,
+                        stream_bytes: 0,
+                        compression: None,
                         snapshot_version: 1,
                         slices: slices
                             .iter()
                             .map(|&n| BuildSlice {
+                                continues: false,
                                 slice_id: n,
                                 slice_number: n,
                                 size_bytes: 1,
@@ -28821,72 +28851,73 @@ mod tests {
                                 staging_path: PathBuf::new(),
                             })
                             .collect(),
-                        span: span.then(|| UnitSpan { slices: Vec::new() }),
+                        span: Some(UnitSpan { slices: Vec::new() }),
                     };
-                    vec![
-                        unit("a", &[1], false),
-                        unit("b", &[1, 2, 3], true),
-                        unit("c", &[1], false),
-                    ]
+                    vec![unit("a", &[1]), unit("b", &[1, 2, 3]), unit("c", &[1])]
                 }
 
-                /// The notices a span tape's plan prints before the tape moves
-                /// name the unit that may span past the fill ceiling and the
-                /// whole units that wait for the next tape; and the write
-                /// names those again when it is done. A plan with a unit that
-                /// may span is never one that commits nothing.
+                /// The notices a tape's plan prints before the tape moves name
+                /// the unit planned past the fill ceiling, to its end, and the
+                /// units that wait for the next tape; and the write names
+                /// those again when it is done.
                 #[test]
-                fn a_span_plans_notices_name_the_span_and_the_units_that_wait() {
+                fn a_plans_notices_name_the_tail_and_the_units_that_wait() {
                     let units = plan_units();
                     let plan = SpanPlan {
                         placement: Placement {
                             order: vec![0, 1],
                             placed: vec![Placed::Committed, Placed::Tail],
-                            errors: Vec::new(),
+                            tail_room: None,
                         },
                         deferred: vec![units[2].clone()],
+                        stops_short: Vec::new(),
                     };
                     let notices = span_plan_notices("SN-0", &plan, &units[..2]);
                     assert_eq!(notices.len(), 2, "{notices:?}");
                     assert!(
                         notices[0].starts_with(
-                            "volume \"SN-0\": \"b\" v1 may span, and the plan takes it past the \
-                             fill ceiling to its end"
+                            "volume \"SN-0\": \"b\" v1 planned past the fill ceiling, to its end: \
+                             the drive's early warning, not the plan, ends it on this tape"
                         ),
                         "{notices:?}"
                     );
                     assert_eq!(notices[1], waiting_notice("SN-0", &plan.deferred).unwrap());
                     assert!(
-                        notices[1].starts_with("volume \"SN-0\": \"c\" v1 waits for the next tape"),
+                        notices[1].starts_with(
+                            "volume \"SN-0\": \"c\" v1 planned and not written: the plan ends \
+                             before it"
+                        ),
                         "{notices:?}"
                     );
-                    assert!(placed_past_ceiling_refusal("SN-0", &plan, &units[..2]).is_none());
 
-                    // A span tail alone commits nothing and is still a plan
-                    // (item 94); a whole unit alone past the ceiling is not.
-                    let tail = SpanPlan {
+                    // A drive with no post_warning_bytes plans the tail only up
+                    // to the fill ceiling, and says which slices.
+                    let short = SpanPlan {
                         placement: Placement {
-                            order: vec![0],
-                            placed: vec![Placed::Tail],
-                            errors: Vec::new(),
+                            order: vec![0, 1],
+                            placed: vec![Placed::Committed, Placed::Committed],
+                            tail_room: None,
                         },
                         deferred: Vec::new(),
+                        stops_short: vec![StopsShort {
+                            unit: "\"b\" v1".into(),
+                            first: 1,
+                            last: 2,
+                        }],
                     };
-                    assert!(placed_past_ceiling_refusal("SN-0", &tail, &units[1..2]).is_none());
-                    let past = SpanPlan {
-                        placement: Placement {
-                            order: vec![0],
-                            placed: vec![Placed::PastCeiling],
-                            errors: Vec::new(),
-                        },
-                        deferred: Vec::new(),
-                    };
-                    assert!(placed_past_ceiling_refusal("SN-0", &past, &units[..1])
-                        .is_some_and(|r| r.contains("would commit nothing")));
+                    let notices = span_plan_notices("SN-0", &short, &units[..2]);
+                    assert_eq!(notices.len(), 1, "{notices:?}");
+                    assert!(
+                        notices[0].starts_with(
+                            "volume \"SN-0\": \"b\" v1 is planned only up to the fill ceiling, \
+                             slices 1-2: the drive declares no post_warning_bytes"
+                        ),
+                        "{notices:?}"
+                    );
                 }
 
-                /// The index's `this-tape` rows (item 126): a unit that may span
-                /// says the run this tape plans, a whole unit its whole set.
+                /// The index's `this-tape` rows (item 126): a unit says the run
+                /// this tape plans.
                 #[test]
                 fn the_index_states_the_run_each_span_unit_plans() {
                     let mut units = plan_units();
@@ -28894,12 +28925,18 @@ mod tests {
                     assert_eq!(
                         index_runs(&units),
                         [
-                            coverage::IndexRun::whole(1),
+                            coverage::IndexRun {
+                                stage_set_id: 1,
+                                slices: Some((1, 1)),
+                            },
                             coverage::IndexRun {
                                 stage_set_id: 1,
                                 slices: Some((2, 3)),
                             },
-                            coverage::IndexRun::whole(1),
+                            coverage::IndexRun {
+                                stage_set_id: 1,
+                                slices: Some((1, 1)),
+                            },
                         ]
                     );
                 }
@@ -28913,7 +28950,7 @@ mod tests {
                         volume_id: 1,
                         label: "SF-3".into(),
                         ending,
-                        cut_units: Vec::new(),
+                        unwritten_units: Vec::new(),
                         range_units,
                     };
                     let run = vec![RangeUnit {
@@ -29594,6 +29631,67 @@ mod tests {
 
         fn file0_text(fake: &FakeTape) -> String {
             String::from_utf8_lossy(&fake.state().files[0]).into_owned()
+        }
+
+        // ---- another layout (volume-format-v3.md §7.6; item 269; #560) ----
+
+        /// A tape of another layout: File 0 and seal as recorded, with
+        /// stand-in files between.
+        fn another_layout_tape(file0: &str, seal: &str) -> FakeTape {
+            FakeTape::with_files(
+                vec![
+                    padded(file0.as_bytes().to_vec()),
+                    padded(b"guide".to_vec()),
+                    padded(b"#!/bin/sh".to_vec()),
+                    padded(b"front index".to_vec()),
+                    padded(vec![7u8; 1000]),
+                    padded(seal.as_bytes().to_vec()),
+                ],
+                BS,
+            )
+        }
+
+        /// `volume init` and `volume init --force` over a volume of
+        /// another layout, Layout 2 as 1.9.2 wrote it and a later one: both
+        /// refused, naming the layout and the label, with nothing written,
+        /// nothing recorded and no seal read; a chip that says the cartridge
+        /// was never written is no proof against a File 0 that reads.
+        #[test]
+        fn init_over_a_tape_of_another_layout_is_refused_with_and_without_force() {
+            use crate::volume::format::foreign_layouts as f;
+            for (n, file0, seal) in [
+                (
+                    2,
+                    f::LAYOUT_2_FILE_0.to_string(),
+                    f::LAYOUT_2_SEAL.to_string(),
+                ),
+                (4, f::layout_4_file_0(), f::layout_4_seal()),
+            ] {
+                for force in [false, true] {
+                    let conn = crate::db::open_memory().unwrap();
+                    let fake = another_layout_tape(&file0, &seal);
+                    let before = fake.state().files.clone();
+                    let det = chip(Some("SER-NEW"), Some(0));
+                    let msg = refusal(init_with(&conn, "NEWVOL", &fake, &det, force, None));
+                    assert!(
+                        msg.contains(&format!("volume of Layout {n}"))
+                            && msg.contains("label \"L6-0001\"")
+                            && msg.contains("RESTORE.sh in its own file 2")
+                            && msg.contains("--force cannot override")
+                            && msg.contains("tapectl cartridge erase"),
+                        "layout {n}, force={force}: {msg}"
+                    );
+                    assert_eq!(fake.state().files, before, "nothing was written");
+                    assert!(
+                        !fake.ops().iter().any(|op| matches!(
+                            op,
+                            crate::tape::fake::Op::Write(_) | crate::tape::fake::Op::Erase(_)
+                        )),
+                        "layout {n}: the drive was written to"
+                    );
+                    assert_eq!(volume_count(&conn), 0);
+                }
+            }
         }
 
         // ---- the chip proof -------------------------------------------
@@ -30649,7 +30747,7 @@ mod tests {
         /// way a not-yet-existing volume can: another uuid and time, other
         /// chip strings, a real MAM length and load count.
         fn real_write_layout_errors(f: &Fixture, usable_bytes: u64) -> Vec<String> {
-            let units = checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None)
+            let units = checked_staged_units(&f.conn, &f.config, None)
                 .unwrap()
                 .units;
             let ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
@@ -30722,7 +30820,7 @@ mod tests {
         }
 
         /// The body of the two tests above, with the envelopes grown by a
-        /// dar catalogue of `catalogue_bytes`.
+        /// catalogue of `catalogue_bytes`.
         fn refused_naming_the_numbers(catalogue_bytes: usize) {
             let f = fixture(&[3 * BS + 17, 5 * BS]);
             grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
@@ -30807,7 +30905,7 @@ mod tests {
         }
 
         /// The body of the two tests above, with the envelopes grown by a
-        /// dar catalogue of `catalogue_bytes`.
+        /// catalogue of `catalogue_bytes`.
         fn a_passing_rehearsal_bounds_the_real_write(catalogue_bytes: usize) {
             let f = fixture(&[2 * BS + 1, BS, 7 * BS - 3]);
             grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
@@ -30910,7 +31008,8 @@ mod tests {
                 let end = prod[start..].find("\n}\n").unwrap() + start;
                 &prod[start..end]
             };
-            assert!(body("fn volume_write_in_contact<'c>(").contains("build_write_layout("));
+            assert!(body("fn volume_write_in_contact<'c>(").contains("build_span_layout("));
+            assert!(body("fn build_span_layout(").contains("build_write_layout("));
             assert!(body("pub(crate) fn rehearse_write_capacity(").contains("build_write_layout("));
             assert!(body("fn build_write_layout(").contains("build::build_with_plan_bound("));
         }
@@ -30939,7 +31038,7 @@ mod tests {
         }
 
         /// The body of the two tests above, with the envelopes grown by a
-        /// dar catalogue of `catalogue_bytes`.
+        /// catalogue of `catalogue_bytes`.
         ///
         /// The one-byte edge is the rehearsal's rule on the probe's own
         /// numbers ([`CapacityNumbers::fits`]): every rehearsal builds
@@ -31000,5 +31099,471 @@ mod tests {
             rehearse(&f, 2 * (threshold + probe.margin) as i64)
                 .expect("within the ceiling it fits");
         }
+    }
+}
+
+/// What a tape carries of a staging's file table and id map
+/// (`volume-format-v3.md` §1.4, §1.6; ADR-0012 items 265, 276; #557, #564),
+/// through the real write: units staged by the real `stage create` on made
+/// trees (a hard link, an ACL naming an id the host has no name for), a
+/// volume made by `volume init` and written by `volume write` over a
+/// [`MemStore`], every envelope read back from the recorded bytes.
+#[cfg(test)]
+mod layout_3_tables_tests {
+    use std::fs;
+
+    use rusqlite::{params, Connection};
+    use tempfile::TempDir;
+
+    use crate::config::{Config, LtoBackendConfig, TapectlPaths};
+    use crate::store::{MemStore, Store};
+    use crate::tape::contact::ContactSlot;
+    use crate::volume::envelope;
+    use crate::volume::format;
+    use crate::volume::write::{self, ContactStore};
+
+    const BS: usize = 4096;
+    const DEVICE: &str = "/nonexistent/tapectl-t46-nst";
+    const BACKEND: &str = "lto6t46";
+    const OPERATOR: &str = "quince-operator-t46";
+    const ONE: &str = "medlar-tenant-one";
+    const TWO: &str = "medlar-tenant-two";
+    /// An id no host names: the ACL entry the first unit's file carries.
+    const NAMELESS_UID: u32 = 4_242_917;
+
+    struct Home {
+        conn: Connection,
+        paths: TapectlPaths,
+        config: Config,
+        sources: std::path::PathBuf,
+        _tmp: TempDir,
+    }
+
+    fn home() -> Home {
+        let tmp = TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open(&paths.db_file).unwrap();
+        let staging = tmp.path().join("staging");
+        let sources = tmp.path().join("sources");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&sources).unwrap();
+        let mut config = Config::default();
+        config.staging.directory = staging.to_string_lossy().into_owned();
+        config.defaults.slice_size = "64K".to_string();
+        config.backends.lto.push(LtoBackendConfig {
+            name: BACKEND.into(),
+            device_tape: DEVICE.into(),
+            device_sg: "/nonexistent/tapectl-t46-sg".into(),
+            generation: "LTO-6".into(),
+            capacity_override: None,
+            fill_ceiling: crate::config::DEFAULT_FILL_CEILING,
+            enospc_buffer: "0".into(),
+            post_warning_bytes: None,
+        });
+        crate::tenant::add_tenant(&conn, &paths, OPERATOR, None, true).unwrap();
+        for tenant in [ONE, TWO] {
+            crate::tenant::add_tenant(&conn, &paths, tenant, None, false).unwrap();
+        }
+        crate::cli::key::create_escrow_recipient(&conn, &paths, None).unwrap();
+        Home {
+            conn,
+            paths,
+            config,
+            sources,
+            _tmp: tmp,
+        }
+    }
+
+    impl Home {
+        /// `unit init` of a folder of `files`, then `snapshot create` and
+        /// `stage create`: its stage set.
+        fn staged(&self, tenant: &str, name: &str, files: &[(&str, &[u8])]) -> i64 {
+            let dir = self.sources.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            for (file, bytes) in files {
+                fs::write(dir.join(file), bytes).unwrap();
+            }
+            self.prepare(name, &dir);
+            crate::unit::init_unit_with_config(
+                &self.conn,
+                &self.config,
+                dir.to_str().unwrap(),
+                tenant,
+                Some(name),
+                &[],
+                None,
+            )
+            .unwrap();
+            let snapshot = crate::staging::snapshot_create(&self.conn, name, &self.config).unwrap();
+            crate::staging::stage_create(&self.conn, &self.paths, &self.config, snapshot, true)
+                .unwrap_or_else(|e| panic!("stage create {name}: {e}"))
+        }
+
+        /// The first unit's tree gains a hard link and an ACL naming an id
+        /// no host names, as an operator's files might.
+        fn prepare(&self, name: &str, dir: &std::path::Path) {
+            if !name.ends_with("-one") {
+                return;
+            }
+            fs::hard_link(dir.join("a.bin"), dir.join("a-link.bin")).unwrap();
+            let ok = std::process::Command::new("setfacl")
+                .arg("-m")
+                .arg(format!("u:{NAMELESS_UID}:r"))
+                .arg(dir.join("a.bin"))
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "setfacl must work on the test's file system");
+        }
+
+        /// `cartridge register` then `volume init` of `label` over a medium.
+        fn volume(&self, label: &str) -> MemStore {
+            self.volume_on(label, &format!("{label}-STK"))
+        }
+
+        /// [`Self::volume`], on a cartridge registered as `barcode`.
+        fn volume_on(&self, label: &str, barcode: &str) -> MemStore {
+            let barcode = barcode.to_string();
+            crate::cli::cartridge::run(
+                &self.conn,
+                &self.config,
+                &crate::cli::cartridge::CartridgeCommands::Register {
+                    barcode: barcode.clone(),
+                    generation: "LTO-6".into(),
+                    capacity: None,
+                    serial: None,
+                    notes: None,
+                },
+                false,
+                true,
+                false,
+            )
+            .unwrap();
+            let mut medium = MemStore::new(BS);
+            let mut slot = ContactSlot::empty();
+            let r = write::volume_init_contacted(
+                &self.conn,
+                &self.config,
+                label,
+                DEVICE,
+                BS,
+                false,
+                None,
+                Some(&barcode),
+                &mut slot,
+                ContactStore::Injected(&mut medium),
+            );
+            slot.finish_result(r).unwrap();
+            medium
+        }
+
+        /// `volume write` of `label` onto `medium`.
+        fn write(&self, label: &str, medium: &mut MemStore) -> crate::error::Result<()> {
+            let mut slot = ContactSlot::empty();
+            let r = write::volume_write_contacted(
+                &self.conn,
+                &self.paths,
+                &self.config,
+                label,
+                DEVICE,
+                BS,
+                false,
+                false,
+                false,
+                false,
+                true,
+                &mut slot,
+                ContactStore::Injected(medium),
+                None,
+            );
+            slot.finish_result(r).map(|_| ())
+        }
+
+        fn identities(&self, tenant: &str) -> Vec<age::x25519::Identity> {
+            crate::crypto::keys::load_tenant_identities(&self.conn, &self.paths.keys_dir, tenant)
+                .unwrap()
+        }
+    }
+
+    fn noise(len: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 11) as u8
+            })
+            .collect()
+    }
+
+    fn entries(store: &mut MemStore) -> Vec<format::ParsedIndexEntry> {
+        let fi = crate::store::read_small_bytes(store, 3, "front index").unwrap();
+        format::parse_front_index(&String::from_utf8_lossy(&fi)).unwrap()
+    }
+
+    /// The Done-when of the plan's T4.6: `volume write` to a `MemStore`, and
+    /// a read-back of every envelope, round-trip the file table and the id
+    /// map (§1.6; D4, D5, D7).
+    /// - Each tenant envelope and its backup give, for its own staging, the
+    ///   catalog's rows exactly (`stage_files`, `stage_ids`), and name no
+    ///   other tenant's staging; its key opens no other tenant's envelope.
+    /// - The id map holds the ACL's nameless id with no name, beside the
+    ///   owner's id with the host's name.
+    /// - The operator envelope carries no `tables/` member; its `catalog.db`
+    ///   carries both stagings' rows exactly, every path they name (the hard
+    ///   link's target among them), and the format's stamp.
+    #[test]
+    fn volume_write_round_trips_every_stagings_file_table_and_id_map() {
+        let h = home();
+        let one = h.staged(
+            ONE,
+            "unit-one",
+            &[("a.bin", &noise(90_000, 1)), ("b.txt", b"small")],
+        );
+        let two = h.staged(TWO, "unit-two", &[("c.bin", &noise(20_000, 2))]);
+        let mut medium = h.volume("T46-01");
+        h.write("T46-01", &mut medium).unwrap();
+
+        let catalog_rows = |id: i64| crate::db::stage_files::load(&h.conn, id).unwrap();
+        let catalog_ids = |id: i64| crate::db::stage_ids::load(&h.conn, id).unwrap();
+        assert!(
+            catalog_rows(one)
+                .iter()
+                .any(|r| r.kind == crate::volume::filetable::Kind::HardLink),
+            "the fixture's hard link is a member"
+        );
+        let ids_one = catalog_ids(one);
+        assert!(
+            ids_one
+                .iter()
+                .any(|r| r.id == NAMELESS_UID && r.name.is_none()),
+            "the ACL's nameless id is in the map with no name: {ids_one:?}"
+        );
+        let me = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(h.sources.join("unit-one").join("b.txt"))
+                .unwrap()
+                .uid()
+        };
+        assert!(
+            ids_one.iter().any(|r| r.id == me && r.name.is_some()),
+            "the owner's id with the host's name: {ids_one:?}"
+        );
+
+        let entries = entries(&mut medium);
+        let scratch = TempDir::new().unwrap();
+        let mut seen = 0;
+        for (tenant, own, other) in [(ONE, one, two), (TWO, two, one)] {
+            let ids = h.identities(tenant);
+            let mut opened_own = 0;
+            for e in entries.iter().filter(|e| {
+                e.type_label == "tenant_envelope" || e.type_label == "tenant_envelope_backup"
+            }) {
+                let dir = scratch.path().join(format!("{tenant}-{}", e.position));
+                match envelope::open_envelope(&mut medium, e, &ids, &dir) {
+                    Ok(env) => {
+                        opened_own += 1;
+                        let rows: Vec<_> = env
+                            .file_table(own)
+                            .unwrap()
+                            .collect::<crate::error::Result<_>>()
+                            .unwrap();
+                        assert_eq!(rows, catalog_rows(own), "{tenant} at {}", e.position);
+                        assert_eq!(env.id_map(own).unwrap(), catalog_ids(own));
+                        assert!(env.file_table(other).is_err(), "no other tenant's table");
+                        assert!(env.tables.len() == 2, "{:?}", env.tables);
+                    }
+                    Err(envelope::OpenError::NoMatchingKey) => {}
+                    Err(envelope::OpenError::Failed(e)) => panic!("{e}"),
+                }
+            }
+            assert_eq!(opened_own, 2, "{tenant}: its envelope and its backup");
+            seen += opened_own;
+        }
+        assert_eq!(seen, 4);
+
+        let op_entry = entries
+            .iter()
+            .find(|e| e.type_label == "operator_envelope")
+            .unwrap();
+        let op = envelope::open_envelope(
+            &mut medium,
+            op_entry,
+            &h.identities(OPERATOR),
+            &scratch.path().join("op"),
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(op.tables.is_empty());
+        for u in &op.manifest.units {
+            assert_eq!((&u.file_table, &u.id_map), (&None, &None), "{}", u.name);
+        }
+        let (conn, cat) =
+            crate::db::ontape_catalog::read_all_but_files(op.catalog_db.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            crate::db::ontape_catalog::stage_sets_with_tables(&conn).unwrap(),
+            vec![one.min(two), one.max(two)]
+        );
+        for id in [one, two] {
+            let rows: Vec<_> = crate::db::ontape_catalog::file_table(&conn)
+                .unwrap()
+                .rows(id)
+                .unwrap()
+                .collect::<crate::error::Result<_>>()
+                .unwrap();
+            assert_eq!(rows, catalog_rows(id), "catalog.db's table of {id}");
+            assert_eq!(
+                crate::db::ontape_catalog::id_map(&conn, id).unwrap(),
+                catalog_ids(id)
+            );
+            let set = cat.stage_sets.iter().find(|s| s.id == id).unwrap();
+            let main: (Option<i64>, Option<String>, Option<String>) = h
+                .conn
+                .query_row(
+                    "SELECT stream_bytes, tar_version, compression FROM stage_sets WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (
+                    set.stream_bytes,
+                    set.tar_version.clone(),
+                    set.compression.clone()
+                ),
+                main
+            );
+            assert!(set
+                .tar_version
+                .as_deref()
+                .is_some_and(|v| v.contains("GNU tar")));
+        }
+        let stamp: (i64, i64) = conn
+            .query_row(
+                "SELECT * FROM pragma_application_id, pragma_user_version",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamp, (crate::db::APPLICATION_ID, 1));
+    }
+
+    /// Item 265 (#557): a write refuses, by name, a unit whose file table the
+    /// catalog cannot supply, before the tape moves, and says to stage it
+    /// again; the medium holds only what `volume init` wrote. The positive
+    /// control: with the table there, the same write seals.
+    #[test]
+    fn a_write_refuses_by_name_a_unit_whose_file_table_is_gone() {
+        let h = home();
+        h.staged(ONE, "unit-whole", &[("w.bin", &noise(5_000, 3))]);
+        let lost = h.staged(TWO, "unit-lost", &[("l.bin", &noise(5_000, 4))]);
+        let saved: Vec<_> = crate::db::stage_files::load(&h.conn, lost).unwrap();
+        h.conn
+            .execute(
+                "DELETE FROM stage_files WHERE stage_set_id = ?1",
+                params![lost],
+            )
+            .unwrap();
+        let mut medium = h.volume("T46-02");
+        let before = medium.files.clone();
+        let err = h.write("T46-02", &mut medium).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("unit-lost v1 (stage set {lost})")),
+            "names the unit: {err}"
+        );
+        assert!(err.contains("Stage each version again"), "{err}");
+        assert!(
+            !err.contains("unit-whole"),
+            "only the unit without one: {err}"
+        );
+        assert_eq!(medium.files, before, "the tape did not move");
+
+        let tx = h.conn.unchecked_transaction().unwrap();
+        crate::db::stage_files::insert(&tx, lost, saved.into_iter().map(Ok)).unwrap();
+        tx.commit().unwrap();
+        h.write("T46-02", &mut medium)
+            .expect("positive control: it seals");
+    }
+
+    /// #547: a hand-typed barcode holding a quote and a backslash (a drive
+    /// with no chip serial: `volume init --cartridge`) reaches File 0 as a
+    /// TOML basic string, so the write seals and every reader of File 0
+    /// reads it back as typed (`volume-format-v3.md` §1.1).
+    #[test]
+    fn a_barcode_holding_a_quote_and_a_backslash_is_written_escaped_and_reads_back() {
+        let h = home();
+        h.staged(ONE, "unit-q", &[("q.bin", &noise(4_000, 9))]);
+        let barcode = "Q\"7\\B";
+        let mut medium = h.volume_on("T46-04", barcode);
+        h.write("T46-04", &mut medium).expect("the write seals");
+        let mut file0 = Vec::new();
+        medium.read_file(0, &mut file0).unwrap();
+        let text = String::from_utf8_lossy(format::without_nul_padding(&file0)).into_owned();
+        format::check_id_thunk_readable(&text).unwrap();
+        assert_eq!(
+            format::parse_id_thunk_identity(&text).unwrap().label,
+            "T46-04"
+        );
+        let media = format::parse_id_thunk_media(&text).unwrap();
+        assert_eq!(media.cartridge_serial, barcode);
+        assert_eq!(media.cartridge_identity_source.as_deref(), Some("operator"));
+        assert!(
+            text.contains("cartridge_serial = \"Q\\\"7\\\\B\"\n"),
+            "escaped as TOML escapes: {text}"
+        );
+    }
+
+    /// `volume write`'s tables are plaintext: generated in the tapectl home's
+    /// work dir and gone with it, never under staging, and in no plaintext
+    /// file of the tape (invariant 3).
+    #[test]
+    fn the_tables_leave_no_plaintext_behind_and_none_on_the_tape() {
+        let h = home();
+        let name = "unit-one";
+        let marker = "zebrawood-needle-path.bin";
+        let id = h.staged(ONE, name, &[("a.bin", &noise(4_000, 5)), (marker, b"x")]);
+        let mut medium = h.volume("T46-03");
+        h.write("T46-03", &mut medium).unwrap();
+        assert!(crate::db::stage_files::load(&h.conn, id)
+            .unwrap()
+            .iter()
+            .any(|r| r.path == marker));
+        let mut stack = vec![
+            std::path::PathBuf::from(&h.config.staging.directory),
+            h.paths.home.join("tmp"),
+        ];
+        let mut scanned = 0;
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                scanned += 1;
+                let bytes = fs::read(&p).unwrap();
+                assert!(
+                    !bytes.windows(marker.len()).any(|w| w == marker.as_bytes())
+                        && !bytes
+                            .windows(crate::volume::filetable::HEADER.len())
+                            .any(|w| w == crate::volume::filetable::HEADER.as_bytes()),
+                    "plaintext table at {}",
+                    p.display()
+                );
+            }
+        }
+        assert!(scanned > 0, "the scan reached staging's files");
+        let positions = entries(&mut medium);
+        let seal_at = medium.files.len() - 1;
+        for pos in [0usize, 1, 2, 3, seal_at] {
+            let mut bytes = Vec::new();
+            medium.read_file(pos as u32, &mut bytes).unwrap();
+            assert!(
+                !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                "file {pos} names a member"
+            );
+        }
+        assert!(positions.iter().all(|e| e.type_label != "file_table"));
     }
 }

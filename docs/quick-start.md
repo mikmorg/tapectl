@@ -29,9 +29,43 @@ Not on x86_64, or no release binary? Build it (Rust from <https://rustup.rs>):
 cargo install --locked --git https://github.com/mikmorg/tapectl
 ```
 
-tapectl also needs `dar`, `sg3-utils` and, for reading a tape back without tapectl,
-`age`, `mt-st` and `tar`. You need not install them first: `tapectl setup` checks
-and prints the install line for what is missing.
+tapectl also needs GNU tar 1.35 or later built with ACL support (the writer's floor),
+`sg3-utils` and, for reading a tape back without tapectl, `age` and `mt-st`. Debian 13 and
+Ubuntu 24.04 and later ship a tar at the floor; Debian 12 and Ubuntu 22.04 ship GNU tar
+1.34, which is below it, so read the next part before step 2. `tapectl setup` checks the
+tar first and, if it is below the floor, stops before it makes a home, a key or a file.
+It checks `sg3-utils`, `age` and `mt-st` later and prints the install line for what is
+missing.
+
+### Get a tar that meets the floor
+
+On Debian 12 or Ubuntu 22.04 (or any host whose `tar --version` says 1.34 or older), build
+GNU tar 1.35 from the upstream release into `/usr/local`, which leaves the system's tar
+alone. The build needs the ACL headers: without `libacl1-dev` a plain `./configure` quietly
+builds a tar with no ACL support, so the two `--with-` switches below make it fail instead.
+
+```bash
+sudo apt install build-essential libacl1-dev libattr1-dev xz-utils acl curl
+curl -fsSLO https://ftp.gnu.org/gnu/tar/tar-1.35.tar.xz
+echo "4d62ff37342ec7aed748535323930c7cf94acf71c3591882b26a7ea50f3edc16  tar-1.35.tar.xz" | sha256sum -c -
+tar -xf tar-1.35.tar.xz && cd tar-1.35
+./configure --prefix=/usr/local --with-posix-acls --with-xattrs --with-selinux=no
+make -j"$(nproc)" && sudo make install
+/usr/local/bin/tar --version
+```
+
+The last line should say `tar (GNU tar) 1.35`. Run `tapectl setup` from a shell where
+`/usr/local/bin` comes before `/usr/bin` in `PATH` (it does on a stock Debian or Ubuntu;
+`echo "$PATH"` shows it), or point tapectl at the new tar once it has a home:
+
+```bash
+tapectl config set tar.binary /usr/local/bin/tar
+```
+
+The proof is tapectl's own: `tapectl setup` goes past its first check, and step 8's
+`tapectl config check` prints `tar: ... (meets the writer's floor ...)`. The longer recipe,
+with how to check by hand that an ACL is written by number, is in
+[install.md](install.md#the-writers-tar).
 
 ## 2. Run `tapectl setup`
 
@@ -138,7 +172,7 @@ collection "photos": 2 created; 0 refused · 0 moved, 0 reactivated, 0 missing �
 8. Check: `tapectl config check`
 config: valid
 home: ~/.tapectl (~/.tapectl, the default: nothing named another home)
-dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
+tar: tar (GNU tar) 1.35 at '/usr/bin/tar' (meets the writer's floor, GNU tar 1.35 with ACL support)
 staging: '/srv/staging' exists and is writable
 …
   config check: ok
@@ -203,7 +237,7 @@ line; a fresh machine gets up to three:
 
 ```text
     sudo usermod -aG tape alice
-    sudo apt install dar sg3-utils age mt-st
+    sudo apt install sg3-utils age mt-st
     sudo loginctl enable-linger alice
 ```
 

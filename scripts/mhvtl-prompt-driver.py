@@ -2,8 +2,9 @@
 """mhvtl-prompt-driver.py -- the person at a cartridge prompt, for the mhvtl gate's span leg.
 
 A restore of a unit held across tapes stops at each tape's end and asks for the next
-cartridge (ADR-0012 items 89, 131 and 132; volume-format-v2.md 4.4): RESTORE.sh reads the
-answer from its input, and tapectl asks only when its input is a terminal (it refuses
+cartridge (ADR-0012 items 89, 131, 266 and 267; volume-format-v3.md): RESTORE.sh reads the
+answer from its input (ENTER: the cartridge is loaded; "done" or the end of the input: "I do
+not have it"; "quit"), and tapectl asks only when its input is a terminal (it does not ask
 unattended). This runs COMMAND with its input on a pipe, or with --pty on a pseudo-terminal
 (stdin only: that is all tapectl's terminal check reads), and its output and errors on one
 pipe, copied to this script's output as they come. Each time PROMPT appears in that output
@@ -12,15 +13,15 @@ environment: the prompt's number and the line it is on), and then ENTER is writt
 COMMAND's input. A prompt with no --swap left, or whose swap fails, is answered with --stop
 instead, so a run that asks more often than expected ends rather than hangs.
 
-At each prompt it records the dar processes running under COMMAND, when the prompt came
-and again just before ENTER is written: the mhvtl gate reads them to tell a dar run that
-waited across the swap (--stream-tapes) from one that has not started yet (the default
-mode). No process is looked up by its command line.
+At each prompt it records the tar processes running under COMMAND, when the prompt came
+and again just before ENTER is written: the mhvtl gate reads them to tell the one tar run
+that waited across the swap (Layout 3's RESTORE.sh feeds one tar run across the cartridges,
+item 267) from a tar that was started again. No process is looked up by its command line.
 
 --events FILE gets one JSON object per line: one per prompt
-  {"prompt", "line", "t_prompt", "dar_at_prompt", "swap_rc", "t_reply", "dar_at_reply",
+  {"prompt", "line", "t_prompt", "tar_at_prompt", "swap_rc", "t_reply", "tar_at_reply",
    "reply"}
-(times in seconds since COMMAND started, dar as [pid, ...]) and a last one
+(times in seconds since COMMAND started, tar as [pid, ...]) and a last one
   {"exit", "prompts", "elapsed", "timed_out"}.
 The exit status is COMMAND's; 124 when --timeout ended it.
 
@@ -67,8 +68,8 @@ def descendants(root):
     return found
 
 
-def dar_pids(root):
-    return sorted(pid for pid, comm in descendants(root) if comm == "dar")
+def tar_pids(root):
+    return sorted(pid for pid, comm in descendants(root) if comm == "tar")
 
 
 def main():
@@ -130,7 +131,7 @@ def main():
                 at = text.find(args.prompt, at + 1)
             line = text[text.rfind("\n", 0, at) + 1:].split("\n", 1)[0]
             event = {"prompt": answered, "line": line, "t_prompt": since(),
-                     "dar_at_prompt": dar_pids(child.pid)}
+                     "tar_at_prompt": tar_pids(child.pid)}
             if swaps:
                 env = dict(os.environ, PROMPT_N=str(answered), PROMPT_LINE=line)
                 print(f"\n[prompt-driver] prompt {answered}: running the swap", flush=True)
@@ -141,7 +142,7 @@ def main():
                       flush=True)
                 event["swap_rc"] = None
                 reply = args.stop
-            event["dar_at_reply"] = dar_pids(child.pid)
+            event["tar_at_reply"] = tar_pids(child.pid)
             event["t_reply"] = since()
             event["reply"] = reply
             events.write(json.dumps(event) + "\n")

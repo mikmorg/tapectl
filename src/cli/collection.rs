@@ -130,13 +130,13 @@ pub enum CollectionCommands {
 
     /// Show how each collection's pending units pack into tapes
     ///
-    /// The units are packed in name order, each tape filled until the next
-    /// unit does not fit (next-fit): each batch is one tape's worth. A unit
-    /// that allows spanning (`allow_spanning`) is not held to one
-    /// tape: it goes last in its batch, and the plan names the unit that
-    /// spans onto the next cartridge. It is refused when it is larger than
-    /// the staging area, or, on a drive that does not declare
-    /// `post_warning_bytes`, larger than the room under the fill ceiling.
+    /// The units are packed in name order, each tape filled until the plan
+    /// passes its bound (next-fit): each batch is one tape's worth, and the
+    /// unit that carries it past the bound is the batch's last, continued on
+    /// the next cartridge. No unit is held to one tape; one larger than the
+    /// staging area is refused. A run may take more than a batch lists: the
+    /// batch is sized by estimate, and when its staged units pack smaller it
+    /// stages the next units until the plan passes the bound.
     ///
     /// The units already staged and still owed a copy are listed after the
     /// batches, with the command that writes them.
@@ -1265,51 +1265,37 @@ fn largest_unit_line(l: &collection::plan::LargestUnit) -> String {
 }
 
 /// The lines naming where a batch's units sit on its tape past the fill
-/// ceiling ([`collection::plan::BatchPlacement`]): the whole units past it
-/// (ADR-0012 item 113), the units that allow spanning past it (items 83 and
-/// 95), and the one that spans (items 94 and 123), with the whole units that
-/// go after its tail on its last tape when it is larger than one tape (item
-/// 147). None when the batch fits under the ceiling, as every batch does
-/// unless the drive declares `post_warning_bytes`.
+/// ceiling ([`collection::plan::BatchPlacement`]): the units planned past it
+/// (ADR-0012 item 113) and the unit that carries the plan past its bound
+/// (items 123, 288 and 289), which continues on the next cartridge. None when
+/// the batch fits under the ceiling.
 fn placement_lines(at: &collection::plan::BatchPlacement) -> Vec<String> {
     let mut lines = Vec::new();
     if !at.past_ceiling.is_empty() {
         lines.push(format!(
-            "past the fill ceiling (the tape may end before them; a unit it ends before is cut \
-             and stays staged for the next cartridge): {}",
+            "past the fill ceiling (the tape's early warning may end it inside one; the rest \
+             of that unit continues on the next cartridge): {}",
             at.past_ceiling.join(", ")
         ));
     }
-    if !at.may_span.is_empty() {
+    if let Some(unit) = &at.continues {
         lines.push(format!(
-            "may span: last on its batch's tape, past the fill ceiling; if the tape ends inside \
-             it, continued on the next: {}",
-            at.may_span.join(", ")
+            "last on its batch's tape, continued on the next cartridge: {unit}"
         ));
-    }
-    if let Some(unit) = &at.spans {
-        if at.after_tail.is_empty() {
-            lines.push(format!(
-                "spans: last on its batch's tape, continued on the next: {unit}"
-            ));
-        } else {
-            lines.push(format!(
-                "spans: larger than one tape, first on its batch's first tape, continued on \
-                 the next: {unit}"
-            ));
-            lines.push(format!(
-                "after the span's tail, on its last tape (ADR-0012 item 147): {}",
-                at.after_tail.join(", ")
-            ));
-        }
     }
     lines
 }
 
 /// The line after `collection plan`'s cartridge count when a batch has a
 /// unit that spans (#478): its continuation takes room the count does not.
-const SPAN_COUNT_CAVEAT: &str = "the count is a minimum: a unit that spans continues on the next \
-                                 cartridge, ahead of the units planned there";
+const SPAN_COUNT_CAVEAT: &str = "the count is a minimum: a unit that continues on the next \
+                                 cartridge goes there ahead of the units planned there";
+
+/// The line after `collection plan`'s batches (ADR-0012 item 289): the plan
+/// reads sizes estimated before staging, and a run goes by the staged ones.
+const RUN_MAY_TAKE_MORE: &str = "a run may take more than a batch lists: the batch is sized by \
+                                 estimate, and when its staged units pack smaller the run \
+                                 stages the next units until the plan passes the tape's bound";
 
 /// Every file the run's release could not remove (issue #108): the
 /// whole-set release's and the per-slice release's. Their `staging_path`
@@ -1425,12 +1411,10 @@ fn cmd_plan(
                             // ADR-0012 item 113: empty unless the drive
                             // declares post_warning_bytes.
                             "past_ceiling": at.past_ceiling,
-                            // #478 (items 83, 94, 95, 123 and 147): empty and
-                            // null unless a unit allows spanning, and the
-                            // drive declares post_warning_bytes.
-                            "may_span": at.may_span,
-                            "spans": at.spans,
-                            "after_tail": at.after_tail,
+                            // Items 288 and 289: the unit that carries the
+                            // plan past its bound and continues on the next
+                            // cartridge; null when the batch fits.
+                            "continues": at.continues,
                             "findings": b
                                 .unit_names()
                                 .into_iter()
@@ -1515,8 +1499,14 @@ fn cmd_plan(
                     crate::render::plural(copies, "copy", "copies"),
                     crate::render::plural(batches.len() as i64 * copies, "cartridge", "cartridges"),
                 );
-                if batches.iter().any(|b| packed.placement(b).spans.is_some()) {
+                if batches
+                    .iter()
+                    .any(|b| packed.placement(b).continues.is_some())
+                {
                     println!("  {SPAN_COUNT_CAVEAT}");
+                }
+                if !batches.is_empty() {
+                    println!("  {RUN_MAY_TAKE_MORE}");
                 }
                 if let Some(l) = largest {
                     println!("  {}", largest_unit_line(l));
@@ -1822,9 +1812,7 @@ fn print_dry_run(d: &DryRun<'_>, json_output: bool) {
                 "budget_from": d.budget_from,
                 "packing_bytes": d.packing_bytes,
                 "past_ceiling": d.at.past_ceiling,
-                "may_span": d.at.may_span,
-                "spans": d.at.spans,
-                "after_tail": d.at.after_tail,
+                "continues": d.at.continues,
                 "units": d.batch.unit_names(),
                 "labels": [d.req.label],
                 // ADR-0012 item 210, additive.
@@ -1973,7 +1961,7 @@ fn run_batch(
     // and the batch index was bounds-checked — so a dry run has already
     // surfaced every reason this run would fail, and is not merely silent.
     // `execute_batch` below is where it stops being reversible: it stages
-    // the whole batch (dar + age, hours and a tape's worth of staging disk)
+    // the whole batch (tar + age, hours and a tape's worth of staging disk)
     // and then writes and SEALS a volume, which ADR-0003 makes immutable.
     // The cartridge is consumed; there is no undo. So the return goes here,
     // printing the plan the run would have executed: the budget line above,
@@ -1998,7 +1986,15 @@ fn run_batch(
         return Ok(exit_code);
     }
 
-    let report = collection::batch::execute_batch_with(
+    // ADR-0012 item 289: the units pending after this batch, for the rounds
+    // that follow its staging, and the destination's whole room the plan of
+    // the staged bytes is asked against.
+    let following: Vec<collection::selector::PendingUnit> = batches
+        .iter()
+        .skip(batch_idx + 1)
+        .flat_map(|b| b.units.iter().cloned())
+        .collect();
+    let report = collection::batch::execute_batch_rounds(
         conn,
         paths,
         config,
@@ -2009,6 +2005,13 @@ fn run_batch(
         req.confirm,
         req.move_to,
         assume_yes,
+        Some(collection::batch::Rounds {
+            room: collection::selector::BatchRoom {
+                fill: budget.fill_bytes,
+                bound: budget.plan_bound_bytes,
+            },
+            following: &following,
+        }),
     )?;
 
     // Issue #108: a file the release could not remove is named, whatever
@@ -2033,10 +2036,11 @@ fn run_batch(
                 "budget_from": budget.binding_label,
                 "packing_bytes": budget.packing_bytes(),
                 "past_ceiling": at.past_ceiling,
-                "may_span": at.may_span,
-                "spans": at.spans,
-                "after_tail": at.after_tail,
+                "continues": at.continues,
                 "units_staged": report.units_staged,
+                // ADR-0012 item 289: the units staged in rounds after the
+                // batch, because the plan had not yet passed its bound.
+                "rounds_staged": report.rounds_staged,
                 "copies_written": report.copies_written,
                 // ADR-0012 item 217: per unit. True when no unit of the batch
                 // kept its staging (the release did not fail); the units
@@ -2092,6 +2096,14 @@ fn run_batch(
             crate::render::plural(report.units_staged as i64, "unit", "units"),
             crate::render::plural(report.copies_written as i64, "copy", "copies"),
         );
+        if !report.rounds_staged.is_empty() {
+            println!(
+                "  the batch packed smaller staged than estimated, so the run staged {} more \
+                 until the plan passed the tape's bound (ADR-0012 item 289): {}",
+                crate::render::plural(report.rounds_staged.len() as i64, "unit", "units"),
+                report.rounds_staged.join(", ")
+            );
+        }
         if let Some(summary) = &summary {
             println!("{}", summary.line());
         }
@@ -2540,9 +2552,9 @@ mod checksum_mode_tests {
                 archive_set: None,
                 checksum_mode: None,
                 compression: None,
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec![],
             },
@@ -2602,11 +2614,12 @@ mod checksum_mode_tests {
         assert!(!line.contains("above a tenth"), "{line}");
     }
 
-    /// ADR-0012 item 113: `collection plan` and `collection run` name a
-    /// batch's units past the fill ceiling, in the batch's order, and say
-    /// nothing for a batch under it — every batch, without a plan bound.
+    /// ADR-0012 items 113, 288 and 289: `collection plan` and `collection run`
+    /// name a batch's units past the fill ceiling, in the batch's order, and
+    /// the unit that carries the plan past the bound, which continues on the
+    /// next cartridge; and say nothing for a batch under the ceiling.
     #[test]
-    fn a_batch_names_its_units_past_the_fill_ceiling_and_only_those() {
+    fn a_batch_names_its_units_past_the_fill_ceiling_and_the_one_that_continues() {
         let bs = 512 * 1024u64;
         let unit = |name: &str, blocks: u64| collection::selector::PendingUnit {
             name: name.into(),
@@ -2616,75 +2629,29 @@ mod checksum_mode_tests {
             units: vec![unit("lib/a", 3), unit("lib/b", 3), unit("lib/c", 2)],
             ..Default::default()
         };
-        let lines = |fill: u64| {
+        let lines = |fill: u64, bound: u64| {
             let room = collection::selector::BatchRoom {
                 fill,
-                bound: Some(u64::MAX),
+                bound: Some(bound),
             };
-            placement_lines(&collection::plan::placement(
-                &batch,
-                room,
-                &Default::default(),
-            ))
+            placement_lines(&collection::plan::placement(&batch, room))
         };
-        assert!(lines(8 * bs).is_empty(), "all under");
-        let lines = lines(4 * bs);
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines(8 * bs, 20 * bs).is_empty(), "all under");
+        // Fill 4 blocks, bound 20: a (3) is under, b (6) and c (8) are past
+        // the ceiling within the bound.
+        let past = lines(4 * bs, 20 * bs);
+        assert_eq!(past.len(), 1, "{past:?}");
         assert!(
-            lines[0].starts_with("past the fill ceiling (the tape may end before them;"),
-            "{lines:?}"
+            past[0].starts_with("past the fill ceiling (the tape's early warning may end it"),
+            "{past:?}"
         );
-        assert!(lines[0].ends_with(": lib/b, lib/c"), "{lines:?}");
-    }
-
-    /// #478 (ADR-0012 items 94, 95, 123 and 147): the preview names the unit
-    /// that spans, last on its batch's tape and continued on the next, and
-    /// a unit that allows spanning past the fill ceiling as one that may. A
-    /// 10-block tape at a 6-block ceiling: `lib/a` (3) and `lib/m` (4,
-    /// spannable, past the ceiling, ending at 7) on one; `lib/z` (12,
-    /// spannable) alone crosses the bound.
-    #[test]
-    fn the_preview_names_the_unit_that_spans_and_one_that_may() {
-        let bs = 512 * 1024u64;
-        let unit = |name: &str, blocks: u64| collection::selector::PendingUnit {
-            name: name.into(),
-            size_bytes: blocks * bs,
-        };
-        let room = collection::selector::BatchRoom {
-            fill: 6 * bs,
-            bound: Some(10 * bs),
-        };
-        let spannable: std::collections::HashSet<String> =
-            ["lib/m".to_string(), "lib/z".to_string()].into();
-        let lines = |units: Vec<collection::selector::PendingUnit>| {
-            let batch = collection::selector::Batch {
-                units,
-                ..Default::default()
-            };
-            placement_lines(&collection::plan::placement(&batch, room, &spannable))
-        };
+        assert!(past[0].ends_with(": lib/b, lib/c"), "{past:?}");
+        // A bound of 7 blocks: c would end at 8, so it is the batch's last,
+        // continued on the next cartridge.
+        let tail = lines(4 * bs, 7 * bs);
         assert_eq!(
-            lines(vec![unit("lib/z", 12)]),
-            ["spans: last on its batch's tape, continued on the next: lib/z"]
-        );
-        assert_eq!(
-            lines(vec![unit("lib/a", 3), unit("lib/m", 4)]),
-            [
-                "may span: last on its batch's tape, past the fill ceiling; if the tape ends \
-                 inside it, continued on the next: lib/m"
-            ]
-        );
-        assert!(lines(vec![unit("lib/a", 1), unit("lib/m", 1)]).is_empty());
-        // Item 147: beside whole units, `lib/z`, larger than one tape, starts
-        // its batch's first tape; by X11's estimate (10 blocks a tape) its
-        // last tape holds its last 2, and `lib/a` goes after that tail.
-        assert_eq!(
-            lines(vec![unit("lib/a", 1), unit("lib/z", 12)]),
-            [
-                "spans: larger than one tape, first on its batch's first tape, continued on the \
-                 next: lib/z",
-                "after the span's tail, on its last tape (ADR-0012 item 147): lib/a",
-            ]
+            tail.last().unwrap(),
+            "last on its batch's tape, continued on the next cartridge: lib/c"
         );
     }
 
@@ -2728,6 +2695,7 @@ mod checksum_mode_tests {
         };
         let report = collection::batch::BatchExecutionReport {
             units_staged: 2,
+            rounds_staged: Vec::new(),
             copies_written: 1,
             cleaned: Some(whole),
             released_units: Vec::new(),
@@ -2777,7 +2745,7 @@ mod checksum_mode_tests {
 /// `collection run --init` and `--move-to` (ADR-0012 item 210), the whole
 /// run on a medium in memory: everything real but the drive. The tenants and
 /// the escrow recipient are made as `init` and `tenant add` make them, the
-/// collection's units registered by `collection sync`, staged by the real dar
+/// collection's units registered by `collection sync`, staged by the real tar
 /// and age, the destination initialized by the real `volume init` and written
 /// by the real `volume write` over a [`MemStore`] (`MemDrive`, the
 /// [`collection::batch::RunDrive`] seam), and moved by `volume write
@@ -2833,7 +2801,6 @@ mod run_tests {
         let root = root.canonicalize().unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string();
         config.staging.directory = staging.to_string_lossy().into_owned();
         config.defaults.min_copies = min_copies;
         config.backends.lto.push(LtoBackendConfig {

@@ -823,7 +823,10 @@ The detail, ratified with the rest of this list (item 290):
   adds nothing around the frame. **Determined** (the frame's fields): gzip is one
   member, with no file name and a zero time in its header; xz is one `.xz` stream with
   the CRC64 check, as the `xz` tool writes by default; zstd is one frame with its content
-  checksum on and the content size stated. A slice is compressed on one thread, so that
+  checksum on and the content size not stated, written as the cut comes (corrected
+  2026-11-18 at T4.5's integration: a stated size needs the whole cut first, which held up
+  to `slice_size` in memory per slice; the size is not a ruled byte, item 290 names only
+  the frame). A slice is compressed on one thread, so that
   memory is bounded by the level.
 - **The levels.** `compression_level` is a whole number in the algorithm's own range
   (**determined:** gzip 1 to 9, xz 0 to 9, zstd 1 to 19). When it is not set the
@@ -1375,7 +1378,7 @@ is integrated):
 | E | T4.8, T4.9, T4.10 | readers of what T4.6 defined; file-disjoint |
 | F | T4.7, T4.11 | |
 | G | T4.12 | |
-| H | T4.13, T4.14 | |
+| H | T4.13, T4.14, T4.17 | T4.17 edits the heir's script after T4.12 and is file-disjoint from T4.13 and T4.14 |
 | I | T4.15 | dar leaves |
 | J | T4.16 (coordinator) | the gate and the suites on Layout 3; the tape chain is green again |
 
@@ -1612,6 +1615,9 @@ file and an excluded folder reports all three, shown by a test; the suite is gre
 and `recheck`; `src/staging/files.rs`.
 
 **Fence:** `src/staging/*` (all of it); `src/cli/stage.rs`; `src/cli/config.rs`;
+`src/db/migrations/001_baseline.sql` (`archive_sets.compression_level`,
+`stage_sets.compression_level` and `stage_slices.continues` only: format Appendix A.2;
+*added 2026-11-18*, T4.3's fence held only D11's columns);
 `src/policy/depth_check.rs`; `src/config.rs` (`[tar]`, and the keys D11 removes or
 redefines); `src/setup.rs` and `src/main.rs` (the tool checks only);
 `tests/pass_budget.rs`, `tests/cli_smoke.rs`, `tests/test_dependencies.rs`, `tests/setup.rs`.
@@ -1706,6 +1712,35 @@ floor, one that writes names, and one that writes no ACL record each refuse the 
 name.
 **Done when:** `stage create`, `quick-archive` and `collection run` stage on tar; nothing
 under `src/staging/` names dar; the pending list is in the report; the suite is green.
+
+### T4.5b A staging job's memory counts its compressor (#570)
+
+Added 2026-11-18 at T4.5's integration. **Owner:** worker. **Depends on:** T4.5. **Runs
+beside** T4.6 (disjoint files).
+
+**Build.** `staging::jobs::effective_jobs` admits jobs at a flat `MEMORY_PER_JOB` (192 MiB),
+which does not count the compressor's own working memory: xz at level 9 takes about 674 MiB
+to pack and 65 MiB to decode again (the decode-and-compare check runs beside the packer).
+Give each job its own figure, from its resolved compression and level: 192 MiB plus the
+algorithm's pack and decode memory at that level, read from a table in `staging::pack`
+beside the level ranges (gzip, xz and zstd, each level; the figures from each library's
+own documentation, cited in the table's comment, never guessed). `effective_jobs` judges
+the queue by the jobs' own figures, and its notice names the compression and level when
+it lowers the count.
+
+**Fence:** `src/staging/jobs.rs`, `src/staging/pack.rs` (the table only).
+
+**Done when:** a test shows that the memory which holds three jobs at `none` holds fewer at
+xz 9, and the notice names the level; each figure in the table cites its source; the suite
+is green.
+
+**For T4.6 to T4.10 (binding, found at T4.5's integration).** T4.5 needed only two
+`L3-pending` marks, because most restore, rebuild, heir and write tests build their
+archives by hand (`dar::create`, fixture stage sets), and the write path accepts a NULL
+`catalog_path`. Those tests will not go red when their path is ported wrongly. Each of
+T4.6 to T4.10 therefore drives its own tests from a **real staging** (`stage create` on a
+made tree, as `src/staging/tar_stage_tests.rs` does) and ports or deletes every test of its
+path that builds a dar archive by hand; the report lists each.
 
 ### T4.6 What a tape carries: Layout 3's identity, the MANIFEST, the envelopes, both ways
 
@@ -1807,7 +1842,10 @@ layout is parsed.
 (a range); ADR-0012 items 101 to 103 (what a damaged slice and a damaged file mean), 127, 264;
 `src/volume/restore/supply.rs`'s module doc; `src/volume/restore/fill.rs`.
 
-**Fence:** `src/volume/restore.rs`, `src/volume/restore/*`, `src/volume/slice_holders.rs`,
+**Fence:** `src/db/migrations/001_baseline.sql` (`restores.tar_argv`, `tar_exit_code`,
+`tar_stdout`, `tar_stderr`, `tar_version`, each after its `dar_*` twin, with the pin in
+`restore_record.rs`'s `restores_has_its_columns_and_indexes`; *added 2026-11-18*: T4.3 could
+not add them without that pin), `src/volume/restore.rs`, `src/volume/restore/*`, `src/volume/slice_holders.rs`,
 `src/volume/restore_record.rs`, `src/cli/restore.rs`, `tests/restore_key.rs`,
 `tests/integration.rs` (restore tests only).
 
@@ -2152,7 +2190,7 @@ history in comments that the coordinator accepts, listed in the report; `grep -r
 
 ### T4.16 The gate and the suites on Layout 3
 
-**Owner:** coordinator (a `scripts/` change is proven only on tape). **Depends:** T4.15.
+**Owner:** coordinator (a `scripts/` change is proven only on tape). **Depends:** T4.15, T4.17.
 
 `scripts/mhvtl-verify-gate.sh`, `scripts/lifecycle-suite.sh`, `scripts/plaintext-scan.sh`,
 `scripts/short-seal-acceptance.sh`, `scripts/span-acceptance.sh`, `scripts/lbp-acceptance.sh`,
@@ -2168,6 +2206,75 @@ algorithm carried, with the real decompressor**. Legs that proved dar's stream (
 restated. The lifecycle suite's restore matrix keeps its twelve methods. Each run record
 names the age version and the tar version. **Done when** the whole chain of T6.5 is green
 on `layout-3`.
+
+### T4.17 A name that is not UTF-8 (#569)
+
+**Owner:** worker. **Depends:** T4.8, T4.12 (the heir's script is edited after its part
+three). **Carries out:** item 297; #569. *Added 2026-11-19, when the CTO ruled #569 into
+2.0.0.* **Read:** ADR-0012 item 297 and its determinations; `volume-format-v3.md` §1.5 (the
+escape's fifth case), §1.6, §1.7, §7.2 to §7.4; #569; `src/volume/index.rs`'s `escape` and
+`unescape`.
+
+**Fence** (the coordinator narrows it at dispatch with a grep of the lossy conversions of a
+path inside a unit): `src/volume/index.rs` (the escape), `src/volume/filetable.rs`, the
+snapshot's walk and the exclusion match (`src/staging/`), the list given to tar
+(`src/staging/archive.rs`, `src/tar/`), the stream reader's comparison (`src/tar/stream.rs`,
+`src/tar/pax.rs`), the catalog's writers and readers of paths (`src/db/`), the restores'
+lookup, disk check and repair (`src/volume/restore.rs`, `src/volume/restore/`), `unit
+check-integrity`, the commands that take a path (`src/cli/restore.rs`, `src/cli/unit.rs`),
+`src/volume/heir/RESTORE.sh` (the per-file check's unescape) with `tests/heir_restore.rs`
+and `tests/common/heir/`, and their tests.
+
+**Build:**
+1. **One pair of functions.** `escape` takes a name's bytes and writes §1.5's form, `\xHH`
+   for each byte outside a valid UTF-8 sequence; `unescape` gives the bytes back. Every path
+   inside a unit passes through them, and through nothing lossy: `to_string_lossy` and
+   `to_str` do not touch such a path anywhere.
+2. **The snapshot** records each path in the escaped form; the catalog keeps that form
+   (item 297). The exclusion patterns match a UTF-8 name as before; a name that is not UTF-8
+   is matched in its escaped form.
+3. **Staging** writes tar's file list from the unescaped bytes (`--null`), and the stream
+   reader compares the stream's bytes with the list's. The pax `path` and `linkpath` records
+   carry the raw bytes under `LC_ALL=C` (measured 2026-11-19, GNU tar 1.35); a record under
+   `hdrcharset=BINARY` means the same bytes and is accepted. The file table, the id map and
+   the index are written with the escape.
+4. **tapectl's restores** find a member by its escaped path, check it on disk by its bytes,
+   and repair it by the same. `restore file --path`, `unit check-integrity` and every other
+   command that takes a path inside a unit take it as bytes from the command line and escape
+   it for the lookup. Output and `--json` show the escaped form.
+5. **The heir's script** unescapes a path only where it names a file on disk: the per-file
+   check. `--path` and `--paths-from` take the escaped form, as `--list` and the
+   damaged-file list write it. The unescape is one awk program, run under gawk, mawk and
+   BusyBox awk with `LC_ALL=C`.
+6. A unit's own root that is not UTF-8 is refused by name at `unit init`; unit, tenant and
+   location names stay UTF-8 text, as today.
+
+**Traps:**
+- A UTF-8 name is written exactly as before on tape. In the catalog a name with a
+  backslash, TAB, LF or CR now reads escaped, as on tape; a test names one.
+- The id map's host names are text from the host: the same escape covers a name that is not
+  UTF-8.
+- `printf %b` is not the unescape: it reads other escapes (`\c` stops output). Write the
+  bytes by their codes, and prove the awk program on all three awks.
+- `sha256sum -c` takes raw bytes in a name; a name with a backslash or LF needs sha256sum's
+  own escaped line, which T4.10's check already writes and reads.
+- Nothing in a JSON document is a byte outside UTF-8: the escaped form is what `--json`
+  carries.
+
+**Verify:** a unit holding a name in Latin-1 (`caf\xe9.txt`), a folder so named with a file
+in it, a hard link and a symbolic link whose target is such a name, and UTF-8 names with a
+backslash, a TAB and an LF. Stage it, write it on `MemStore`, then:
+- `restore unit`, and `restore file` with the name typed as bytes;
+- `catalog rebuild`, and a second copy written from the rebuilt catalog;
+- `unit check-integrity`, clean;
+- the heir's `--list`, `--restore`, `--path`, `--paths-from` with the damaged-file list
+  round-tripping the name, and the per-file check catching a damaged one.
+
+Every restored name is compared byte for byte with the source. The test that writes the
+unit fails on the parent (the staging is refused).
+
+**Done when:** #569's criteria are met; the suite is green; the coordinator's Ubuntu 26.04
+container run of the heir's tests passes as uid 1000.
 ---
 
 ## S5. Stage 5: every carried feature, proven on the new payload
@@ -2179,7 +2286,15 @@ on Layout 3. Most of this stage is proof, with the fixes the proof finds.
 
 Waves: T5.1 alone (it touches the write plan); then T5.2 and T5.4; then T5.3 alone (it
 shares `src/cli/audit.rs` and `src/cli/report.rs` with T5.2, and its order of work is a
-safety rule); then T5.5, T5.6, T5.7.
+safety rule); then T5.5, T5.6, T5.7 and T5.8 (T5.8 waits for T5.5 if the doc #543 names
+is one of T5.8's); then T5.9; then T5.10 alone; then T5.11 alone, on the CTO's choice.
+
+The coordinator, at the landings: when T5.4 lands, rehearses the warehouse write-back on
+mhvtl (a volume's files dumped, written back to a blank cartridge one tape file each, then
+`RESTORE.sh --verify` and a restore), since T5.4 wrote it from the format document alone;
+when T5.1's text lands in the guides (T5.8), corrects `docs/coordinator-handoff.md` the same
+way; and when Stage 5 merges `layout-3` to `master`, corrects `CLAUDE.md` where it still
+calls Layout 2 normative and dar a dependency (T6.7 rewrites it for the release).
 
 ### T5.1 Every unit continues at the early warning, and the queue is filled to it (items 246, 288, 289)
 
@@ -2393,6 +2508,10 @@ readback has taken the rest; item 93's shape (two copies: tapes
 1 and 3, or tape 2 alone) and a unit on three tapes restore whole through tapectl and
 through the heir's script, in tests and on mhvtl (`scripts/span-acceptance.sh --mhvtl`);
 `grep -rn 'allow_spanning\|may_span' src tests` finds nothing; the suite is green.
+*Added at T4.16 (the coordinator):* the "PENDING T5.1" block of
+`examples/short_seal_filler.rs`'s `compare` (a writer's `cut` read back by a rebuild as the
+`range` it is) is deleted, and `scripts/short-seal-acceptance.sh --mhvtl` passes without it;
+the `# T5.1 removes this` lines of the gate and the acceptances go with `allow_spanning`.
 
 ### T5.2 Two places, and the per-location writes (#550; items 147 to 160, 257)
 
@@ -2515,7 +2634,12 @@ before it makes a home, shown by a test with a stand-in tar; the quick start's s
 home pointer, the tape lock and `tapectl-op`, as its criteria list them. #545 is the
 coordinator's: the three rulings adjusted while building have their item (261), and the two
 stale texts are corrected.
+Also: `scripts/upgrade-mhvtl.sh` and `scripts/shaping-drive-phase.sh` still set up dar
+(`DAR_BIN`), which T4.15 removed; they follow the tar writer (`--tar`/`TAR_BIN`, as
+`first-run.sh` and the suites do) or drop the dar step. Neither is in the proof chain, so
+`bash -n` and the coordinator's run of each prove them.
 **Fence:** `scripts/first-run.sh`, `scripts/install-systemd.sh`, `scripts/check-tapectl-op.sh`,
+`scripts/upgrade-mhvtl.sh`, `scripts/shaping-drive-phase.sh`,
 `contrib/systemd/tapectl-op.in`, and the doc #543 names as contradicting `tapectl-op`; the
 `tests/first_run_*.rs` pins of a text this task changes.
 **Done when:** each of #543's criteria is met or reported as needing the tape; `bash -n`
@@ -2551,6 +2675,69 @@ size on tape and the early warning's rules hold with slices of unequal size.
 `tests/catalog_rebuild.rs`, `tests/format_v3.rs`. A source file is changed only for a defect
 a proof shows: report the defect and the file first.
 **Done when:** each sentence above has a test for each algorithm carried, on real stagings;
+the suite is green.
+
+### T5.8 The guides follow T5.1
+
+**Owner:** worker. T5.1 removed the `cut` unit, `allow_spanning` and `may_span` from the
+binary and from `docs/configuration.md`; the guides still describe them. Every statement of
+them, and of a unit that waits for the next tape because it would not fit, follows items
+288 and 289: a unit continues on the next cartridge at the early warning with no opt-in, a
+set planned after the warning gets no `writes` row and stays staged, and an interrupted set's
+row is a `range`. `docs/lto6-validation-checklist.md` is the real-drive procedure of T6.6:
+its spanning and short-seal steps match `scripts/span-acceptance.sh` and
+`scripts/short-seal-acceptance.sh` as T5.1 left them, and its old-binary step (`OLD_BIN`,
+the Layout 2 write T4.16 dropped from the LBP acceptance) goes. Every command shown passes
+`check-docs.py`; output shown is what the binary prints, run in a temp home.
+**Fence:** `docs/operator-guide.md` (not the warehouse section, T5.4's), `docs/troubleshooting.md`,
+`docs/handoff.md` (its undated text; a dated step's record stays as written),
+`docs/lto6-validation-checklist.md`.
+**Done when:** `grep -n -i "allow_spanning\|may_span\|cut unit\|OLD_BIN"` over the fence
+finds only text that says they are gone; `check-docs.py` reports nothing.
+
+### T5.9 What dar and Layout 2 left in the code
+
+**Owner:** worker. **Depends:** T5.6 and T5.7 have landed (shared files).
+1. #524 criterion 2: the not-initialised message (`src/startup.rs`) does not offer plain
+   `tapectl init` to a reader who came from the Heir Kit's sheet without saying what it
+   mints. Criteria 1 and 3 are checked as T4.14 left them and reported.
+2. `catalogs_dir` (`src/config.rs`, its uses in `src/staging/mod.rs`, and `init` making
+   `catalogs/`) held dar catalogues, which Layout 3 has none of: it goes, unless a reader of
+   Layout 3 still uses it (say which).
+3. Comments and messages that cite `volume-format-v2.md` (`src/volume/restore.rs`,
+   `src/volume/restore/span.rs`'s user-visible text, and any other a grep finds) cite the
+   Layout 3 section that holds the rule, or drop the citation where none does.
+**Fence:** `src/startup.rs`, `src/config.rs` (only `catalogs_dir`), `src/staging/mod.rs`
+(only `catalogs_dir`), the `init` home-making code, the files the grep in 3 names (comments
+and message text only), their tests, the generated pages if a message in them changes.
+**Done when:** a test pins the message of 1 (seen failing first); a new home has no
+`catalogs/`; `grep -rn "volume-format-v2" src/` finds nothing; the suite is green.
+
+### T5.10 The restore's memory (#571)
+
+**Owner:** worker for the measurement; the choice is the CTO's. tapectl's restore holds a
+whole slice's decoded cut in memory (T4.8's reader), so its peak follows `slice_size`.
+Measure it on a real staging at two slice sizes and state it in the docs as a function of
+`slice_size` (or of the largest member). Then STOP: bounding it below `slice_size` (one
+member at a time, a long member streamed by the run mechanism) or accepting the bound with a
+warning from `config check` and the restore when `slice_size` exceeds available memory is
+the CTO's choice (Appendix B), and the build follows it.
+**Fence:** a test of the measurement, `docs/configuration.md`'s `slice_size` row.
+**Done when:** the measurement is a test that states the peak; the choice is with the CTO.
+
+### T5.11 The restore's memory, as ruled (#571, item 298)
+
+**Owner:** worker. The CTO chose A (item 298): the restore keeps one whole slice in memory,
+sizes each buffer exactly from the catalog (the frame from the encrypted size, the cut from
+`size_bytes`), frees the frame before tar is fed, and warns, from `config check` and from the
+restore, when the figure (1× the slice uncompressed, frame plus cut, about 2×, compressed) is
+more than `MemAvailable`. Item 298's determinations say where each figure comes from.
+**Fence:** the restore reader and its supply (`src/volume/restore/`), the restore's entry,
+`config check`, `tests/restore_memory.rs` (its bounds tightened to the new figure, and a slice
+size that is not a power of two, so that exact sizing is proved and not met by chance), and
+the `slice_size` row of `docs/configuration.md`.
+**Done when:** `tests/restore_memory.rs` holds the peak at the new figure at every size it
+measures; both warnings are tested through a pure function that takes the available memory;
 the suite is green.
 
 ---
@@ -2678,7 +2865,7 @@ coordinator when every task named beside it has landed and the gate has run.
 | #521 | T4.12 (the cartridge at the prompt); its `--swap-tapes` mode is gone (item 255) | #545 | T5.5 |
 | #522 | T4.13 | #546 | T2.6 |
 | #523 | T4.13 | #547 | T4.6 |
-| #524 | T4.14 | #548 | T5.6 (the clock), T6.2, Stage 7 step 4 (the drill) |
+| #524 | T4.14, T5.9 (criterion 2) | #548 | T5.6 (the clock), T6.2, Stage 7 step 4 (the drill) |
 | #525 | T4.10 | #549 | deferred (item 251) |
 | #526 | T4.13 | #550 | T5.2 |
 | #527 | T2.5 | #551 | T6.1 |
@@ -2697,6 +2884,8 @@ coordinator when every task named beside it has landed and the gate has run.
 | #540 | T2.4 | #564 | T1.3, T4.3, T4.5, T4.6, T4.8, T4.9, T4.11 |
 | #541 | T2.1 | #565 | T0.5, T0.6, T4.0, T4.5, T4.6, T4.8, T4.10, T4.13, T4.14, T4.16, T5.7 |
 | #566 | closed: slices stay (item 282) | #567 | T0.7, T4.2, T4.3, T4.5, T4.6, T4.8 to T4.13, T4.16, T5.1, T5.3 |
+| #569 | T4.17 (item 297) | #570 | T4.5b |
+| #571 | T5.10 (the measurement), T5.11 (item 298: A) | | |
 
 **ADR-0012's items from 239.**
 
@@ -2728,6 +2917,7 @@ coordinator when every task named beside it has landed and the gate has run.
 | 283 a slice ends at a member's start | T0.7, T4.2, T4.3, T4.5, T4.6, T4.8, T4.10 to T4.13; section 5, rules 4 and 13 | 287 an archive may set a level | T4.5, T5.7 |
 | 284 each slice compressed alone | T0.5, T4.5, T4.8, T4.10; section 5, rule 11 | 288 every unit continues at the early warning | T4.6, T4.9, T4.12, T5.1, T5.3, T6.6 |
 | 285 gzip, xz and zstd are carried | T0.5, T0.6, T4.0, T4.5, T4.15 | 289 the queue is filled to the warning | T5.1, T6.6 |
+| 297 a name that is not UTF-8 is carried by its bytes | T4.17 | | |
 
 **#562's rules for the format document.** Each is written into the format document by T1.1
 and built where shown.
@@ -2771,3 +2961,6 @@ and built where shown.
    document.
 4. Each real-drive run of T6.6, and the tag.
 5. A SERIOUS finding of T6.1 or T6.2, and a finding that asks for a design change.
+6. #571 (T5.10): whether the restore's memory is bounded below `slice_size` or the bound
+   is accepted with a warning, once T5.10 has measured it. Ruled 2026-11-20 (item 298):
+   accepted, with exact sizing and two warnings; T5.11 builds it.

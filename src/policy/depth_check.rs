@@ -3,7 +3,7 @@
 //! fails `config check`'s exit code, and it never opens a tape device (only
 //! `Path::exists` on the configured device paths).
 //!
-//! Following the [`crate::policy::subsumed`] pattern, I/O-performing `check_*`
+//! I/O-performing `check_*`
 //! functions are kept separate from pure `describe_*` functions so the text
 //! and `--json` arms of `config check` can never drift, and so the wording
 //! is unit-testable without touching a filesystem.
@@ -12,26 +12,27 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::dar::version;
 
-/// Result of probing the configured dar binary.
+/// Result of probing the configured tar (`[tar] binary`; ADR-0012 item
+/// 274): the writer's floor is GNU tar 1.35 built with ACL support.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DarCheck {
-    /// Nothing exists at the configured path.
+pub enum TarToolCheck {
+    /// No tar at the configured path, or none of that name on `PATH`.
     Missing { path: String },
-    /// Exists but is not executable.
-    NotExecutable { path: String },
-    /// Exists, executable, ran, and its version could not be determined
-    /// (e.g. `--version` produced unparseable output).
+    /// It could not be run or probed.
     Unreadable { path: String, detail: String },
-    /// Ran and reports a version below the documented minimum.
-    TooOld {
+    /// It ran and `stage create` would refuse it: the probe's refusal text.
+    Refused {
         path: String,
-        found: String,
-        minimum: String,
+        first_line: String,
+        refusal: String,
     },
-    /// Ran and meets the documented minimum.
-    Ok { path: String, version: String },
+    /// It ran and meets the floor.
+    Ok {
+        path: String,
+        first_line: String,
+        acl: String,
+    },
 }
 
 /// Walk `path_var` (a `PATH`-style, `:`-separated list of directories) for
@@ -70,95 +71,61 @@ pub fn resolve_on_path(binary: &str, path_var: &OsStr) -> Option<PathBuf> {
     None
 }
 
-/// Probe `binary`: existence, executable bit, then `dar --version` via the
-/// existing runner in `dar::version` (never a second implementation of it).
-///
-/// If `binary` contains no path separator (a bare name like `"dar"`), it is
-/// first resolved against `PATH` via [`resolve_on_path`] — mirroring what
-/// the runtime actually does (`Command::new` in `dar::version::check`
-/// resolves bare names via `PATH`/`execvp`). Before this, `check_dar` used
-/// `Path::exists` directly on the bare name, which is never true, so a
-/// perfectly working `binary = "dar"` was reported `Missing` (issue #119).
-/// An absolute or relative path containing `/` is used as-is, unchanged
-/// from before.
-pub fn check_dar(binary: &str) -> DarCheck {
-    let resolved: PathBuf = if binary.contains('/') {
-        PathBuf::from(binary)
-    } else {
-        let path_var = std::env::var_os("PATH").unwrap_or_default();
-        match resolve_on_path(binary, &path_var) {
-            Some(p) => p,
-            None => {
-                return DarCheck::Missing {
-                    path: binary.to_string(),
-                };
-            }
-        }
-    };
-    let path = resolved.as_path();
-    let path_str = resolved.to_string_lossy().to_string();
-
-    if !path.exists() {
-        return DarCheck::Missing { path: path_str };
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let executable = std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
-        if !executable {
-            return DarCheck::NotExecutable { path: path_str };
-        }
-    }
-
-    match version::check(&path_str) {
-        Ok(v) => DarCheck::Ok {
-            path: path_str,
-            version: v.full_string,
+/// Probe `binary` as `stage create` does (`tar::probe`): found on `PATH`
+/// when it is a bare name, its first `--version` line, whether it is GNU
+/// tar at or above the floor, and whether it stores an ACL by number,
+/// found by archiving one file with an ACL in a directory made in
+/// `scratch` (removed after). The refusal is the probe's own text, so
+/// `config check`, `init` and `stage create` say the same thing.
+pub fn check_tar(binary: &str, scratch: &Path) -> TarToolCheck {
+    match crate::tar::probe(binary, scratch) {
+        Err(crate::error::TapectlError::TarNotFound(_)) => TarToolCheck::Missing {
+            path: binary.to_string(),
         },
-        Err(crate::error::TapectlError::DarVersionTooOld { found, minimum }) => DarCheck::TooOld {
-            path: path_str,
-            found,
-            minimum,
-        },
-        Err(e) => DarCheck::Unreadable {
-            path: path_str,
+        Err(e) => TarToolCheck::Unreadable {
+            path: binary.to_string(),
             detail: e.to_string(),
         },
+        Ok(check) => {
+            let path = check.path.to_string_lossy().into_owned();
+            match check.refusal() {
+                Some(refusal) => TarToolCheck::Refused {
+                    path,
+                    first_line: check.first_line,
+                    refusal,
+                },
+                None => TarToolCheck::Ok {
+                    path,
+                    first_line: check.first_line,
+                    acl: check.acl.to_string(),
+                },
+            }
+        }
     }
 }
 
-/// The advisory line for a dar check. Pure — testable by constructing
-/// [`DarCheck`] variants directly, no filesystem or subprocess involved.
-pub fn describe_dar(check: &DarCheck) -> String {
+/// The advisory line for a tar check. Pure — testable by constructing
+/// [`TarToolCheck`] variants directly, no filesystem or subprocess involved.
+pub fn describe_tar(check: &TarToolCheck) -> String {
+    let (major, minor) = crate::tar::FLOOR;
     match check {
-        DarCheck::Missing { path } => format!(
-            "warning: dar binary not found at '{path}' — config.dar.binary points nowhere; \
-             archiving will fail until this is corrected (install dar, or set [dar] binary \
-             to an absolute path if it is not on PATH)"
+        TarToolCheck::Missing { path } => format!(
+            "warning: tar not found at '{path}' — config.tar.binary points nowhere; \
+             staging will fail until this is corrected (install GNU tar {major}.{minor} or \
+             later built with ACL support, or set [tar] binary to its path)"
         ),
-        DarCheck::NotExecutable { path } => {
-            format!("warning: dar binary at '{path}' exists but is not executable")
+        TarToolCheck::Unreadable { path, detail } => {
+            format!("warning: tar at '{path}' could not be probed: {detail}")
         }
-        DarCheck::Unreadable { path, detail } => {
-            format!("warning: dar binary at '{path}' could not be version-checked: {detail}")
+        TarToolCheck::Refused { refusal, .. } => {
+            format!("warning: stage create would refuse this tar: {refusal}")
         }
-        DarCheck::TooOld {
-            path,
-            found,
-            minimum,
+        TarToolCheck::Ok {
+            path, first_line, ..
         } => format!(
-            "warning: dar at '{path}' is version {found}, below the required minimum {minimum}"
+            "tar: {first_line} at '{path}' (meets the writer's floor, GNU tar {major}.{minor} \
+             with ACL support)"
         ),
-        DarCheck::Ok { path, version } => {
-            format!(
-                "dar: {version} at '{path}' (meets minimum {}.{})",
-                version::MIN_VERSION.0,
-                version::MIN_VERSION.1
-            )
-        }
     }
 }
 
@@ -215,7 +182,7 @@ pub fn describe_staging(check: &StagingCheck) -> String {
 /// The THIRD staging check, beside existence and writability. Those two ask
 /// whether staging works at all; this asks whether it is big enough for the
 /// job, which is a different failure and a much later one — `stage create`
-/// fills staging with dar slices and their encrypted copies before anything
+/// fills staging with encrypted slices before anything
 /// reaches tape, so an undersized staging directory fails PARTWAY through a
 /// long archive rather than at the start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,7 +288,7 @@ pub fn describe_staging_space(check: &StagingSpaceCheck) -> Option<String> {
             generation,
         } => Some(format!(
             "warning: staging '{path}' has {} free; one {generation} cartridge is up to {} — \
-             a tape filled in one session will not fit: stage create stops before dar \
+             a tape filled in one session will not fit: stage create stops before tar \
              and asks (or refuses) when a unit will not fit",
             decimal_bytes(*free_bytes),
             decimal_bytes(*tape_bytes),
@@ -408,41 +375,38 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    // -- describe_dar: pure, no filesystem --
+    // -- describe_tar: pure, no filesystem --
 
     #[test]
-    fn describe_dar_missing_names_the_path() {
-        let line = describe_dar(&DarCheck::Missing {
-            path: "/usr/local/bin/dar".to_string(),
+    fn describe_tar_missing_names_the_path_and_the_floor() {
+        let line = describe_tar(&TarToolCheck::Missing {
+            path: "/usr/local/bin/tar".to_string(),
         });
-        assert!(line.contains("/usr/local/bin/dar"));
+        assert!(line.contains("/usr/local/bin/tar"));
         assert!(line.contains("not found"));
-        // Issue #124: the old hint named the shipped default
-        // (/opt/dar/bin/dar) as though that were still the story; now that
-        // the default is a bare, PATH-resolved "dar", the hint should point
-        // at what an operator can actually do instead.
-        assert!(line.contains("install dar"));
+        assert!(line.contains("GNU tar 1.35"), "{line}");
     }
 
     #[test]
-    fn describe_dar_ok_reports_version() {
-        let line = describe_dar(&DarCheck::Ok {
-            path: "/usr/bin/dar".to_string(),
-            version: "2.7.13".to_string(),
+    fn describe_tar_refused_carries_the_probes_text() {
+        let line = describe_tar(&TarToolCheck::Refused {
+            path: "/usr/bin/tar".to_string(),
+            first_line: "tar (GNU tar) 1.30".to_string(),
+            refusal: "GNU tar 1.30 at /usr/bin/tar is below the writer's floor".to_string(),
         });
-        assert!(line.contains("2.7.13"));
-        assert!(line.contains("/usr/bin/dar"));
+        assert!(line.contains("would refuse"));
+        assert!(line.contains("below the writer's floor"));
     }
 
     #[test]
-    fn describe_dar_too_old_names_found_and_minimum() {
-        let line = describe_dar(&DarCheck::TooOld {
-            path: "/usr/bin/dar".to_string(),
-            found: "2.5.0".to_string(),
-            minimum: "2.6".to_string(),
+    fn describe_tar_ok_reports_its_version() {
+        let line = describe_tar(&TarToolCheck::Ok {
+            path: "/usr/bin/tar".to_string(),
+            first_line: "tar (GNU tar) 1.35".to_string(),
+            acl: "Yes".to_string(),
         });
-        assert!(line.contains("2.5.0"));
-        assert!(line.contains("2.6"));
+        assert!(line.contains("tar (GNU tar) 1.35") && line.contains("/usr/bin/tar"));
+        assert!(!line.contains("warning"));
     }
 
     // -- describe_staging: pure --
@@ -512,14 +476,15 @@ mod tests {
         assert!(line.contains("both present"));
     }
 
-    // -- check_dar / check_staging / scan_tape_devices: I/O, exercised with
+    // -- check_tar / check_staging / scan_tape_devices: I/O, exercised with
     // tempfiles/tempdirs rather than mocked, since Path::exists and
     // std::fs::write are the entire surface being tested.
 
     #[test]
-    fn check_dar_missing_path_reports_missing() {
-        let check = check_dar("/nonexistent/path/to/dar-that-does-not-exist");
-        assert!(matches!(check, DarCheck::Missing { .. }));
+    fn check_tar_missing_path_reports_missing() {
+        let tmp = TempDir::new().unwrap();
+        let check = check_tar("/nonexistent/path/to/tar-that-does-not-exist", tmp.path());
+        assert!(matches!(check, TarToolCheck::Missing { .. }), "{check:?}");
     }
 
     // -- resolve_on_path: pure, exercised with an explicit PATH string so no
@@ -529,16 +494,9 @@ mod tests {
     #[test]
     fn resolve_on_path_finds_an_executable_bare_name_shim() {
         let tmp = TempDir::new().unwrap();
-        let shim_name = format!("fakedar-{}", std::process::id());
+        let shim_name = format!("faketar-{}", std::process::id());
         let shim_path = tmp.path().join(&shim_name);
-        // Mirror the shape `dar::version::check` parses ("dar version
-        // X.Y.Z, ..."), so this also doubles as proof the resolved path is
-        // actually usable end to end, not merely present on disk.
-        std::fs::write(
-            &shim_path,
-            "#!/bin/sh\necho 'dar version 2.7.13, Copyright (C) 2002-2023 Denis Corbin'\n",
-        )
-        .unwrap();
+        std::fs::write(&shim_path, "#!/bin/sh\necho 'tar (GNU tar) 1.35'\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -547,17 +505,13 @@ mod tests {
         let path_var = std::ffi::OsString::from(tmp.path());
         let resolved = resolve_on_path(&shim_name, &path_var);
         assert_eq!(resolved, Some(shim_path.clone()));
-
-        let version = crate::dar::version::check(shim_path.to_str().unwrap())
-            .expect("shim should parse as a valid dar version");
-        assert_eq!(version.full_string, "2.7.13");
     }
 
     #[test]
     fn resolve_on_path_skips_a_non_executable_match_and_keeps_looking() {
         let tmp1 = TempDir::new().unwrap();
         let tmp2 = TempDir::new().unwrap();
-        let name = format!("fakedar-noexec-{}", std::process::id());
+        let name = format!("faketar-noexec-{}", std::process::id());
 
         // A same-named, non-executable file earlier on PATH must not shadow
         // a real executable later on PATH -- matches `execvp`'s behavior.
@@ -584,29 +538,22 @@ mod tests {
     }
 
     #[test]
-    fn check_dar_bare_name_absent_from_path_reports_missing() {
-        // Doesn't touch the real PATH -- just asserts against a name that
-        // (overwhelmingly likely) isn't installed anywhere on it.
-        let check = check_dar("definitely-not-here-xyz-tapectl-test");
-        assert!(matches!(check, DarCheck::Missing { .. }));
+    fn check_tar_bare_name_absent_from_path_reports_missing() {
+        let tmp = TempDir::new().unwrap();
+        let check = check_tar("definitely-not-here-xyz-tapectl-test", tmp.path());
+        assert!(matches!(check, TarToolCheck::Missing { .. }), "{check:?}");
     }
 
+    /// GNU tar at the floor is on `PATH` for the suite (tests/test_dependencies.rs):
+    /// a bare `tar` resolves like the runtime resolves it, and passes.
     #[test]
-    fn check_dar_bare_name_present_on_path_resolves_like_the_runtime_does() {
-        // `dar` is a hard runtime dependency and guaranteed on PATH for this
-        // whole test suite (CLAUDE.md; enforced by `tests/test_dependencies.rs`),
-        // so this exercises check_dar's PATH-resolution branch end to end
-        // against the real environment, complementing the explicit-PATH
-        // `resolve_on_path` tests above.
-        let check = check_dar("dar");
-        match check {
-            DarCheck::Ok { path, .. } => {
-                assert!(
-                    path.contains('/'),
-                    "expected a resolved absolute path, got {path}"
-                )
+    fn check_tar_bare_name_present_on_path_resolves_like_the_runtime_does() {
+        let tmp = TempDir::new().unwrap();
+        match check_tar("tar", tmp.path()) {
+            TarToolCheck::Ok { path, .. } => {
+                assert!(path.contains('/'), "a resolved absolute path, got {path}")
             }
-            other => panic!("expected 'dar' on PATH to resolve to Ok, got {other:?}"),
+            other => panic!("expected 'tar' on PATH to pass the probe, got {other:?}"),
         }
     }
 

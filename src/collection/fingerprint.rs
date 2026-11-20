@@ -124,7 +124,7 @@ pub struct PendingScan {
 /// snapshot.
 ///
 /// **Issue #49:** this walk used to be deliberately unfiltered, on the
-/// reasoning that "excludes are a dar-time / archive-content concern
+/// reasoning that "excludes are a tar-time / archive-content concern
 /// applied later at stage create, and the `files` table this compares
 /// against is unfiltered too." That stopped being true once #49 wired
 /// `staging::walk_directory` (which populates `files`) through the shared
@@ -164,17 +164,15 @@ fn walk_fingerprint(unit_path: &Path, global_excludes: &[String]) -> Result<Vec<
         if crate::staging::exclude::is_excluded(path, &exclude_compiled) {
             continue;
         }
-        // Lossy on purpose (issue #465): `staging::walk_directory` refuses a
-        // name that is not UTF-8 at `snapshot create`, so such a unit never
-        // has a snapshot to be compared with and stays pending, and the
-        // refusal reaches the operator from the snapshot, naming the path.
-        // An `Err` from here would be reported by
-        // `pending_units_for_collection` as a refused dotfile, which it is not.
-        let rel = path
-            .strip_prefix(unit_path)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        // The relative path is a name's bytes, written in the escaped form
+        // of `volume-format-v3.md` §1.5 (ADR-0012 item 297, #569) that
+        // `staging::walk_directory` records in the catalog, so the two walks
+        // spell every name alike (a name that is not UTF-8, or has a
+        // backslash, included). Nothing here converts a name lossily.
+        let rel = crate::volume::index::escape_os(
+            path.strip_prefix(unit_path).unwrap_or(path).as_os_str(),
+        )
+        .into_owned();
         out.push(FileStamp {
             path: rel,
             size_bytes: meta.len() as i64,
@@ -465,6 +463,102 @@ mod tests {
             classify(&conn, &unit, &[]).unwrap().is_none(),
             "freshly snapshotted, unchanged unit must not be pending"
         );
+    }
+
+    /// ADR-0012 item 297 (#569): names that are not UTF-8, and one with a
+    /// backslash, are recorded by the snapshot in the escaped form and walked
+    /// again in the same form, so a unit holding them is NOT changed after
+    /// its snapshot, in either checksum mode. Before, the walk here was lossy
+    /// and every such unit was reported changed for ever.
+    #[test]
+    fn a_unit_with_names_that_are_not_utf8_is_not_changed_after_its_snapshot() {
+        use std::os::unix::ffi::OsStrExt;
+        for mode in ["mtime_size", "sha256"] {
+            let conn = db::open_memory().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            for name in [&b"caf\xe9.txt"[..], b"back\\slash.txt", b"plain.txt"] {
+                std::fs::write(tmp.path().join(std::ffi::OsStr::from_bytes(name)), b"hello")
+                    .unwrap();
+            }
+            std::fs::create_dir(tmp.path().join(std::ffi::OsStr::from_bytes(b"d\xff"))).unwrap();
+            std::fs::write(
+                tmp.path()
+                    .join(std::ffi::OsStr::from_bytes(b"d\xff"))
+                    .join(std::ffi::OsStr::from_bytes(b"in\xe9")),
+                b"nested",
+            )
+            .unwrap();
+            let unit_id = seed_unit(&conn, tmp.path());
+            conn.execute(
+                "UPDATE units SET checksum_mode = ?1 WHERE id = ?2",
+                params![mode, unit_id],
+            )
+            .unwrap();
+            let unit_uuid: String = conn
+                .query_row(
+                    "SELECT uuid FROM units WHERE id = ?1",
+                    params![unit_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+                .unwrap()
+                .unwrap();
+            crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+            conn.execute("UPDATE snapshots SET status = 'current'", [])
+                .unwrap();
+            if mode == "sha256" {
+                // A baseline for the hash comparison to read: what a stage records.
+                conn.execute(
+                    "UPDATE file_versions SET sha256 = zeroblob(32) WHERE kind = 1",
+                    [],
+                )
+                .unwrap();
+                let hash = crate::db::files::sha256_from_hex(&format!("{:x}", {
+                    use sha2::Digest;
+                    sha2::Sha256::digest(b"hello")
+                }))
+                .unwrap();
+                conn.execute(
+                    "UPDATE file_versions SET sha256 = ?1 WHERE size_bytes = 5",
+                    params![hash.to_vec()],
+                )
+                .unwrap();
+                let nested = crate::db::files::sha256_from_hex(&format!("{:x}", {
+                    use sha2::Digest;
+                    sha2::Sha256::digest(b"nested")
+                }))
+                .unwrap();
+                conn.execute(
+                    "UPDATE file_versions SET sha256 = ?1 WHERE size_bytes = 6",
+                    params![nested.to_vec()],
+                )
+                .unwrap();
+            }
+            assert!(
+                classify(&conn, &unit, &[]).unwrap().is_none(),
+                "{mode}: a freshly snapshotted unit holding such names must not be pending"
+            );
+            // Positive control: the names ARE in the snapshot, escaped, and a
+            // real change to one of them is seen.
+            let recorded: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM paths WHERE path IN ('caf\\xe9.txt', 'back\\\\slash.txt', 'd\\xff/in\\xe9')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded, 3, "{mode}");
+            std::fs::write(
+                tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt")),
+                b"changed!",
+            )
+            .unwrap();
+            assert!(
+                classify(&conn, &unit, &[]).unwrap().is_some(),
+                "{mode}: a change to a name that is not UTF-8 is seen"
+            );
+        }
     }
 
     #[test]
@@ -957,9 +1051,9 @@ mod tests {
                 archive_set: None,
                 checksum_mode: Some("mtime_size".into()),
                 compression: Some("none".into()),
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec!["*.tmp".into(), "Thumbs.db".into()],
             },
@@ -1038,9 +1132,9 @@ mod tests {
                 archive_set: None,
                 checksum_mode: None,
                 compression: None,
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec![".cache/".into()],
             },
@@ -1085,15 +1179,14 @@ mod tests {
         );
     }
 
-    /// #478 (ADR-0012 item 82): the dotfile model gained `allow_spanning`,
-    /// and an existing unit's dotfile that does not set it keeps its
+    /// An existing unit's dotfile keeps its
     /// fingerprint across the rewrite every unit command does (`unit tag`,
     /// `unit rename`, `tenant reassign`: `read_dotfile` then
     /// `write_dotfile`): the same walk, the same paths and sizes, and the
     /// dotfile's own bytes unchanged. (Its mtime moves with any rewrite; the
     /// dotfile is not content either way, ADR-0012 item 24.)
     #[test]
-    fn an_unset_allow_spanning_leaves_an_existing_dotfiles_fingerprint_unchanged() {
+    fn a_rewrite_leaves_an_existing_dotfiles_fingerprint_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(".tapectl-unit.toml");
         let existing = "[unit]\nuuid = \"u-1\"\nname = \"fixture\"\n\
@@ -1109,7 +1202,6 @@ mod tests {
         let before = sized(walk_fingerprint(tmp.path(), &[]).unwrap());
 
         let df = crate::unit::dotfile::read_dotfile(&path).unwrap();
-        assert!(df.allow_spanning.is_none());
         crate::unit::dotfile::write_dotfile(&path, &df).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
@@ -1193,9 +1285,9 @@ mod tests {
                 archive_set: None,
                 checksum_mode: Some("mtime_size".into()),
                 compression: Some("none".into()),
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec!["*.tmp".into()],
             },

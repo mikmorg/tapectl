@@ -60,8 +60,8 @@ pub enum CartridgeCommands {
     List {
         /// Filter by status (available, in_use, pending_erase, retired_permanent).
         ///
-        /// `offsite` was removed by ADR-0011 -- a cartridge's place is a
-        /// location now; use --location.
+        /// A cartridge's place is a location (ADR-0011), not a status; use
+        /// --location.
         #[arg(long)]
         status: Option<String>,
         /// Filter by physical location name -- the sibling of `--status`.
@@ -520,17 +520,8 @@ const CARTRIDGE_STATUSES: &[&str] = &["available", "in_use", "pending_erase", "r
 
 /// `cartridge list --status` is a usage error when it names anything other
 /// than one of `CARTRIDGE_STATUSES` (issue #171, ADR-0012) — silently
-/// answering "no cartridges registered" for a typo, or for a status
-/// ADR-0011 removed, is worse than refusing.
+/// answering "no cartridges registered" for a typo is worse than refusing.
 fn validate_cartridge_status(value: &str) -> Result<()> {
-    if value == "offsite" {
-        return Err(TapectlError::Other(format!(
-            "--status \"offsite\" was removed by ADR-0011 -- a cartridge's place is a \
-             location now, not a status. Use `cartridge list --location <NAME>` (see \
-             `location list` for the names), or one of: {}",
-            CARTRIDGE_STATUSES.join(", ")
-        )));
-    }
     crate::config::validate_closed_set("--status", value, CARTRIDGE_STATUSES)
         .map_err(TapectlError::Other)
 }
@@ -1994,55 +1985,29 @@ mod tests {
         assert!(rows.iter().all(|r| r.status == "available"));
     }
 
-    /// Issue #171 / ADR-0012: `cartridge list --status offsite` must name
-    /// ADR-0011 and point at locations, not silently answer "no cartridges
-    /// registered". Exercised through `run()`, not the helper, because the
-    /// acceptance criterion names the COMMAND.
-    #[test]
-    fn list_status_offsite_names_adr_0011_and_points_at_locations() {
-        let conn = seed();
-        let err = run(
-            &conn,
-            &crate::config::Config::default(),
-            &CartridgeCommands::List {
-                status: Some("offsite".to_string()),
-                location: None,
-            },
-            false,
-            false,
-            false,
-        )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("ADR-0011"), "{msg}");
-        assert!(msg.contains("location"), "{msg}");
-        assert!(
-            msg.contains("available"),
-            "must still list the current statuses: {msg}"
-        );
-    }
-
-    /// A typo (not the retired `offsite`) is a plain usage error naming the
-    /// accepted set, not a silent empty list.
+    /// A typo, or `offsite` (ADR-0011: a place, not a status), is a plain usage
+    /// error naming the accepted set, not a silent empty list.
     #[test]
     fn list_status_typo_is_a_usage_error_naming_accepted_values() {
         let conn = seed();
-        let err = run(
-            &conn,
-            &crate::config::Config::default(),
-            &CartridgeCommands::List {
-                status: Some("avilable".to_string()),
-                location: None,
-            },
-            false,
-            false,
-            false,
-        )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("avilable"), "{msg}");
-        assert!(msg.contains("available"), "{msg}");
-        assert!(msg.contains("retired_permanent"), "{msg}");
+        for bad in ["avilable", "offsite"] {
+            let err = run(
+                &conn,
+                &crate::config::Config::default(),
+                &CartridgeCommands::List {
+                    status: Some(bad.to_string()),
+                    location: None,
+                },
+                false,
+                false,
+                false,
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(bad), "{msg}");
+            assert!(msg.contains("available"), "{msg}");
+            assert!(msg.contains("retired_permanent"), "{msg}");
+        }
     }
 
     /// ADR-0011: `cartridges.location_id` finally has a reader. The LEFT

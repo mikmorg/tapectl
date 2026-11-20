@@ -51,7 +51,7 @@ pub struct RawRestoreReport {
     pub unverifiable_count: usize,
     pub files: Vec<RawFileResult>,
     /// `Some(K)` when the tape sealed short (#420): its seal, at K+1, says
-    /// the tape ended after file K (`volume-format-v2.md` §4.2).
+    /// the tape ended after file K (`volume-format-v3.md` §5.1).
     pub ended_after: Option<u32>,
     /// The planned files after `ended_after` the selection named, as
     /// `(position, front-index type)`: not on this tape, so not read and not
@@ -60,7 +60,7 @@ pub struct RawRestoreReport {
     pub not_on_tape: Vec<(i32, String)>,
     /// `Some(p)` when a tape that may end early has no seal this tapectl
     /// accepts and the drive reported END OF DATA at planned file `p` (#490;
-    /// `volume-format-v2.md` §4.2 R2): the end of the tape, so `p` and every
+    /// `volume-format-v3.md` §5.1 R2): the end of the tape, so `p` and every
     /// later planned file are not on it.
     pub end_of_data_at: Option<i32>,
 }
@@ -232,12 +232,12 @@ pub fn restore_raw_selected(
         }
     }
 
-    // #420 (`volume-format-v2.md` §4.2 R1): on a tape that may end early,
+    // #420 (`volume-format-v3.md` §5.1 R1): on a tape that may end early,
     // where it ended is learnt from its seal before any data slice is read,
     // and nothing after that is read (R3). File 3 is the plan; the seal,
     // found by §1.2 rule 6, says which of its files are on the tape. Only a
     // selection that reaches the slices needs it: every file before the
-    // first data slice is on every sealed tape (§4.3 W4).
+    // first data slice is on every sealed tape (§5.2 W4).
     let ending = end_of_tape(
         store,
         &thunk_text,
@@ -288,9 +288,8 @@ pub fn restore_raw_selected(
     // R2 (#490): with no seal it accepts, a tape that may end early ends at
     // END OF DATA. Only the store's own END OF DATA says so; any other read
     // failure is an unreadable file and fails the dump, as before.
-    let r2 = ending.is_none()
-        && format::parse_id_thunk_claims(&thunk_text)
-            .is_ok_and(|c| c.requires.iter().any(|f| f == format::SHORT_SEAL));
+    // Every Layout 3 tape may end early (`volume-format-v3.md` §1.8).
+    let r2 = ending.is_none();
     let mut end_of_data_at = None;
 
     fs::create_dir_all(dest)?;
@@ -386,11 +385,10 @@ pub fn restore_raw_selected(
     })
 }
 
-/// Where a tape that may end early ended (#420): `Some(K)` when its seal,
-/// found by `volume-format-v2.md` §1.2 rule 6 and accepted there, is a short
-/// one; `None` for a full seal, for a tape that does not require
-/// `short-seal` (it cannot end early, and its seal is read in the dump's own
-/// pass, as before 1.6.0), and for a selection that reads no data slice. A
+/// Where a tape ended (#420; every Layout 3 tape may end early): `Some(K)`
+/// when its seal, found by `volume-format-v3.md` §1.2 rule 6 and accepted
+/// there, is a short one; `None` for a full seal and for a selection that
+/// reads no data slice (its seal is read in the dump's own pass). A
 /// seal this tapectl must not interpret refuses the dump by name (§1.2
 /// rule 1). With no seal it accepts, the dump reads on as for an unsealed
 /// tape (R2), as before 1.6.0.
@@ -402,8 +400,8 @@ fn end_of_tape(
     entries: &[format::ParsedIndexEntry],
     selection: &RawSelection,
 ) -> Result<Option<u32>> {
-    let may_end_early = format::parse_id_thunk_claims(thunk_text)
-        .is_ok_and(|c| c.requires.iter().any(|f| f == format::SHORT_SEAL));
+    // Every Layout 3 tape may end early (`volume-format-v3.md` §1.8): no
+    // `requires` entry says so (D1).
     let first_slice = entries
         .iter()
         .filter(|e| e.type_label == "data_slice")
@@ -414,7 +412,7 @@ fn end_of_tape(
             .iter()
             .any(|e| e.position >= first && selection.selects(e))
     });
-    if !may_end_early || !reaches_slices {
+    if !reaches_slices {
         return Ok(None);
     }
     let (Ok(fi_position), Ok(planned)) = (
@@ -705,14 +703,11 @@ pub(crate) mod tests {
         let data = b"some plaintext".to_vec();
         let mut store = build_synthetic_tape("RAWFC", &data);
         let f0 = String::from_utf8(store.files[0].clone()).unwrap();
-        // From 1.6.0 File 0 states `requires = ["short-seal"]` (ADR-0012
-        // item 111): the fixture is checked to say so before it is edited.
-        assert!(f0.contains("requires = [\"short-seal\"]"), "{f0}");
+        // Every Layout 3 File 0 states `requires = []` (D1): the fixture is
+        // checked to say so before it is edited.
+        assert!(f0.contains("requires = []"), "{f0}");
         store.files[0] = f0
-            .replace(
-                "requires = [\"short-seal\"]",
-                "requires = [\"unknown-feature\"]",
-            )
+            .replace("requires = []", "requires = [\"unknown-feature\"]")
             .into_bytes();
         let tmp = TempDir::new().unwrap();
         let err = restore_raw(&mut store, tmp.path(), None)
@@ -728,10 +723,7 @@ pub(crate) mod tests {
         // Control: an unknown key nobody requires is read past.
         let mut store = build_synthetic_tape("RAWFC", &data);
         store.files[0] = f0
-            .replace(
-                "requires = [\"short-seal\"]",
-                "requires = [\"short-seal\"]\nfuture_key = 1",
-            )
+            .replace("requires = []", "requires = []\nfuture_key = 1")
             .into_bytes();
         let tmp = TempDir::new().unwrap();
         restore_raw(&mut store, tmp.path(), None).unwrap();
@@ -919,7 +911,7 @@ pub(crate) mod tests {
             }
         }
 
-        /// #490, §4.2 R2: a 1.6.0 tape whose write stopped after file K,
+        /// #490, §5.1 R2: a 1.6.0 tape whose write stopped after file K,
         /// before any seal, ends at END OF DATA. The dump keeps files 0..=K
         /// and names every planned file from K+1 on as not on the tape;
         /// before this it failed at K+1.

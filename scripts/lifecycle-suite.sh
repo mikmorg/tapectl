@@ -193,7 +193,7 @@ if [ "$DRY_RUN" = 1 ]; then
     STAMP="dryrun"
 else
     # ---------- preconditions (loud — see mhvtl-verify-gate.sh's rationale) ----------
-    for bin in lsscsi mtx mt dar age sha256sum python3 cargo shellcheck; do
+    for bin in lsscsi mtx mt tar age sha256sum python3 cargo shellcheck; do
         command -v "$bin" >/dev/null || die "required binary missing: $bin"
     done
     [ -n "$TAPE_DEV" ] || die "--device (or TAPECTL_GATE_TAPE) is required; there is no default"
@@ -373,7 +373,7 @@ TCTL() {
     "$BIN" --home "$HOME_DIR" --config "$CFG" "$@" </dev/null
 }
 
-# devcmd wraps any real OS-level action (mt, dd, mtx, age, dar, sha256sum,
+# devcmd wraps any real OS-level action (mt, dd, mtx, age, tar, sha256sum,
 # chmod, rm, cp, tee) so it is skipped in dry-run and journaled for real.
 # Never used for pure inspection the report doesn't need (`[ -L ... ]`,
 # `test -f`) — only for actions and destructive/state-changing calls.
@@ -660,7 +660,7 @@ lc_dump_whole_tape() { # lc_dump_whole_tape <outfile>
 # "searched nothing", which is how the gate's version of this check passed
 # for 100+ commits while reading nothing at all (issue #275), how
 # `csc_fingerprint` passed vacuously (#258), and how `permute`'s restore
-# matrix went unrun. `volume-format-v2.md` puts the volume label in the ID
+# matrix went unrun. `volume-format-v3.md` puts the volume label in the ID
 # thunk in plaintext by design, so if the label is not found the SCAN is
 # broken and this check must fail as loudly as a real leak.
 #
@@ -981,13 +981,16 @@ rm_step_file() {
 rm_step_restore_sh_dd() {
     ensure_heir_restore_sh || return 1
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: ./RESTORE.sh --info (expect 'Verdict: SEALED'); ./RESTORE.sh --verify (expect 'VERIFY: PASS')"
+        echo "PLAN: ./RESTORE.sh --info (expect the full-seal line); ./RESTORE.sh --verify (expect 'VERIFY PASSED')"
         return 0
     fi
     (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --info) >"$RM_WORK/info.txt" 2>&1
-    grep -q "Verdict: SEALED" "$RM_WORK/info.txt" || { cat "$RM_WORK/info.txt"; echo "expected Verdict: SEALED"; return 1; }
+    # The words tests/heir_restore.rs::info_names_the_tape_its_files_and_its_full_seal_and_rewinds_once asserts.
+    grep -q "the tape is complete, every planned file is on it" "$RM_WORK/info.txt" || { cat "$RM_WORK/info.txt"; echo "expected the full-seal line: the tape is complete, every planned file is on it"; return 1; }
+    grep -q "Layout 3" "$RM_WORK/info.txt" || { cat "$RM_WORK/info.txt"; echo "expected --info to name Layout 3"; return 1; }
     (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --verify) >"$RM_WORK/verify_sh.txt" 2>&1
-    grep -q "VERIFY: PASS" "$RM_WORK/verify_sh.txt" || { cat "$RM_WORK/verify_sh.txt"; echo "expected VERIFY: PASS"; return 1; }
+    # tests/heir_restore.rs::verify_passes_a_full_tape_with_no_key_and_reads_it_forward_once
+    grep -q "VERIFY PASSED" "$RM_WORK/verify_sh.txt" || { cat "$RM_WORK/verify_sh.txt"; echo "expected VERIFY PASSED"; return 1; }
 }
 
 # heir_key_candidates <tenant> <key_type> — every key FILE of that type this
@@ -1057,7 +1060,7 @@ for k in active + list(reversed(inactive)):
 # choose which generation sealed which half.
 heir_restore_try_keys() { # <key_type> <dest> <logfile>
     local ktype="$1" to="$2" log="$3"
-    local keys k opened
+    local keys k
     local -a args=()
     keys="$(heir_key_candidates "$RM_TENANT" "$ktype")"
     [ -n "$keys" ] || { echo "no $ktype key of tenant $RM_TENANT on disk at all"; return 1; }
@@ -1068,8 +1071,8 @@ heir_restore_try_keys() { # <key_type> <dest> <logfile>
     : >"$log"
     if (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore \
             --unit "$RM_UNIT" "${args[@]}" --to "$to") >>"$log" 2>&1; then
-        opened="$(sed -n 's/.*opened with key //p' "$log" | head -1)"
-        echo "heir restore of $RM_UNIT succeeded from a keyring of $((${#args[@]} / 2)) $ktype key(s); envelope opened with ${opened:-<unreported>}"
+        # Layout 3's RESTORE.sh does not say which key matched; the keyring is the claim.
+        echo "heir restore of $RM_UNIT succeeded from a keyring of $((${#args[@]} / 2)) $ktype key(s)"
         return 0
     fi
     cat "$log"
@@ -1266,7 +1269,7 @@ restore_matrix() {
 # ============================================================
 
 # bootstrap_config — `tapectl init` plus the same config.toml hand-edits
-# every scenario needs: dar resolved via PATH (never hardcode a path —
+# every scenario needs: tar resolved via PATH (never hardcode a path —
 # CLAUDE.md), a staging directory under this scenario's own tree, the
 # discovered/consented device wired into a [[backends.lto]] entry, and
 # `slice_size = "1M"` so the `big` fixture profile (12 MB) naturally spans
@@ -1280,7 +1283,7 @@ restore_matrix() {
 bootstrap_config() {
     TCTL init --operator "$OPERATOR" --no-escrow || return 1
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: python3 rewrites $CFG (dar binary=dar, slice_size=1M, staging dir, backends.lto entry for $TAPE_DEV, compaction.utilization_threshold=0.95)"
+        echo "PLAN: python3 rewrites $CFG (tar binary=tar, slice_size=1M, staging dir, backends.lto entry for $TAPE_DEV, compaction.utilization_threshold=0.95)"
         return 0
     fi
     local scenario_dir staging_dir
@@ -1298,7 +1301,7 @@ _ = single  # kept for signature stability; copy policy is handled in audit_pass
 # is derived from device_tape. `sg` stays on the argv for its callers.
 _ = sg
 t = open(cfg).read()
-t = re.sub(r'(?m)^binary *=.*$', 'binary = "dar"', t, count=1)
+t = re.sub(r'(?m)^binary *=.*$', 'binary = "tar"', t, count=1)  # [tar] binary: the only key named binary in a fresh init
 t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "1M"', t, count=1)
 t = re.sub(r'(?m)^directory *=.*$', f'directory = "{staging}"', t, count=1)
 t = re.sub(r'(?m)^utilization_threshold *=.*$', 'utilization_threshold = 0.95', t, count=1)
@@ -2263,8 +2266,7 @@ cp_release_staging() { TCTL stage clean --force; }
 # in `rr_write_second_copy_volb` cannot ever have run green either. Writing
 # the same staged slices twice is also the more faithful shape: it yields
 # BYTE-IDENTICAL content, which is what ADR-0012 defines a Copy to be,
-# where a re-stage would produce fresh bytes (dar timestamps, randomized
-# age) for the same version.
+# where a re-stage would produce fresh bytes (age's per-call randomness) for the same version.
 cp_write_photos_v2_second_copy() {
     next_tape VOL-H || return 1
     vinit VOL-H && TCTL volume write VOL-H --device "$TAPE_DEV" --yes
@@ -2438,8 +2440,7 @@ rr_retire_refused_sole_copy() {
 # So the second copy is simply a SECOND WRITE of the sets that are still
 # live from `bootstrap_archive_v1`. That is also the more faithful shape:
 # it yields byte-identical content, which is what ADR-0012 defines a Copy to
-# be, where a re-stage would produce fresh bytes (dar timestamps, randomized
-# age) for the same version.
+# be, where a re-stage would produce fresh bytes (age's per-call randomness) for the same version.
 rr_write_second_copy_volb() {
     if [ "$SINGLE_CARTRIDGE" = 1 ]; then
         skip "rr.write_second_copy_volb" "single-cartridge mode cannot hold a second, independent copy of VOL-A's content"
@@ -4454,8 +4455,7 @@ PY2
 # This is the whole proof that the second copy consumed the SAME staged bytes
 # instead of re-staging, and a re-stage would show in all three halves at
 # once: a new `stage_sets` row (new id), `stage_set_count` above 1 for that
-# version, and DIFFERENT sha256s -- dar stamps timestamps and age is
-# randomised per call, so identical input never re-encrypts to identical bytes
+# version, and DIFFERENT sha256s -- age is randomised per call, so identical input never re-encrypts to identical bytes
 # (CLAUDE.md, "Re-staging vs read-slices"). Comparing the ciphertext hash is
 # what makes this an assertion about BYTES rather than about row counts.
 csc_fingerprint() { # csc_fingerprint <outfile>

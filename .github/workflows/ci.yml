@@ -45,33 +45,87 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: Install dar
-        # The ungated suite is NOT hermetic, despite what this file claimed
-        # until 2026-07-31. `staging::tests` and `cli::stage::tests` shell out
-        # to a real dar to build archives, and `tests/cli_smoke.rs` spawns
-        # `stage create`, which does the same. Without dar those tests fail,
-        # and they had been failing here for many commits while every local
-        # `cargo test` passed — this job was reporting red so consistently
-        # that its signal had stopped meaning anything.
+      - name: Install the test tools
+        # The ungated suite is NOT hermetic: staging runs the real GNU tar, and
+        # `tests/cli_smoke.rs` spawns `stage create`, which does the same.
+        # Without these tools those tests fail, and they had been failing here
+        # for many commits once while every local `cargo test` passed (issue
+        # #43): this job reported red so consistently that its signal had
+        # stopped meaning anything.
         #
-        # Installing dar is the honest fix: dar >= 2.6 is a documented hard
-        # dependency of the tool (CLAUDE.md, README), so a CI run without it
-        # is not testing the product as shipped. Ubuntu's `dar` package is
-        # 2.7.x, comfortably above the minimum enforced by src/dar/version.rs.
+        # Layout 3 (2.0.0) needs what its tests run for real: `acl` (setfacl
+        # and getfacl, for the stream's ACL checks) and the decompressor of
+        # each algorithm it carries (ADR-0012 item 285: gzip, xz, zstd), which
+        # read library-made slices back.
         run: |
           sudo apt-get update
-          sudo apt-get install -y dar
-          dar --version | head -2
+          sudo apt-get install -y acl attr gzip xz-utils zstd
+          getfacl --version | head -1
+          gzip --version | head -1
+          xz --version | head -1
+          zstd --version | head -1
+
+      - name: The runner's tar
+        # Layout 3's writer is GNU tar at or above the floor (ADR-0012 item 274: 1.35,
+        # built with ACL support). The line is kept in every run so that a runner image
+        # that changes its tar shows it here first.
+        run: tar --version | head -1
 
       - name: Run tests
         # Debug profile on purpose — release builds are for publishing and the
         # perf suite only (house build rule). No $HOME dependence and no tape
         # devices: the mhvtl e2e and perf suites stay gated out (see the
-        # header). dar is the one external binary this suite genuinely needs,
-        # installed above. --no-fail-fast: cargo otherwise stops at the first
+        # header). The external tools this suite genuinely needs are
+        # installed above (tar is the runner's own). --no-fail-fast: cargo otherwise stops at the first
         # failing test binary, so a red lib binary hid every binary after it
         # (2026-10-21 to 10-24, when the runner moved to Ubuntu 26).
         run: cargo test --locked --no-fail-fast
+
+  heir-script:
+    name: RESTORE.sh lint
+    # The heir's script (src/volume/heir/RESTORE.sh, File 2 of every Layout 3
+    # tape; the plan's T4.10, #553) is a shell file, so it is linted as one:
+    # `bash -n`, `shellcheck` at warning level, and its awk programs run under
+    # every awk an heir may have (gawk, mawk, BusyBox awk). The tests that do
+    # the third are the `lint_` tests of tests/heir_restore.rs; with
+    # TAPECTL_REQUIRE_HEIR_TOOLS=1 a missing tool fails them instead of
+    # skipping them, so a lint that did not run is never green.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install the lint tools and what the script's tests run
+        # acl and attr, the decompressors: the fixtures are real stagings (GNU tar
+        # at the writer's floor, setfacl, each algorithm's tool).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck gawk mawk busybox acl attr gzip xz-utils zstd
+          shellcheck --version | head -2
+          gawk --version | head -1
+          mawk -W version 2>&1 | head -1
+          busybox 2>&1 | head -1
+          tar --version | head -1
+
+      - name: bash -n and shellcheck
+        run: |
+          bash -n src/volume/heir/RESTORE.sh
+          shellcheck -S warning src/volume/heir/RESTORE.sh
+
+      - name: The script under gawk, mawk and BusyBox awk
+        env:
+          TAPECTL_REQUIRE_HEIR_TOOLS: "1"
+        run: |
+          cargo build --locked --example heir_age
+          cargo test --locked --test heir_restore lint_
 
   man-drift:
     name: Man pages in sync

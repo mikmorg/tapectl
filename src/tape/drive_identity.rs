@@ -1146,69 +1146,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_019_applies_from_001_forward_and_fsck_passes() {
-        // `open_memory` runs the full ordered migration chain.
-        let conn = crate::db::open_memory().unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'drives'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1, "migration 019 must create the drives table");
-
-        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
-        assert!(report.integrity_ok, "integrity_check after 019");
-        assert!(
-            report.issues.is_empty(),
-            "db fsck must be clean after 019: {:?}",
-            report.issues
-        );
-    }
-
-    #[test]
-    fn migration_019_adds_no_column_to_health_logs() {
-        // ADR-0013 §3 gives `health_logs` exactly ONE rebuild, and it is
-        // migration 021 (issue #296). 019 must leave it byte-identical to
-        // what 009 left behind — a drive column here would be the second of
-        // the four uncoordinated rebuilds the ADR exists to prevent.
-        //
-        // Migrated to exactly 019, not "latest": 021 IS that one rebuild and
-        // legitimately adds `contact_id`/`tapectl_version`, so a pin against
-        // the newest schema would be measuring 021, not 019.
-        let conn = crate::db::open_memory_at_version(19);
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, 19, "positive control: this pin is about 019");
-        let mut stmt = conn.prepare("PRAGMA table_info(health_logs)").unwrap();
-        let columns: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .map(|c| c.unwrap())
-            .collect();
-        assert_eq!(
-            columns,
-            vec![
-                "id",
-                "volume_id",
-                "session_id",
-                "logged_at",
-                "operation",
-                "total_bytes",
-                "total_uncorrected",
-                "total_corrected",
-                "total_retries",
-                "total_rewritten",
-                "raw_log",
-                "tape_alerts",
-            ],
-            "health_logs must carry exactly 001's columns plus 009's tape_alerts"
-        );
-    }
-
-    #[test]
     fn upsert_records_the_drive_on_first_sight() {
         let conn = crate::db::open_memory().unwrap();
         let id = upsert(&conn, &identity(Some("XYZZY_A1"), "2160"))
@@ -1356,17 +1293,5 @@ mod tests {
             rows, 1,
             "the reading is still worth recording without an identified drive"
         );
-    }
-
-    /// Migration 019 must not backfill. Pre-019 `health_logs` rows cannot be
-    /// attributed to any drive — the machine that produced them was never
-    /// recorded — and a guess would read exactly like an observation.
-    #[test]
-    fn migration_019_leaves_the_drives_table_empty() {
-        let conn = crate::db::open_memory().unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
     }
 }

@@ -7,7 +7,8 @@
 # step 12, and every tape-touching command is confirmed by name):
 #
 #    1  Rust toolchain (rustup; the repo pins 1.94.1 in rust-toolchain.toml)
-#    2  runtime tools: dar >= 2.6, mt, sg3-utils, acl, python3, lsscsi (age optional: heir path + rehearsal)
+#    2  runtime tools: GNU tar >= 1.35 with ACL support (checked, never installed), mt,
+#       sg3-utils, acl, python3, lsscsi (age optional: heir path + rehearsal)
 #    3  build tapectl (release) and install it system-wide
 #    4  the ungated test suite (no tape needed)
 #    5  the SERVICE USER: a nologin `tapectl` account owns the keys, catalog and staging;
@@ -91,7 +92,7 @@ VERIFY_INTERVAL_DAYS="" # step 7: [defaults] verify_interval_days, the full-read
 POST_WARNING_BYTES=""  # step 8: the drive's post_warning_bytes, its room past the early warning as scripts/lto-profile.sh
                        # measured it (decimal, e.g. 99008M; ADR-0012 item 200). Set when the drive has none; a drive that
                        # already says something else is refused, never overwritten. Empty = step 8 says what is lost.
-DAR_BIN=""             # step 2/4/7: the dar to check, test with and write into [dar] binary
+TAR_BIN=""             # step 2/4/7: the tar to check against the floor, test with and write into [tar] binary
 SVC_HOME_WANT=""       # step 5: home for a NEW service user (default /var/lib/<user>)
 LOCATIONS=()           # step 10: "name|description" — the first is the shelf step 13 moves tape 1 to
 TENANTS=()             # step 11: "name|description" — non-operator tenants to create
@@ -120,7 +121,7 @@ ADOPT_KEYS_FROM=""     # steps 7 and 11: a directory of <tenant>.key age identit
 # by name before anything runs (#506). ERASE_LABEL is not in it, and is not
 # refused either: a profile's value is only reported as not used (#469, step 13).
 PROFILE_VARS=(
-  HOME_DIR TAPECTL_HOME_DIR TAPECTL SKIP_BUILD SKIP_TESTS SVC_USER SVC_HOME_WANT WORK_DIR DAR_BIN
+  HOME_DIR TAPECTL_HOME_DIR TAPECTL SKIP_BUILD SKIP_TESTS SVC_USER SVC_HOME_WANT WORK_DIR TAR_BIN
   DEVICE SG DGEN OPERATOR ESCROW_PUBLIC_KEY ADOPT_KEYS_FROM STAGING_DIR STAGING_JOBS
   VERIFY_INTERVAL_DAYS CONTENDER_PROCESSES OPS_GROUP KIT_OUT LOCATIONS LOCATION
   TENANTS TENANT UNIT_PATH COLLECTIONS TEST_BARCODE LABEL CONTENDER_UNITS
@@ -218,8 +219,9 @@ Options:
                     to rehearse: step 14 installs no timers for a --home.
   --tapectl-home DIR
                     the host's own tapectl home when it is not the service user's ~/.tapectl (the
-                    profile's TAPECTL_HOME_DIR): an installed home, unlike --home. Refused while a
-                    ~/.tapectl exists in the service user's home, which tapectl would find first
+                    profile's TAPECTL_HOME_DIR): an installed home, unlike --home. Step 14 refuses
+                    to install timers while a ~/.tapectl exists in the service user's home, which
+                    tapectl would find first
   --from N          start at step N (0-14)
   --to N            stop after step N (0-14; e.g. --to 9: everything up to and including the printed kit)
   --upgrade         upgrade this installed host in place to the checkout's release tag (ADR-0012
@@ -284,8 +286,9 @@ $(printf '%s\n' "${PROFILE_VARS[*]}" | fold -s -w 72 | sed 's/ *$//; s/^/       
   --mint-escrow     step 7 under --auto, on a fresh home with no ESCROW_PUBLIC_KEY: mint a NEW escrow
                     identity. Without it --auto refuses there: no command replaces an escrow identity
                     (ADR-0005). A flag only, never a profile: it is consent (ADR-0012 item 188)
-  --dar PATH       the dar binary: checked in step 2, first on PATH for the step-4 suite,
-                    written to [dar] binary in step 7 (default: dar on PATH)
+  --tar PATH       the GNU tar the writer uses: checked against the floor (1.35, with ACL
+                    support) in step 2, first on PATH for the step-4 suite, written to [tar]
+                    binary in step 7 (default: tar on PATH)
   --skip-build      do not build/install (use the resolved binary as-is)
   --skip-tests      skip the ungated test suite
   -h, --help
@@ -320,7 +323,7 @@ while [ $# -gt 0 ]; do
     --staging) STAGING_DIR="$2"; shift 2 ;;
     --tape-nice) TAPE_NICE="$2"; shift 2 ;;
     --tape-ionice) TAPE_IONICE="$2"; shift 2 ;;
-    --dar) DAR_BIN="$2"; shift 2 ;;
+    --tar) TAR_BIN="$2"; shift 2 ;;
     --adopt-keys-from) ADOPT_KEYS_FROM="$2"; shift 2 ;;
     --escrow-public-key) ESCROW_PUBLIC_KEY="$2"; shift 2 ;;
     --erase-label) ERASE_LABEL="$2"; shift 2 ;;
@@ -394,7 +397,7 @@ BUILD_LOCK="$WORK_DIR/tapectl-build.lock"
 # install-systemd.sh's TAPECTL_UNIT_DIR is: the upgrade harness
 # (scripts/upgrade-mhvtl.sh) points it into its workspace.
 INSTALL_BIN="${TAPECTL_INSTALL_BIN:-/usr/local/bin/tapectl}"
-DAR="${DAR_BIN:-dar}"
+TAR="${TAR_BIN:-tar}"
 if [ -t 1 ]; then B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'; Y=$'\e[33m'; G=$'\e[32m'; RD=$'\e[31m'; else B=""; D=""; R=""; Y=""; G=""; RD=""; fi
 [ "$SVC_MODE" = 1 ] && [ "$SVC_USER" = "$USER" ] && SVC_MODE=0
 # The command an operator types for a catalog command, named in every remedy
@@ -413,6 +416,14 @@ as_svc()   { if [ "$SVC_MODE" = 1 ]; then sudo -u "$SVC_USER" -H "$@"; else "$@"
 svc_home() { if [ "$SVC_MODE" = 1 ]; then { getent passwd "$SVC_USER" 2>/dev/null || true; } | cut -d: -f6; else printf '%s' "$HOME"; fi; }
 svc_in_group() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -x "$2" >/dev/null; }
 compute_home() { local h; h="$(svc_home)"; EFFECTIVE_HOME="${HOME_DIR:-${TAPECTL_HOME_DIR:-${h:-/var/lib/$SVC_USER}/.tapectl}}"; }
+# home_pointer: the home pointer step 7 keeps (#437). Under --home only one the
+# caller names (TAPECTL_HOME_POINTER, as the mhvtl harnesses do), else none:
+# /etc/tapectl/home is the host's, and a throwaway home must never aim it at
+# itself or remove it (#543).
+home_pointer() {
+  if [ -n "$HOME_DIR" ]; then printf '%s' "${TAPECTL_HOME_POINTER:-}"
+  else printf '%s' "${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"; fi
+}
 compute_home
 # Item 197: before step 14 installs tapectl-op, which carries it, a printed remedy
 # names the home itself: the pointer may not exist yet (it is step 7's only with
@@ -596,7 +607,11 @@ derive_nodes() {
 # step-13 tests (tests/first_run_volume_state.rs) point it at a file of their
 # own, so they never hold the lock a gate on the same host needs.
 TAPE_LOCK="${TAPECTL_TAPE_LOCK:-/tmp/tapectl-tape.lock}"
-tape_lock() { exec 9>"$TAPE_LOCK"; flock -n 9 || die "another process holds the tape lock ($TAPE_LOCK) — a gate, a rehearsal or a fill is using the drive; wait for it"; }
+# A symlink at the fixed name would send `exec 9>` to its target, truncating it as
+# the invoker (#543): a link is refused, never followed. (A directory only the
+# operator and the service user can write would close the name altogether, but
+# every harness takes this path: moving it is one change in all of them.)
+tape_lock() { [ ! -L "$TAPE_LOCK" ] || die "$TAPE_LOCK is a symbolic link: it is not followed. Look at who made it, remove it, and run again"; exec 9>"$TAPE_LOCK"; flock -n 9 || die "another process holds the tape lock ($TAPE_LOCK) — a gate, a rehearsal or a fill is using the drive; wait for it"; }
 # Item 190: step 12 and the drive poll. A poll during the rehearsal records the
 # test cartridge in the PRODUCTION catalog: the rehearsal's homes are throwaway
 # ones, so the production drive lock never sees it. drive_poll_pause refuses
@@ -892,9 +907,9 @@ drive_post_warning() {
 }
 skip_if() { [ "$FROM" -gt "$STEP" ] && { note "skipped (--from $FROM)"; return 0; }; return 1; }
 vercmp_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
-# dar_path_prefix: "DIR:" when --dar names a dar outside PATH's first hit, so the
-# step-4 suite (whose fixtures run plain `dar`) tests the dar production uses.
-dar_path_prefix() { [ -n "$DAR_BIN" ] && printf '%s:' "$(dirname "$DAR_BIN")"; return 0; }
+# tar_path_prefix: "DIR:" when --tar names a tar outside PATH's first hit, so the
+# step-4 suite (whose fixtures run plain `tar`) tests the tar production uses.
+tar_path_prefix() { [ -n "$TAR_BIN" ] && printf '%s:' "$(dirname "$TAR_BIN")"; return 0; }
 # rustup's env is loaded here, not only in step 1, so --from 3 never falls
 # through to a distro cargo that cannot parse edition 2021.
 # shellcheck disable=SC1091
@@ -950,61 +965,11 @@ sys.exit(3 if sys.argv[1] in (d.get("barcode"), d.get("serial_number"), d.get("o
 printf '%stapectl first run%s — repo %s\n' "$B" "$R" "$REPO"
 printf 'home: %s   log: %s\n' "$EFFECTIVE_HOME" "$LOG"
 if [ -n "$PROFILE" ]; then printf 'profile: %s\n' "$PROFILE"; elif [ "$PROFILE_GIVEN" = 1 ]; then printf 'profile: none\n'; fi
-printf 'work dir: %s   dar: %s\n' "$WORK_DIR" "$DAR"
+printf 'work dir: %s   tar: %s\n' "$WORK_DIR" "$TAR"
 printf 'service user: %s\n' "$( [ "$SVC_MODE" = 1 ] && echo "$SVC_USER (every tapectl command runs as it)" || echo "none — running as $USER" )"
 if [ "$SVC_MODE" = 0 ] || id "$SVC_USER" >/dev/null 2>&1; then
   if [ -z "$HOME_DIR" ] && as_svc test -e "$EFFECTIVE_HOME/tapectl.db" 2>/dev/null && [ "$FROM" -le 7 ]; then
     note "$EFFECTIVE_HOME is already initialised. This script will detect that in step 7 and not re-init."
-  fi
-  # ADR-0012 item 197: a home outside ~/.tapectl is found through --home, the
-  # units' TAPECTL_HOME and the pointer, and tapectl ranks an account's own
-  # ~/.tapectl above the pointer. One left beside it would be what a plain
-  # `sudo -u USER -H tapectl` opens, silently: refuse until it is moved.
-  _own="$(svc_home)/.tapectl"
-  if [ -n "$TAPECTL_HOME_DIR" ] && [ "$_own" != "$EFFECTIVE_HOME" ] && as_svc test -e "$_own" 2>/dev/null; then
-    die "$_own exists, and the home is $EFFECTIVE_HOME (TAPECTL_HOME_DIR). tapectl finds an account's own ~/.tapectl before the pointer /etc/tapectl/home, so a plain \`${SUDO_PREFIX}tapectl <command>\` would open $_own, not $EFFECTIVE_HOME. Move it aside first (handoff (i) step 2 moves it to .tapectl-old), then run this again"
-  fi
-  unset _own
-  # Keys renamed since a home may have been initialised (ADR-0012, 2026-09-28
-  # amendment; issue #348): [defaults] min_copies_for_tape_only → min_copies and
-  # min_locations_for_tape_only → min_locations, same meaning. The new binary
-  # refuses the old names, and a re-entry at --from 12/13 never reaches step 7's
-  # config probe — so the fixup lives here, where every run passes.
-  CFG0="$EFFECTIVE_HOME/config.toml"
-  if as_svc test -f "$CFG0" 2>/dev/null \
-     && as_svc grep -qE '^[[:space:]]*min_(copies|locations)_for_tape_only[[:space:]]*=' "$CFG0" 2>/dev/null; then
-    note "$CFG0 uses key names this tapectl renamed (same meaning):"
-    note "  min_copies_for_tape_only → min_copies,  min_locations_for_tape_only → min_locations"
-    if confirm "Rename them in place now (the old file is kept beside it)?"; then
-      run as_svc cp "$CFG0" "$CFG0.pre-rename-$(date +%Y%m%d-%H%M%S)"
-      run as_svc sed -i -E \
-        -e 's/^([[:space:]]*)min_copies_for_tape_only([[:space:]]*=)/\1min_copies\2/' \
-        -e 's/^([[:space:]]*)min_locations_for_tape_only([[:space:]]*=)/\1min_locations\2/' "$CFG0"
-      as_svc grep -qE '^[[:space:]]*min_(copies|locations)_for_tape_only[[:space:]]*=' "$CFG0" \
-        && die "the rename did not take — edit [defaults] in $CFG0 by hand"
-      ok "config keys renamed"
-    else
-      note "left as is — every tapectl command will refuse this config until the two keys are renamed"
-    fi
-  fi
-  # Issue #391 (ADR-0012, 2026-10-06 items 9 and 16): [[backends.lto]]
-  # usable_capacity_factor → fill_ceiling, same meaning (the share of a
-  # cartridge a write may fill). Renaming keeps the value the file has; deleting
-  # the line instead takes the ruled default, 0.97.
-  if as_svc test -f "$CFG0" 2>/dev/null \
-     && as_svc grep -qE '^[[:space:]]*usable_capacity_factor[[:space:]]*=' "$CFG0" 2>/dev/null; then
-    note "$CFG0 uses a key this tapectl renamed (same meaning): usable_capacity_factor → fill_ceiling"
-    note "  renaming keeps your value; to take the new default (0.97) delete the line instead"
-    if confirm "Rename it in place now, keeping its value (the old file is kept beside it)?"; then
-      run as_svc cp "$CFG0" "$CFG0.pre-rename-$(date +%Y%m%d-%H%M%S)"
-      run as_svc sed -i -E \
-        -e 's/^([[:space:]]*)usable_capacity_factor([[:space:]]*=)/\1fill_ceiling\2/' "$CFG0"
-      as_svc grep -qE '^[[:space:]]*usable_capacity_factor[[:space:]]*=' "$CFG0" \
-        && die "the rename did not take — edit [[backends.lto]] in $CFG0 by hand"
-      ok "config key renamed"
-    else
-      note "left as is — every tapectl command will refuse this config until the key is renamed or deleted"
-    fi
   fi
 fi
 resolve_tapectl() {
@@ -1055,6 +1020,19 @@ PY
 # installed_is_new: the installed binary is a build of the tag.
 installed_is_new() { case "$("$INSTALL_BIN" --version 2>/dev/null)" in "tapectl $NEW_VER ($TAG, "*) return 0 ;; *) return 1 ;; esac; }
 need_new() { installed_is_new || die "the installed $INSTALL_BIN is not $TAG ($("$INSTALL_BIN" --version 2>/dev/null || echo unreadable)): run --upgrade --from 4"; }
+# need_rollback: steps 4 and 5 replace the binary and migrate the catalog, so the
+# records a rollback stands on must exist first: step 2's backup (a readable
+# file) and step 3's kept binary of the OLD version. `--from 4`, which need_new
+# itself suggests, skips both steps (#543).
+need_rollback() {
+  local _b _kv
+  _b="$(ustate backup)"
+  [ -n "$_b" ] || die "$U_STATE records no backup from step 2: this step replaces the binary or migrates the catalog, and a rollback would have nothing to import. Run --upgrade from step 2 (a plain --upgrade resumes there)"
+  as_svc test -r "$_b" || die "the backup $_b that $U_STATE records is not readable: run --upgrade from step 2"
+  [ -e "$KEEP" ] || die "no kept copy of $OLD_VER at $KEEP (step 3): a rollback would have no binary. Run --upgrade from step 3"
+  _kv="$("$KEEP" --version 2>/dev/null | awk '{ print $2; exit }')"
+  [ "$_kv" = "$OLD_VER" ] || die "$KEEP is tapectl ${_kv:-<unreadable>}, not $OLD_VER: stop and look"
+}
 # upgrade_child N [ARG…]: this script's own step N, with the installed binary and
 # the arguments this run was given (FWD_ARGS). Not through `run`: the child logs
 # its own lines, and its prompts read the terminal.
@@ -1114,6 +1092,7 @@ UNIT_BDIR=""
 if [ -r "$UNIT_FILE" ]; then UNIT_BDIR="$(sed -n '/^Environment=TAPECTL_BACKUP_DIR=/{s///p;q;}' "$UNIT_FILE")"; fi
 if [ -z "$OLD_VER" ]; then
   [ "$INST_VER" != "$NEW_VER" ] || die "the installed tapectl is already $NEW_VER ($INST_LINE), and no upgrade to it is recorded here ($U_STATE): there is nothing to upgrade. Every build installed on a production host has a version of its own (ADR-0012, 2026-09-30)"
+  vercmp_ge "$INST_VER" 2.0.0 || die "the installed tapectl is $INST_VER: there is no upgrade from a release before 2.0.0 (ADR-0012 item 258(c)), because 2.0.0 reads and writes Layout 3 and one baseline schema only. The way is a fresh start: a new catalog, new keys, new units and new cartridges (docs/install.md §10)"
   vercmp_ge "$NEW_VER" "$INST_VER" || die "$TAG is older than the installed $INST_VER: there is no downgrade past a migration (docs/install.md §10, \"Rolling back\")"
   OLD_VER="$INST_VER"
   ustate_set old "$OLD_VER"
@@ -1155,10 +1134,28 @@ log "upgrade $OLD_VER -> $NEW_VER ($U_STATE)"
 uhdr 2 "Back up the catalog with the old binary ($OLD_VER)"
 uskip || {
 U_BACKUP="$(ustate backup)"
+# A backup recorded by an earlier run is the rollback step 13 prints, so its age
+# is stated, and while the OLD binary is still installed (step 4 has not run) the
+# catalog may have moved on since: past U_BACKUP_MAX_AGE seconds (an hour, or
+# TAPECTL_UPGRADE_BACKUP_MAX_AGE) it is not reused, and a new one is taken (#543).
+U_BACKUP_MAX_AGE="${TAPECTL_UPGRADE_BACKUP_MAX_AGE:-3600}"
+case "$U_BACKUP_MAX_AGE" in '' | *[!0-9]*) die "TAPECTL_UPGRADE_BACKUP_MAX_AGE must be a number of seconds, got '$U_BACKUP_MAX_AGE'" ;; esac
+U_BACKUP_AGE=""
+if [ -n "$U_BACKUP" ]; then
+  _mt="$(as_svc stat -c %Y "$U_BACKUP" 2>/dev/null)" || die "cannot read the backup $U_BACKUP that $U_STATE records"
+  U_BACKUP_AGE=$(( $(date +%s) - _mt ))
+  [ "$U_BACKUP_AGE" -ge 0 ] || U_BACKUP_AGE=0
+  U_BACKUP_AGE_TEXT="$((U_BACKUP_AGE / 3600)) h $((U_BACKUP_AGE % 3600 / 60)) min"
+  if [ "$INST_VER" = "$OLD_VER" ] && [ "$U_BACKUP_AGE" -gt "$U_BACKUP_MAX_AGE" ]; then
+    note "the backup $U_BACKUP is $U_BACKUP_AGE_TEXT old and $OLD_VER is still installed, so the catalog may have changed since: it is not reused, a new one is taken"
+    U_BACKUP=""
+  fi
+fi
 if [ -n "$U_BACKUP" ]; then
   _facts="$(db_facts "$U_BACKUP")" || die "cannot read the backup $U_BACKUP that $U_STATE records"
   [ "${_facts#* }" = ok ] || die "the backup $U_BACKUP fails SQLite's integrity check"
-  ok "taken already: $U_BACKUP (schema ${_facts%% *}, integrity ok)"
+  ok "taken already: $U_BACKUP ($U_BACKUP_AGE_TEXT old, schema ${_facts%% *}, integrity ok)"
+  [ "$U_BACKUP_AGE" -le "$U_BACKUP_MAX_AGE" ] || note "a rollback to it loses whatever the catalog recorded in those $U_BACKUP_AGE_TEXT"
 else
   [ "$INST_VER" = "$OLD_VER" ] || die "the installed tapectl is $INST_VER, and $U_STATE records no backup taken with $OLD_VER: the catalog may have moved on already. Do not go on without a backup: stop and look"
   { as_svc test -d "$U_BDIR" && as_svc test -w "$U_BDIR"; } || die "$U_RUN_USER cannot write $U_BDIR, the backup directory"
@@ -1167,10 +1164,7 @@ else
     U_BACKUP="$U_BDIR/tapectl-pre-$NEW_VER-$(date -u +%Y%m%dT%H%M%SZ).db"
     note "tapectl-pre-$NEW_VER.db is there already; this backup goes to $U_BACKUP"
   fi
-  # The OLD binary's own spelling (ADR-0012 OQ1): `db backup FILE` from 1.9.0,
-  # `db backup --to FILE` before it (1.9.0 refuses --to by name).
-  if vercmp_ge "$OLD_VER" 1.9.0; then U_BACKUP_ARGS=("$U_BACKUP"); else U_BACKUP_ARGS=(--to "$U_BACKUP"); fi
-  run tc db backup "${U_BACKUP_ARGS[@]}" || die "db backup with $OLD_VER failed (above); nothing has changed"
+  run tc db backup "$U_BACKUP" || die "db backup with $OLD_VER failed (above); nothing has changed"
   _facts="$(db_facts "$U_BACKUP")" || die "cannot read the backup $U_BACKUP just written"
   [ "${_facts#* }" = ok ] || die "the backup $U_BACKUP fails SQLite's integrity check: do not go on"
   ustate_set backup "$U_BACKUP"
@@ -1196,6 +1190,7 @@ fi
 # ---------------------------------------------------------------- upgrade 4
 uhdr 4 "Build and install $TAG"
 uskip || {
+need_rollback
 if installed_is_new; then ok "installed already: $("$INSTALL_BIN" --version)"
 else
   if [ -n "$NEW_BIN" ]; then
@@ -1224,6 +1219,7 @@ fi
 uhdr 5 "The new binary's first open: the migrations"
 uskip || {
 need_new
+need_rollback
 _before="$(ustate schema_before)"
 [ -n "$_before" ] || { _before="$(db_facts "$CATALOG" version)" || die "cannot read $CATALOG's schema"; }
 run tc config check || die "config check refused (above). A key a release renamed or removed is named there; the release notes say what to do ($U_NOTES, \"Upgrading\"). Fix it, then run --upgrade again"
@@ -1316,8 +1312,20 @@ if [ -n "$HOME_DIR" ]; then
 elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl cat tapectl-backup.service >/dev/null 2>&1; then
   note "tapectl-backup.service is not installed on this host (step 14 installs it): no copy taken"
 elif confirm "Start tapectl-backup.service once now (sudo), so a copy made by $NEW_VER lands in its directory?"; then
+  _t0=$(( $(date +%s) - 1 ))
   run sudo systemctl start tapectl-backup.service || die "tapectl-backup.service failed: journalctl -u tapectl-backup.service -n 30"
-  ok "tapectl-backup.service ran"
+  # The unit has SuccessExitStatus=75 and the wrapper exits 75 after removing its
+  # copy when another command held the catalog, so "started" is not "a copy was
+  # made": say which (#543).
+  _copy="$(as_svc find "$U_BDIR" -maxdepth 1 -type f -name 'tapectl-*.db' -newermt "@$_t0" 2>/dev/null | sort | tail -n 1)"
+  _mrc="$(systemctl show tapectl-backup.service -p ExecMainStatus --value 2>/dev/null || true)"
+  if [ -n "$_copy" ]; then
+    ok "tapectl-backup.service wrote a copy: $_copy"
+  elif [ "$_mrc" = 75 ]; then
+    note "tapectl-backup.service exited 75 (catalog busy: another tapectl command held the catalog) and wrote NO copy; once nothing else is running: sudo systemctl start tapectl-backup.service"
+  else
+    note "tapectl-backup.service started and no new tapectl-*.db appeared in $U_BDIR (service exit status ${_mrc:-unknown}): read journalctl -u tapectl-backup.service -n 30, then sudo systemctl start tapectl-backup.service again"
+  fi
 else
   note "skipped: sudo systemctl start tapectl-backup.service takes one later"
 fi
@@ -1424,13 +1432,20 @@ ok "tidy done"
 uhdr 13 "The rollback"
 _rb="$(ustate backup)"
 explain <<EOF
-Should $NEW_VER have to come out: with the timers stopped, import the backup step 2 took with $OLD_VER while $NEW_VER is still installed, then put the kept binary back and check the catalog with it. In that order: every tapectl command opens the catalog first, and $OLD_VER cannot open one $NEW_VER has migrated, so $OLD_VER's own import would be refused. Whatever the catalog recorded after that backup is lost, and $OLD_VER may refuse a tape $NEW_VER wrote in between.
+Should $NEW_VER have to come out: with the timers stopped, import the backup step 2 took with $OLD_VER while $NEW_VER is still installed, then put the kept binary back and check the catalog with it. In that order: every tapectl command opens the catalog first, and $OLD_VER cannot open one $NEW_VER has migrated, so $OLD_VER's own import would be refused. Whatever the catalog recorded after that backup is lost, and $OLD_VER may refuse a tape $NEW_VER wrote in between. The binary alone is not the whole rollback: step 6 installed $NEW_VER's wrappers (the daily backup's among them), and a wrapper may call a spelling $OLD_VER does not have, so $OLD_VER's own step 14 puts its wrappers back before the timers start again.
 EOF
 _timers="tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer"
 [ -n "$HOME_DIR" ] || printf '     sudo systemctl stop %s\n' "$_timers"
 printf '     %s db import %s\n' "$U_OP" "${_rb:-<the backup from step 2: none is recorded in $U_STATE>}"
 printf '     sudo cp -p %s %s\n' "$KEEP" "$INSTALL_BIN"
 printf '     %s db fsck\n' "$U_OP"
+# The wrappers step 6 installed are $NEW_VER's and may call a spelling $OLD_VER
+# does not have (1.8.1 wants `db backup --to`, 1.9.x takes the path): the binary
+# alone is not the rollback. The OLD checkout's own step 14 puts its wrappers back.
+_rpa=()
+[ "$PROFILE_GIVEN" = 0 ] || _rpa=(--profile "${PROFILE:-none}")
+printf '     git -C %s checkout v%s\n' "$REPO" "$OLD_VER"
+printf '     bash %s/scripts/first-run.sh %s--tapectl %s --skip-build --skip-tests --from 14 --to 14   # v%s'"'"'s wrappers, beside v%s'"'"'s binary\n' "$REPO" "$(printf '%s ' ${_rpa[@]+"${_rpa[@]}"} ${FWD_ARGS[@]+"${FWD_ARGS[@]}"})" "$INSTALL_BIN" "$OLD_VER" "$OLD_VER"
 [ -n "$HOME_DIR" ] || printf '     sudo systemctl start %s\n' "$_timers"
 ustate_set finished "$(date -u +%FT%TZ)"
 ok "upgraded to $TAG: $("$INSTALL_BIN" --version). Log: $LOG; record: $U_STATE"
@@ -1460,18 +1475,18 @@ ok "rustc $(rustc --version | awk '{print $2}'), cargo $(cargo --version | awk '
 hdr 2 "Runtime tools"
 skip_if || {
 explain <<'EOF'
-tapectl shells out to `dar` for every archive (a hard dependency, >= 2.6, 2.7.20+ recommended) and to `mt` and the sg3-utils for drive control, health pages, the cartridge's MAM and, from 1.7.2, the drive's Logical Block Protection page (`sg_modes`, `sg_wr_mode`). `age` is not used by the binary itself — it uses the rage crate — but the on-tape RESTORE.sh, the heir path, needs it, and so does the rehearsal in step 12. `setfacl` (package acl) grants the service user read on your data in step 11. `lsscsi` and `python3` are for step 6 and the lifecycle suite.
+tapectl runs GNU tar for every archive it stages, and holds it to a floor: GNU tar 1.35 built with ACL support (ADR-0012 item 274; below 1.35 `--numeric-owner` does not reach an ACL entry, so a name would be written into the stream, and a 1.35 built without ACL support writes no ACL at all). This step checks the tar it would use and never installs one: Debian 13 and Ubuntu 24.04 and later ship one, and on an older host contrib/hosts/<host>-prep.sh builds it (docs/install.md, "The writer's tar"). It also uses `mt` and the sg3-utils for drive control, health pages, the cartridge's MAM and, from 1.7.2, the drive's Logical Block Protection page (`sg_modes`, `sg_wr_mode`). `age` is not used by the binary itself — it uses the rage crate — but the on-tape RESTORE.sh, the heir path, needs it, and so does the rehearsal in step 12. `setfacl` (package acl) grants the service user read on your data in step 11. `lsscsi` and `python3` are for step 6 and the lifecycle suite.
 EOF
 MISSING=()
 for t in mt sg_read_attr sg_logs sg_modes sg_wr_mode setfacl python3 lsscsi; do command -v "$t" >/dev/null 2>&1 || MISSING+=("$t"); done
-if [ -n "$DAR_BIN" ]; then [ -x "$DAR_BIN" ] || die "--dar $DAR_BIN is not executable (on home2, contrib/hosts/home2-prep.sh builds it)"
-else command -v dar >/dev/null 2>&1 || MISSING+=(dar); fi
+if [ -n "$TAR_BIN" ]; then [ -x "$TAR_BIN" ] || die "--tar $TAR_BIN is not executable (on home2, contrib/hosts/home2-prep.sh builds it)"
+else command -v tar >/dev/null 2>&1 || MISSING+=(tar); fi
 if [ "${#MISSING[@]}" -gt 0 ]; then
   note "missing: ${MISSING[*]}"
   explain <<'EOF'
-Debian/Ubuntu package names: dar, mt-st, sg3-utils, acl, python3, lsscsi.
+Debian/Ubuntu package names: tar, mt-st, sg3-utils, acl, python3, lsscsi.
 EOF
-  if confirm "Run: sudo apt install dar mt-st sg3-utils acl python3 lsscsi ?"; then run sudo apt install -y dar mt-st sg3-utils acl python3 lsscsi; else die "install the missing tools and re-run with --from 2"; fi
+  if confirm "Run: sudo apt install tar mt-st sg3-utils acl python3 lsscsi ?"; then run sudo apt install -y tar mt-st sg3-utils acl python3 lsscsi; else die "install the missing tools and re-run with --from 2"; fi
 fi
 if ! command -v age >/dev/null 2>&1; then
   explain <<'EOF'
@@ -1480,7 +1495,7 @@ EOF
   if confirm "Install age v1.3.2 from the upstream GitHub release into /usr/local/bin now?"; then
     AGE_TAG="v1.3.2"
     AGE_URL="https://github.com/FiloSottile/age/releases/download/${AGE_TAG}/age-${AGE_TAG}-linux-amd64.tar.gz"
-    # sha256 of that tarball (#506), as home2-prep.sh pins its dar: its age and
+    # sha256 of that tarball (#506), as home2-prep.sh pins its tar: its age and
     # age-keygen are byte for byte the ones installed on home2. A new AGE_TAG needs a new pin.
     AGE_SHA256="cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10"
     TMPD="$(mktemp -d)"
@@ -1493,12 +1508,26 @@ EOF
     run age --version
   else note "continuing without age — the step-12 rehearsal will be unavailable until it is installed"; fi
 fi
-DARV="$("$DAR" --version </dev/null 2>&1 | sed -n 's/.*dar version \([0-9.]*\).*/\1/p' | head -1)"
-[ -n "$DARV" ] || DARV="$("$DAR" --version </dev/null 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-[ -n "$DARV" ] || die "could not read dar's version (dar --version)"
-vercmp_ge "$DARV" "2.6.0" || die "dar $DARV is too old; tapectl needs >= 2.6"
-vercmp_ge "$DARV" "2.7.20" || note "dar $DARV works; 2.7.20+ is recommended (bookworm ships 2.7.x)"
-ok "dar $DARV ($DAR), mt, sg3-utils, setfacl, python3, lsscsi present$(command -v age >/dev/null 2>&1 && echo ", age present" || echo "; age ABSENT (heir-path script and rehearsal only)")"
+# The writer's floor (ADR-0012 item 274; #563): GNU tar 1.35 built with ACL
+# support. Both halves are proved here, not assumed from a version number:
+# the version, and a real ACL entry written by number with no name beside it.
+TARV="$("$TAR" --version </dev/null 2>&1 | head -1)"
+case "$TARV" in
+  "tar (GNU tar) "*) TARN="${TARV#tar (GNU tar) }"; TARN="${TARN%% *}" ;;
+  *) die "$TAR is not GNU tar ($TARV): tapectl writes with GNU tar 1.35 or later, built with ACL support (docs/install.md, \"The writer's tar\")" ;;
+esac
+vercmp_ge "$TARN" "1.35" || die "$TAR is GNU tar $TARN, below the floor, 1.35: below it --numeric-owner does not reach an ACL entry. Debian 13 and Ubuntu 24.04 and later ship 1.35; on an older host build it into /usr/local (docs/install.md, \"The writer's tar\"; on home2, contrib/hosts/home2-prep.sh) and give it with --tar"
+ACLDIR="$(mktemp -d "$WORK_DIR/tar-acl.XXXXXX" 2>/dev/null || mktemp -d)"
+if ( cd "$ACLDIR" && : > f && setfacl -m u:1:r,g:2:r f 2>/dev/null && getfacl -p f 2>/dev/null | grep -q '^user:[^:]\+:r--' ); then
+  ACLTXT="$( cd "$ACLDIR" && "$TAR" --format=pax --numeric-owner --xattrs --acls --xattrs-exclude='system.posix_acl_*' -cf - f 2>/dev/null | tr -c '[:print:]\n' '\n' | grep -a '^user:' || true )"
+  case "$ACLTXT" in
+    *"user:1:r--"*) ok "$TAR ($TARN) writes ACL entries by number" ;;
+    "") rm -rf "$ACLDIR"; die "$TAR ($TARN) wrote no ACL entry for a file that has one: it was built without ACL support. Build GNU tar 1.35 with libacl-dev installed (docs/install.md, \"The writer's tar\")" ;;
+    *) rm -rf "$ACLDIR"; die "$TAR ($TARN) wrote an ACL entry with a name in it ($ACLTXT): --numeric-owner did not reach the ACL. Use GNU tar 1.35 or later" ;;
+  esac
+else note "could not make an ACL on a file under ${ACLDIR%/*} (no ACL support on that filesystem?): the ACL check is skipped here; tapectl's own check of the stream is the proof at stage time"; fi
+rm -rf "$ACLDIR"
+ok "tar $TARN ($TAR), mt, sg3-utils, setfacl, python3, lsscsi present$(command -v age >/dev/null 2>&1 && echo ", age present" || echo "; age ABSENT (heir-path script and rehearsal only)")"
 }
 
 # ================================================================ step 3
@@ -1525,9 +1554,9 @@ hdr 4 "The ungated test suite"
 skip_if || {
 if [ "$SKIP_TESTS" = 1 ]; then note "--skip-tests"; else
 explain <<'EOF'
-`cargo test` runs the ungated suite (about 4,600 tests), which needs no tape and no mhvtl — only dar. It proves this machine's dar, filesystem and toolchain behave the way the suite expects. Two to three minutes.
+`cargo test` runs the ungated suite (about 4,600 tests), which needs no tape and no mhvtl — only a GNU tar at the floor (step 2). It proves this machine's tar, filesystem and toolchain behave the way the suite expects. Two to three minutes.
 EOF
-if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && PATH="$(dar_path_prefix)$PATH" run flock -w 1200 -E 99 "$BUILD_LOCK" cargo test </dev/null ) || die "the suite is red on this machine (exit 99 = timed out waiting for the build lock) — stop here and look"; ok "suite green"; fi
+if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && PATH="$(tar_path_prefix)$PATH" run flock -w 1200 -E 99 "$BUILD_LOCK" cargo test </dev/null ) || die "the suite is red on this machine (exit 99 = timed out waiting for the build lock) — stop here and look"; ok "suite green"; fi
 fi
 }
 
@@ -1538,7 +1567,7 @@ if [ "$SVC_MODE" != 1 ]; then note "--no-service-user: tapectl runs as $USER, ho
 explain <<EOF
 WHY A SERVICE USER. The tapectl home holds the operator private key, every tenant private key and the catalog, and tapectl resolves that home from \$HOME (as \$HOME/.tapectl, unless the profile's TAPECTL_HOME_DIR puts it elsewhere). Under a dedicated account those files share a home with nothing else — not your shell history, your ssh agent or the next script you run — and the systemd audit timer in contrib/ gets the fixed User= and HOME= it needs. The account is a nologin system user; you drive it with \`sudo -u $SVC_USER -H tapectl …\`, which is what this script does for every tapectl command from here on.
 
-Its needs are exactly three, and each is granted where it arises: membership of the group that owns the drive nodes (step 6), read on the trees it archives (per unit, by ACL, step 11), and ownership of the staging directory (step 7). Restore needs no root — dar runs with -O — but a restore destination must be writable by $SVC_USER.
+Its needs are exactly three, and each is granted where it arises: membership of the group that owns the drive nodes (step 6), read on the trees it archives (per unit, by ACL, step 11), and ownership of the staging directory (step 7). Restore needs no root — tar extracts as the account that runs it, and the restored files are that account's — but a restore destination must be writable by $SVC_USER.
 EOF
 if id "$SVC_USER" >/dev/null 2>&1; then ok "user $SVC_USER exists: $(id "$SVC_USER")"
   if [ -n "$SVC_HOME_WANT" ] && [ "$(svc_home)" != "$SVC_HOME_WANT" ]; then
@@ -1713,8 +1742,8 @@ EOF
   fi
   # Issue #437: a home pointer left from a deleted home names a directory that
   # no longer exists, and init would refuse on it. It is rewritten in step 7.
-  _ptr="${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"
-  if [ -f "$_ptr" ] && ! sudo test -d "$(cat "$_ptr")"; then run sudo rm -f "$_ptr"; fi
+  _ptr="$(home_pointer)"
+  if [ -n "$_ptr" ] && [ -f "$_ptr" ] && ! sudo test -d "$(cat "$_ptr")"; then run sudo rm -f "$_ptr"; fi
   note "PAPER READY? The escrow secret appears exactly once, next."
   confirm "Run init now? (type y — Enter means no, nothing has been created)" || die "stopped before init: nothing was minted or written. Re-run with --from $STEP and answer y when the paper is ready"
   run_nolog tc "${INIT_ARGS[@]}"
@@ -1766,22 +1795,27 @@ if declare -p CONTENDER_PROCESSES >/dev/null 2>&1 && [ "${#CONTENDER_PROCESSES[@
   run tc config set host_check.contender_processes "$CP_TOML" || die "could not set host_check.contender_processes = $CP_TOML"
   ok "host check names these processes before a write: ${CONTENDER_PROCESSES[*]}"
 fi
-if [ -n "$DAR_BIN" ]; then
-  # [dar] binary: the dar every tapectl command runs, whatever PATH the caller
+if [ -n "$TAR_BIN" ]; then
+  # [tar] binary: the tar every tapectl command runs, whatever PATH the caller
   # (sudo's secure_path, a systemd unit) happens to have.
-  CUR_DAR="$(as_svc sed -n '/^\[dar\]/,/^\[/{s/^binary *= *"\(.*\)"/\1/p}' "$CFG" | head -1)"
-  if [ "$CUR_DAR" != "$DAR_BIN" ]; then
-    as_svc sed -i "/^\[dar\]/,/^\[/{s|^binary *= *\".*\"|binary = \"$DAR_BIN\"|}" "$CFG"
-    as_svc grep -q "^binary = \"$DAR_BIN\"" "$CFG" || die "could not set [dar] binary in $CFG — edit it by hand"
+  CUR_TAR="$(as_svc sed -n '/^\[tar\]/,/^\[/{s/^binary *= *"\(.*\)"/\1/p}' "$CFG" | head -1)"
+  if [ "$CUR_TAR" != "$TAR_BIN" ]; then
+    as_svc sed -i "/^\[tar\]/,/^\[/{s|^binary *= *\".*\"|binary = \"$TAR_BIN\"|}" "$CFG"
+    as_svc grep -q "^binary = \"$TAR_BIN\"" "$CFG" || die "could not set [tar] binary in $CFG — edit it by hand"
   fi
   run tc config check || true
-  ok "dar: $DAR_BIN"
+  ok "tar: $TAR_BIN"
 fi
 # Issue #393: the profile's OPS_GROUP lets the operator's own account (and an
 # agent helping them) watch sessions with `tapectl status` without sudo. The
 # group reads logs/ and nothing else in the home; the service user must be a
 # member too, so tapectl can give the home and logs/ the group itself.
-if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ]; then
+# Under --home only with a pointer the caller names (home_pointer): the host-wide
+# /etc/tapectl/home must never name a throwaway home (#543).
+if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ] && [ -z "$(home_pointer)" ]; then
+  note "ops group $OPS_GROUP: not set up for --home $HOME_DIR (the home pointer /etc/tapectl/home is the host's, not a throwaway home's; TAPECTL_HOME_POINTER names one of its own)"
+fi
+if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ] && [ -n "$(home_pointer)" ]; then
   explain <<EOF
 THE OPS GROUP. Live progress prints only on the terminal that started a command, and the session logs under $EFFECTIVE_HOME/logs/ belong to $SVC_USER (0700), so your own account cannot see whether a write is running, which phase it is in, or how the last one ended without sudo. With [ops] group = "$OPS_GROUP", every tapectl command run as $SVC_USER keeps the home at 0710 and logs/ at 2750 owned by $OPS_GROUP, and writes each session log 0640: members can run a plain \`tapectl status\` (the pointer /etc/tapectl/home names the home) and read the logs, and open nothing else — every other entry of the home (the catalog, the keys, config.toml, …) is kept closed to the group. Group membership takes effect at the member's next login.
 EOF
@@ -1802,7 +1836,7 @@ EOF
     run tc config check || true
     # Issue #437 / ADR-0012 2026-10-15 item 62: a pointer so members need no
     # --home. tapectl ignores it as root and when the account has its own ~/.tapectl.
-    POINTER="${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"
+    POINTER="$(home_pointer)"
     run sudo install -d -m 0755 "$(dirname "$POINTER")"
     printf '%s\n' "$EFFECTIVE_HOME" | sudo tee "$POINTER" >/dev/null
     run sudo chmod 0644 "$POINTER"
@@ -2189,7 +2223,7 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
     # /usr/sbin:/sbin: Debian installs mtx there and leaves both off a normal
     # user's PATH; the suite's precondition check wants mtx even on a real
     # drive (home2, 2026-09-28).
-    CMD="cd '$REPO' && PATH='$(dar_path_prefix)$PATH:/usr/sbin:/sbin' TAPECTL_LIFECYCLE_OUT='$WORK_DIR/tapectl-lifecycle' TAPECTL_BIN='$TAPECTL' bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$TEST_BARCODE'"
+    CMD="cd '$REPO' && PATH='$(tar_path_prefix)$PATH:/usr/sbin:/sbin' TAPECTL_LIFECYCLE_OUT='$WORK_DIR/tapectl-lifecycle' TAPECTL_BIN='$TAPECTL' bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$TEST_BARCODE'"
     if [ "${#WRAP[@]}" -gt 0 ]; then run "${WRAP[@]}" "$CMD"; else run bash -c "$CMD"; fi || die "rehearsal RED — do not write real data until this is understood"
     ok "rehearsal green"
     # B14: step 13 checks for this marker (per binary) before the first write.
@@ -2210,7 +2244,7 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
 [ "$NV" != 0 ] && note "$NV volume(s) already in the catalog." && { confirm "Write another tape now, or finish one an interrupted run left (same label)?" || { ok "nothing to do"; FROM=14; }; }
 if [ "$FROM" -le 13 ]; then
 explain <<'EOF'
-The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` hashes every source file, runs dar, and encrypts the archive once (age: one random file key per slice, wrapped for each recipient in a small header) into slices in staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session, seals it, and reads EVERY file back against the plan (--full-confirm) before it says the volume is sealed and confirmed. That readback is the tape's first full verify and is recorded as one, so nothing reads the tape a second time here (ADR-0012 item 218): `volume verify --full` is for the periodic re-reads `verify_interval_days` asks for. On a full tape the readback takes about as long as the write. A sealed volume is immutable: there is no append. Once it is confirmed, the write moves the volume to its shelf and releases the staging of each unit that has reached its copy floor (ADR-0012 item 217); a unit still short of it (every unit, after the first of two copies) stays staged for the next tape.
+The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` hashes every source file, runs GNU tar over the exact list, checks the stream as it passes, and cuts, optionally compresses and encrypts it once (age: one random file key per slice, wrapped for each recipient in a small header) into slices in staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session, seals it, and reads EVERY file back against the plan (--full-confirm) before it says the volume is sealed and confirmed. That readback is the tape's first full verify and is recorded as one, so nothing reads the tape a second time here (ADR-0012 item 218): `volume verify --full` is for the periodic re-reads `verify_interval_days` asks for. On a full tape the readback takes about as long as the write. A sealed volume is immutable: there is no append. Once it is confirmed, the write moves the volume to its shelf and releases the staging of each unit that has reached its copy floor (ADR-0012 item 217); a unit still short of it (every unit, after the first of two copies) stays staged for the next tape.
 
 `volume init` also reads the loaded cartridge: its generation from the density code, which fixes this tape's capacity and is checked against what the drive can write, and its medium serial, which binds the volume to a cartridge in the catalog (ADR-0010). Nothing to set for a mixed LTO-5/LTO-6 shelf — each tape is planned against its own size.
 
@@ -2280,7 +2314,7 @@ except Exception: pass')" || true
   log "step 13: volume $LABEL is $VSTATE"
   tape_raise_setup
   # The quiet-host check (ADR-0012, 2026-09-24 amendment, item 7), run right
-  # before the WRITE or RESUME confirmation: staging's own dar load is over by
+  # before the WRITE or RESUME confirmation: staging's own tar load is over by
   # then, and what matters is the host the tape I/O will run on. `host check`
   # reads /proc and systemd only and exits 1 when anything tripped; it never
   # refuses anything. The two homorg timers are passed with --unit because
@@ -2403,7 +2437,7 @@ EOF
   # Issue #269: this used to be ONE confirm covering both phases, and then a
   # single loop doing snapshot+stage per unit. Two problems on production day.
   #
-  # The operator agreed to the EXPENSIVE phase (hashing, dar and one encryption
+  # The operator agreed to the EXPENSIVE phase (hashing, tar and one encryption
   # pass over the data, hours and a lot of staging disk) before anything had told
   # them how much data that was -- and the authoritative capacity check is the
   # pre-flight gate inside `volume write`, which runs AFTER all of it. Too much
@@ -2422,9 +2456,9 @@ EOF
     run tc snapshot create "$u" || die "snapshot failed for $u"
   done <<< "$UNITS"
   explain <<'EOF'
-Those are the sizes `snapshot create` recorded, before compression and encryption. Staging is the expensive phase — it reads and hashes every file, runs dar over every unit, and encrypts each archive once (the recipients only add a few hundred bytes of header each, not another pass), writing the slices to your staging directory. That is several full passes over the data. If that total looks wrong for the cartridge you have loaded, stop here: nothing has been archived yet, and stopping now costs you only the metadata walk. To do a subset instead, answer no and run `tapectl stage create <unit>` for the ones you want, then re-run this step with --from 13. `[staging] jobs` in config.toml (1 unless you set it) is how many units are staged at once; the largest start first.
+Those are the sizes `snapshot create` recorded, before compression and encryption. Staging is the expensive phase — it reads and hashes every file, runs tar over every unit, and compresses (if asked) and encrypts each slice once (the recipients only add a few hundred bytes of header each, not another pass), writing the slices to your staging directory. That is several full passes over the data. If that total looks wrong for the cartridge you have loaded, stop here: nothing has been archived yet, and stopping now costs you only the metadata walk. To do a subset instead, answer no and run `tapectl stage create <unit>` for the ones you want, then re-run this step with --from 13. `[staging] jobs` in config.toml (1 unless you set it) is how many units are staged at once; the largest start first.
 EOF
-  confirm "Stage them now? (runs dar + encryption, writes to staging)" || die "stopped before staging"
+  confirm "Stage them now? (runs tar + encryption, writes to staging)" || die "stopped before staging"
   # Issue #283: this loop MUST tolerate a unit that is already staged. The
   # explain block directly above tells the operator they may stage a subset
   # by hand and re-enter with `--from 13` -- and `stage create` refuses a unit

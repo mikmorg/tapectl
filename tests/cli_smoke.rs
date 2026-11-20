@@ -506,9 +506,8 @@ fn a_collections_or_archive_sets_table_appended_to_a_fresh_init_config_loads() {
 
 /// Issue #348 (CTO ruling 2026-09-28): `init` writes the renamed `[defaults]`
 /// keys `min_copies` / `min_locations`, and a config still carrying the old
-/// `*_for_tape_only` names is refused by `config check` with the new names
-/// in the message — the operator's own copy of an older config must say
-/// what to change, not just "unknown field".
+/// `*_for_tape_only` names is refused by `config check` as an unknown key
+/// (ADR-0012 item 258(d): 2.0 keeps no remediation text for a 1.x key).
 #[test]
 fn init_writes_min_copies_and_min_locations_and_the_old_names_are_refused() {
     let home = TempDir::new().expect("tempdir");
@@ -539,9 +538,14 @@ fn init_writes_min_copies_and_min_locations_and_the_old_names_are_refused() {
     let stdout = String::from_utf8_lossy(&check.stdout);
     assert!(stdout.contains("config: INVALID"), "{stdout}");
     assert!(
-        stdout.contains("defaults.min_copies and defaults.min_locations"),
-        "the refusal must name both new keys: {stdout}"
+        stdout.contains("unknown field `min_copies_for_tape_only`"),
+        "the old name must be refused as unknown: {stdout}"
     );
+    assert!(
+        stdout.contains("unknown key: defaults.min_locations_for_tape_only"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("renamed"), "{stdout}");
 }
 
 /// Acceptance criterion (issue #172): "`logging.level = \"debug\"` actually
@@ -686,8 +690,8 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
     // stream) with the exit code unchanged (asserted above via
     // `.success()`, i.e. still 0 with these fields added).
     assert!(
-        parsed.get("dar").is_some(),
-        "config check --json missing 'dar' depth-check field: {parsed}"
+        parsed.get("tar").is_some(),
+        "config check --json missing 'tar' depth-check field: {parsed}"
     );
     assert!(
         parsed.get("staging").is_some(),
@@ -710,23 +714,16 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
         Some(&serde_json::json!([])),
         "config check --json missing/non-empty 'unsupported_compression' field on a fresh db: {parsed}"
     );
-    // Fresh init's default dar.binary is now the bare, PATH-resolved "dar"
-    // (issue #124 — the old shipped default /opt/dar/bin/dar existed on no
-    // mainstream distro). `dar` is a hard runtime dependency guaranteed on
-    // PATH for this whole suite (CLAUDE.md; enforced by
-    // tests/test_dependencies.rs), and `config check` now resolves a bare
-    // name via PATH the same way the runtime does (issue #119), so a fresh
-    // init's dar status must come back "ok", not "missing" — the field
-    // still must be present and reported either way, and must not fail the
-    // command. Coverage for the "reported, not silently absent, when
-    // actually missing" case moved to depth_check.rs's own unit tests.
+    // A fresh init's tar is the bare, PATH-resolved "tar" (D11). GNU tar at
+    // the writer's floor is on PATH for this suite (tests/test_dependencies.rs),
+    // and `config check` probes it as `stage create` does, so it must pass.
     assert_eq!(
-        parsed["dar"]["status"],
+        parsed["tar"]["status"],
         serde_json::json!("ok"),
-        "expected a fresh init's default dar.binary ('dar') to resolve via PATH: {parsed}"
+        "expected a fresh init's default tar.binary ('tar') to pass the probe: {parsed}"
     );
     assert!(
-        parsed["dar"]["path"]
+        parsed["tar"]["path"]
             .as_str()
             .is_some_and(|p| p.starts_with('/')),
         "expected config check to report the PATH-resolved absolute path, not the bare name: {parsed}"
@@ -751,7 +748,7 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
 /// parse as whole JSON once something is staged -- the JSON arm never
 /// resolves an LTO backend (only the human "estimated tapes" line does,
 /// via `resolve_lto_backend`), so a fresh home with no `[[backends.lto]]`
-/// configured is fine here. Seeds one `staged` stage_set directly (no dar,
+/// configured is fine here. Seeds one `staged` stage_set directly (no tar,
 /// no encryption) since `volume plan` only ever reads the DB.
 #[test]
 fn volume_plan_json_parses_with_one_staged_unit() {
@@ -864,16 +861,17 @@ fn db_fsck_before_init_is_not_a_silent_success() {
 /// binary — not the lib's `#[cfg(test)]` fixtures, which are invisible from
 /// here (see this file's header comment).
 ///
-/// `.foreign_key_check()` (migrations 003/012/013/017) runs `PRAGMA
-/// foreign_key_check` with no table argument — i.e. whole-database — so a
-/// pre-existing orphan ANYWHERE makes `db::open`'s `migrate()` call fail the
-/// instant any pending migration carrying the check runs. That failure sits
-/// behind `main.rs`'s single shared `db::open()` gate, ahead of every
-/// command dispatch, including `db fsck --repair` — the one command that
-/// deletes orphans. This builds a database that never migrated past 002
-/// (one migration short of 003, the first `.foreign_key_check()`-decorated
-/// migration) and already carries one dangling `units.tenant_id`, the way a
-/// hand-edited, partially-restored, or pre-003 database would arrive.
+/// `.foreign_key_check()` runs `PRAGMA foreign_key_check` with no table
+/// argument — i.e. whole-database — so a pre-existing orphan ANYWHERE makes
+/// `db::open`'s `migrate()` call fail the instant any pending migration
+/// carrying the check runs. That failure sits behind `main.rs`'s single
+/// shared `db::open()` gate, ahead of every command dispatch, including
+/// `db fsck --repair` — the one command that deletes orphans. This builds a
+/// catalog at the baseline carrying one dangling `units.tenant_id`, and runs
+/// the binary with `TAPECTL_TEST_PENDING_MIGRATION` set
+/// (`db::PENDING_TEST_MIGRATION_ENV`), which gives a debug build one more,
+/// empty, migration with the check: with one baseline schema there is no
+/// real migration left to be behind on (T3.1 step 6).
 ///
 /// Negative control (pre-fix): `db fsck --repair` exits non-zero with a
 /// migration/foreign-key error and never runs the repair at all — the
@@ -882,11 +880,8 @@ fn db_fsck_before_init_is_not_a_silent_success() {
 fn issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open() {
     let home = TempDir::new().expect("tempdir");
 
-    // `init` first, purely to get a real `config.toml` and directory tree
-    // in place the way an operator's `~/.tapectl` would have one. Its
-    // freshly-created database is already at the latest migration (no
-    // pending migration means no `.foreign_key_check()` ever runs against
-    // it), so it is discarded and replaced below with the broken shape.
+    // `init` first, to get a real `config.toml`, directory tree and catalog
+    // the way an operator's `~/.tapectl` would have them.
     let init_out = run_tapectl(home.path(), &["init"]);
     assert!(
         init_out.status.success(),
@@ -895,29 +890,12 @@ fn issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open(
         String::from_utf8_lossy(&init_out.stderr)
     );
 
+    // Plant one orphan row the way issue #104's fsck tests do: FK
+    // enforcement OFF for the insert, back ON afterward (re-enabling the
+    // pragma does not retroactively validate rows already there).
     let db_path = home.path().join(".tapectl").join("tapectl.db");
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
-    }
-
-    // Build a database at exactly the 002 schema and plant one orphan row
-    // the way issue #104's fsck tests do: FK enforcement OFF for the
-    // insert, back ON afterward (re-enabling the pragma does not
-    // retroactively validate rows already there). Runs the REAL migration
-    // files through the real `rusqlite_migration` runner — never hand-
-    // applied SQL — same as `src/db/mod.rs`'s own `open_memory_at_*`
-    // fixtures, just file-backed and stopped two migrations early.
     {
-        use rusqlite_migration::{Migrations, M};
-        let mut conn = rusqlite::Connection::open(&db_path).expect("open fixture db");
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        Migrations::new(vec![
-            M::up(include_str!("../src/db/migrations/001_initial.sql")),
-            M::up(include_str!("../src/db/migrations/002_fts5_catalog.sql")),
-        ])
-        .to_latest(&mut conn)
-        .expect("migrate fixture db to 002");
-
+        let conn = rusqlite::Connection::open(&db_path).expect("open the catalog");
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         conn.execute(
             "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
@@ -927,12 +905,32 @@ fn issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open(
         .expect("plant the orphan row");
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
     }
+    let behind = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tapectl"))
+            .args(args)
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env(tapectl::db::PENDING_TEST_MIGRATION_ENV, "1")
+            .output()
+            .expect("failed to spawn tapectl binary")
+    };
+
+    // Positive control: an ordinary command, one migration behind, is
+    // refused by the orphan.
+    let refused = behind(&["db", "stats"]);
+    assert!(
+        !refused.status.success()
+            && String::from_utf8_lossy(&refused.stderr).contains("db fsck --repair"),
+        "the orphan must block an ordinary command: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
 
     // THE assertion that is red before the fix: `db fsck --repair` must be
     // able to open and fix this database even though it is behind head and
     // carrying an orphan that would otherwise block every command,
     // including this one.
-    let repair_out = run_tapectl(home.path(), &["db", "fsck", "--repair"]);
+    let repair_out = behind(&["db", "fsck", "--repair"]);
     assert!(
         matches!(repair_out.status.code(), Some(0) | Some(1)),
         "db fsck --repair must not exit with the ERROR code for a database it just fixed \
@@ -959,13 +957,21 @@ fn issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open(
     // And now that it is repaired, an ordinary command must succeed --
     // proving the very next `db::open()` completed the migration the
     // repair connection deliberately never ran.
-    let stats_out = run_tapectl(home.path(), &["db", "stats"]);
+    let stats_out = behind(&["db", "stats"]);
     assert!(
         stats_out.status.success(),
         "an ordinary command must succeed against the now-repaired database: \
          stdout={}\nstderr={}",
         String::from_utf8_lossy(&stats_out.stdout),
         String::from_utf8_lossy(&stats_out.stderr)
+    );
+    let version: i64 = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 2,
+        "the pending migration ran once the orphan was gone"
     );
 }
 
@@ -1046,21 +1052,21 @@ fn prepare_home_for_staging(
     source_dir: &std::path::Path,
     staging_dir: &std::path::Path,
 ) -> String {
-    // Fail FAST if dar is missing (issue #43). Without this, `stage create`
+    // Fail FAST if tar is missing (issue #43). Without this, `stage create`
     // dies immediately but the callers' `poll_stage_set_status` sits out its
-    // full 60-second timeout first, so a dar-less machine pays two silent
-    // 60s hangs before seeing an error that never names dar.
+    // full 60-second timeout first, so a tar-less machine pays two silent
+    // 60s hangs before seeing an error that never names tar.
     // `tests/test_dependencies.rs` reports the dependency properly; this is
     // only here so these two tests fail in milliseconds rather than minutes.
     assert!(
-        Command::new("dar")
+        Command::new("tar")
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false),
-        "`dar` not on PATH — see tests/test_dependencies.rs for what this costs"
+        "`tar` not on PATH — see tests/test_dependencies.rs for what this costs"
     );
 
     // `init --no-escrow`: this flow registers the escrow recipient explicitly
@@ -1074,13 +1080,13 @@ fn prepare_home_for_staging(
     );
 
     // Repoint staging.directory at our own TempDir before anything stages.
-    // `Config::default`'s dar.binary is the bare, PATH-resolved "dar"
-    // (issue #124), which already works on this box; TAPECTL_TEST_DAR_BIN
-    // lets a caller override it to an explicit path instead.
+    // `Config::default`'s tar.binary is the bare, PATH-resolved "tar" (D11),
+    // which already works on this box; TAPECTL_TEST_TAR_BIN lets a caller
+    // override it to an explicit path instead.
     let config_path = home.join(".tapectl").join("config.toml");
     let mut cfg = tapectl::config::Config::load(&config_path).expect("load freshly-init'd config");
     cfg.staging.directory = staging_dir.to_string_lossy().to_string();
-    cfg.dar.binary = std::env::var("TAPECTL_TEST_DAR_BIN").unwrap_or_else(|_| "dar".to_string());
+    cfg.tar.binary = std::env::var("TAPECTL_TEST_TAR_BIN").unwrap_or_else(|_| "tar".to_string());
     cfg.save(&config_path).expect("save repointed config");
 
     // `tenant add` already generates a keypair automatically (see
@@ -1137,10 +1143,10 @@ fn prepare_home_for_staging(
 }
 
 /// A source directory with one large-ish, incompressible file — big enough
-/// that `stage create`'s sha256 validation + dar run take a real,
+/// that `stage create`'s sha256 validation + tar run take a real,
 /// observable amount of wall-clock time, giving the polling loops below a
 /// wide window to catch the process mid-flight. Zero-filled data compresses
-/// to nothing and would race dar to completion in milliseconds; pseudo-random
+/// to nothing and would race tar to completion in milliseconds; pseudo-random
 /// bytes don't.
 fn make_slow_source_dir() -> tempfile::TempDir {
     use std::io::Write;
@@ -1150,7 +1156,7 @@ fn make_slow_source_dir() -> tempfile::TempDir {
     let mut buf = vec![0u8; 1024 * 1024];
     for i in 0..250 {
         // A cheap, non-cryptographic fill that isn't just zeros or a
-        // repeating byte (both of which dar's compression would flatten to
+        // repeating byte (both of which compression would flatten to
         // near-nothing): vary the byte value per megabyte per offset.
         for (j, b) in buf.iter_mut().enumerate() {
             *b = ((i * 2654435761u64 + j as u64) % 251) as u8;
@@ -1197,11 +1203,10 @@ fn poll_stage_set_status(
     }
 }
 
-/// Poll `staging_dir` until at least one `.dar.age` slice appears — proof
-/// dar has actually started producing output, not just that `stage_create`
-/// got as far as its initial INSERT. Bounded by `timeout`. (dar writes no
-/// plaintext `.dar` there since issue #370; the slice being written is
-/// ciphertext.)
+/// Poll `staging_dir` until at least one `.tar.age` slice appears — proof
+/// tar has actually started producing output, not just that `stage_create`
+/// got as far as its initial INSERT. Bounded by `timeout`. (The slice being
+/// written is ciphertext, issue #370.)
 fn poll_for_any_slice_file(
     staging_dir: &std::path::Path,
     timeout: std::time::Duration,
@@ -1211,14 +1216,14 @@ fn poll_for_any_slice_file(
         if let Ok(entries) = std::fs::read_dir(staging_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".dar.age") {
+                if name.ends_with(".tar.age") {
                     return entry.path();
                 }
             }
         }
         if start.elapsed() > timeout {
             panic!(
-                "timed out after {:?} waiting for a .dar.age file to appear under {}",
+                "timed out after {:?} waiting for a .tar.age file to appear under {}",
                 timeout,
                 staging_dir.display()
             );
@@ -1262,10 +1267,11 @@ fn crashed_stage_is_detected_and_then_cleanable() {
     // Precondition 1: the row exists and is 'staging' — proves the INSERT
     // + flock + COMMIT sequence has happened.
     poll_stage_set_status(&db_path, "staging", std::time::Duration::from_secs(60));
-    // Precondition 2: dar has actually produced output — gives `stage
+    // Precondition 2: tar has actually produced output — gives `stage
     // clean`'s prefix scan something real to find and remove.
-    let dar_file = poll_for_any_slice_file(staging_dir.path(), std::time::Duration::from_secs(60));
-    assert!(dar_file.exists());
+    let slice_file =
+        poll_for_any_slice_file(staging_dir.path(), std::time::Duration::from_secs(60));
+    assert!(slice_file.exists());
 
     sigkill(child.id());
     let _ = child.wait();
@@ -1293,7 +1299,7 @@ fn crashed_stage_is_detected_and_then_cleanable() {
     drop(conn);
 
     assert!(
-        dar_file.exists(),
+        slice_file.exists(),
         "the sweep must mark status only, never touch files"
     );
 
@@ -1304,7 +1310,7 @@ fn crashed_stage_is_detected_and_then_cleanable() {
         String::from_utf8_lossy(&clean_out.stderr)
     );
     assert!(
-        !dar_file.exists(),
+        !slice_file.exists(),
         "stage clean must remove the crashed stage's half-written slice"
     );
 }
@@ -1332,8 +1338,9 @@ fn live_stage_is_not_disturbed_by_a_concurrent_read_only_command() {
         .expect("failed to spawn stage create");
 
     poll_stage_set_status(&db_path, "staging", std::time::Duration::from_secs(60));
-    let dar_file = poll_for_any_slice_file(staging_dir.path(), std::time::Duration::from_secs(60));
-    assert!(dar_file.exists());
+    let slice_file =
+        poll_for_any_slice_file(staging_dir.path(), std::time::Duration::from_secs(60));
+    assert!(slice_file.exists());
 
     // The live stage is still running (never killed) — run a read-only
     // command in a second, independent process while it's in flight.
@@ -1360,7 +1367,7 @@ fn live_stage_is_not_disturbed_by_a_concurrent_read_only_command() {
         "a live stage's row must not be marked 'failed' by a concurrent sweep"
     );
     assert!(
-        dar_file.exists(),
+        slice_file.exists(),
         "a live stage's files must not be touched by a concurrent sweep"
     );
 
@@ -2492,7 +2499,7 @@ fn stage_create_json_is_one_array_and_its_session_is_logged() {
         [
             "num_slices",
             "stage_set_id",
-            "total_dar_size",
+            "stream_bytes",
             "total_encrypted_size",
             "unit"
         ]
@@ -2505,7 +2512,6 @@ fn stage_create_json_is_one_array_and_its_session_is_logged() {
         "phase end: check",
         "phase start: archive",
         "phase end: recheck",
-        "phase end: catalog",
         "phase end: finalize",
         "session end after",
     ] {
@@ -2532,7 +2538,7 @@ fn stage_create_json_is_one_array_and_its_session_is_logged() {
 /// error on stdout), as before #368 — not an empty `[]` a script would read
 /// as "staged nothing, fine". The failure here is the missing escrow
 /// recipient (`init --no-escrow`), which is refused inside the stage,
-/// before dar.
+/// before tar.
 #[test]
 fn stage_create_json_prints_nothing_when_its_one_unit_fails() {
     let home = TempDir::new().expect("home tempdir");
@@ -2645,7 +2651,6 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
             "cartridge_serial",
             "condition",
             "created_at",
-            "cut_units",
             "deposits",
             "ended_after",
             "feed_ratios",
@@ -2671,35 +2676,36 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
             "writes",
         ],
         "volume info --json is unchanged by issue #386 (sealed_at was added after it, \
-         for first-run.sh step 13; feed_ratios by issue #439; ended_after and cut_units by \
+         for first-run.sh step 13; feed_ratios by issue #439; ended_after by \
          issue #490; range_units by #478; write_lbp and write_lbp_note by #388)"
     );
 }
 
-// --- issue #404: signals stop a long run cleanly; dar dies with tapectl ---
+// --- issue #404: signals stop a long run cleanly; tar dies with tapectl ---
 
-/// A stand-in for dar whose archive step never finishes on its own: on
-/// `-c -` (the archive, on standard output since issue #370) it records its
-/// pid next to itself and becomes `sleep 60` (same pid, so the death signal
-/// set before exec still applies); everything else (`--version`, the slice
-/// template's `-c <file>`, the catalogue's `-C`) is the real dar.
-fn slow_dar(dir: &std::path::Path) -> std::path::PathBuf {
+/// A stand-in for tar whose archive run never finishes on its own: on
+/// `--create` (the stream, on standard output) outside the probe's own
+/// directory (whose file is `acl-probe`) it records its pid next to itself
+/// and becomes `sleep 60` (same pid, so the death signal set before exec
+/// still applies); everything else (`--version`, the probe's archive of one
+/// file) is the real tar.
+fn slow_tar(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let script = dir.join("slow-dar");
+    let script = dir.join("slow-tar");
     std::fs::write(
         &script,
         "#!/bin/sh\n\
-         if [ \"$1\" = -c ] && [ \"$2\" = - ]; then echo $$ > \"$0.pid.tmp\"; mv \"$0.pid.tmp\" \"$0.pid\"; exec sleep 60; fi\n\
-         exec dar \"$@\"\n",
+         if [ \"$1\" = --create ] && [ ! -e acl-probe ]; then echo $$ > \"$0.pid.tmp\"; mv \"$0.pid.tmp\" \"$0.pid\"; exec sleep 60; fi\n\
+         exec tar \"$@\"\n",
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     script
 }
 
-/// A home staged up to `stage create`, using [`slow_dar`]; returns the
-/// spawned `stage create` child and the fake dar's pid once it is running.
-fn stage_create_parked_in_dar(
+/// A home staged up to `stage create`, using [`slow_tar`]; returns the
+/// spawned `stage create` child and the fake tar's pid once it is running.
+fn stage_create_parked_in_tar(
     home: &std::path::Path,
     staging: &std::path::Path,
     source: &std::path::Path,
@@ -2707,10 +2713,10 @@ fn stage_create_parked_in_dar(
 ) -> (std::process::Child, u32) {
     let unit = prepare_home_for_staging(home, source, staging);
     assert_eq!(unit, "unit1");
-    let script = slow_dar(bin_dir);
+    let script = slow_tar(bin_dir);
     let config_path = home.join(".tapectl").join("config.toml");
     let mut cfg = tapectl::config::Config::load(&config_path).unwrap();
-    cfg.dar.binary = script.to_string_lossy().to_string();
+    cfg.tar.binary = script.to_string_lossy().to_string();
     cfg.save(&config_path).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_tapectl"))
@@ -2721,21 +2727,21 @@ fn stage_create_parked_in_dar(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn stage create");
-    let pid_file = bin_dir.join("slow-dar.pid");
+    let pid_file = bin_dir.join("slow-tar.pid");
     let start = std::time::Instant::now();
     while !pid_file.exists() {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(60),
-            "dar never started"
+            "tar never started"
         );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    let dar_pid: u32 = std::fs::read_to_string(&pid_file)
+    let tar_pid: u32 = std::fs::read_to_string(&pid_file)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    (child, dar_pid)
+    (child, tar_pid)
 }
 
 /// Whether `pid` is still a live (not zombie) process.
@@ -2766,12 +2772,12 @@ fn wait_with_timeout(
     }
 }
 
-/// Issue #404: SIGINT, SIGTERM and SIGHUP sent to `stage create` while dar
+/// Issue #404: SIGINT, SIGTERM and SIGHUP sent to `stage create` while tar
 /// runs each stop it within seconds, through the handled path: exit by
 /// status (not by the signal), the message naming where it stopped and
-/// what to run next, dar reaped, and the stage set `failed` so a re-run
+/// what to run next, tar reaped, and the stage set `failed` so a re-run
 /// starts it over. Before #404 SIGTERM and SIGHUP killed tapectl outright
-/// (leaving dar running), and SIGINT waited for dar to finish.
+/// (leaving the archiver running), and SIGINT waited for it to finish.
 fn a_signal_stops_stage_create_cleanly(signal: &str) {
     use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
@@ -2781,8 +2787,8 @@ fn a_signal_stops_stage_create_cleanly(signal: &str) {
     std::fs::write(source.path().join("a.txt"), b"some content").unwrap();
     let bin = TempDir::new().unwrap();
 
-    let (mut child, dar_pid) =
-        stage_create_parked_in_dar(home.path(), staging.path(), source.path(), bin.path());
+    let (mut child, tar_pid) =
+        stage_create_parked_in_tar(home.path(), staging.path(), source.path(), bin.path());
     let sent = Command::new("kill")
         .args([&format!("-{signal}"), &child.id().to_string()])
         .status()
@@ -2794,7 +2800,7 @@ fn a_signal_stops_stage_create_cleanly(signal: &str) {
         let _ = child.kill();
         let _ = child.wait();
         let _ = Command::new("kill")
-            .args(["-KILL", &dar_pid.to_string()])
+            .args(["-KILL", &tar_pid.to_string()])
             .status();
         panic!("SIG{signal}: stage create did not stop within 20 s");
     };
@@ -2812,14 +2818,14 @@ fn a_signal_stops_stage_create_cleanly(signal: &str) {
     );
     assert_eq!(status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("stopped by a signal: stage create unit1: dar was stopped while archiving"),
+        stderr.contains("stopped by a signal: stage create unit1: tar was stopped while archiving"),
         "SIG{signal}: {stderr}"
     );
     assert!(
         stderr.contains("run `tapectl stage create unit1` to stage it again"),
         "{stderr}"
     );
-    assert!(!process_alive(dar_pid), "dar must not outlive the stop");
+    assert!(!process_alive(tar_pid), "tar must not outlive the stop");
 
     // As after any failed stage, the next open's sweep marks the set
     // `failed` (its lock is free), and `stage create` starts it over.
@@ -2855,29 +2861,29 @@ fn sighup_stops_stage_create_cleanly() {
     a_signal_stops_stage_create_cleanly("HUP");
 }
 
-/// Issue #404: `kill -9` of tapectl takes dar with it (`PR_SET_PDEATHSIG`).
-/// Before, dar kept running, still filling staging.
+/// Issue #404: `kill -9` of tapectl takes tar with it (`PR_SET_PDEATHSIG`).
+/// Before, the archiver kept running, still filling staging.
 #[test]
-fn dar_dies_with_a_killed_tapectl() {
+fn tar_dies_with_a_killed_tapectl() {
     let home = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     let source = TempDir::new().unwrap();
     std::fs::write(source.path().join("a.txt"), b"some content").unwrap();
     let bin = TempDir::new().unwrap();
 
-    let (mut child, dar_pid) =
-        stage_create_parked_in_dar(home.path(), staging.path(), source.path(), bin.path());
-    assert!(process_alive(dar_pid), "positive control: dar is running");
+    let (mut child, tar_pid) =
+        stage_create_parked_in_tar(home.path(), staging.path(), source.path(), bin.path());
+    assert!(process_alive(tar_pid), "positive control: tar is running");
     sigkill(child.id());
     let _ = child.wait();
 
     let start = std::time::Instant::now();
-    while process_alive(dar_pid) {
+    while process_alive(tar_pid) {
         if start.elapsed() > std::time::Duration::from_secs(10) {
             let _ = Command::new("kill")
-                .args(["-KILL", &dar_pid.to_string()])
+                .args(["-KILL", &tar_pid.to_string()])
                 .status();
-            panic!("dar (pid {dar_pid}) outlived the tapectl that started it");
+            panic!("tar (pid {tar_pid}) outlived the tapectl that started it");
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }

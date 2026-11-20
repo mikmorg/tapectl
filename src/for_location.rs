@@ -22,9 +22,9 @@
 //! starts at slice 1 continues no range (item 93's tape 2 begins a copy of
 //! its own) and is judged by its need like any version.
 //!
-//! **The plan** (items 83, 95 and 152): the riding sets first, then the
-//! units to stage in priority order, whole units before units that may span
-//! (item 83), each next-fit (item 69): a unit is planned while
+//! **The plan** (items 122, 152, 288 and 289): the riding sets first, owed
+//! runs ahead of the queue (item 122), then the
+//! units to stage in priority order, each next-fit (item 69): a unit is planned while
 //! [`CapacityBudget::place`] puts every planned unit on this tape, and the
 //! first one it does not closes the tape; the rest wait for the next tape
 //! for X. The room is the volume's own (`collection::plan::destination_budget`):
@@ -589,13 +589,11 @@ fn padded_slices(
 type OwedRun = (i64, i64);
 
 /// How the write plans a staged set (`volume::write::find_staged_data` and
-/// its `plan_span_set`, mirrored from the catalog): a set whose unit allows
-/// spanning or that has a `range` row is planned as a span, its owed run
-/// ([`PlanClass::Owed`]) when it has a `range` row on a sealed volume and
-/// slices short of its copy floor, otherwise the whole set
-/// ([`PlanClass::Spannable`]); any other set is a whole unit of its slices
-/// still on disk. Returns the class, the owed run, and the block-padded
-/// bytes the tape plans.
+/// its `plan_span_set`, mirrored from the catalog; ADR-0012 items 122 and
+/// 288): its owed run ([`PlanClass::Owed`]) when it has a `range` row on a
+/// sealed volume and slices short of its copy floor, otherwise the whole set
+/// ([`PlanClass::Queued`]). Returns the class, the owed run, and the
+/// block-padded bytes the tape plans.
 fn staged_set_plan(
     conn: &Connection,
     config: &Config,
@@ -603,21 +601,13 @@ fn staged_set_plan(
     resolved: &ResolvedPolicy,
     stage_set_id: i64,
 ) -> Result<(PlanClass, Option<OwedRun>, u64)> {
-    let (has_range, sealed_range): (bool, bool) = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM writes WHERE stage_set_id = ?1 AND status = 'range'),
-                EXISTS(SELECT 1 FROM writes w JOIN volumes v ON v.id = w.volume_id
+    let sealed_range: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM writes w JOIN volumes v ON v.id = w.volume_id
                         WHERE w.stage_set_id = ?1 AND w.status = 'range'
                           AND v.status = 'sealed')",
         params![stage_set_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| r.get(0),
     )?;
-    if !(resolved.allow_spanning || has_range) {
-        return Ok((
-            PlanClass::Whole,
-            None,
-            padded_slices(conn, stage_set_id, true, None)?,
-        ));
-    }
     let floor = coverage::copy_floor(config, resolved.copy_floor_base(), &unit.status);
     let owed: Vec<i64> = if sealed_range {
         coverage::slice_copies(conn, stage_set_id)?
@@ -635,7 +625,7 @@ fn staged_set_plan(
             padded_slices(conn, stage_set_id, false, Some((first, last)))?,
         )),
         _ => Ok((
-            PlanClass::Spannable,
+            PlanClass::Queued,
             None,
             padded_slices(conn, stage_set_id, false, None)?,
         )),
@@ -848,10 +838,16 @@ fn read_back(
         // Holder labels in the order `holders_of_set` gives them for the
         // first slice each holds: in service first, then volume order.
         let mut held: Vec<(String, Vec<i64>)> = Vec::new();
+        let mut in_service: Vec<String> = Vec::new();
         for h in &holders {
             match held.iter_mut().find(|(l, _)| *l == h.holder.label) {
                 Some((_, s)) => s.push(h.slice_number),
                 None => held.push((h.holder.label.clone(), vec![h.slice_number])),
+            }
+            if h.holder.standing == crate::volume::slice_holders::Standing::InService
+                && !in_service.contains(&h.holder.label)
+            {
+                in_service.push(h.holder.label.clone());
             }
         }
         let mut left: Vec<i64> = slices.clone();
@@ -862,10 +858,13 @@ fn read_back(
                 .filter(|(_, s)| s.contains(&lowest))
                 .max_by_key(|(l, s)| {
                     let n = s.iter().filter(|n| left.contains(n)).count();
-                    // `max_by_key` keeps the LAST maximum: rank earlier
-                    // holders higher so the first in order wins a tie.
+                    // Standing before the count, as the doc says: a tape
+                    // in service is asked for before a quarantined one
+                    // that holds more of what is left. `max_by_key` keeps
+                    // the LAST maximum: rank earlier holders higher so the
+                    // first in order wins a tie.
                     let rank = held.len() - held.iter().position(|(x, _)| x == l).unwrap_or(0);
-                    (n, rank)
+                    (in_service.contains(l), n, rank)
                 });
             let Some((label, s)) = best else {
                 break;
@@ -945,11 +944,7 @@ fn judge_unit(
         return Ok(out);
     }
     let staged_snapshots: Vec<i64> = staged.iter().map(|s| s.snapshot_id).collect();
-    let class = if resolved.allow_spanning {
-        PlanClass::Spannable
-    } else {
-        PlanClass::Whole
-    };
+    let class = PlanClass::Queued;
     let judge = |copies: i64, here: i64| {
         NeedAt::judge(config, &resolved, &unit.status, location, copies, here)
     };
@@ -1089,7 +1084,7 @@ fn judge_unit(
             }
             (Source::Unavailable(_), None) => None,
             (_, None) if !unreadable.is_empty() => Some(format!(
-                "no live volume holds every slice of {}, so it cannot be read back",
+                "live volumes together do not hold every slice of {}, so it cannot be read back",
                 unreadable
                     .iter()
                     .map(|v| format!("v{v}"))
@@ -1107,21 +1102,20 @@ fn judge_unit(
 }
 
 /// Whether `placement` puts every unit on this tape: none deferred to a
-/// later tape and none refused.
+/// later tape.
 fn every_unit_on_this_tape(placement: &crate::volume::layout_model::Placement) -> bool {
     placement
         .placed
         .iter()
-        .all(|p| !matches!(p, Placed::Deferred | Placed::Refused))
+        .all(|p| !matches!(p, Placed::Deferred))
 }
 
-/// Where a class goes in the walk: owed runs, whole units, units that may
-/// span (items 83, 95 and 122).
+/// Where a class goes in the walk: owed runs, then the queue (items 122 and
+/// 288).
 fn class_rank(class: PlanClass) -> u8 {
     match class {
         PlanClass::Owed => 0,
-        PlanClass::Whole => 1,
-        PlanClass::Spannable => 2,
+        PlanClass::Queued => 1,
     }
 }
 
@@ -1131,7 +1125,7 @@ fn class_rank(class: PlanClass) -> u8 {
 ///
 /// `label` must be a write target, and its room is
 /// `collection::plan::destination_budget`'s: an empty volume's room under
-/// the fill ceiling (`unit_limit_bytes`) and its plan bound, with nothing
+/// the fill ceiling (`fill_bytes`) and its plan bound, with nothing
 /// subtracted for what is staged — the staged sets a write for X takes are
 /// planned here, and those it does not take do not ride. `device` names the
 /// drive whose fill ceiling and reserve apply (no drive is touched).
@@ -1146,7 +1140,7 @@ pub fn plan(
     let destination =
         crate::collection::plan::destination_budget(conn, config, device, &[label.to_string()])?;
     let room = BatchRoom {
-        fill: destination.unit_limit_bytes,
+        fill: destination.fill_bytes,
         bound: destination.plan_bound_bytes,
     };
 
@@ -1175,7 +1169,7 @@ pub fn plan(
     let staged_overflow: Vec<String> = riding
         .iter()
         .zip(&riding_placement.placed)
-        .filter(|(_, p)| matches!(p, Placed::Deferred | Placed::Refused))
+        .filter(|(_, p)| matches!(p, Placed::Deferred))
         .map(|(c, _)| c.name())
         .collect();
     let mut planned = riding;
@@ -1356,8 +1350,7 @@ fn bytes_text(bytes: u64) -> String {
 fn class_text(class: PlanClass) -> &'static str {
     match class {
         PlanClass::Owed => "owed",
-        PlanClass::Whole => "whole",
-        PlanClass::Spannable => "spannable",
+        PlanClass::Queued => "queued",
     }
 }
 
@@ -1403,8 +1396,7 @@ fn disposition_key(c: &Candidate, staged: Option<&Staged>) -> &'static str {
 fn candidate_line(c: &Candidate, location: &str, tail: &str) -> String {
     let class = match c.class {
         PlanClass::Owed => " (its owed run, first on the tape)",
-        PlanClass::Spannable => " (may span: last on the tape)",
-        PlanClass::Whole => "",
+        PlanClass::Queued => "",
     };
     format!(
         "  {}: {}; {}{class}{tail}",
@@ -1720,9 +1712,9 @@ mod tests {
         fn write(&self, set: i64, volume: i64, status: &str, first: i64, last: i64) {
             self.conn
                 .execute(
-                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                     SELECT id, snapshot_id, ?2, ?3, ?4 FROM stage_sets WHERE id = ?1",
-                    params![set, volume, status, i64::from(status == "range")],
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT id, snapshot_id, ?2, ?3 FROM stage_sets WHERE id = ?1",
+                    params![set, volume, status],
                 )
                 .unwrap();
             let write = self.conn.last_insert_rowid();
@@ -1890,7 +1882,6 @@ mod tests {
     #[test]
     fn a_span_continues_only_at_its_location() {
         let mut c = Cat::new();
-        c.config.defaults.allow_spanning = true;
         c.config.defaults.min_copies = 1;
         let u = c.unit("span", "active", None);
         let v = c.version(u, 1, "staged");
@@ -1970,50 +1961,34 @@ mod tests {
     /// closes the tape, so a smaller one after it waits too (item 69), and
     /// every waiting unit is named with its need.
     #[test]
-    fn packing_fills_the_volume_with_units_that_may_span_last_and_names_the_waiting() {
+    fn packing_ends_the_tape_at_the_unit_that_carries_the_plan_past_the_room_and_names_the_waiting()
+    {
         let c = Cat::new();
         let mib = MIB as usize;
         c.unit("a", "active", Some(&[("f", 3 * mib)]));
         c.unit("b", "active", Some(&[("f", 4 * mib)]));
         c.unit("c", "active", Some(&[("f", 5 * mib)]));
         c.unit("d", "active", Some(&[("f", mib)]));
-        let span = c.unit("aa-span", "active", Some(&[("f", mib)]));
-        let dir: String = c
-            .conn
-            .query_row(
-                "SELECT current_path FROM units WHERE id = ?1",
-                params![span],
-                |r| r.get(0),
-            )
-            .unwrap();
-        std::fs::write(
-            Path::new(&dir).join(".tapectl-unit.toml"),
-            "[unit]\nuuid = \"aa-span\"\nname = \"aa-span\"\ncreated = \"2026-10-25\"\n\
-             tenant = \"t\"\n\n[policy]\nallow_spanning = true\n",
-        )
-        .unwrap();
-
         let plan = c.plan("offsite").unwrap();
         assert_eq!(
             names(&plan.planned),
-            ["\"a\" (new version)", "\"b\" (new version)"]
+            [
+                "\"a\" (new version)",
+                "\"b\" (new version)",
+                "\"c\" (new version)"
+            ]
         );
-        assert_eq!(plan.planned_bytes(), 7 * MIB);
+        assert_eq!(plan.planned_bytes(), 12 * MIB);
         assert_eq!(
             names(&plan.waiting),
-            [
-                "\"c\" (new version)",
-                "\"d\" (new version)",
-                "\"aa-span\" (new version)"
-            ],
-            "c closes the tape; d would fit but waits; the unit that may span is last"
+            ["\"d\" (new version)"],
+            "c carries the plan past the room and is the tape's last (item 289); d waits"
         );
-        assert_eq!(plan.waiting[2].class, PlanClass::Spannable);
         assert!(plan.waiting.iter().all(
             |w| w.describe_need("offsite") == "group 2: 0 of its copy floor 2, none at offsite"
         ));
 
-        // With room for all but c, the unit that may span is planned last.
+        // Without c, everything fits the room.
         std::fs::remove_dir_all(c.tmp.path().join("src").join("c")).unwrap();
         let plan = c.plan("offsite").unwrap();
         assert_eq!(
@@ -2021,8 +1996,7 @@ mod tests {
             [
                 "\"a\" (new version)",
                 "\"b\" (new version)",
-                "\"d\" (new version)",
-                "\"aa-span\" (new version)"
+                "\"d\" (new version)"
             ]
         );
         assert_eq!(
@@ -2170,7 +2144,9 @@ mod tests {
             plan.skipped,
             [Skipped {
                 unit: "lost".into(),
-                reason: "no live volume holds every slice of v1, so it cannot be read back".into(),
+                reason:
+                    "live volumes together do not hold every slice of v1, so it cannot be read back"
+                        .into(),
             }]
         );
         let paths = TapectlPaths::new(c.tmp.path().join("home"));
@@ -2185,6 +2161,45 @@ mod tests {
         assert!(out
             .iter()
             .any(|l| l == "then write them: tapectl volume write L1 --for-location offsite"));
+    }
+
+    /// `read_back` ranks a holder by standing before it counts the slices left:
+    /// an in-service tape is asked for before a quarantined one even when the
+    /// quarantined tape holds more of what remains.
+    #[test]
+    fn read_back_asks_an_in_service_tape_before_a_quarantined_one_holding_more() {
+        let c = Cat::new();
+        let q = c.tape("QUAR", Some("home"));
+        let a = c.tape("A1", Some("home"));
+        let b = c.tape("A2", Some("home"));
+        c.conn
+            .execute(
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+                params![q],
+            )
+            .unwrap();
+        let u = c.unit("split", "tape_only", None);
+        c.targets(u, r#"{"offsite":1}"#);
+        let v = c.version(u, 1, "current");
+        let set = c.set(v, &[MIB; 6], "cleaned", false);
+        c.write(set, q, "range", 1, 5);
+        c.write(set, a, "range", 1, 2);
+        c.write(set, b, "range", 3, 6);
+        let plan = c.plan("offsite").unwrap();
+        let commands: Vec<(String, Vec<i64>)> = plan
+            .read_slices()
+            .iter()
+            .map(|r| (r.from.clone(), r.slices.clone()))
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                ("A1".to_string(), vec![1, 2]),
+                ("A2".to_string(), vec![3, 4, 5, 6]),
+            ],
+            "{:?}",
+            plan.skipped
+        );
     }
 
     /// A version already staged is reused, never staged again: `stage`
@@ -2310,19 +2325,25 @@ mod tests {
     fn staged_sets_that_alone_overflow_the_volume_are_named_and_nothing_more_is_planned() {
         let c = Cat::new();
         let mut sets = Vec::new();
-        for (name, bytes) in [("s1", 4 * MIB), ("s2", 4 * MIB), ("s3", 3 * MIB)] {
+        for (name, bytes) in [
+            ("s1", 4 * MIB),
+            ("s2", 4 * MIB),
+            ("s3", 3 * MIB),
+            ("s4", MIB),
+        ] {
             let u = c.unit(name, "active", None);
             let v = c.version(u, 1, "staged");
             sets.push(c.set(v, &[bytes], "staged", true));
         }
         c.unit("new", "active", Some(&[("f", MIB as usize)]));
 
-        // 4 + 4 + 3 MiB against 10: s3 does not fit.
+        // 4 + 4 + 3 + 1 MiB against 10: s3 carries the plan past it (item 289),
+        // and s4 after it does not fit.
         let plan = c.plan("offsite").unwrap();
-        assert_eq!(plan.staged_overflow, ["\"s3\" v1"]);
+        assert_eq!(plan.staged_overflow, ["\"s4\" v1"]);
         assert_eq!(
             names(&plan.planned),
-            ["\"s1\" v1", "\"s2\" v1", "\"s3\" v1"]
+            ["\"s1\" v1", "\"s2\" v1", "\"s3\" v1", "\"s4\" v1"]
         );
         assert!(
             plan.planned
@@ -2334,7 +2355,7 @@ mod tests {
         assert_eq!(
             names(&plan.waiting),
             ["\"new\" (new version)"],
-            "1 MiB would fit beside s1 and s2 (8 MiB of 10), but nothing more is planned"
+            "the staged sets fill the tape, so nothing more is planned"
         );
         assert_eq!(
             staged_sets_for_location(&c.conn, &c.config, "offsite")
@@ -2352,7 +2373,7 @@ mod tests {
             overflow_warning(&err).as_deref(),
             Some(
                 "warning: what is already staged for offsite does not all fit volume \"L1\" \
-                 (\"s3\" v1): nothing more was planned, and `tapectl volume write L1 \
+                 (\"s4\" v1): nothing more was planned, and `tapectl volume write L1 \
                  --for-location offsite` leaves what does not fit staged for the next tape, or \
                  refuses"
             ),
@@ -2365,13 +2386,13 @@ mod tests {
             "{out:?}"
         );
         let json = to_json(&plan, None);
-        assert_eq!(json["staged_overflow"], serde_json::json!(["\"s3\" v1"]));
+        assert_eq!(json["staged_overflow"], serde_json::json!(["\"s4\" v1"]));
         assert_eq!(json["waiting"][0]["unit"], "new");
-        assert_eq!(json["planned"].as_array().unwrap().len(), 3);
+        assert_eq!(json["planned"].as_array().unwrap().len(), 4);
         let counts = (c.count("snapshots"), c.count("stage_sets"));
         let paths = TapectlPaths::new(c.tmp.path().join("home"));
         let staged = stage(&c.conn, &paths, &c.config, &plan, 1, true).unwrap();
-        assert_eq!(staged, vec![Staged::Already; 3]);
+        assert_eq!(staged, vec![Staged::Already; 4]);
         assert_eq!(
             (c.count("snapshots"), c.count("stage_sets")),
             counts,
@@ -2400,10 +2421,15 @@ mod tests {
         );
         assert_eq!(
             names(&plan.planned),
-            ["\"s1\" v1", "\"s2\" v1", "\"new\" (new version)"]
+            [
+                "\"s1\" v1",
+                "\"s2\" v1",
+                "\"s4\" v1",
+                "\"new\" (new version)"
+            ]
         );
         assert_eq!(
-            plan.planned[2].how,
+            plan.planned[3].how,
             How::Snapshot {
                 reason: PendingReason::New
             }
@@ -2434,7 +2460,7 @@ mod tests {
         );
     }
 
-    /// A catalog on disk that [`stage`] runs against with dar (on `PATH`):
+    /// A catalog on disk that [`stage`] runs against with tar (on `PATH`):
     /// the operator `op`, the tenant `alice`, a registered escrow recipient,
     /// `home` and `offsite` (shelves), and the volume `L1` (initialized,
     /// 10 MiB) on [`Cat`]'s drive, staging at 1 MiB slices.
@@ -2454,7 +2480,6 @@ mod tests {
             let staging = tmp.path().join("staging");
             std::fs::create_dir_all(&staging).unwrap();
             let mut config = Cat::new().config;
-            config.dar.binary = "dar".into();
             config.staging.directory = staging.to_string_lossy().into_owned();
             config.defaults.slice_size = "1M".into();
             crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
@@ -2562,7 +2587,7 @@ mod tests {
         }
     }
 
-    /// Item 153, end to end with dar: `stage` snapshots a new unit and a
+    /// Item 153, end to end with tar: `stage` snapshots a new unit and a
     /// changed one and stages each, and the round trip holds: what it staged
     /// for X is exactly what `volume write --for-location X` takes, the
     /// changed unit's new version included although its old version has
@@ -2770,3 +2795,6 @@ mod tests {
         assert_eq!(c.count("stage_sets"), sets + 1);
     }
 }
+
+#[cfg(test)]
+mod two_places_proofs;

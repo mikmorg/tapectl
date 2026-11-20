@@ -32,16 +32,17 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod host_check;
+pub mod idmap;
 pub mod signal;
 pub mod startup;
 pub mod tenant;
 pub mod unit;
 
 pub mod collection;
-pub mod dar;
 pub mod for_location;
 pub mod staging;
 pub mod tape;
+pub mod tar;
 pub mod volume;
 
 pub mod media;

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection};
 use tracing::warn;
 
 use crate::config::Config;
@@ -69,31 +69,28 @@ pub enum CleanScope<'a> {
 /// enforces, as a reusable SQL boolean expression (issue #96's
 /// single-derivation rule, restated for issue #279): at least one `writes`
 /// row of the stage_set named by `id_expr` is `'completed'`, and every
-/// other is `'completed'` or `'cut'`. `id_expr` is the caller's own
+/// other is `'completed'`. `id_expr` is the caller's own
 /// qualified column or placeholder (`stage_sets.id`, `ss.id`, `?1`) so this
 /// drops into any query's WHERE clause without forcing a particular alias.
 ///
-/// **A `'cut'` row is no write** (1.6.0, issue #420; ADR-0012 item 112;
-/// `layout-session.md` "The short ending"). It is a stage set planned past
-/// where its tape sealed short: never a copy, and finished with, so it
-/// neither releases the staging nor holds it as an unfinished write would.
-/// A stage set whose only rows are `'cut'` therefore stays staged -- the
-/// next ordinary `volume write` writes it whole on another cartridge from
-/// exactly these slices -- and once one of its rows is `'completed'` it is
-/// released by the same rule as any other. Requiring a `'completed'` row
-/// (rather than any row) changes nothing for a set without `'cut'` rows:
-/// there, "every row completed" already implies one is.
+/// **A set the tape was planned to take and did not has no row** (ADR-0012
+/// item 288; before it a `'cut'` row said so): it stays staged -- the next
+/// ordinary `volume write` writes it from exactly these slices -- and once
+/// one of its rows is `'completed'` it is released by the same rule as any
+/// other. Requiring a `'completed'` row (rather than any row) changes nothing
+/// for a set whose every row is completed: there, "every row completed"
+/// already implies one is.
 ///
 /// `clean_staging`'s own non-force SQL below builds its query from this
 /// fragment. `cli::staging::staged_release_candidate_units` must state the
 /// same rule; this is `pub(crate)` so that query can be built from it too.
 /// [`release_blocker`] answers the same question per stage set, with the
-/// reason, and drops `'cut'` rows the same way.
+/// reason.
 ///
 /// **A `'range'` row is terminal** (1.7.0, issue #478; ADR-0012 items 121
 /// and 129; `layout-session.md` "Per-slice release"): like a `'completed'`
 /// row it never holds the staging as an unfinished write would
-/// ([`writes_finished_sql`]), and unlike a `'cut'` row its slices count.
+/// ([`writes_finished_sql`]), and its slices count.
 /// But a set holding one has its slices on different volumes, so it is never
 /// released whole here: it is released slice by slice
 /// ([`slice_release_candidate_predicate_sql`], [`release_covered_slices`]).
@@ -128,15 +125,14 @@ pub(crate) fn slice_release_candidate_predicate_sql(id_expr: &str) -> String {
 
 /// A SQL boolean: no `writes` row of the stage set `id_expr` holds its
 /// staging as an unfinished write would. `'completed'` and `'range'` rows
-/// are finished and count, a `'cut'` row is no write (ADR-0012 items 112,
-/// 121 and 129); every other status is a write that is live, resumable, or
+/// are finished and count (ADR-0012 items 121 and 129); every other status is a write that is live, resumable, or
 /// abandoned, which keeps the staging until `--force`.
 fn writes_finished_sql(id_expr: &str) -> String {
     format!(
         "NOT EXISTS (
              SELECT 1 FROM writes w
              WHERE w.stage_set_id = {id_expr}
-               AND w.status NOT IN ('completed', 'cut', 'range')
+               AND w.status NOT IN ('completed', 'range')
          )"
     )
 }
@@ -168,7 +164,7 @@ fn holds_a_range_sql(id_expr: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReleaseBlocker {
     /// Nothing blocks it: at least one `writes` row is `'completed'` or
-    /// `'range'` and every other is one of those or `'cut'`. A bare clean
+    /// `'range'` and every other is one of those. A bare clean
     /// releases it unless the unit is below its policy's `min_copies` -- or,
     /// for a set holding a range, releases each slice that has its copies
     /// ([`Self::SlicesShort`] names the ones that do not).
@@ -186,15 +182,6 @@ pub(crate) enum ReleaseBlocker {
     /// No `writes` row at all — staged and never written. A bare clean does
     /// not see it; only `--force` releases it.
     NeverWritten,
-    /// Only `'cut'` rows (1.6.0, issue #420; ADR-0012 item 112): the stage
-    /// set was planned onto `volume_label`, whose tape sealed short before
-    /// it, so it is written whole nowhere. A cut is no write: the next
-    /// ordinary `volume write` onto another cartridge writes the set whole
-    /// from these slices, and only then does a bare clean release them.
-    /// Until then, as for [`Self::NeverWritten`], only `--force` releases
-    /// them. `volume_label` is the volume that cut it (the latest, when
-    /// several did).
-    Cut { volume_label: Option<String> },
     /// A write session is live RIGHT NOW (`'planned'` or `'in_progress'`)
     /// and is reading these slices.
     WriteInFlight { volume_label: Option<String> },
@@ -227,14 +214,6 @@ pub(crate) enum ReleaseBlocker {
 /// an abandoned one: the worst thing to be wrong about is telling someone
 /// to delete slices something is still using.
 ///
-/// `'cut'` rows are dropped before any of that, as
-/// [`release_candidate_predicate_sql`] drops them: a cut is no write
-/// (ADR-0012 item 112), so it is never a blocker beside another row -- nor
-/// what the fall-through below would otherwise make of it, an abandoned
-/// session whose remedy is `--force`. Only a set with nothing but `'cut'`
-/// rows reads [`ReleaseBlocker::Cut`], so its refusal can name the volume
-/// that cut it and the write that finishes it.
-///
 /// A `'range'` row (1.7.0, issue #478; ADR-0012 items 121 and 129) is
 /// terminal, as [`release_candidate_predicate_sql`] reads it: beside
 /// `'completed'` rows, or alone, it blocks nothing. Whether the slices of a
@@ -242,24 +221,12 @@ pub(crate) enum ReleaseBlocker {
 /// function's to say ([`ReleaseBlocker::SlicesShort`]).
 pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<ReleaseBlocker> {
     let statuses: Vec<String> = conn
-        .prepare("SELECT status FROM writes WHERE stage_set_id = ?1 AND status <> 'cut'")?
+        .prepare("SELECT status FROM writes WHERE stage_set_id = ?1")?
         .query_map(params![stage_set_id], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if statuses.is_empty() {
-        let cut_on: Option<Option<String>> = conn
-            .query_row(
-                "SELECT v.label FROM writes w LEFT JOIN volumes v ON v.id = w.volume_id
-                 WHERE w.stage_set_id = ?1 AND w.status = 'cut'
-                 ORDER BY w.id DESC LIMIT 1",
-                params![stage_set_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        return Ok(match cut_on {
-            Some(volume_label) => ReleaseBlocker::Cut { volume_label },
-            None => ReleaseBlocker::NeverWritten,
-        });
+        return Ok(ReleaseBlocker::NeverWritten);
     }
     if statuses.iter().all(|s| s == "completed" || s == "range") {
         return Ok(ReleaseBlocker::None);
@@ -334,9 +301,8 @@ fn in_the_window() {}
 ///
 /// The `'staged'` default guard requires (a) at least one `writes` row for
 /// the stage_set is `'completed'` (it was actually written whole somewhere),
-/// AND (b) no `writes` row for it is anything other than `'completed'` or
-/// `'cut'` -- a `'cut'` row (1.6.0, issue #420) is no write, see
-/// [`release_candidate_predicate_sql`]. This is
+/// AND (b) no `writes` row for it is anything other than `'completed'`
+/// (see [`release_candidate_predicate_sql`]). This is
 /// stricter than "at least one completed write": a stage_set batched onto
 /// two cartridges (2 copies) with one sealed and the other still
 /// `'planned'`/`'in_progress'`/`'interrupted'` — or terminally `'aborted'`/
@@ -363,11 +329,9 @@ fn in_the_window() {}
 /// - Files named for the set that no `staging_path` names, by
 ///   dot-terminated filesystem prefix (`staging::archive_base_prefix`,
 ///   scanned under `config.staging.directory`): a `'failed'` set's
-///   plaintext `.dar`/`.sha512` (dar writes all slices up front, so most
-///   have no `stage_slices` row at all) and its half-written `.dar.age`
-///   (issue #402: the crash came before the row); and, for any released
-///   set, a `.dar.age` an older, interrupted clean nulled the path of
-///   without unlinking (issue #402).
+///   half-written `.tar.age` (issue #402: the crash came before the row);
+///   and, for any released set, a `.tar.age` an older, interrupted clean
+///   nulled the path of without unlinking (issue #402).
 ///
 /// Ordering is load-bearing: `stage_slices.staging_path` is the ONLY handle
 /// on a staged `.age` file, so every DB change (nulling `staging_path`,
@@ -555,9 +519,8 @@ pub fn clean_staging(
                 };
 
                 // Files named for this set that no `staging_path` names
-                // (issue #402): a 'failed' set's plaintext `.dar`/`.sha512`
-                // (dar writes every slice up front) and a half-written
-                // `.dar.age` (the crash came before its row); and, for either
+                // (issue #402): a 'failed' set's half-written `.tar.age`
+                // (the crash came before its row); and, for either
                 // status, a `.age` whose path an older, interrupted clean
                 // nulled without unlinking it. The prefix carries the stage
                 // set id, so nothing live can match it, and the set is
@@ -1020,14 +983,13 @@ fn remove_and_account(path: &Path, report: &mut CleanReport) {
     }
 }
 
-/// Files named for `stage_set_id` in `staging_dir` — plaintext
-/// `.dar`/`.sha512` left by a crashed dar run, and `.dar.age` ciphertext
+/// Files named for `stage_set_id` in `staging_dir` — `.tar.age` ciphertext
 /// (issue #402: a half-written one has no `stage_slices` row; one an older
 /// interrupted clean nulled has no `staging_path`) — by the same
 /// dot-terminated prefix rule as `staging::cleanup_failed_stage_set`'s
-/// `archive_base_prefix` (issue #54): dar names every slice
-/// `{base}.{N}.dar`, so `{base}.` (not the bare base) is the real
-/// filesystem prefix, keeping `_s1` from prefix-matching `_s10.1.dar`.
+/// `archive_base_prefix` (issue #54): every slice is
+/// `{base}.{N}.tar.age`, so `{base}.` (not the bare base) is the real
+/// filesystem prefix, keeping `_s1` from prefix-matching `_s10.1.tar.age`.
 fn find_prefix_orphans(
     conn: &Connection,
     staging_dir: &Path,
@@ -1054,11 +1016,7 @@ fn find_prefix_orphans(
     if let Ok(entries) = fs::read_dir(staging_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix)
-                && (name.ends_with(".dar")
-                    || name.ends_with(".sha512")
-                    || name.ends_with(".dar.age"))
-            {
+            if name.starts_with(&prefix) && name.ends_with(crate::staging::SLICE_SUFFIX) {
                 found.push(entry.path());
             }
         }
@@ -1309,7 +1267,7 @@ pub fn reclaim_session_dirs_and_lockfiles(
 ) -> Result<()> {
     reclaim_session_dirs(conn, config, force, report)?;
     reclaim_lockfiles(conn, db_file, report)?;
-    reclaim_home_leftovers(conn, db_file, report)?;
+    reclaim_home_leftovers(db_file, report)?;
     reclaim_recovery_read_dirs(conn, config, report)?;
     Ok(())
 }
@@ -1414,44 +1372,15 @@ const HOME_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 
 /// and a SIGKILL or a power loss does not (issue #465; `threat-model.md` §3
 /// promises `stage clean` handles what was left):
 ///
-/// - **`<home>/catalogs/<uuid8>/s<id>/`** (issue #419) of a stage set that
-///   never staged: `staged_at IS NULL`, and `failed` — or `cleaned`, because
-///   `clean_staging` releases failed sets before this runs. A set that was
-///   staged keeps its catalogue even when released: `restore` reads it
-///   (`dar::restore::entry_slices`). A set still `staging` is live.
-/// - **`<home>/tmp/*`** (`staging::home_work_dir`: dar's slice template, the
-///   write's `catalog.db`), when nothing in the entry changed for
+/// - **`<home>/tmp/*`** (`staging::home_work_dir`: tar's file list and
+///   probe, the write's `catalog.db`), when nothing in the entry changed for
 ///   [`HOME_TMP_MAX_AGE`]. Never a younger one: a live run is using it.
 ///
 /// The home is the directory holding the catalog, as for the lockfiles.
-fn reclaim_home_leftovers(
-    conn: &Connection,
-    db_file: &Path,
-    report: &mut CleanReport,
-) -> Result<()> {
+fn reclaim_home_leftovers(db_file: &Path, report: &mut CleanReport) -> Result<()> {
     let Some(home) = db_file.parent() else {
         return Ok(());
     };
-    let never_staged: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT ss.id, u.uuid FROM stage_sets ss
-             JOIN snapshots sn ON sn.id = ss.snapshot_id
-             JOIN units u ON u.id = sn.unit_id
-             WHERE ss.status IN ('failed', 'cleaned') AND ss.staged_at IS NULL",
-        )?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows
-    };
-    let paths = crate::config::TapectlPaths::new(home.to_path_buf());
-    for (stage_set_id, uuid) in never_staged {
-        let dir = crate::staging::stage_set_catalogue_dir(&paths, &uuid, stage_set_id);
-        if dir.is_dir() {
-            remove_leftover(&dir, report);
-        }
-    }
-
     let now = std::time::SystemTime::now();
     if let Ok(entries) = fs::read_dir(home.join("tmp")) {
         for entry in entries.flatten() {
@@ -1876,12 +1805,12 @@ mod tests {
         }
     }
 
-    /// A `'failed'` stage_set with NO `stage_slices` rows (the common shape
-    /// for a crash before the encryption loop starts) but real plaintext
-    /// `.dar`/`.sha512` files sitting under `staging_dir`, named exactly the
-    /// way `stage_create_inner`'s dar run would have named them. Returns
-    /// `(conn, stage_set_id, staging_dir, dar_path, sha512_path, TempDir guard)`.
-    fn seed_failed_stage_set_with_plaintext_orphan() -> (
+    /// A `'failed'` stage_set with NO `stage_slices` rows (a crash before
+    /// any slice was recorded) but two `.tar.age` files sitting under
+    /// `staging_dir`, named exactly the way `stage_create_inner` names its
+    /// slices. Returns `(conn, stage_set_id, staging_dir, slice 1, slice 2,
+    /// TempDir guard)`.
+    fn seed_failed_stage_set_with_rowless_slices() -> (
         Connection,
         i64,
         std::path::PathBuf,
@@ -1920,17 +1849,17 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let prefix = crate::staging::archive_base_prefix(unit_uuid, 1, stage_set_id);
-        let dar_path = dir.path().join(format!("{prefix}1.dar"));
-        let sha_path = dir.path().join(format!("{prefix}1.sha512"));
-        std::fs::write(&dar_path, b"plaintext dar slice").unwrap();
-        std::fs::write(&sha_path, b"deadbeef").unwrap();
+        let slice_1 = dir.path().join(format!("{prefix}1.tar.age"));
+        let slice_2 = dir.path().join(format!("{prefix}2.tar.age"));
+        std::fs::write(&slice_1, b"age-encryption.org/v1\nslice 1").unwrap();
+        std::fs::write(&slice_2, b"age-encryption.org/v1\nslice 2").unwrap();
 
         (
             conn,
             stage_set_id,
             dir.path().to_path_buf(),
-            dar_path,
-            sha_path,
+            slice_1,
+            slice_2,
             dir,
         )
     }
@@ -2462,69 +2391,41 @@ mod tests {
         }
     }
 
-    // --- `cut` (1.6.0, issue #420; ADR-0012 item 112) ---
+    // --- a set the tape did not take (ADR-0012 item 288) ---
 
-    /// A `cut` row for `stage_set_id` on a volume that sealed short at
-    /// `ended_after`: the only shape the spec allows a `cut` row in.
-    fn seed_cut(conn: &Connection, stage_set_id: i64, label: &str, ended_after: i64) {
-        seed_write(conn, stage_set_id, label, "cut");
-        conn.execute(
-            "UPDATE volumes SET status = 'sealed', sealed_at = datetime('now'), ended_after = ?2
-             WHERE label = ?1",
-            params![label, ended_after],
-        )
-        .unwrap();
-    }
-
-    /// A `cut` row is no write: a stage set whose only row is `cut` was
-    /// never written whole, and the next `volume write` rewrites it from
+    /// A set planned onto a tape that sealed short and not written has no
+    /// row: it was never written, and the next `volume write` writes it from
     /// these slices, so a bare clean keeps it. The positive control is the
-    /// same row `completed`, which the same call releases.
+    /// same set with a `completed` row, which the same call releases.
     #[test]
-    fn default_guard_keeps_a_set_whose_only_write_is_cut() {
+    fn default_guard_keeps_a_set_the_short_tape_did_not_take() {
         let (conn, stage_set_id, path, dir) = seed_stage_set();
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
 
         let report =
             clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
-        assert_eq!(report.sets_cleaned, 0, "a cut-only set must stay staged");
+        assert_eq!(
+            report.sets_cleaned, 0,
+            "a set with no write must stay staged"
+        );
         assert!(path.exists());
 
-        conn.execute("UPDATE writes SET status = 'completed'", [])
-            .unwrap();
+        seed_write(&conn, stage_set_id, "V-NEXT", "completed");
         let report =
             clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
         assert_eq!(
             report.sets_cleaned, 1,
             "positive control: completed releases"
         );
-        assert!(!path.exists());
-    }
-
-    /// Once the cut set is written whole on another cartridge, the `cut` row
-    /// does not hold its staging the way an unfinished write would: it is
-    /// released by the same rule as any other.
-    #[test]
-    fn default_guard_releases_a_cut_set_once_it_is_completed_elsewhere() {
-        let (conn, stage_set_id, path, dir) = seed_stage_set();
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
-        seed_write(&conn, stage_set_id, "V-NEXT", "completed");
-
-        let report =
-            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
-        assert_eq!(report.sets_cleaned, 1);
         assert_eq!(report.files_removed, 1);
         assert!(!path.exists());
     }
 
-    /// A `cut` row excuses nothing else: beside a completed copy, any other
-    /// row that is not `completed` still keeps the staging, exactly as it
-    /// does without the cut.
+    /// Beside a completed copy, any other row that is not `completed` still
+    /// keeps the staging.
     #[test]
-    fn a_cut_row_does_not_excuse_an_unfinished_or_abandoned_write_elsewhere() {
+    fn an_unfinished_or_abandoned_write_elsewhere_keeps_the_staging() {
         for other in ["planned", "in_progress", "interrupted", "aborted", "failed"] {
             let (conn, stage_set_id, path, dir) = seed_stage_set();
-            seed_cut(&conn, stage_set_id, "V-SHORT", 9);
             seed_write(&conn, stage_set_id, "V-SEALED", "completed");
             seed_write(&conn, stage_set_id, "V-OTHER", other);
 
@@ -2535,26 +2436,15 @@ mod tests {
         }
     }
 
-    /// `release_blocker` drops `cut` rows before it classifies, as the guard
-    /// does: cut-only reads as cut, naming the volume that cut it (the next
-    /// `volume write` onto another cartridge is the remedy), cut beside a
-    /// completed copy reads as releasable, and a cut never turns an
-    /// interrupted session into an abandoned one -- the fall-through a `cut`
-    /// row would otherwise take, whose advice is `--force`.
+    /// `release_blocker`: no row reads as never written, a completed copy as
+    /// releasable, and an interrupted or aborted row as itself.
     #[test]
-    fn release_blocker_treats_a_cut_row_as_no_write() {
+    fn release_blocker_classifies_the_rows_a_set_has() {
         let (conn, stage_set_id, _path, _dir) = seed_stage_set();
         assert_eq!(
             release_blocker(&conn, stage_set_id).unwrap(),
             ReleaseBlocker::NeverWritten,
-            "positive control: no row at all is never written"
-        );
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
-        assert_eq!(
-            release_blocker(&conn, stage_set_id).unwrap(),
-            ReleaseBlocker::Cut {
-                volume_label: Some("V-SHORT".into())
-            }
+            "no row at all is never written"
         );
         seed_write(&conn, stage_set_id, "V-NEXT", "completed");
         assert_eq!(
@@ -2563,7 +2453,6 @@ mod tests {
         );
 
         let (conn, stage_set_id, _path, _dir) = seed_stage_set();
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
         seed_write(&conn, stage_set_id, "V-PAUSED", "interrupted");
         assert_eq!(
             release_blocker(&conn, stage_set_id).unwrap(),
@@ -2573,23 +2462,21 @@ mod tests {
         );
 
         let (conn, stage_set_id, _path, _dir) = seed_stage_set();
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
         seed_write(&conn, stage_set_id, "V-DEAD", "aborted");
         assert_eq!(
             release_blocker(&conn, stage_set_id).unwrap(),
-            ReleaseBlocker::Abandoned { reconfirm_on: None },
-            "the aborted row is the blocker, not the cut one"
+            ReleaseBlocker::Abandoned { reconfirm_on: None }
         );
     }
 
     /// A short-sealed session is finished with its directory: its volume is
-    /// sealed and confirmed, and the slices a `cut` row did write stay in
-    /// `write_positions`. So `cut`, like `completed`, frees the directory.
+    /// sealed and confirmed, and the slices a `range` row did write stay in
+    /// `write_positions`. So `range`, like `completed`, frees the directory.
     #[test]
-    fn session_dir_reclaimed_when_write_is_cut() {
+    fn session_dir_reclaimed_when_write_is_a_range() {
         let conn = db::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let session_dir = seed_session_dir_with_write(&conn, dir.path(), "cut");
+        let session_dir = seed_session_dir_with_write(&conn, dir.path(), "range");
 
         let mut report = CleanReport::default();
         reclaim_session_dirs(&conn, &config_for(dir.path()), false, &mut report).unwrap();
@@ -2605,10 +2492,9 @@ mod tests {
     /// until someone decides which it is (`live_status_check`'s reason).
     #[test]
     fn session_dir_statuses_cover_every_write_status() {
-        // `range` (039, ADR-0012 item 121) is terminal, like `cut`: its
-        // volume is sealed and confirmed, and its written slices stay in
-        // `write_positions`.
-        let finished = ["completed", "cut", "range", "failed", "aborted"];
+        // `range` (039, ADR-0012 item 121) is terminal: its volume is sealed
+        // and confirmed, and its written slices stay in `write_positions`.
+        let finished = ["completed", "range", "failed", "aborted"];
         let mut covered: Vec<String> = SESSION_NON_TERMINAL
             .iter()
             .chain(finished.iter())
@@ -2748,22 +2634,22 @@ mod tests {
     }
 
     /// The common crash shape: a `'failed'` stage_set with zero
-    /// `stage_slices` rows (the process died before the encryption loop
-    /// ever inserted one) but real plaintext `.dar`/`.sha512` files dar left
-    /// behind. `clean_staging` must find and remove them by dot-terminated
-    /// filesystem prefix, exactly as `cleanup_failed_stage_set` (#54) would
-    /// have if the process had lived long enough to run its own Err path.
+    /// `stage_slices` rows (the process died before a slice was recorded)
+    /// but `.tar.age` files left behind. `clean_staging` must find and
+    /// remove them by dot-terminated filesystem prefix, exactly as
+    /// `cleanup_failed_stage_set` (#54) would have if the process had lived
+    /// long enough to run its own Err path.
     #[test]
-    fn failed_set_with_no_slice_rows_removes_plaintext_orphans_by_prefix() {
-        let (conn, stage_set_id, staging_dir, dar_path, sha_path, _dir) =
-            seed_failed_stage_set_with_plaintext_orphan();
+    fn failed_set_with_no_slice_rows_removes_rowless_slices_by_prefix() {
+        let (conn, stage_set_id, staging_dir, slice_1, slice_2, _dir) =
+            seed_failed_stage_set_with_rowless_slices();
 
         let report =
             clean_staging(&conn, &config_for(&staging_dir), false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 1);
-        assert_eq!(report.files_removed, 2, "both .dar and .sha512 orphans");
-        assert!(!dar_path.exists(), "orphaned .dar must be removed");
-        assert!(!sha_path.exists(), "orphaned .sha512 must be removed");
+        assert_eq!(report.files_removed, 2, "both rowless slices");
+        assert!(!slice_1.exists(), "rowless slice 1 must be removed");
+        assert!(!slice_2.exists(), "rowless slice 2 must be removed");
 
         let status: String = conn
             .query_row(
@@ -3045,19 +2931,19 @@ mod tests {
         assert_eq!(nulled, 2);
     }
 
-    /// Issue #402: a half-written `{prefix}N.dar.age` — the crash came
+    /// Issue #402: a half-written `{prefix}N.tar.age` — the crash came
     /// after the encryption started and before its `stage_slices` row —
-    /// has no row, so discovery by row never saw it. The prefix scan now
-    /// includes `.dar.age`.
+    /// has no row, so discovery by row never saw it. The prefix scan
+    /// finds it.
     #[test]
     fn a_failed_sets_rowless_age_file_is_removed_by_prefix() {
         let (conn, stage_set_id, _path, dir) = seed_stage_set_with_status("failed");
         let prefix = crate::staging::archive_base_prefix("u-uuid", 1, stage_set_id);
-        let half_written = dir.path().join(format!("{prefix}2.dar.age"));
+        let half_written = dir.path().join(format!("{prefix}2.tar.age"));
         std::fs::write(&half_written, b"half an encryption").unwrap();
         // A sibling stage set's file must not match (the trailing dot).
         let sibling = dir.path().join(format!(
-            "{}1.dar.age",
+            "{}1.tar.age",
             crate::staging::archive_base_prefix("u-uuid", 1, stage_set_id * 10)
         ));
         std::fs::write(&sibling, b"not ours").unwrap();
@@ -3066,7 +2952,7 @@ mod tests {
             clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
         assert!(
             !half_written.exists(),
-            "the row-less .dar.age must be removed"
+            "the row-less .tar.age must be removed"
         );
         assert!(
             sibling.exists(),
@@ -3083,7 +2969,7 @@ mod tests {
     fn releasing_a_half_cleaned_set_removes_its_nulled_age_files() {
         let (conn, stage_set_id, path, dir) = seed_stage_set();
         let prefix = crate::staging::archive_base_prefix("u-uuid", 1, stage_set_id);
-        let stranded = dir.path().join(format!("{prefix}2.dar.age"));
+        let stranded = dir.path().join(format!("{prefix}2.tar.age"));
         std::fs::write(&stranded, b"nulled but not unlinked").unwrap();
         conn.execute(
             "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
@@ -3180,7 +3066,7 @@ mod tests {
         conn.last_insert_rowid()
     }
 
-    /// A `range` write of `stage_set_id` (planned spannable) on a new sealed
+    /// A `range` write of `stage_set_id` on a new sealed
     /// volume `label`, holding the slices `written`, with every later slice
     /// planned and `pending` (the tape ended first): the row confirm leaves.
     fn seed_range_on(
@@ -3191,8 +3077,8 @@ mod tests {
     ) {
         let volume_id = sealed_volume(conn, label);
         conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-             SELECT id, snapshot_id, ?2, 'range', 1 FROM stage_sets WHERE id = ?1",
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT id, snapshot_id, ?2, 'range' FROM stage_sets WHERE id = ?1",
             params![stage_set_id, volume_id],
         )
         .unwrap();
@@ -3207,14 +3093,13 @@ mod tests {
         .unwrap();
     }
 
-    /// A `completed` write of the whole set on a new sealed volume `label`,
-    /// planned spannable or not.
-    fn seed_whole_on(conn: &Connection, stage_set_id: i64, label: &str, may_span: bool) {
+    /// A `completed` write of the whole set on a new sealed volume `label`.
+    fn seed_whole_on(conn: &Connection, stage_set_id: i64, label: &str) {
         let volume_id = sealed_volume(conn, label);
         conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-             SELECT id, snapshot_id, ?2, 'completed', ?3 FROM stage_sets WHERE id = ?1",
-            params![stage_set_id, volume_id, may_span],
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT id, snapshot_id, ?2, 'completed' FROM stage_sets WHERE id = ?1",
+            params![stage_set_id, volume_id],
         )
         .unwrap();
     }
@@ -3274,7 +3159,7 @@ mod tests {
             (false, true),
             "a set holding a range is released slice by slice, never whole"
         );
-        seed_whole_on(&conn, set, "V-W2", true);
+        seed_whole_on(&conn, set, "V-W2");
         assert_eq!(release_blocker(&conn, set).unwrap(), ReleaseBlocker::None);
         assert_eq!(predicates(&conn, set), (false, true));
 
@@ -3302,7 +3187,7 @@ mod tests {
 
         // A set with no range row reads exactly as in 1.6.0.
         let (conn, set, _files, _dir) = seed_span(2);
-        seed_whole_on(&conn, set, "V-W1", true);
+        seed_whole_on(&conn, set, "V-W1");
         assert_eq!(predicates(&conn, set), (true, false));
     }
 
@@ -3374,7 +3259,7 @@ mod tests {
         assert_eq!(report.slices_short, vec![(set, vec![1, 2, 3, 4])]);
         assert!(files.iter().all(|f| f.exists()));
 
-        seed_whole_on(&conn, set, "V-T2", true);
+        seed_whole_on(&conn, set, "V-T2");
         let report = release_covered_slices(&conn, &config, set, 2).unwrap();
         assert_eq!(report.slices_released, vec![(set, vec![1, 2])]);
         assert_eq!(report.slices_short, vec![(set, vec![3, 4])]);
@@ -3391,27 +3276,25 @@ mod tests {
     }
 
     /// A set with no `range` row has every slice on the same volumes: the
-    /// per-slice release never touches it, even one planned spannable that
-    /// reached its tape whole, and `clean_staging` releases it whole as in
-    /// 1.6.0, row for row: every path cleared, no `released_at` set.
+    /// per-slice release never touches it, even one that reached its tape
+    /// whole, and `clean_staging` releases it whole, row for row: every path
+    /// cleared, no `released_at` set.
     #[test]
-    fn a_set_with_no_range_row_is_released_whole_as_in_1_6_0() {
-        for may_span in [false, true] {
-            let (conn, set, files, dir) = seed_span(3);
-            let config = config_for(dir.path());
-            seed_whole_on(&conn, set, "V-W1", may_span);
+    fn a_set_with_no_range_row_is_released_whole() {
+        let (conn, set, files, dir) = seed_span(3);
+        let config = config_for(dir.path());
+        seed_whole_on(&conn, set, "V-W1");
 
-            let report = release_covered_slices(&conn, &config, set, 1).unwrap();
-            assert_eq!(report.files_removed, 0, "may_span={may_span}: {report:?}");
-            assert!(report.slices_released.is_empty() && report.slices_short.is_empty());
-            assert!(files.iter().all(|f| f.exists()));
+        let report = release_covered_slices(&conn, &config, set, 1).unwrap();
+        assert_eq!(report.files_removed, 0, "{report:?}");
+        assert!(report.slices_released.is_empty() && report.slices_short.is_empty());
+        assert!(files.iter().all(|f| f.exists()));
 
-            let report = clean_staging(&conn, &config, false, CleanScope::Whole).unwrap();
-            assert_eq!((report.sets_cleaned, report.files_removed), (1, 3));
-            assert!(report.slices_released.is_empty());
-            assert_eq!(slice_rows(&conn, set), [(false, false); 3]);
-            assert_eq!(set_status(&conn, set), "cleaned");
-        }
+        let report = clean_staging(&conn, &config, false, CleanScope::Whole).unwrap();
+        assert_eq!((report.sets_cleaned, report.files_removed), (1, 3));
+        assert!(report.slices_released.is_empty());
+        assert_eq!(slice_rows(&conn, set), [(false, false); 3]);
+        assert_eq!(set_status(&conn, set), "cleaned");
     }
 
     /// The whole-set release never takes a set holding a range, even one
@@ -3422,7 +3305,7 @@ mod tests {
         let (conn, set, files, dir) = seed_span(4);
         let config = config_for(dir.path());
         seed_range_on(&conn, set, "V-T1", 1..=2);
-        seed_whole_on(&conn, set, "V-T2", true);
+        seed_whole_on(&conn, set, "V-T2");
 
         let report = clean_staging(&conn, &config, false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 0, "{report:?}");
@@ -3620,88 +3503,8 @@ mod tests {
         }
     }
 
-    /// Issue #465 item 5: a SIGKILL or a power loss mid-stage leaves the
-    /// stage set's catalogue directory (`<home>/catalogs/<uuid8>/s<id>/`,
-    /// issue #419) behind — `cleanup_failed_stage_set` runs only in-process.
-    /// `stage clean` removes it for a set that never reached `staged`. The
-    /// set is `failed` when the sweep looks, or already `cleaned` (the same
-    /// command's `clean_staging` releases failed sets first); either way
-    /// `staged_at` is NULL. A set that was staged keeps its catalogue — it
-    /// serves `restore` (`entry_slices`) — released or not; a set still
-    /// `staging` is live.
-    #[test]
-    fn staging_clean_removes_the_catalogue_directory_of_a_set_that_never_staged() {
-        let conn = db::open_memory().unwrap();
-        conn.execute(
-            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
-            [],
-        )
-        .unwrap();
-        let tenant_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
-             VALUES ('abcdef01-2345-6789-abcd-ef0123456789', 'u', ?1, '/tmp/u', 'active')",
-            params![tenant_id],
-        )
-        .unwrap();
-        let unit_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
-             VALUES (?1, 1, 'staged', '/tmp/u', 1, 10)",
-            params![unit_id],
-        )
-        .unwrap();
-        let snapshot_id = conn.last_insert_rowid();
-        let home = tempfile::tempdir().unwrap();
-        let db_file = home.path().join("tapectl.db");
-        let catalogue_dir = |id: i64| home.path().join(format!("catalogs/abcdef01/s{id}"));
-
-        let mut sets = Vec::new();
-        for (status, staged) in [
-            ("failed", false),
-            ("cleaned", false),
-            ("cleaned", true),
-            ("staged", true),
-            ("staging", false),
-        ] {
-            conn.execute(
-                "INSERT INTO stage_sets (snapshot_id, status, slice_size, staged_at)
-                 VALUES (?1, ?2, 524288, CASE WHEN ?3 THEN datetime('now') END)",
-                params![snapshot_id, status, staged],
-            )
-            .unwrap();
-            let id = conn.last_insert_rowid();
-            let dir = catalogue_dir(id);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("abcdef01_v1.1.dar"), b"catalogue").unwrap();
-            sets.push((id, status, staged));
-        }
-
-        let mut report = CleanReport::default();
-        reclaim_session_dirs_and_lockfiles(
-            &conn,
-            &config_for(home.path()),
-            &db_file,
-            false,
-            &mut report,
-        )
-        .unwrap();
-
-        for (id, status, staged) in sets {
-            let gone = !staged && matches!(status, "failed" | "cleaned");
-            assert_eq!(
-                catalogue_dir(id).exists(),
-                !gone,
-                "{status} (staged: {staged}): its catalogue directory {}",
-                if gone { "is removed" } else { "is kept" }
-            );
-        }
-        assert_eq!(report.home_leftovers_reclaimed, 2);
-        assert_eq!(report.errors, 0);
-    }
-
     /// Issue #465 item 5: `<home>/tmp` holds the plaintext of a stage or a
-    /// write for a moment (dar's slice template, the write's `catalog.db`);
+    /// write for a moment (tar's file list, the write's `catalog.db`);
     /// a hard kill leaves it. `stage clean` removes what is older than a
     /// day — by the newest change anywhere in it, since a live write's file
     /// is rewritten inside a directory whose own mtime stays put — and
@@ -3723,11 +3526,11 @@ mod tests {
         let (day, hour) = (24 * 3600, 3600);
 
         // An old work directory and an old stray file: removed.
-        let old_dir = tmp.join(".dar-slice-template-old");
+        let old_dir = tmp.join(".tar-list-old");
         std::fs::create_dir_all(old_dir.join("empty")).unwrap();
-        std::fs::write(old_dir.join("template.1.dar"), b"x").unwrap();
+        std::fs::write(old_dir.join("tar-list-x"), b"x").unwrap();
         for p in [
-            old_dir.join("template.1.dar"),
+            old_dir.join("tar-list-x"),
             old_dir.join("empty"),
             old_dir.clone(),
         ] {
@@ -3737,7 +3540,7 @@ mod tests {
         std::fs::write(&old_file, b"x").unwrap();
         age(&old_file, 2 * day);
         // A young directory and file: kept.
-        let young_dir = tmp.join(".dar-slice-template-young");
+        let young_dir = tmp.join(".tar-list-young");
         std::fs::create_dir_all(&young_dir).unwrap();
         age(&young_dir, hour);
         let young_file = tmp.join("catalog-young.db");
@@ -3870,31 +3673,31 @@ mod tests {
         assert_eq!(report.errors, 0);
     }
 
-    /// A sibling stage_set's plaintext files must never be swept up by
+    /// A sibling stage_set's files must never be swept up by
     /// another stage_set's prefix scan — the same collision this repo's
     /// `archive_base_prefix` trailing-dot convention already guards against
     /// for `cleanup_failed_stage_set`. Uses stage_set ids 1 and 10 so a
     /// naive (non-dot-terminated) prefix match would wrongly conflate them.
     #[test]
     fn failed_set_prefix_scan_does_not_touch_a_sibling_stage_sets_files() {
-        let (conn, stage_set_id, staging_dir, dar_path, _sha_path, dir) =
-            seed_failed_stage_set_with_plaintext_orphan();
+        let (conn, stage_set_id, staging_dir, slice_1, _slice_2, dir) =
+            seed_failed_stage_set_with_rowless_slices();
 
         // A sibling stage_set (different id) sharing the same staging_dir,
         // deliberately NOT matched by this test's clean_staging call (it's
         // still 'staging', not 'failed' — never a cleanup candidate here).
         let other_uuid = "0123456789abcdef0123456789abcdef";
         let other_prefix = crate::staging::archive_base_prefix(other_uuid, 1, stage_set_id * 10);
-        let other_path = dir.path().join(format!("{other_prefix}1.dar"));
-        std::fs::write(&other_path, b"sibling's plaintext slice").unwrap();
+        let other_path = dir.path().join(format!("{other_prefix}1.tar.age"));
+        std::fs::write(&other_path, b"sibling's slice").unwrap();
 
         let report =
             clean_staging(&conn, &config_for(&staging_dir), false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 1);
-        assert!(!dar_path.exists());
+        assert!(!slice_1.exists());
         assert!(
             other_path.exists(),
-            "a sibling stage_set's plaintext files must survive"
+            "a sibling stage_set's files must survive"
         );
     }
 }

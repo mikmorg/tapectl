@@ -3,7 +3,7 @@
 //!
 //! A unit is registered at a real path (`units.current_path`), and every path
 //! the catalog records stays that one: `snapshots.source_path`, the `files`
-//! rows' relative paths, `stage_sets.dar_command`. A [`SourceView`] only
+//! rows' relative paths (`stage_sets.tar_command` names no folder). A [`SourceView`] only
 //! redirects the READS: `collection run`, whose `snapshot_command` took a
 //! read-only snapshot of the collection's root, hands each unit's snapshot and
 //! stage a view whose [`read_path`](SourceView::read_path) is the same folder

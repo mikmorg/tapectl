@@ -116,12 +116,12 @@ pub(crate) fn write_error(what: &str, e: &io::Error) -> TapectlError {
 }
 
 /// More than this many refusals of one block in a row is the hard end
-/// (`volume-format-v2.md` §4.3 W2): the medium has no room left, and the
+/// (`volume-format-v3.md` §5.2 W2): the medium has no room left, and the
 /// write fails as [`TapectlError::MediumFull`]. The measured runs past the
 /// early warning were at most 3 (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`).
 pub const MAX_REFUSALS_IN_A_ROW: u32 = 16;
 
-/// The drive's early warning, as a store saw it (`volume-format-v2.md` §4.3
+/// The drive's early warning, as a store saw it (`volume-format-v3.md` §5.2
 /// W1; `layout-session.md`, the Store seam): the first block write st
 /// refused with ENOSPC. `None` until then, and from then on `Some` for the
 /// rest of the store's life — sticky, because the warning is a fact about
@@ -169,8 +169,8 @@ impl EarlyWarningState {
 }
 
 /// Write one tape block whole through `write` — one `write(2)` per call —
-/// retrying a block st refuses past the early warning (`volume-format-v2.md`
-/// §4.3 W1, W2). The one implementation: `TapeDevice` runs its block writes
+/// retrying a block st refuses past the early warning (`volume-format-v3.md`
+/// §5.2 W1, W2). The one implementation: `TapeDevice` runs its block writes
 /// through it, and so do the test doubles (`MemStore`, the in-memory
 /// `FakeTape`), so a test of either runs the real retry.
 ///
@@ -808,14 +808,14 @@ impl TapeDevice {
     /// (synchronous if `sync`). Peak memory is one block, never `len` (the
     /// H9 streaming requirement; the whole-buffer v1 writers it replaced are
     /// gone, issue #417,
-    /// `docs/design/volume-format-v2.md` §7 / layout-session.md's Store seam).
+    /// `docs/design/volume-format-v3.md` §8 / layout-session.md's Store seam).
     /// Returns the number of bytes committed to the medium including padding
     /// (`layout_model::pad_to_blocks(len, block_size)`).
     ///
     /// Every block goes through [`write_block_retrying`] (#420): past the
     /// early warning a refused block is written again, and only the hard end
     /// fails the write. The filemark is one ioctl, never retried
-    /// (`volume-format-v2.md` §4.3 W3): refused, it is a full medium.
+    /// (`volume-format-v3.md` §5.2 W3): refused, it is a full medium.
     pub fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
         if self.writes_checked() {
             self.ensure_st_block(self.write_wire())?;
@@ -1604,7 +1604,7 @@ mod density_tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
-    // --- the early warning's retry (#420, `volume-format-v2.md` §4.3) -----
+    // --- the early warning's retry (#420, `volume-format-v3.md` §5.2) -----
 
     fn enospc() -> io::Error {
         io::Error::from_raw_os_error(nix::libc::ENOSPC)

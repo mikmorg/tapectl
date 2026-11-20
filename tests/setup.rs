@@ -425,3 +425,125 @@ fn setup_dry_run_says_it_would_keep_a_config_toml_it_finds() {
         "{stdout}"
     );
 }
+
+// ── the writer's tar floor (T5.4; ADR-0012 items 229, 274) ───────────────
+
+/// A directory holding an executable `tar` that is a shell script.
+fn stand_in_tar(w: &World, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = w.p(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tar = dir.join("tar");
+    std::fs::write(&tar, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o755)).unwrap();
+    tar
+}
+
+/// `tapectl setup ...` with `first` at the front of `PATH`.
+fn setup_with_path_front(w: &World, first: &Path, extra: &[&str]) -> Output {
+    let mut args = w.setup_args();
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let path = format!(
+        "{}:{}",
+        first.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(w.home())
+        .args(&args)
+        .env("HOME", w.p("user"))
+        .env("USER", "friend")
+        .env("PATH", path)
+        .env_remove("TAPECTL_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("TAPECTL_SETUP_UNIT_DIR", w.units())
+        .env("TAPECTL_TEST_SETUP_GROUPS", "friend,users")
+        .env("TAPECTL_TEST_SETUP_BY_ID_DIR", w.p("by-id"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn tapectl")
+}
+
+const TAR_1_34: &str = "echo 'tar (GNU tar) 1.34'; exit 0";
+
+fn assert_stopped_at_the_floor(out: &Output) {
+    let (stdout, stderr) = text(out);
+    assert!(
+        !out.status.success(),
+        "a tar below the floor must stop setup\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let all = format!("{stdout}{stderr}");
+    assert!(all.contains("GNU tar 1.35"), "names the floor: {all}");
+    assert!(all.contains("ACL support"), "names the floor: {all}");
+    assert!(all.contains("1.34"), "names the tar it found: {all}");
+    assert!(all.contains("quick-start.md"), "points at the way: {all}");
+}
+
+/// A host whose tar is GNU tar 1.34 (Debian 12, Ubuntu 22.04): setup names
+/// the floor and the tar it found and stops before it makes a home, a key or
+/// a config, in a dry run too. On the parent it went on and made all three.
+#[test]
+fn a_tar_below_the_floor_stops_setup_before_it_makes_a_home() {
+    let w = World::new();
+    let before = w.tree();
+    let tar = stand_in_tar(&w, "old-tar", TAR_1_34);
+    let dir = tar.parent().unwrap().to_path_buf();
+    let before_with_tar = {
+        let mut b = before;
+        b.insert(dir.clone(), Vec::new());
+        b.insert(tar.clone(), std::fs::read(&tar).unwrap());
+        b
+    };
+    let out = setup_with_path_front(&w, &dir, &[]);
+    assert_stopped_at_the_floor(&out);
+    assert!(!w.home().exists(), "no home was made");
+    assert!(!w.units().exists(), "no unit file was written");
+    assert_eq!(before_with_tar, w.tree(), "setup left something behind");
+
+    let out = setup_with_path_front(&w, &dir, &["--dry-run"]);
+    assert_stopped_at_the_floor(&out);
+    assert!(!w.home().exists());
+}
+
+/// The config's `[tar] binary` decides where one is in play: a bad one named
+/// there stops setup although `tar` on `PATH` is fine.
+#[test]
+fn the_configs_tar_binary_is_the_one_checked() {
+    let w = world_with_a_kept_config();
+    let bad = stand_in_tar(&w, "named-tar", TAR_1_34);
+    let config = std::fs::read_to_string(w.home().join("config.toml")).unwrap();
+    assert!(config.contains("[tar]\nbinary = \"tar\""), "{config}");
+    let config = config.replace(
+        "[tar]\nbinary = \"tar\"",
+        &format!("[tar]\nbinary = \"{}\"", bad.display()),
+    );
+    std::fs::write(w.home().join("config.toml"), &config).unwrap();
+    let out = w.setup(&[]);
+    assert_stopped_at_the_floor(&out);
+    assert!(!w.home().join("tapectl.db").exists(), "no catalog was made");
+    assert_eq!(
+        std::fs::read_to_string(w.home().join("config.toml")).unwrap(),
+        config,
+        "the config is as it was"
+    );
+}
+
+/// A tar that meets the floor, named by the config, gets past the step even
+/// when the `tar` first on `PATH` is below it.
+#[test]
+fn a_config_naming_a_tar_at_the_floor_gets_past_it() {
+    let w = world_with_a_kept_config();
+    let good = stand_in_tar(&w, "good-tar", "exec /usr/bin/tar \"$@\"");
+    let config = std::fs::read_to_string(w.home().join("config.toml")).unwrap();
+    assert!(config.contains("[tar]\nbinary = \"tar\""), "{config}");
+    let config = config.replace(
+        "[tar]\nbinary = \"tar\"",
+        &format!("[tar]\nbinary = \"{}\"", good.display()),
+    );
+    std::fs::write(w.home().join("config.toml"), &config).unwrap();
+    let bad = stand_in_tar(&w, "old-tar", TAR_1_34);
+    let out = setup_with_path_front(&w, bad.parent().unwrap(), &[]);
+    assert_ok(&out, "setup with a good [tar] binary");
+    assert!(w.home().join("tapectl.db").exists());
+}

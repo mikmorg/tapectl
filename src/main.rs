@@ -39,13 +39,6 @@ fn main() {
     // document on stdout, those raised before clap has parsed the line
     // included, so whether it was asked for is read from the line first.
     let json = cli::json_requested(&args);
-    // ADR-0012 item 203: a spelling 1.9.0 removed is refused by name,
-    // however it is typed (`--help` and `help <old>` included), before clap
-    // parses the line and before any home is resolved, so the refusal reads
-    // nothing and creates nothing.
-    if let Some(renamed) = cli::renamed::find(&args) {
-        error::exit_reporting(&renamed.message(), error::EXIT_ERROR, json);
-    }
     // The grouped top-level help (ADR-0012 item 211) is `cli::command()`'s.
     let cli = match cli::try_parse_from(&args) {
         Ok(cli) => cli,
@@ -296,16 +289,8 @@ fn run(
     // is now a refusal, and `tapectl completions bash` in the very cron,
     // systemd or container shell that lacks one must keep working — it
     // reads nothing and writes nothing but the script.
-    // ADR-0012 item 203: the second line behind `main`'s scan of the raw
-    // command line. A removed command's hidden stub that clap matched is
-    // refused with the same words, still before any home is resolved.
-    if let Some(renamed) = cli::renamed::parsed(&cli.command) {
-        return Err(renamed.refusal().into());
-    }
-
     if let Commands::Completions { shell } = cli.command {
-        // Without the hidden stubs of removed spellings (ADR-0012 item 203).
-        let mut cmd = cli::completion_command();
+        let mut cmd = <cli::Cli as clap::CommandFactory>::command();
         // ADR-0012 item 220: `clap_complete` `expect`s its own writes, so
         // given stdout itself `completions zsh | head -3` panicked (exit 101)
         // once `head` had gone. Generated into memory, written once through
@@ -673,6 +658,9 @@ fn run(
         Commands::Location { ref command } => {
             cli::location::run(&conn, command, cli.json, cli.dry_run)?;
         }
+        Commands::Drill { ref command } => {
+            cli::drill::run(&conn, command, cli.json, cli.dry_run)?;
+        }
         Commands::Cartridge { ref command } => {
             cli::cartridge::run(&conn, &cfg, command, cli.json, cli.yes, cli.dry_run)?;
         }
@@ -736,11 +724,7 @@ fn run(
         | Commands::Completions { .. }
         | Commands::Host { .. }
         | Commands::Drive { .. }
-        | Commands::Status { .. }
-        | Commands::Staging { .. }
-        | Commands::Backend { .. }
-        | Commands::Export(_)
-        | Commands::Import(_) => {
+        | Commands::Status { .. } => {
             unreachable!()
         }
     }
@@ -934,9 +918,16 @@ fn cmd_init(
         Some(created.keypair.public_key)
     };
 
-    // Validate dar availability (non-fatal warning)
-    let dar_path = &cfg.dar.binary;
-    let dar_ok = check_dar(dar_path);
+    // The writer's floor (ADR-0012 item 274), probed as `stage create`
+    // probes it (non-fatal: a warning, with the probe's own text).
+    let tar_check = {
+        let work = tapectl::staging::home_work_dir(paths, ".tar-probe-")?;
+        tapectl::policy::depth_check::check_tar(&cfg.tar.binary, work.path())
+    };
+    let tar_ok = matches!(
+        tar_check,
+        tapectl::policy::depth_check::TarToolCheck::Ok { .. }
+    );
 
     if json_output {
         println!(
@@ -947,7 +938,7 @@ fn cmd_init(
                 "operator_id": tenant_id,
                 "operator_key_adopted": adopted_operator_key.as_ref().map(|i| &i.public_key),
                 "config_kept": config_kept,
-                "dar_available": dar_ok,
+                "tar_available": tar_ok,
                 "escrow_public_key": escrow_public_key,
                 "next": INIT_NEXT_STEPS.iter().map(|(_, cmd)| cmd).collect::<Vec<_>>(),
             })
@@ -986,28 +977,15 @@ fn cmd_init(
                 "  escrow:   not created (--no-escrow) — register one with `key generate --escrow` or `key import --escrow` before staging"
             ),
         }
-        if dar_ok {
-            // Issue #119/#124: use the same PATH-resolution helper `config
-            // check` uses, so a bare, PATH-resolved dar.binary (the default
-            // as of issue #124) shows the operator where it actually
-            // resolved to, not just the bare name they configured.
-            let found_at = if dar_path.contains('/') {
-                None
-            } else {
-                std::env::var_os("PATH")
-                    .and_then(|path_var| {
-                        tapectl::policy::depth_check::resolve_on_path(dar_path, &path_var)
-                    })
-                    .map(|p| p.display().to_string())
-            };
-            match found_at {
-                Some(found) => println!("  dar:      {dar_path} (found at {found})"),
-                None => println!("  dar:      {dar_path} (ok)"),
-            }
-        } else if dar_path.contains('/') {
-            println!("  dar:      {dar_path} (NOT FOUND — install before staging)");
-        } else {
-            println!("  dar:      {dar_path} (NOT FOUND on PATH — install before staging)");
+        match &tar_check {
+            tapectl::policy::depth_check::TarToolCheck::Ok {
+                path, first_line, ..
+            } => println!("  tar:      {first_line} (found at {path})"),
+            other => println!(
+                "  tar:      {} — {}",
+                cfg.tar.binary,
+                tapectl::policy::depth_check::describe_tar(other)
+            ),
         }
         print!("{}", init_next_steps());
     }
@@ -1055,15 +1033,4 @@ fn init_next_steps() -> String {
     }
     out.push_str("`tapectl status` shows where things stand and the next command at every step.\n");
     out
-}
-
-/// Check if dar is available at the configured path.
-fn check_dar(dar_path: &str) -> bool {
-    std::process::Command::new(dar_path)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }

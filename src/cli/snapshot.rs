@@ -218,6 +218,10 @@ fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created>
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
 
+    // #542: what the version left out (the newest version's, when nothing
+    // was minted), so a file on no tape is never silent.
+    let left_out = crate::db::snapshot_left_out::load(conn, outcome.snapshot_id)?;
+
     let json = serde_json::json!({
         "snapshot_id": outcome.snapshot_id,
         "unit": name,
@@ -228,8 +232,9 @@ fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created>
         // the created path, `false` when an existing version was reported
         // instead — never two different JSON shapes for the same command.
         "minted": outcome.minted,
+        "left_out": left_out.iter().map(left_out_json).collect::<Vec<_>>(),
     });
-    let line = if outcome.minted {
+    let mut line = if outcome.minted {
         format!(
             "snapshot created: {} v{} ({}, {})",
             name,
@@ -243,7 +248,62 @@ fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created>
             outcome.version,
         )
     };
+    line.push_str(&left_out_lines(&left_out));
     Ok(Created { line, json })
+}
+
+/// One thing a version left out, as `--json` carries it (#542).
+fn left_out_json(row: &crate::db::snapshot_left_out::LeftOut) -> serde_json::Value {
+    serde_json::json!({
+        "reason": row.reason.as_str(),
+        "pattern": row.pattern,
+        "path": row.path,
+        "kind": row.kind(),
+        "files": row.files,
+        "bytes": row.bytes,
+    })
+}
+
+/// How many left-out things `snapshot create` names in its text before it
+/// counts the rest; `--json` and the catalog carry them all.
+const LEFT_OUT_LINES: usize = 20;
+
+/// The lines naming what a version left out: the pattern or the socket
+/// rule, the path, and for a folder what was under it (#542). Empty when
+/// nothing was left out. Names are escaped as the index escapes them, so a
+/// name with a newline stays on its line.
+fn left_out_lines(rows: &[crate::db::snapshot_left_out::LeftOut]) -> String {
+    use crate::db::snapshot_left_out::Reason;
+    let mut out = String::new();
+    for row in rows.iter().take(LEFT_OUT_LINES) {
+        let why = match (row.reason, &row.pattern) {
+            (Reason::Pattern, Some(p)) => format!("pattern {p}"),
+            _ => "socket".to_string(),
+        };
+        let what = if row.folder {
+            format!(
+                "folder, {why}, {} under it, {}",
+                crate::render::plural(row.files, "file", "files"),
+                crate::util::format_bytes_binary(row.bytes)
+            )
+        } else if row.reason == Reason::Socket {
+            why
+        } else {
+            format!("{why}, {}", crate::util::format_bytes_binary(row.bytes))
+        };
+        out.push_str(&format!(
+            // The stored form is the escaped one (§1.5; item 297): printed as it is.
+            "\n  left out: {} ({what})",
+            row.path
+        ));
+    }
+    if rows.len() > LEFT_OUT_LINES {
+        out.push_str(&format!(
+            "\n  and {} more left out; `--json` lists them all",
+            rows.len() - LEFT_OUT_LINES
+        ));
+    }
+    out
 }
 
 /// The error a `snapshot create` of `named` units ends with, `None` when
@@ -745,6 +805,58 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    /// #542: `snapshot create` names what the patterns and the socket rule
+    /// left out, in its line and in `--json`'s new `left_out` key; an
+    /// unchanged unit reports what its newest version left out.
+    #[test]
+    fn create_names_what_was_left_out_in_its_line_and_its_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = two_units(tmp.path());
+        let dir = tmp.path().join("unit1");
+        std::fs::write(dir.join("a.nfo"), b"12345").unwrap();
+        std::fs::create_dir_all(dir.join(".cache")).unwrap();
+        std::fs::write(dir.join(".cache/x"), b"123").unwrap();
+        let _l = std::os::unix::net::UnixListener::bind(dir.join("s.sock")).unwrap();
+        let mut config = Config::default();
+        config.defaults.global_excludes = vec!["*.nfo".into(), ".cache/".into()];
+
+        for pass in ["minted", "unchanged"] {
+            let created = create_one(&conn, &config, "unit1").unwrap();
+            let left = created.json["left_out"].as_array().unwrap_or_else(|| {
+                panic!("{pass}: no left_out key in {}", created.json);
+            });
+            let mut seen: Vec<(String, String, String, i64, i64)> = left
+                .iter()
+                .map(|r| {
+                    (
+                        r["reason"].as_str().unwrap().to_string(),
+                        r["path"].as_str().unwrap().to_string(),
+                        r["kind"].as_str().unwrap().to_string(),
+                        r["files"].as_i64().unwrap(),
+                        r["bytes"].as_i64().unwrap(),
+                    )
+                })
+                .collect();
+            seen.sort();
+            assert_eq!(
+                seen,
+                vec![
+                    ("pattern".into(), ".cache".into(), "folder".into(), 1, 3),
+                    ("pattern".into(), "a.nfo".into(), "file".into(), 1, 5),
+                    ("socket".into(), "s.sock".into(), "file".into(), 1, 0),
+                ],
+                "{pass}"
+            );
+            for needle in ["a.nfo", ".cache", "s.sock", "*.nfo", "socket"] {
+                assert!(
+                    created.line.contains(needle),
+                    "{pass}: {needle} in {}",
+                    created.line
+                );
+            }
+        }
     }
 
     /// Issue #404 with ADR-0012 item 210: a signal stops a `snapshot create`

@@ -91,8 +91,8 @@ pub(crate) struct State {
     pub watched: Vec<(u32, bool)>,
     /// `(file read, bytes of regular files directly inside `watch` then)`,
     /// one per read — how a test sees whether a restore SPOOLS decrypted
-    /// slices to disk or streams them to dar (issues #411, #498: a streamed
-    /// slice goes to dar's standard input and holds nothing on disk).
+    /// slices to disk or streams them to tar (issues #411, #498: a streamed
+    /// slice goes to tar's standard input and holds nothing on disk).
     pub watched_bytes: Vec<(u32, u64)>,
     /// The distance model's length for the file at a position, where it is
     /// not the file's stored bytes (issue #416). Keyed by POSITION, not by
@@ -337,7 +337,7 @@ impl FakeTape {
     /// [`State`] models after its last file: each block through the real
     /// [`write_block_retrying`] against [`MediumEnd`] and the hard end
     /// ([`State::capacity`]), into `bytes`; then one filemark, never retried
-    /// (`volume-format-v2.md` §4.3 W3). On an error, `bytes` holds what
+    /// (`volume-format-v3.md` §5.2 W3). On an error, `bytes` holds what
     /// landed.
     fn lay_down(
         s: &mut State,
@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(s.head, (1, 2), "inside the file: no filemark was written");
     }
 
-    // --- the early warning (#420, `volume-format-v2.md` §4.3) -----------
+    // --- the early warning (#420, `volume-format-v3.md` §5.2) -----------
 
     fn block_of(b: u8, blocks: usize) -> Vec<u8> {
         vec![b; blocks * BS]

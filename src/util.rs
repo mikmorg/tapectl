@@ -188,8 +188,8 @@ impl<W: Write> Write for TruncatingWriter<W> {
 /// Human-readable byte count in BINARY units (KiB/MiB/GiB/TiB, 1024-based).
 ///
 /// For **data sizes**: slice bytes, staged/encrypted bytes, bytes read or
-/// written, reclaimable/freed bytes — anything `dar` or the block layer
-/// actually measured. ADR-0012: "data sizes are binary, as dar and the
+/// written, reclaimable/freed bytes — anything tar or the block layer
+/// actually measured. ADR-0012: "data sizes are binary, as tar and the
 /// block layer count."
 ///
 /// Never call this on a stored capacity (`cartridges.nominal_capacity`,
@@ -283,7 +283,7 @@ pub fn format_capacity_progress(bytes_written: i64, capacity_bytes: i64) -> Stri
 /// ignored. Use it only where nothing reads the same bytes again soon: the
 /// write path's read of a staged file is one (the next read of a slice is
 /// the next copy's write, hours later); a source file during `stage create`
-/// is not (dar and the hasher share one read of it through the page cache,
+/// is not (tar and the hasher share one read of it through the page cache,
 /// issue #364), nor is a file just materialized and about to be written.
 /// What it reads is counted as a staging read for the budget tests
 /// ([`crate::pass_count`], issue #416).

@@ -368,8 +368,8 @@ pub enum TapectlError {
     /// `rusqlite_migration::Error::ForeignKeyCheck` — never any other
     /// migration failure, and never a match on `e.to_string()` — and
     /// surfaces this instead of the generic [`TapectlError::Migration`]
-    /// above. `.foreign_key_check()` (migrations 003/012/013/017) runs
-    /// `PRAGMA foreign_key_check` with no table argument, i.e.
+    /// above. `.foreign_key_check()` (on a migration that rebuilds a
+    /// table) runs `PRAGMA foreign_key_check` with no table argument, i.e.
     /// whole-database, so a pre-existing orphan ANYWHERE — hand-edited,
     /// partially restored, recovered from a damaged file, or written by an
     /// older tapectl — trips it the instant any pending migration carrying
@@ -425,15 +425,12 @@ pub enum TapectlError {
     #[error("unit path does not exist: {0}")]
     UnitPathNotFound(String),
 
-    // dar
-    #[error("dar error: {0}")]
-    Dar(String),
+    // tar, the Layout 3 writer (volume-format-v3.md §3.1)
+    #[error("tar error: {0}")]
+    Tar(String),
 
-    #[error("dar not found at configured path: {0}")]
-    DarNotFound(String),
-
-    #[error("dar version {found} below minimum {minimum}")]
-    DarVersionTooOld { found: String, minimum: String },
+    #[error("tar not found: {0}")]
+    TarNotFound(String),
 
     // Volume / Tape
     #[error("volume not found: {0}")]

@@ -152,10 +152,9 @@ impl IntegrityReport {
 
 /// The exit code of a `unit check-integrity` whose only finding is CHANGED
 /// files (edited since the baseline was snapshotted). The one place it is
-/// decided: the CTO's question Q40. This is the coordinator's
-/// recommendation, 0 with a one-line note naming `snapshot create`, since an
-/// edit is not damage; the CTO's answer is a change to this line (and its
-/// pin, `changed_exit_code_is_q40s_recommendation`).
+/// decided: ADR-0012 item 223 (2026-11-09, Q40) ruled 0, with a one-line note
+/// naming `snapshot create`, since an edit is not damage (pinned by
+/// `changed_exit_code_is_item_223s_ruling`).
 pub fn changed_exit_code() -> i32 {
     crate::error::EXIT_SUCCESS
 }
@@ -251,7 +250,9 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
     };
 
     for (rel_path, expected_size, expected_sha, recorded_mtime) in &staged_files {
-        let full_path = Path::new(current_path).join(rel_path);
+        // The catalog's path is the escaped form (§1.5; ADR-0012 item 297): the
+        // name on disk is its bytes.
+        let full_path = Path::new(current_path).join(crate::volume::index::on_disk(rel_path));
         if !full_path.exists() {
             report.missing += 1;
             report.details.push(IntegrityDetail {
@@ -3069,20 +3070,20 @@ pub fn export_unit(
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
     // Select a SINGLE stage_set — the latest staged one for this unit — so the
-    // export never interleaves slices from two dar runs (H11). Two stage sets
+    // export never interleaves slices from two stagings (H11). Two stage sets
     // staged simultaneously (a re-stage, or two versions) would otherwise land
     // duplicate slice numbers in one directory and an heir following
     // RECOVERY.md would get an ambiguous, unrestorable set.
-    let (stage_set_id, snapshot_version): (i64, i64) = conn
+    let (stage_set_id, snapshot_version, compression): (i64, i64, Option<String>) = conn
         .query_row(
-            "SELECT ss.id, s.version
+            "SELECT ss.id, s.version, ss.compression
              FROM stage_sets ss
              JOIN snapshots s ON s.id = ss.snapshot_id
              WHERE s.unit_id = ?1 AND ss.status = 'staged'
              ORDER BY ss.created_at DESC, ss.id DESC
              LIMIT 1",
             params![unit.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| {
             TapectlError::Other(format!(
@@ -3139,7 +3140,7 @@ pub fn export_unit(
         let src_path = Path::new(src);
         let file_name = src_path
             .file_name()
-            .unwrap_or(std::ffi::OsStr::new("slice.dar.age"))
+            .unwrap_or(std::ffi::OsStr::new("slice.tar.age"))
             .to_string_lossy()
             .to_string();
         let dest_file = Path::new(dest_dir).join(&file_name);
@@ -3186,19 +3187,38 @@ pub fn export_unit(
     }
     fs::write(Path::new(dest_dir).join("SHA256SUMS"), &sums)?;
 
-    // Archive base = the common `base.N.dar` prefix of the exported slices
-    // (strip the `.N.dar.age` suffix), so RECOVERY.md can name the exact
-    // `dar -x` argument instead of an ARCHIVE_BASE placeholder.
+    // Archive base = the common `base.N.tar.age` prefix of the exported
+    // slices (strip the `.N.tar.age` suffix), so RECOVERY.md can name the
+    // exact files instead of a placeholder.
     let archive_base = manifest_entries
         .first()
         .map(|(_, f, _, _)| {
-            let stem = f.strip_suffix(".dar.age").unwrap_or(f);
+            let stem = f.strip_suffix(crate::staging::SLICE_SUFFIX).unwrap_or(f);
             stem.rsplit_once('.')
                 .map(|(b, _)| b)
                 .unwrap_or(stem)
                 .to_string()
         })
         .unwrap_or_else(|| "archive".to_string());
+    let last_slice = manifest_entries.len();
+
+    // Each slice is compressed alone, after the cut and before it is
+    // encrypted (ADR-0012 item 284), so it is decrypted, then decompressed
+    // by itself; the slices joined in order are the tar stream.
+    let (decompressor_need, decrypt_pipe) = match compression.as_deref() {
+        Some(alg @ ("gzip" | "xz" | "zstd")) => {
+            let tool = match alg {
+                "gzip" => "gzip",
+                "xz" => "xz",
+                _ => "zstd",
+            };
+            (
+                format!("- `{tool}` (each slice was compressed alone with {alg})\n"),
+                format!(" | {tool} -dc"),
+            )
+        }
+        _ => (String::new(), String::new()),
+    };
 
     // Write RECOVERY.md
     let recovery = format!(
@@ -3207,24 +3227,25 @@ pub fn export_unit(
          ## Snapshot version: {snapshot_version}\n\n\
          ### Prerequisites\n\n\
          - `age` CLI (https://github.com/FiloSottile/age)\n\
-         - `dar` >= 2.6\n\
+         - `tar` (GNU tar)\n\
+         {decompressor_need}\
          - The age secret key used to encrypt this data\n\n\
          ### Steps\n\n\
          1. Verify the encrypted slices against their checksums:\n\
          ```bash\n\
          sha256sum -c SHA256SUMS\n\
          ```\n\n\
-         2. Decrypt each slice:\n\
+         2. Decrypt each slice (the slices share the base name `{archive_base}`):\n\
          ```bash\n\
-         for f in *.dar.age; do\n\
-           age -d -i YOUR_KEY.age.key -o \"${{f%.age}}\" \"$f\"\n\
+         for f in *.tar.age; do\n\
+           age -d -i YOUR_KEY.age.key \"$f\"{decrypt_pipe} > \"${{f%.age}}\"\n\
          done\n\
          ```\n\n\
-         3. Extract with dar (the slices share the base name `{archive_base}`):\n\
+         3. Join the slices in order and extract the tar stream:\n\
          ```bash\n\
-         dar -x {archive_base} -R /destination/path -O -Q\n\
-         ```\n\
-         `-O` ignores stored ownership, needed when restoring as a non-root user.\n",
+         for n in $(seq 1 {last_slice}); do cat \"{archive_base}.$n.tar\"; done \\\n\
+           | tar -x -f - -C /destination/path\n\
+         ```\n",
     );
     fs::write(Path::new(dest_dir).join("RECOVERY.md"), &recovery)?;
 
@@ -4369,7 +4390,7 @@ fn copy_database_in_one_step(
 ///    hand-rolled `writes`/`stage_slices` scans, and `--repair`'s DELETEs
 ///    ran under immediate FK enforcement, so any orphan with children of
 ///    its own (a `writes` row with `write_positions`, a `stage_slices` row
-///    with `write_positions`/`sacrificed_slice_id`/`verification_results`)
+///    with `write_positions`/`verification_results`)
 ///    tripped the very constraint it was trying to close and rolled the
 ///    whole repair back. Reporting now runs `pragma_foreign_key_check`,
 ///    which is schema-derived and covers every edge without hand-keeping
@@ -5138,7 +5159,6 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string();
         config.staging.directory = staging.to_string_lossy().into_owned();
         config.backends.lto = vec![crate::config::LtoBackendConfig {
             name: "lto0".to_string(),
@@ -5916,12 +5936,44 @@ mod tests {
         assert_eq!(gone.exit_code(), crate::error::EXIT_WARNING);
     }
 
-    /// Q40, with the CTO: the exit of a check whose only finding is CHANGED
-    /// is ONE decision, `changed_exit_code()`. This pins the coordinator's
-    /// recommendation (0, with the note); the CTO's answer changes the
-    /// function and this pin. Damage beside a CHANGED file still exits 1.
+    /// ADR-0012 item 297 (#569): the catalog holds a path in the escaped form,
+    /// `unit check-integrity` finds the file by its bytes, and what it prints,
+    /// plain and `--json`, is the escaped form.
     #[test]
-    fn changed_exit_code_is_q40s_recommendation() {
+    fn check_integrity_finds_names_that_are_not_utf8_and_shows_them_escaped() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TempDir::new().unwrap();
+        let latin = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+        let slash = tmp.path().join("back\\slash.txt");
+        std::fs::write(&latin, b"hello").unwrap();
+        std::fs::write(&slash, b"hello").unwrap();
+        let (conn, sid) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        let hash = direct_old_style_hash(b"hello");
+        insert_file(&conn, sid, "caf\\xe9.txt", 5, &hash);
+        insert_file(&conn, sid, "back\\\\slash.txt", 5, &hash);
+        let clean = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(
+            (clean.ok, clean.missing),
+            (2, 0),
+            "both names are found by their bytes: {:?}",
+            clean.details
+        );
+        std::fs::remove_file(&latin).unwrap();
+        let gone = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!((gone.ok, gone.missing), (1, 1));
+        let plain = render_integrity(&gone);
+        assert!(plain.contains("caf\\xe9.txt \u{2014} MISSING"), "{plain}");
+        let json = integrity_json(&gone);
+        assert_eq!(json["details"][0]["path"], "caf\\xe9.txt", "{json}");
+        // Nothing in the JSON is a byte outside UTF-8.
+        assert!(serde_json::to_string(&json).is_ok());
+    }
+
+    /// ADR-0012 item 223 (Q40): the exit of a check whose only finding is
+    /// CHANGED is ONE decision, `changed_exit_code()`, ruled 0 (with the
+    /// note). Damage beside a CHANGED file still exits 1.
+    #[test]
+    fn changed_exit_code_is_item_223s_ruling() {
         assert_eq!(changed_exit_code(), crate::error::EXIT_SUCCESS);
         let changed_only = IntegrityReport {
             changed: 2,
@@ -10956,7 +11008,7 @@ mod tests {
 
         let mut slice_files = Vec::new();
         for n in 1..=2i64 {
-            let f = dir.join(format!("{unit_name}-slice{n}.dar.age"));
+            let f = dir.join(format!("{unit_name}-slice{n}.tar.age"));
             fs::write(&f, b"ciphertext").unwrap();
             conn.execute(
                 "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
@@ -11080,7 +11132,7 @@ mod tests {
         let volume_id = insert_volume(&conn, "VOL-RANGE");
         let (write_id, _) = insert_write(&conn, snap_id, volume_id, "planned", None);
         conn.execute(
-            "UPDATE writes SET status = 'range', may_span = 1 WHERE id = ?1",
+            "UPDATE writes SET status = 'range' WHERE id = ?1",
             params![write_id],
         )
         .unwrap();
@@ -11121,10 +11173,12 @@ mod tests {
         assert_eq!(left, 1);
 
         conn.execute(
-            "UPDATE writes SET status = 'cut' WHERE id = ?1",
+            "DELETE FROM write_positions WHERE write_id = ?1",
             params![write_id],
         )
         .unwrap();
+        conn.execute("DELETE FROM writes WHERE id = ?1", params![write_id])
+            .unwrap();
         snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
     }
 
@@ -11720,8 +11774,7 @@ mod tests {
     /// row orphaned on `volumes` with a `write_positions` child and a
     /// `verification_results` grandchild (via that child), plus a
     /// `stage_slices` row orphaned on `stage_sets` referenced by a second
-    /// `write_positions` row and by the orphan write's
-    /// `sacrificed_slice_id`.
+    /// `write_positions` row.
     ///
     /// Negative control (pre-fix HEAD): `db_fsck(&conn, true)` returns
     /// `Err` whose text contains `FOREIGN KEY constraint failed`, and every
@@ -11789,13 +11842,11 @@ mod tests {
         .unwrap();
         let slice_orphan_id = conn.last_insert_rowid();
 
-        // An orphan writes row -- its OWN volume_id dangles -- that also
-        // references the orphan slice via `sacrificed_slice_id` (that
-        // reference is not itself dangling: the row exists).
+        // An orphan writes row -- its OWN volume_id dangles.
         conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, sacrificed_slice_id)
-             VALUES (?1, ?2, 99999, 'completed', ?3)",
-            params![stage_set_id, snap_id, slice_orphan_id],
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, 99999, 'completed')",
+            params![stage_set_id, snap_id],
         )
         .unwrap();
         let write_orphan_id = conn.last_insert_rowid();

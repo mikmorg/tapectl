@@ -38,7 +38,7 @@
 # Optional healthchecks.io-style pinging: set TAPECTL_HEALTHCHECK_URL. If it is
 # unset, or curl is missing, or the ping fails, the run's own exit status is
 # unchanged. Monitoring must never be able to break the thing it monitors
-# (same fail-open rule as the dar capability probe, issue #97).
+# (same fail-open rule as the audit's other advisory probes, issue #97).
 
 set -uo pipefail
 # NOTE: deliberately no `set -e`. We need `audit`'s nonzero exit as data, and

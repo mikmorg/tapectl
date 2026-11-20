@@ -6,12 +6,12 @@
 //! runs. inotify reports every file created there, however briefly it
 //! lived, so the audit sees:
 //!
-//! - every name: each must be a `.dar.age` slice of the stage or the
-//!   writability probe — anything else (a `.dar`, a dar temporary, a
+//! - every name: each must be a `.tar.age` slice of the stage or the
+//!   writability probe — anything else (a plaintext `.tar` cut, a temporary, a
 //!   directory) is a violation;
 //! - every file's content: the audit opens each file the moment it appears
 //!   and keeps it open, so it can read the bytes at the end even if the
-//!   file was deleted meanwhile. A `.dar.age` must be age ciphertext from
+//!   file was deleted meanwhile. A `.tar.age` must be age ciphertext from
 //!   its first byte, and no file may hold a planted marker.
 //!
 //! The raw-device layer (a deleted block still on the disk) is
@@ -56,12 +56,12 @@ pub(super) struct AuditReport {
 }
 
 /// The names `stage create` may create under staging: its slices,
-/// `{uuid12}_v{V}_s{id}.{N}.dar.age`, and its writability probe.
+/// `{uuid12}_v{V}_s{id}.{N}.tar.age`, and its writability probe.
 fn allowed_name(name: &str) -> bool {
     if let Some(pid) = name.strip_prefix(".tapectl-stage-probe-") {
         return !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit());
     }
-    let Some(stem) = name.strip_suffix(".dar.age") else {
+    let Some(stem) = name.strip_suffix(".tar.age") else {
         return false;
     };
     let Some((base, n)) = stem.rsplit_once('.') else {
@@ -161,7 +161,7 @@ impl StagingAudit {
             let mut bytes = Vec::new();
             file.seek(SeekFrom::Start(0)).unwrap();
             file.read_to_end(&mut bytes).unwrap();
-            if name.ends_with(".dar.age")
+            if name.ends_with(".tar.age")
                 && !bytes.is_empty()
                 && !bytes.starts_with(b"age-encryption.org/v1\n")
             {
@@ -215,18 +215,18 @@ mod tests {
     #[test]
     fn the_allowed_names_are_slices_and_the_probe() {
         for ok in [
-            "0123456789ab_v1_s7.1.dar.age",
-            "0123456789ab_v12_s300.10.dar.age",
+            "0123456789ab_v1_s7.1.tar.age",
+            "0123456789ab_v12_s300.10.tar.age",
             ".tapectl-stage-probe-4242",
         ] {
             assert!(allowed_name(ok), "{ok}");
         }
         for bad in [
-            "0123456789ab_v1_s7.1.dar",
-            "0123456789ab_v1_s7.1.dar.sha512",
-            "0123456789ab_v1_s7.dar.age",
+            "0123456789ab_v1_s7.1.tar",
+            "0123456789ab_v1_s7.1.tar.sha512",
+            "0123456789ab_v1_s7.tar.age",
             "catalog_snapshot.db",
-            "secret-unit.1.dar.age",
+            "secret-unit.1.tar.age",
             ".tapectl-stage-probe-",
         ] {
             assert!(!allowed_name(bad), "{bad}");
@@ -283,7 +283,7 @@ mod tests {
         let seen_slices = report
             .created
             .iter()
-            .filter(|n| n.ends_with(".dar.age"))
+            .filter(|n| n.ends_with(".tar.age"))
             .count();
         assert_eq!(
             seen_slices as i64, slices,
@@ -298,8 +298,8 @@ mod tests {
     }
 
     /// The positive control the audit owes: the same audit, around
-    /// plaintext planted in staging by hand — a `.dar` slice deleted at
-    /// once, and plaintext under an allowed `.dar.age` name — reports both.
+    /// plaintext planted in staging by hand — a plaintext `.tar` cut deleted at
+    /// once, and plaintext under an allowed `.tar.age` name — reports both.
     #[test]
     fn the_audit_catches_plaintext_planted_in_staging() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -308,14 +308,14 @@ mod tests {
         let marker = format!("plaintext-marker-{}", token());
 
         let audit = StagingAudit::start(&staging);
-        let leaked = staging.join("0123456789ab_v1_s1.1.dar");
-        fs::write(&leaked, format!("dar slice {marker}")).unwrap();
+        let leaked = staging.join("0123456789ab_v1_s1.1.tar");
+        fs::write(&leaked, format!("tar slice {marker}")).unwrap();
         // Long enough for the audit to open it, then gone, as the old
         // pipeline's plaintext slices were.
         std::thread::sleep(Duration::from_millis(20));
         fs::remove_file(&leaked).unwrap();
         fs::write(
-            staging.join("0123456789ab_v1_s1.2.dar.age"),
+            staging.join("0123456789ab_v1_s1.2.tar.age"),
             format!("not ciphertext {marker}"),
         )
         .unwrap();
@@ -323,18 +323,18 @@ mod tests {
 
         let has = |needle: &str| report.violations.iter().any(|v| v.contains(needle));
         assert!(
-            has("a file staging must never create: 0123456789ab_v1_s1.1.dar"),
+            has("a file staging must never create: 0123456789ab_v1_s1.1.tar"),
             "{:#?}",
             report.violations
         );
         assert!(
-            has("0123456789ab_v1_s1.1.dar holds plaintext"),
+            has("0123456789ab_v1_s1.1.tar holds plaintext"),
             "the deleted file's content is still checked: {:#?}",
             report.violations
         );
         assert!(
-            has("0123456789ab_v1_s1.2.dar.age is not age ciphertext")
-                && has("0123456789ab_v1_s1.2.dar.age holds plaintext"),
+            has("0123456789ab_v1_s1.2.tar.age is not age ciphertext")
+                && has("0123456789ab_v1_s1.2.tar.age holds plaintext"),
             "{:#?}",
             report.violations
         );

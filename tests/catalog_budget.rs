@@ -284,7 +284,7 @@ fn run(command: Command, conn: &Connection, config: &Config) {
             version: None,
         }),
         Command::Search => catalog(CatalogCommands::Search {
-            pattern: "f0042".to_string(),
+            pattern: "f0042".into(),
             limit: 50,
             all_versions: false,
         }),

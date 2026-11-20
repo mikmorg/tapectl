@@ -148,7 +148,7 @@ pub(crate) fn add(
 
     // Devices are checked but never enforced: an operator may configure a
     // drive before plugging it in, and this box is not the only machine the
-    // config may be carried to. Same fail-open rule as #97's dar probe —
+    // config may be carried to. Same fail-open rule as #97's probe —
     // a helpful check must not become a tool that refuses to run.
     for (flag, path) in [
         ("--device-tape", Some(device_tape)),
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn the_generated_table_parses_as_a_backend() {
         let text = added(
-            "[dar]\nbinary = \"dar\"\n",
+            "[tar]\nbinary = \"tar\"\n",
             backend_fields(
                 "hp-lto6",
                 "/dev/tape/by-id/scsi-ABC-nst",
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn the_device_sg_line_is_written_only_when_given() {
         let without = added(
-            "[dar]\nbinary = \"dar\"\n",
+            "[tar]\nbinary = \"tar\"\n",
             backend_fields("b", "/dev/nst0", None, "LTO-6", None, None),
         );
         assert!(!without.contains("device_sg"), "{without}");
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(cfg.backends.lto[0].device_sg, "");
 
         let with = added(
-            "[dar]\nbinary = \"dar\"\n",
+            "[tar]\nbinary = \"tar\"\n",
             backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
         );
         assert!(with.contains("device_sg = \"/dev/sg1\""), "{with}");
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn inert_knobs_are_absent_and_defaulted() {
         let text = added(
-            "[dar]\nbinary = \"dar\"\n",
+            "[tar]\nbinary = \"tar\"\n",
             backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
         );
         assert!(!text.contains("block_size"), "{text}");
@@ -349,7 +349,7 @@ mod tests {
         // still-live `[defaults]` field whose non-default value must still be
         // exactly what comes back out.
         let before =
-            "[dar]\nbinary = \"dar\"\n\n[backends]\nlto = []\n\n[defaults]\nchecksum_mode = \"sha256\"\n";
+            "[tar]\nbinary = \"tar\"\n\n[backends]\nlto = []\n\n[defaults]\nchecksum_mode = \"sha256\"\n";
         let text = added(
             before,
             backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
@@ -365,7 +365,7 @@ mod tests {
     /// very thing this command configures.
     #[test]
     fn commented_lines_are_left_alone() {
-        let text = "[dar]\nbinary = \"dar\"\n\n# [[backends.lto]]\n# lto = []\n# name = \"lto6\"\n";
+        let text = "[tar]\nbinary = \"tar\"\n\n# [[backends.lto]]\n# lto = []\n# name = \"lto6\"\n";
         let after = added(
             text,
             backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn adding_preserves_comments_already_in_the_file() {
         let original =
-            "# operator note: the drive lives in the basement\n[dar]\nbinary = \"dar\"\n";
+            "# operator note: the drive lives in the basement\n[tar]\nbinary = \"tar\"\n";
         let after = added(
             original,
             backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
@@ -423,7 +423,7 @@ mod tests {
         std::fs::write(
             &paths.config_file,
             format!(
-                "[dar]\nbinary = \"dar\"\n\n[[backends.lto]]\n\
+                "[tar]\nbinary = \"tar\"\n\n[[backends.lto]]\n\
                  name = \"{existing_name}\"\ndevice_tape = \"{existing_device_tape}\"\n\
                  device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n"
             ),
@@ -575,7 +575,7 @@ mod tests {
 
     fn empty_config(dir: &std::path::Path) -> TapectlPaths {
         let paths = TapectlPaths::new(dir.to_path_buf());
-        std::fs::write(&paths.config_file, "[dar]\nbinary = \"dar\"\n").unwrap();
+        std::fs::write(&paths.config_file, "[tar]\nbinary = \"tar\"\n").unwrap();
         paths
     }
 

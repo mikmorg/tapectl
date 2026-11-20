@@ -10,9 +10,10 @@ use crate::staging;
 pub enum StageCommands {
     /// Archive and encrypt each unit's newest snapshot into staging
     ///
-    /// Each unit's sources are hashed as dar reads them once, and dar's
-    /// archive is cut into slices and age-encrypted in memory: no plaintext
-    /// reaches staging. Several units
+    /// GNU tar archives each unit's files from its snapshot's exact list;
+    /// its stream is checked and hashed as it passes, cut into slices of
+    /// whole files, packed alone when compressed and age-encrypted in
+    /// memory: no plaintext reaches staging. Several units
     /// may be named; `--jobs` stages that many at once. Every name is checked
     /// before any unit is staged. Under --json, an array of one object per
     /// unit, printed only when every unit was staged.
@@ -132,7 +133,7 @@ pub enum StageCommands {
     /// always swept.
     Clean(crate::cli::staging::CleanArgs),
 
-    /// Show a version's newest stage set: its dar, sizes and slices
+    /// Show a version's newest stage set: its tar, sizes and slices
     Info {
         /// The unit
         name: String,
@@ -520,10 +521,10 @@ pub fn run(
                 Option<i64>,
                 Option<String>,
             );
-            let (ss_id, status, dar_ver, dar_cmd, num_slices, dar_size, enc_size, staged_at): Row =
+            let (ss_id, status, tar_ver, tar_cmd, num_slices, stream_size, enc_size, staged_at): Row =
                 conn.query_row(
-                    "SELECT ss.id, ss.status, ss.dar_version, ss.dar_command,
-                            ss.num_slices, ss.total_dar_size, ss.total_encrypted_size, ss.staged_at
+                    "SELECT ss.id, ss.status, ss.tar_version, ss.tar_command,
+                            ss.num_slices, ss.stream_bytes, ss.total_encrypted_size, ss.staged_at
                      FROM stage_sets ss
                      JOIN snapshots s ON s.id = ss.snapshot_id
                      WHERE s.unit_id = ?1 AND s.version = ?2
@@ -558,31 +559,47 @@ pub fn run(
                 |row| row.get(0),
             )?;
 
+            // The staging's packing (items 286, 287).
+            let (compression, compression_level): (Option<String>, Option<i64>) = conn.query_row(
+                "SELECT compression, compression_level FROM stage_sets WHERE id = ?1",
+                params![ss_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+
             // Get slices
             let mut stmt = conn.prepare(
-                "SELECT slice_number, size_bytes, encrypted_bytes, sha256_encrypted
+                "SELECT slice_number, size_bytes, encrypted_bytes, sha256_encrypted, continues
                  FROM stage_slices WHERE stage_set_id = ?1 ORDER BY slice_number",
             )?;
-            let slices: Vec<(i64, i64, Option<i64>, Option<String>)> = stmt
+            #[allow(clippy::type_complexity)]
+            let slices: Vec<(i64, i64, Option<i64>, Option<String>, bool)> = stmt
                 .query_map(params![ss_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             if json_output {
                 let slice_json: Vec<serde_json::Value> = slices
                     .iter()
-                    .map(|(num, size, enc, sha)| {
+                    .map(|(num, size, enc, sha, continues)| {
                         serde_json::json!({
-                            "slice": num, "dar_bytes": size,
+                            "slice": num, "stream_bytes": size,
                             "encrypted_bytes": enc, "sha256": sha,
+                            "continues": continues,
                         })
                     })
                     .collect();
                 crate::render::print_json(&serde_json::json!({
                     "unit": name, "version": version, "stage_set_id": ss_id,
-                    "status": status, "dar_version": dar_ver,
-                    "num_slices": num_slices, "total_dar_size": dar_size,
+                    "status": status, "tar_version": tar_ver,
+                    "compression": compression, "compression_level": compression_level,
+                    "num_slices": num_slices, "stream_bytes": stream_size,
                     "total_encrypted_size": enc_size, "slices": slice_json,
                     "stage_set_count": stage_set_count,
                 }));
@@ -594,16 +611,21 @@ pub fn run(
                     );
                 }
                 println!("  Status:    {status}");
-                if let Some(dv) = &dar_ver {
-                    println!("  dar:       {dv}");
+                if let Some(tv) = &tar_ver {
+                    println!("  tar:       {tv}");
                 }
-                if let Some(dc) = &dar_cmd {
-                    println!("  command:   {dc}");
+                if let Some(tc) = &tar_cmd {
+                    println!("  command:   {tc}");
+                }
+                match (compression.as_deref(), compression_level) {
+                    (None | Some("none"), _) => println!("  Packing:   none"),
+                    (Some(c), Some(l)) => println!("  Packing:   {c}, level {l}"),
+                    (Some(c), None) => println!("  Packing:   {c}"),
                 }
                 println!("  Slices:    {}", num_slices.unwrap_or(0));
                 println!(
-                    "  dar size:  {}",
-                    crate::util::format_bytes_binary(dar_size.unwrap_or(0))
+                    "  stream:    {}",
+                    crate::util::format_bytes_binary(stream_size.unwrap_or(0))
                 );
                 println!(
                     "  encrypted: {}",
@@ -614,12 +636,17 @@ pub fn run(
                 }
                 if !slices.is_empty() {
                     println!("  Slices:");
-                    for (num, size, enc, sha) in &slices {
+                    for (num, size, enc, sha, continues) in &slices {
                         println!(
-                            "    #{num}: {} dar, {} enc, sha256={}",
+                            "    #{num}: {} of the stream, {} enc, sha256={}{}",
                             crate::util::format_bytes_binary(*size),
                             crate::util::format_bytes_binary(enc.unwrap_or(0)),
                             sha.as_deref().unwrap_or("(none)"),
+                            if *continues {
+                                " (continues a file)"
+                            } else {
+                                ""
+                            },
                         );
                     }
                 }
@@ -676,14 +703,14 @@ pub fn run(
             version,
             jobs,
         } => {
-            // Issue #241: the dar archive + age encryption pipeline IS
+            // Issue #241: the tar archive + age encryption pipeline IS
             // the work (hours and a tape's worth of staging disk, per
             // `collection run`'s own dry-run comment) — most of the
             // command with none of the safety if run "dry".
             if dry_run {
                 return Err(crate::cli::refuse_dry_run(
                     "stage create",
-                    "the dar archive, sha256 validation and age encryption pipeline IS the \
+                    "the tar archive, its checks and age encryption pipeline IS the \
                      work — there is no cheaper way to know what would be staged.",
                 ));
             }
@@ -737,9 +764,9 @@ pub fn run(
             let done = staging::jobs::first_failure(outcomes)?;
             let mut rows = Vec::with_capacity(done.len());
             for (unit_name, stage_set_id) in &done {
-                let (num_slices, total_dar, total_enc): (Option<i64>, Option<i64>, Option<i64>) =
-                    conn.query_row(
-                        "SELECT num_slices, total_dar_size, total_encrypted_size
+                let (num_slices, stream, total_enc): (Option<i64>, Option<i64>, Option<i64>) = conn
+                    .query_row(
+                        "SELECT num_slices, stream_bytes, total_encrypted_size
                          FROM stage_sets WHERE id = ?1",
                         params![stage_set_id],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -748,15 +775,15 @@ pub fn run(
                     "stage_set_id": stage_set_id,
                     "unit": unit_name,
                     "num_slices": num_slices,
-                    "total_dar_size": total_dar,
+                    "stream_bytes": stream,
                     "total_encrypted_size": total_enc,
                 }));
                 if !json_output {
                     println!(
-                        "staged: {} ({}, {} dar, {} encrypted)",
+                        "staged: {} ({}, {} stream, {} encrypted)",
                         unit_name,
                         crate::render::plural(num_slices.unwrap_or(0), "slice", "slices"),
-                        crate::util::format_bytes_binary(total_dar.unwrap_or(0)),
+                        crate::util::format_bytes_binary(stream.unwrap_or(0)),
                         crate::util::format_bytes_binary(total_enc.unwrap_or(0)),
                     );
                 }
@@ -917,15 +944,12 @@ fn snapshot_to_stage(
                         // set, whose ciphertext cannot continue the ranges
                         // already sealed. So `--force` costs more here than
                         // for an abandoned session (a re-confirmation, and
-                        // its remedy text recommends --force) or a cut set
-                        // (written nowhere, nothing on tape to orphan), and
+                        // its remedy text recommends --force) or a set
+                        // written nowhere (nothing on tape to orphan), and
                         // it outranks both; a live or resumable session
                         // still outranks it, being in use now or next.
                         staging::clean::ReleaseBlocker::SlicesShort { .. } => 4,
                         staging::clean::ReleaseBlocker::Abandoned { .. } => 3,
-                        // #420: never written whole, as `NeverWritten`, but
-                        // it names the volume that cut it.
-                        staging::clean::ReleaseBlocker::Cut { .. } => 2,
                         staging::clean::ReleaseBlocker::NeverWritten => 1,
                         staging::clean::ReleaseBlocker::None => 0,
                     };
@@ -953,25 +977,6 @@ fn snapshot_to_stage(
                          --unit {name} --version {v}` would leave it untouched — \
                          pass --force to release it"
                     ),
-                    // #420 (ADR-0012 item 112): a short seal cut it. The
-                    // slices are the input to the write that puts it on
-                    // tape whole, which is an ordinary `volume write` onto
-                    // another cartridge.
-                    staging::clean::ReleaseBlocker::Cut { volume_label } => {
-                        let on = match volume_label {
-                            Some(l) => format!("volume \"{l}\""),
-                            None => "its volume".to_string(),
-                        };
-                        format!(
-                            "{head}, and it is written whole nowhere: {on} sealed short before \
-                             it, so it was cut there and is not a copy. Write it whole onto \
-                             another cartridge with `tapectl volume write <LABEL>` (`--init` \
-                             initialises a new one); these slices are what that write \
-                             reads. `tapectl stage clean --unit {name} --version {v}` \
-                             leaves it untouched until then — pass --force only to give the \
-                             version up"
-                        )
-                    }
                     // #478 (ADR-0012 items 85 and 129): a span in
                     // progress. Its released slices are on tape; the short
                     // ones continue it, and are released one by one as
@@ -1078,7 +1083,7 @@ mod tests {
     //!
     //! Shared setup builds a real tenant + unit (via `unit::init_unit`, so
     //! a real dotfile + real tenant keys exist — `stage_create` refuses to
-    //! encrypt without active tenant keys) and runs the real `dar` binary,
+    //! encrypt without active tenant keys) and runs the real `tar` binary,
     //! matching the pattern already established in
     //! `staging::tests::stage_create_uses_archive_set_resolved_slice_size_not_global_default`.
 
@@ -1228,7 +1233,6 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
         let mut config = Config::default();
         config.staging.directory = staging_dir.to_string_lossy().to_string();
-        config.dar.binary = "dar".to_string();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
         crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
@@ -1767,40 +1771,6 @@ mod tests {
         }
     }
 
-    /// #420 (ADR-0012 item 112): a version whose only write was CUT by a
-    /// short seal is written whole nowhere. The refusal names the volume
-    /// that cut it and the write that finishes it — `volume write` onto
-    /// another cartridge — and not `volume resume` (nothing is resumable)
-    /// nor the abandoned-session advice its `writes` row would otherwise
-    /// fall into.
-    #[test]
-    fn create_with_version_refusal_names_the_volume_that_cut_it_and_the_next_write() {
-        let (conn, paths, config, _tmp) = staged_unit_with_write("cut", "sealed", false);
-        conn.execute(
-            "UPDATE volumes SET ended_after = 9, sealed_at = datetime('now') WHERE label = 'L6-0007'",
-            [],
-        )
-        .unwrap();
-        let msg = stage_version_1_refusal(&conn, &paths, &config);
-        assert!(
-            msg.contains("already has a stage set with live slices"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("volume \"L6-0007\" sealed short before it"),
-            "{msg}"
-        );
-        assert!(msg.contains("`tapectl volume write <LABEL>`"), "{msg}");
-        assert!(msg.contains("another cartridge"), "{msg}");
-        assert!(
-            msg.contains("tapectl stage clean --unit unit1 --version 1"),
-            "{msg}"
-        );
-        assert!(!msg.contains("volume resume"), "{msg}");
-        assert!(!msg.contains("aborted"), "{msg}");
-        assert!(!msg.contains("copy floor"), "{msg}");
-    }
-
     /// #478 (ADR-0012 items 85 and 129): a version spanning cartridges,
     /// whose tape so far holds its slice 1 as a `range` row and whose slice
     /// 2 is still short of copies. The refusal names the short slice, says
@@ -1825,7 +1795,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE writes SET status = 'range', may_span = 1 WHERE stage_set_id = ?1",
+            "UPDATE writes SET status = 'range' WHERE stage_set_id = ?1",
             params![stage_set_id],
         )
         .unwrap();

@@ -3741,3 +3741,86 @@ to the CTO in four questions, each with a recommendation. The CTO chose each rec
      `--xattrs-exclude='system.posix_acl_*'` whenever it passes `--xattrs`, whatever
      `preserve_acls` says, so an ACL is stored only as the text record that `--acls` writes,
      and only when `preserve_acls` is on (items 273, 274; T0.1).
+
+## Amendment, 2026-11-19: a name that is not UTF-8 (#569)
+
+Ruled 2026-11-19. In the 2.0.0 build (T4.2, 2026-11-18) the coordinator found that a file whose
+name is not valid UTF-8 cannot be archived: the snapshot records each path through a lossy
+conversion, the catalog's paths are text, tar cannot find the lossy name, and the staging is
+refused by name. Nothing was lost silently, but such a unit could not be archived at all, and
+names of that kind are ordinary on old media (item 281: what tapectl holds later is not known).
+The coordinator recommended fixing it in 2.0.0, while the schema is still a fresh baseline and
+before a production tape exists. The CTO: "Address 569 as you recommend".
+
+297. **A file whose name is not UTF-8 is archived and restored by its bytes in 2.0.0.** A name
+     is a sequence of bytes, and tapectl carries it so, from the snapshot's walk to tar's file
+     list, the stream reader's check, every text on the tape, the catalog, a restore and the
+     heir's per-file check.
+
+**Determinations, not rulings, said so that they can be corrected** (the coordinator's, for the
+task that builds it, T4.17):
+
+- *One escape.* §1.5's escaping, "the one rule for the whole format", gains a fifth case:
+  each byte that is not part of a valid UTF-8 sequence is written `\xHH`, two lowercase hex
+  digits. Backslash is already written `\\`, so `\x` in escaped text means only this, the
+  escape stays reversible, and every text on the tape stays UTF-8. A name that is UTF-8 is
+  written exactly as before.
+- *The catalog keeps the escaped form.* `paths.path` (and every other column that holds a
+  path inside a unit) holds a path as §1.5 writes it, which is the file table's and the
+  index's form, so a rebuild copies texts verbatim and nothing converts between the tape and
+  the catalog. No column is added. The baseline has no upgrade from 1.x (item 258), so no
+  catalog in the field holds the old form.
+- *tar is given the bytes.* Measured on 2026-11-19 with GNU tar 1.35 under `LC_ALL=C`
+  (`--format=posix`, `--null -T`): the pax `path` record carries the name's raw bytes, with no
+  `hdrcharset` record, and extraction gives back the same bytes. The writer's file list is
+  written from the unescaped bytes, and the stream reader compares bytes.
+- *Commands show the escaped form and take bytes.* Output, `--json` included, shows a path as
+  the file table writes it; a path given on the command line is taken as bytes and escaped
+  for the lookup, so the operator types the name as the shell has it.
+- *The heir's script* unescapes only where it names a file on disk (the per-file check).
+  `--path` and `--paths-from` take a path as `--list` and the damaged-file list write it.
+- *Scope.* Names inside a unit and a symbolic link's target. A unit's own root, a unit's,
+  tenant's or location's name, and any other configuration text stay UTF-8; a root path that
+  is not UTF-8 is refused by name at `unit init`.
+
+## Amendment, 2026-11-20: the restore's memory (#571)
+
+Ruled 2026-11-20. T5.10 measured tapectl's own restore (`tests/restore_memory.rs`, layout-3
+53ff6cff): it holds one whole slice's plaintext at a time, so its peak follows `slice_size`,
+not the largest file. That is about 1× the slice when the slice is not compressed. For a zstd
+staging of data that does not compress it is 2× to 3×, because the frame and the decoded cut
+are alive together and a `Vec` doubles its capacity; by allocated capacity the worst case is
+4×. The heir's RESTORE.sh streams through the stock tools and is unaffected. The coordinator
+asked question 45: accept the bound and warn (A, recommended), or bound the restore below
+`slice_size` by holding one member at a time (B). The ask said "ratify" would be read to cover
+A as written and nothing else. The CTO: "Ratify".
+
+298. **The restore keeps one whole slice in memory, and warns before that bites.**
+     - *Exact allocation.* The restore gives each buffer the size it needs, sized from the
+       catalog: the decrypted frame from the slice's encrypted size, and the decoded cut from
+       its `size_bytes`. No buffer grows by doubling. The frame is freed before tar is fed.
+       The peak is about 1× the slice uncompressed, and for a compressed slice the frame plus
+       the cut, about 2× at worst (on data that does not compress, the frame is a little
+       larger than the cut).
+     - *Two warnings.* `config check` warns, and so does the restore, when that figure is
+       more than the host's available memory (`MemAvailable`).
+     - *The docs row* for `slice_size` (`docs/configuration.md`) states the figure and the
+       warnings.
+     - *No format change.* The whole slice in memory is what reading around a bad age chunk
+       and taking a chunk from another copy rest on.
+
+**Determinations, not rulings, said so that they can be corrected** (the coordinator's, for the
+task that builds it, T5.11):
+
+- *The restore's figure comes from what it reads*: the largest `size_bytes` among the slices
+  it is about to read, doubled when their staging is compressed. It is not taken from the
+  configuration's `slice_size`, which a rebuilt catalog on another host does not share.
+- *`config check`'s figure* is the largest effective `slice_size` among the defaults and the
+  archive sets, doubled where that level sets a compression.
+- *A warning is advisory*: it changes no exit code and refuses nothing, and follows the
+  existing warning text and `--json` shapes.
+- *A size that cannot be allocated* (a corrupt catalog record) makes the slice bad, by name,
+  and never aborts the process.
+- *T5.6's `volumes.restore_sh_sha256`* (the sha256 of the RESTORE.sh a volume carries, copied
+  by `drill record`) was put to the CTO beside question 45 as a determination they may
+  overrule, and was not overruled. It stays a determination, not a ruling.

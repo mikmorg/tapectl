@@ -1,4 +1,4 @@
-//! The cross-volume index (`docs/design/volume-format-v2.md` §1.5, ADR-0012
+//! The cross-volume index (`docs/design/volume-format-v3.md` §1.5, ADR-0012
 //! items 78-80, #418 R4): which volumes hold which version of each unit and,
 //! for a tenant, every path of those versions. Written into the envelopes by
 //! `volume::build`, read by `RESTORE.sh` and, as a to-do list, by `catalog
@@ -79,61 +79,145 @@ fn write_hex<W: Write + ?Sized>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     w.write_all(&out[..bytes.len() * 2])
 }
 
-/// Write `field` with the four escapes (§1.5): backslash as `\\`, TAB as
-/// `\t`, LF as `\n`, CR as `\r`, and nothing else. All four are ASCII, so a
-/// byte scan never splits a UTF-8 sequence.
-fn write_escaped<W: Write + ?Sized>(w: &mut W, field: &str) -> io::Result<()> {
-    let bytes = field.as_bytes();
-    let mut start = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        let esc: &[u8] = match b {
-            b'\\' => b"\\\\",
-            b'\t' => b"\\t",
-            b'\n' => b"\\n",
-            b'\r' => b"\\r",
-            _ => continue,
+/// Write `bytes` with the format's one escape (§1.5): backslash as `\\`, TAB
+/// as `\t`, LF as `\n`, CR as `\r`, and each byte that is not part of a valid
+/// UTF-8 sequence as `\xHH` (two lowercase hex digits; ADR-0012 item 297,
+/// #569). Nothing else is escaped, so a UTF-8 name is written as it is and
+/// every text stays UTF-8.
+fn write_escaped_bytes<W: Write + ?Sized>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (valid, bad) = match std::str::from_utf8(rest) {
+            Ok(_) => (rest.len(), 0),
+            Err(e) => (
+                e.valid_up_to(),
+                e.error_len().unwrap_or(rest.len() - e.valid_up_to()),
+            ),
         };
-        w.write_all(&bytes[start..i])?;
-        w.write_all(esc)?;
-        start = i + 1;
+        let mut start = 0;
+        for (i, &b) in rest[..valid].iter().enumerate() {
+            let esc: &[u8] = match b {
+                b'\\' => b"\\\\",
+                b'\t' => b"\\t",
+                b'\n' => b"\\n",
+                b'\r' => b"\\r",
+                _ => continue,
+            };
+            w.write_all(&rest[start..i])?;
+            w.write_all(esc)?;
+            start = i + 1;
+        }
+        w.write_all(&rest[start..valid])?;
+        for &b in &rest[valid..valid + bad] {
+            w.write_all(&[
+                b'\\',
+                b'x',
+                DIGITS[(b >> 4) as usize],
+                DIGITS[(b & 15) as usize],
+            ])?;
+        }
+        rest = &rest[valid + bad..];
     }
-    w.write_all(&bytes[start..])
+    Ok(())
 }
 
-/// `field` escaped, as a string: [`write_escaped`] for callers that hold it.
+/// Write the text `field` with the escape ([`write_escaped_bytes`]).
+fn write_escaped<W: Write + ?Sized>(w: &mut W, field: &str) -> io::Result<()> {
+    write_escaped_bytes(w, field.as_bytes())
+}
+
+/// A name's bytes in the form every text of the format and the catalog keeps
+/// (§1.5): the ONE escape. A name that is UTF-8 with no backslash, TAB, LF or
+/// CR comes back as it is.
+pub fn escape_bytes(bytes: &[u8]) -> Cow<'_, str> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text.contains(['\\', '\t', '\n', '\r']) {
+            return Cow::Borrowed(text);
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    write_escaped_bytes(&mut out, bytes).expect("a Vec does not fail to write");
+    Cow::Owned(String::from_utf8(out).expect("the escape writes UTF-8 only"))
+}
+
+/// [`escape_bytes`] for a name held as text.
 pub fn escape(field: &str) -> Cow<'_, str> {
-    if !field.contains(['\\', '\t', '\n', '\r']) {
-        return Cow::Borrowed(field);
-    }
-    let mut out = Vec::with_capacity(field.len() + 8);
-    write_escaped(&mut out, field).expect("a Vec does not fail to write");
-    Cow::Owned(String::from_utf8(out).expect("escaping ASCII bytes keeps UTF-8 whole"))
+    escape_bytes(field.as_bytes())
 }
 
-/// The inverse of [`escape`]. A backslash followed by anything but
-/// `\`, `t`, `n` or `r`, or ending the field, is not something the writer
-/// makes: refused rather than guessed at.
-pub fn unescape(field: &str) -> std::result::Result<String, String> {
-    if !field.contains('\\') {
-        return Ok(field.to_string());
-    }
-    let mut out = String::with_capacity(field.len());
-    let mut chars = field.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+/// [`escape_bytes`] for a path as the operating system has it.
+pub fn escape_os(name: &std::ffi::OsStr) -> Cow<'_, str> {
+    use std::os::unix::ffi::OsStrExt;
+    escape_bytes(name.as_bytes())
+}
+
+/// The inverse of [`escape_bytes`]: the name's bytes. A backslash followed by
+/// anything but `\`, `t`, `n`, `r` or `x` and two lowercase hex digits, or
+/// ending the field, is not something the writer makes: refused rather than
+/// guessed at.
+pub fn unescape(field: &str) -> std::result::Result<Vec<u8>, String> {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        i += 1;
+        if b != b'\\' {
+            out.push(b);
             continue;
         }
-        match chars.next() {
-            Some('\\') => out.push('\\'),
-            Some('t') => out.push('\t'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some(other) => return Err(format!("unknown escape `\\{other}`")),
-            None => return Err("a backslash ends the field".to_string()),
+        let Some(&c) = bytes.get(i) else {
+            return Err("a backslash ends the field".to_string());
+        };
+        i += 1;
+        match c {
+            b'\\' => out.push(b'\\'),
+            b't' => out.push(b'\t'),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b'x' => {
+                let hex = |d: Option<&u8>| match d {
+                    Some(d @ b'0'..=b'9') => Some(d - b'0'),
+                    Some(d @ b'a'..=b'f') => Some(d - b'a' + 10),
+                    _ => None,
+                };
+                match (hex(bytes.get(i)), hex(bytes.get(i + 1))) {
+                    (Some(h), Some(l)) => {
+                        out.push(h << 4 | l);
+                        i += 2;
+                    }
+                    _ => {
+                        return Err("`\\x` is not followed by two lowercase hex digits".to_string())
+                    }
+                }
+            }
+            other => return Err(format!("unknown escape `\\{}`", other as char)),
         }
     }
     Ok(out)
+}
+
+/// [`unescape`] for a name that must be text (a unit's or tenant's name, an
+/// id map's name read as text): refused when it is not UTF-8.
+pub fn unescape_text(field: &str) -> std::result::Result<String, String> {
+    String::from_utf8(unescape(field)?).map_err(|_| "the name is not UTF-8".to_string())
+}
+
+/// A path in the escaped form (§1.5) as the name it is on disk: its own bytes,
+/// relative as it was written. Every path tapectl holds was made by the
+/// escape, so this does not fail for one; a text that is not well escaped is
+/// taken as it is rather than guessed at.
+pub fn on_disk(escaped: &str) -> std::path::PathBuf {
+    unescape_os(escaped)
+        .unwrap_or_else(|_| escaped.into())
+        .into()
+}
+
+/// [`unescape`] as a path for the operating system.
+pub fn unescape_os(field: &str) -> std::result::Result<std::ffi::OsString, String> {
+    use std::os::unix::ffi::OsStringExt;
+    unescape(field).map(std::ffi::OsString::from_vec)
 }
 
 /// A catalog timestamp (`YYYY-MM-DD HH:MM:SS`, UTC, what `datetime('now')`
@@ -201,7 +285,7 @@ fn write_units_row<W: Write + ?Sized>(
     field(w, &r.unit_uuid)?;
     write!(w, "{}\t", r.version)?;
     // The run of the slices this volume holds (§1.5): 1..=num_slices for a
-    // whole version, a range's own run (1.7.0, §4.4). A stage set with none
+    // whole version, a range's own run (1.7.0, §5.3). A stage set with none
     // recorded has no run and no size to state, and a run the catalog does
     // not know is not stated either (an empty field is "not known").
     if r.num_slices > 0 {
@@ -293,9 +377,16 @@ fn write_paths<W: Write + ?Sized>(
             // Only a regular file states a hash (§1.5): whatever the column
             // holds for a directory, a symlink or a special file is not a
             // content claim the format makes. The column's CHECK admits NULL
-            // or 32 bytes.
+            // or 32 bytes. The unit's own dotfile states none either (D8,
+            // #528, #562): it is not content, a re-stage after `unit tag`
+            // carries it with new bytes, and its recorded hash is the first
+            // staging's.
             let sha256 = match (kind, row.get_ref(3)?) {
-                ('f', rusqlite::types::ValueRef::Blob(b)) if b.len() == 32 => Some(b),
+                ('f', rusqlite::types::ValueRef::Blob(b))
+                    if b.len() == 32 && !crate::unit::dotfile::is_unit_dotfile(path) =>
+                {
+                    Some(b)
+                }
                 _ => None,
             };
             // The contract is a bytewise order (§1.5); a plan that stopped
@@ -316,7 +407,9 @@ fn write_paths<W: Write + ?Sized>(
                 write_hex(w, hash)?;
             }
             w.write_all(b"\t")?;
-            write_escaped(w, path)?;
+            // The catalog keeps a path escaped already (item 297): it is the
+            // §1.5 form, written as it is.
+            w.write_all(path.as_bytes())?;
             w.write_all(b"\n")?;
         }
     }
@@ -567,8 +660,8 @@ pub struct PathsRow {
     pub kind: String,
     pub size_bytes: Option<i64>,
     /// The file's recorded content hash, 64 lowercase hex characters; empty
-    /// for a directory, a symlink, a special file, an older writer's tape
-    /// (the column is new in 1.3.0) or where none was recorded.
+    /// for a directory, a symlink, a special file, or where none was
+    /// recorded. A file with no `sha256` column is refused ([`parse_paths`]).
     pub sha256: String,
     pub path: String,
 }
@@ -598,11 +691,13 @@ fn header_columns<'a>(
 
 /// Each data row of `text` as its unescaped fields, with the line number for
 /// errors. Every row must have as many fields as the header: an escaped TAB
-/// never splits one.
+/// never splits one. Column `keep`, when given, is a path: it is checked to be
+/// well escaped and kept escaped, the form the catalog holds (item 297).
 fn rows_of<'a>(
     file: &'a str,
     text: &'a str,
     columns: usize,
+    keep: Option<usize>,
 ) -> impl Iterator<Item = Result<(usize, Vec<String>)>> + 'a {
     text.split('\n')
         .enumerate()
@@ -619,8 +714,15 @@ fn rows_of<'a>(
             }
             fields
                 .into_iter()
-                .map(|f| {
-                    unescape(f).map_err(|e| TapectlError::Other(format!("{file}: line {n}: {e}")))
+                .enumerate()
+                .map(|(i, f)| {
+                    let bad = |e: String| TapectlError::Other(format!("{file}: line {n}: {e}"));
+                    if Some(i) == keep {
+                        unescape(f).map_err(bad)?;
+                        Ok(f.to_string())
+                    } else {
+                        unescape_text(f).map_err(bad)
+                    }
                 })
                 .collect::<Result<Vec<String>>>()
                 .map(|f| (n, f))
@@ -646,7 +748,7 @@ pub fn parse_units(text: &str) -> Result<Vec<UnitsRow>> {
     let cols = header_columns(FILE, header, &["unit", "version", "volume"])?;
     let width = header.split('\t').count();
     let mut out = Vec::new();
-    for row in rows_of(FILE, text, width) {
+    for row in rows_of(FILE, text, width, None) {
         let (n, f) = row?;
         let text_of = |name: &str| cols.get(name).map(|&i| f[i].clone()).unwrap_or_default();
         let int_of = |name: &str| -> Result<Option<i64>> {
@@ -677,14 +779,17 @@ pub fn parse_units(text: &str) -> Result<Vec<UnitsRow>> {
     Ok(out)
 }
 
-/// Parse a `paths.tsv`. `unit`, `version` and `path` must be there.
+/// Parse a `paths.tsv`. `unit`, `version`, `sha256` and `path` must be
+/// there: every `paths.tsv` this tapectl writes has the `sha256` column, and
+/// one without it (an older writer's) is refused, naming it (ADR-0012 item
+/// 258(d)).
 pub fn parse_paths(text: &str) -> Result<Vec<PathsRow>> {
     const FILE: &str = "index/paths.tsv";
     let header = text.split('\n').next().unwrap_or("");
-    let cols = header_columns(FILE, header, &["unit", "version", "path"])?;
+    let cols = header_columns(FILE, header, &["unit", "version", "sha256", "path"])?;
     let width = header.split('\t').count();
     let mut out = Vec::new();
-    for row in rows_of(FILE, text, width) {
+    for row in rows_of(FILE, text, width, cols.get("path").copied()) {
         let (n, f) = row?;
         let text_of = |name: &str| cols.get(name).map(|&i| f[i].clone()).unwrap_or_default();
         out.push(PathsRow {
@@ -728,7 +833,7 @@ mod tests {
             );
             assert_eq!(
                 unescape(&escaped).as_deref(),
-                Ok(s),
+                Ok(s.as_bytes()),
                 "{s:?} via {escaped:?}"
             );
         }
@@ -741,9 +846,37 @@ mod tests {
         assert!(matches!(escape("a/b \"c\" \u{0}\u{e9}"), Cow::Borrowed(_)));
     }
 
+    /// ADR-0012 item 297 (#569): each byte outside a valid UTF-8 sequence is
+    /// `\xHH`, two lowercase hex digits, and the escape reverses to the bytes.
+    #[test]
+    fn a_byte_outside_utf8_is_written_x_hh_and_comes_back() {
+        for (bytes, want) in [
+            (&b"caf\xe9.txt"[..], "caf\\xe9.txt"),
+            (b"\xff", "\\xff"),
+            (b"a\xe2\x82", "a\\xe2\\x82"),
+            (b"\xe2\x82\xac", "\u{20ac}"),
+            (b"back\\xe9", "back\\\\xe9"),
+            (b"x\xc3", "x\\xc3"),
+            (b"\xed\xa0\x80", "\\xed\\xa0\\x80"),
+        ] {
+            let escaped = escape_bytes(bytes);
+            assert_eq!(escaped, want, "{bytes:?}");
+            assert_eq!(unescape(&escaped).unwrap(), bytes, "{bytes:?}");
+        }
+        // A UTF-8 name with no separator or backslash is as it was.
+        assert!(matches!(
+            escape_bytes("caf\u{e9}".as_bytes()),
+            Cow::Borrowed(_)
+        ));
+        // The two spellings are told apart: a literal backslash-x is `\\x`.
+        assert_ne!(escape_bytes(b"\xe9"), escape_bytes(b"\\xe9"));
+    }
+
     #[test]
     fn the_unescaper_refuses_what_the_writer_never_makes() {
         assert!(unescape("a\\xb").unwrap_err().contains("\\x"));
+        assert!(unescape("a\\xAB").is_err(), "uppercase hex is not written");
+        assert!(unescape("a\\q").is_err());
         assert!(unescape("ends\\").is_err());
     }
 
@@ -959,17 +1092,22 @@ mod tests {
         );
         let rows = parse_paths(&text).unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1].path, "sub/a\tb\nc\\d");
+        // A path is kept in the escaped form, the catalog's (item 297).
+        assert_eq!(rows[1].path, "sub/a\\tb\\nc\\\\d");
         assert_eq!(rows[1].kind, "f");
         assert_eq!(rows[1].size_bytes, Some(12));
         assert_eq!(rows[1].sha256, hash);
         assert_eq!(rows[0].sha256, "");
         assert_eq!(rows[2].kind, "l");
-        // A tape written before 1.3.0 has no such column: the parser reads it
-        // as "not recorded", it does not refuse the file.
-        let old = parse_paths("unit\tversion\tkind\tsize_bytes\tpath\ndocs\t1\tf\t3\ta\n").unwrap();
-        assert_eq!(old[0].sha256, "");
-        assert_eq!(old[0].path, "a");
+        // ADR-0012 item 258(d): a `paths.tsv` with no `sha256` column (an
+        // older writer's) is refused, naming the column.
+        let err = parse_paths("unit\tversion\tkind\tsize_bytes\tpath\ndocs\t1\tf\t3\ta\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("index/paths.tsv: the header has no `sha256` column"),
+            "{err}"
+        );
     }
     // ── over a catalog ──
 
@@ -1298,8 +1436,12 @@ mod tests {
         let c = IndexCatalog::new();
         let u = c.unit("alpha", "odd/unit\tname");
         let (snap, ss) = c.version(u, 1, "staged", &[1]);
+        // The catalog holds a path escaped (item 297): these are the stored
+        // forms of the names `a<TAB>b`, `a<LF>b`, `a<CR>b`, `a\b` and a
+        // Latin-1 `caf<0xe9>`.
         let names = [
-            "b", "B", "a b", "a\tb", "a\nb", "a\rb", "a\\b", "a/b", "\u{e9}", "z", "ab",
+            "b", "B", "a b", "a\\tb", "a\\nb", "a\\rb", "a\\\\b", "a/b", "\u{e9}", "z", "ab",
+            "caf\\xe9",
         ];
         let entries: Vec<(&str, crate::db::files::FileKind, i64)> =
             names.iter().map(|n| (*n, Regular, 1)).collect();
@@ -1363,6 +1505,45 @@ mod tests {
         assert_eq!(by_path["pipe"], kv("s", String::new()));
         // The row, byte for byte: six fields, the fifth empty.
         assert!(text.contains("\nmixed\t1\td\t0\t\tdir\n"), "{text}");
+    }
+
+    /// D8 (#528, #562; `volume-format-v3.md` §1.5): `paths.tsv` states no
+    /// sha256 for the unit's own dotfile, which a re-stage after `unit tag`
+    /// carries with new bytes beside the first staging's hash. A dotfile
+    /// deeper in the tree is ordinary content and keeps its hash.
+    #[test]
+    fn the_unit_dotfile_states_no_hash_and_a_deeper_one_does() {
+        let c = IndexCatalog::new();
+        let u = c.unit("alpha", "dotted");
+        let (snap, ss) = c.version(u, 1, "staged", &[1]);
+        let dotfile = crate::unit::dotfile::UNIT_DOTFILE;
+        let deeper = format!("sub/{dotfile}");
+        c.paths(
+            snap,
+            &[
+                (dotfile, Regular, 40),
+                (deeper.as_str(), Regular, 41),
+                ("file", Regular, 5),
+            ],
+        );
+        for n in [dotfile, deeper.as_str(), "file"] {
+            set_sha256(&c.conn, snap, n, Some(&hash(0x5c)));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let files = generate_to(dir.path(), &c, &[ss]);
+        let text = read(&files.tenants[&c.tenant("alpha")].paths);
+        let by_path: BTreeMap<String, String> = parse_paths(&text)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.path, r.sha256))
+            .collect();
+        assert_eq!(by_path["file"], hash(0x5c), "positive control");
+        assert_eq!(
+            by_path[deeper.as_str()],
+            hash(0x5c),
+            "a deeper one is content"
+        );
+        assert_eq!(by_path[dotfile], "", "the unit's own dotfile: no hash");
     }
 
     #[test]

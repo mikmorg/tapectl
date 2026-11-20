@@ -30,21 +30,27 @@
 //!    the tape (`stage_sets.origin = 'rebuilt'`) never satisfies it.
 //!
 //! **A tape that ended early** (#420; layout-session.md's condition 3): the
-//! seal is located by `volume-format-v2.md` §1.2 rule 6, the hashes are
-//! compared only at or before its `ended_after`, and a stage set with a slice
-//! after it is not whole but cut: the rebuild recorded it `cut` (and the
-//! ending on this row), adoption checks the rows say what the tape says, and
+//! seal is located by `volume-format-v3.md` §1.2 rule 6, the hashes are
+//! compared only at or before its `ended_after`, and the rebuild recorded
+//! the ending on this row. Adoption checks the rows say what the tape says,
 //! records `ended_after` with the seal and promotes only the whole versions.
 //!
-//! **A range** (#478, ADR-0012 items 121, 128 and 130): a write that may span
-//! splits three ways, as confirm splits it and the rebuild recorded it
-//! (`volume-format-v2.md` §4.4): `completed` when the tape holds every slice
-//! of the set, `range` when it holds some, `cut` when it holds none. A
-//! `range` row is adopted when its positions are one unbroken run of the
-//! set's slices at consecutive tape positions, the run the rows plan; its
-//! version is promoted only once every slice of the set is on a sealed
-//! volume, this one counted (item 128), and the `write_completed` event
-//! names the range units with their runs, as confirm's does.
+//! **A range** (#478, ADR-0012 items 121, 128, 130 and 288): every write
+//! splits three ways by its positions and the seal (`volume-format-v3.md`
+//! §5.3), as confirm splits it and the rebuild recorded it, for any staging:
+//! `completed` when the tape holds every slice of the set, `range` when it
+//! holds some, and no row when it holds none. A `range` row is adopted when its
+//! positions are one unbroken run of the set's slices at consecutive tape
+//! positions, the run the rows plan; its version is promoted only once every
+//! slice of the set is on a sealed volume, this one counted (item 128), and
+//! the `write_completed` event names the range units with their runs, as
+//! confirm's does.
+//!
+//! **The file table** (ADR-0012 items 265 and 276; #557): a staging the tape
+//! holds must still have its table in the catalog, or the adoption is
+//! refused naming it. The adoption reads File 0, the seal and the front
+//! index and compares ciphertext hashes with the staged rows; it never reads
+//! the payload.
 //!
 //! When all three hold, [`adopt`] writes the session facts a passing confirm
 //! would have written — `status = 'sealed'`, `sealed_at`, the write
@@ -105,10 +111,9 @@ pub enum LostAdoption {
 
 /// Whether `volume_id` is in the state #360 is about: `initialized`, its
 /// seal never recorded, its condition `ok`, and writes rows that are all
-/// `completed`, `range` or `cut` — what a rebuild attaches to a row a
-/// pre-write backup left behind (`cut` for a unit a tape that ended early
-/// does not hold whole, #420; `range` for a spannable set the tape holds
-/// some of, #478, ADR-0012 item 130). A recorded seal is #280's territory
+/// `completed` or `range` — what a rebuild attaches to a row a pre-write
+/// backup left behind (`range` for a set the tape holds some of, #478,
+/// ADR-0012 items 130 and 288; a set it holds none of has no row). A recorded seal is #280's territory
 /// (an interrupted or aborted session of this catalog's own), and any
 /// unresolved row is a session `volume resume` continues the ordinary way,
 /// so neither is adopted here.
@@ -119,7 +124,7 @@ pub fn is_lost_write(conn: &Connection, volume_id: i64) -> Result<bool> {
                 AND EXISTS(SELECT 1 FROM writes WHERE volume_id = v.id)
                 AND NOT EXISTS(SELECT 1 FROM writes
                                WHERE volume_id = v.id
-                                 AND status NOT IN ('completed', 'range', 'cut'))
+                                 AND status NOT IN ('completed', 'range'))
          FROM volumes v WHERE v.id = ?1",
         params![volume_id],
         |r| r.get(0),
@@ -171,8 +176,8 @@ pub fn adopt(
     if !is_lost_write(conn, volume_id)? {
         return Err(TapectlError::Other(format!(
             "volume \"{label}\" is not a write this catalog lost: only an `initialized` volume \
-             with no recorded seal, an `ok` condition and nothing but completed (or range, or \
-             cut) writes attached is adopted this way (ADR-0012, 2026-09-29 later)"
+             with no recorded seal, an `ok` condition and nothing but completed (or range) \
+             writes attached is adopted this way (ADR-0012, 2026-09-29 later)"
         )));
     }
     let expected_uuid: Option<String> = conn.query_row(
@@ -246,12 +251,12 @@ struct SealedIndex {
     sealed_at: String,
     front_index_sha256: String,
     /// `Some(K)` when the tape sealed short (#420): only files 0 to K are on
-    /// it (`volume-format-v2.md` §4.2).
+    /// it (`volume-format-v3.md` §5.1).
     ended_after: Option<u32>,
 }
 
 /// Condition 1's second half: File 0's own layout pointers name the front
-/// index and the planned seal; the seal is located by `volume-format-v2.md`
+/// index and the planned seal; the seal is located by `volume-format-v3.md`
 /// §1.2 rule 6 (at that pointer, or as the last file on a tape that ended
 /// early, #420), parses, is one this tapectl may read and rule 6 accepts
 /// where it lies, and its `front_index_sha256` is the hash of File 3's true
@@ -300,14 +305,17 @@ fn sealed_front_index(
 ///
 /// On a tape that ended early (#420, `ended_after = Some(K)`;
 /// layout-session.md's condition 3): the front index is the plan, so only
-/// its slices at or before K are on the tape and compared, and a stage set
-/// with a slice after K is not whole but cut. The catalog's rows must say
-/// the same — `completed` for a set wholly at or before K, `cut` for every
-/// other, as the rebuild recorded them and a passing short confirm would —
-/// and its recorded ending must be the seal's.
+/// its slices at or before K are on the tape and compared. The catalog's
+/// rows must say what the tape says, by [`span_matches`] for every write
+/// (item 288): `completed` for a set wholly at or before K, `range` for one
+/// with some of its slices there, and no row for one with none, as the
+/// rebuild recorded them and a passing confirm would — and its recorded
+/// ending must be the seal's.
 ///
-/// A row that may span (#478) is matched by [`span_matches`] instead: a
-/// `range` holds fewer slices than its set has, by definition.
+/// Every staging the tape holds, whole or in part, must still have its file
+/// table in this catalog, or the adoption is refused naming it (item 265).
+/// Nothing here reads the payload: the front index's hashes, the seal and
+/// the catalog's rows are all it compares.
 fn staged_match(
     conn: &Connection,
     volume_id: i64,
@@ -408,26 +416,17 @@ fn staged_match(
             )));
         }
     }
-    #[allow(clippy::type_complexity)]
-    let whole: Vec<(i64, i64, String, bool, i64, i64, Option<i64>)> = conn
+    // Every write is split as a passing confirm splits it, by its positions
+    // and the seal (`volume-format-v3.md` §5.3, ADR-0012 item 288): any
+    // staging may be held in part.
+    let writes: Vec<(i64, i64, String, i64)> = conn
         .prepare(
-            "SELECT w.id, w.stage_set_id, w.status, w.may_span,
-                    (SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = w.stage_set_id),
-                    (SELECT COUNT(*) FROM write_positions WHERE write_id = w.id),
-                    (SELECT MAX(CAST(position AS INTEGER)) FROM write_positions
-                      WHERE write_id = w.id)
+            "SELECT w.id, w.stage_set_id, w.status,
+                    (SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = w.stage_set_id)
              FROM writes w WHERE w.volume_id = ?1 ORDER BY w.id",
         )?
         .query_map(params![volume_id], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
     // The last position a split counts, as confirm counts it
@@ -446,63 +445,60 @@ fn staged_match(
             .and_then(|e| u32::try_from(e.position).ok())
             .map_or(u32::MAX, |m| m.saturating_sub(1)),
     };
-    for (write_id, stage_set_id, status, may_span, staged, here, last) in whole {
-        if may_span {
-            // #478 (ADR-0012 items 121 and 130, `volume-format-v2.md` §4.4):
-            // the three-way split, by confirm's `span_split`.
-            if let Err(why) = span_matches(
-                conn,
-                write_id,
-                stage_set_id,
-                &status,
-                staged,
-                counted_through,
-            )? {
-                return Ok(Err(why));
-            }
-            continue;
+    let mut without_table: Vec<String> = Vec::new();
+    for (write_id, stage_set_id, status, staged) in writes {
+        if let Err(why) = span_matches(
+            conn,
+            write_id,
+            stage_set_id,
+            &status,
+            staged,
+            counted_through,
+        )? {
+            return Ok(Err(why));
         }
-        // #420: a set with a slice after the end is cut, and is not on this
-        // tape whole by definition.
-        let cut = last.is_some_and(|last| !on_tape(last));
-        match (cut, status.as_str()) {
-            (true, "cut") => continue,
-            (false, "completed") => {}
-            (true, _) => {
-                return Ok(Err(format!(
-                    "stage set {stage_set_id} is recorded `{status}`, but its slice at file {} \
-                     lies after the end of the tape (it ended after file {}): it is cut",
-                    last.unwrap_or_default(),
-                    sealed_ending.unwrap_or_default()
-                )))
-            }
-            (false, _) => {
-                return Ok(Err(format!(
-                    "stage set {stage_set_id} is recorded `{status}`, but every slice of it is \
-                     on the tape"
-                )))
-            }
+        // A staging this tape holds, whole or in part, must still have its
+        // file table in this catalog (ADR-0012 item 265, #557): the
+        // adoption records the write as a copy a later write of the
+        // staging may be made from, and a write refuses a staging without
+        // one.
+        if !crate::db::stage_files::exists(conn, stage_set_id)? {
+            without_table.push(staging_name(conn, stage_set_id)?);
         }
-        if staged != here {
-            return Ok(Err(format!(
-                "stage set {stage_set_id} staged {staged} slice(s), but {here} of them are on \
-                 this tape"
-            )));
-        }
+    }
+    if !without_table.is_empty() {
+        return Ok(Err(format!(
+            "this catalog holds no file table for {}: the table is what a copy written from \
+             the staging carries (volume-format-v3.md §1.6), so it is not adopted without it. \
+             `catalog rebuild --from-volume` puts a table back from a tape's operator \
+             envelope, or stage the version again",
+            without_table.join(", ")
+        )));
     }
     Ok(Ok(matched))
 }
 
-/// Condition 3 for a write that may span (#478; ADR-0012 items 121 and 130):
+/// `<unit> v<N> (stage set <id>)`, for a refusal's message.
+fn staging_name(conn: &Connection, stage_set_id: i64) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT u.name || ' v' || s.version FROM stage_sets ss
+           JOIN snapshots s ON s.id = ss.snapshot_id
+           JOIN units u ON u.id = s.unit_id WHERE ss.id = ?1",
+        params![stage_set_id],
+        |r| r.get::<_, String>(0),
+    )? + &format!(" (stage set {stage_set_id})"))
+}
+
+/// Condition 3 for one write (#478; ADR-0012 items 121, 130 and 288):
 /// the row says what the tape holds of its stage set. The slices its rows
 /// plan (its `write_positions`) must be one unbroken run in slice order at
-/// consecutive tape positions (`volume-format-v2.md` §4.4: "a volume holds at
+/// consecutive tape positions (`volume-format-v3.md` §5.3: "a volume holds at
 /// most one unbroken range of a stage set"), and the row's status must be the
 /// split confirm makes, by confirm's own derivation
 /// ([`crate::volume::session::span_split`]): of every slice of the set, those
 /// `written` here at or before `counted_through` (K on a short seal, M-1 on a
 /// full one) — all of them `completed` (item 93's middle tape), some `range`,
-/// none `cut`. The front index and the hashes were matched position by
+/// none no row. The front index and the hashes were matched position by
 /// position before this. `Ok(Err(why))` names the disagreement.
 fn span_matches(
     conn: &Connection,
@@ -548,7 +544,7 @@ fn span_matches(
             "range",
             format!("slices {first_slice}-{last_slice} of its {staged}"),
         ),
-        Split::Cut => ("cut", "none of its slices".to_string()),
+        Split::Unwritten => ("no row", "none of its slices".to_string()),
     };
     if status != expected {
         return Ok(Err(format!(
@@ -627,8 +623,8 @@ fn record_adoption(
              adopted. Run the same command again."
         )));
     }
-    // Only a version this tape holds whole is promoted: a cut one's is not
-    // written yet (#420), as a passing short confirm leaves it. A range
+    // Only a version this tape holds whole is promoted: one it holds none of
+    // is not written yet (#420), as a passing short confirm leaves it. A range
     // (#478) promotes its version as confirm's does (ADR-0012 item 128):
     // once every slice of its stage set is on a sealed volume, this one
     // counted (sealed above, in this transaction, and named all the same).
@@ -646,15 +642,8 @@ fn record_adoption(
     // The three-way split the rows record (`staged_match` checked they say
     // what the tape says), each in plan order, for the `write_completed`
     // event a confirm of this write would have recorded.
-    let cut_units: Vec<String> = tx
-        .prepare(
-            "SELECT u.name FROM writes w
-               JOIN snapshots s ON s.id = w.snapshot_id
-               JOIN units u ON u.id = s.unit_id
-              WHERE w.volume_id = ?1 AND w.status = 'cut' ORDER BY w.id",
-        )?
-        .query_map(params![volume_id], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    // A set the tape holds none of has no row to read it from (item 288).
+    let unwritten_units: Vec<String> = Vec::new();
     // A range's run is its row's `written` positions (item 121): the
     // rebuild left the positions past the end `pending`.
     let range_units: Vec<crate::volume::session::RangeUnit> = tx
@@ -704,7 +693,7 @@ fn record_adoption(
     // #420: on a tape that sealed short, the details a short write's own
     // `write_completed` event carries, from the one function that makes them
     // (`write::write_completed_details`: the ending, `ended_after` and the
-    // cut units by name), with the adoption's account beside them under
+    // units planned and not written), with the adoption's account beside them under
     // `adopted`; on a full seal the account alone, as before 1.6.0. #478:
     // with the range units and their runs, on either ending, as confirm's.
     let as_written =
@@ -715,7 +704,7 @@ fn record_adoption(
                 Some(ended_after) => crate::volume::session::Ending::Short { ended_after },
                 None => crate::volume::session::Ending::Full,
             },
-            cut_units,
+            unwritten_units,
             range_units,
         });
     let details = match as_written
@@ -932,6 +921,7 @@ mod tests {
             )
             .unwrap();
             slices.push(BuildSlice {
+                continues: false,
                 slice_id,
                 slice_number: n,
                 size_bytes: content.len() as i64,
@@ -947,14 +937,38 @@ mod tests {
             unit_name: "unit-lost".to_string(),
             unit_uuid: "unit-uuid-360".to_string(),
             tenant_id,
-            dar_version: Some("2.7.20".to_string()),
-            dar_command: None,
-            catalog_path: None,
+            tar_version: None,
+            stream_bytes: 0,
+            compression: None,
             snapshot_version: 1,
             slices,
             span: None,
         };
+        // The staging's file table, which the catalog holds for every
+        // staging a real `stage create` made and the adoption requires
+        // (item 265): this fixture has no tar stream, so the write-path
+        // fixtures' own support makes one from the slices.
+        crate::volume::write::fixture_file_tables(&src);
+        // What every write's operator envelope carries, made as `volume
+        // write` makes it: the on-tape `catalog.db` and the cross-volume
+        // index (a rebuild refuses a tape without them).
+        let extras_dir = tempfile::tempdir().unwrap();
+        let catalog_db = extras_dir.path().join("catalog.db");
+        db::ontape_catalog::write(&src, &[stage_set_id], &catalog_db).unwrap();
+        let index = crate::volume::index::generate_files(
+            &src,
+            &crate::policy::coverage::IndexThisTape {
+                label: LABEL,
+                uuid: VOL_UUID,
+                cartridge_serial: "",
+                generation: "LTO-6",
+            },
+            &[stage_set_id],
+            &extras_dir.path().join("index"),
+        )
+        .unwrap();
         let inputs = BuildInputs {
+            tables: None,
             label: LABEL.to_string(),
             volume_uuid: VOL_UUID.to_string(),
             media_type: "LTO-6".to_string(),
@@ -978,8 +992,8 @@ mod tests {
             }],
             operator_public_keys: vec![operator.public_key.clone()],
             escrow_public_key: None,
-            catalog_db_path: None,
-            index: None,
+            catalog_db_path: Some(catalog_db),
+            index: Some(index),
         };
         let session_dir = tempfile::tempdir().unwrap();
         let built = build::build(&inputs, session_dir.path()).unwrap();
@@ -1212,8 +1226,8 @@ mod tests {
 
     /// `Lost`'s sealed tape on a `FakeTape`, so the head motion is recorded;
     /// File 0's `requires` line replaced by `to` (`STATED` leaves the tape as
-    /// written, and proves the fixture states 1.6.0's
-    /// `requires = ["short-seal"]`, ADR-0012 item 111).
+    /// written, and proves the fixture states Layout 3's `requires = []`,
+    /// D1).
     fn on_fake_tape(
         lost: &Lost,
         to: &str,
@@ -1225,7 +1239,7 @@ mod tests {
         (fake, store)
     }
 
-    const STATED: &str = "\nrequires = [\"short-seal\"]\n";
+    const STATED: &str = "\nrequires = []\n";
 
     /// #476 (ADR-0012 2026-10-06 item 15): File 0 is this volume's and reads,
     /// but states a feature this tapectl does not know — a tape it cannot
@@ -1501,7 +1515,7 @@ mod tests {
         let verdict = lost.adopt();
         assert!(
             matches!(&verdict, LostAdoption::NotWhatThisCatalogStaged { why }
-                if why.contains("staged 3 slice(s), but 2 of them")),
+                if why.contains("holds slices 1-2 of its 3") && why.contains("`range`")),
             "{verdict:?}"
         );
         assert_refused_untouched(&lost, &verdict);
@@ -1665,6 +1679,7 @@ mod tests {
                 )
                 .unwrap();
                 slices.push(BuildSlice {
+                    continues: false,
                     slice_id,
                     slice_number: n,
                     size_bytes: content.len() as i64,
@@ -1674,6 +1689,11 @@ mod tests {
                     staging_path: path,
                 });
             }
+            // The staging's file table, which the catalog holds for every
+            // staging a real `stage create` made and the adoption requires
+            // (item 265): this fixture has no tar stream, so the write-path
+            // fixtures' own support makes one from the slices.
+            crate::volume::write::fixture_file_tables(&src);
             let span = build::UnitSpan {
                 slices: slices.iter().map(build::SpanSlice::from).collect(),
             };
@@ -1685,9 +1705,9 @@ mod tests {
                     unit_name: UNIT.to_string(),
                     unit_uuid: "unit-uuid-478".to_string(),
                     tenant_id,
-                    dar_version: Some("2.7.20".to_string()),
-                    dar_command: None,
-                    catalog_path: None,
+                    tar_version: None,
+                    stream_bytes: 0,
+                    compression: None,
                     snapshot_version: 1,
                     slices,
                     span: Some(span),
@@ -1724,7 +1744,34 @@ mod tests {
                 slices: w.unit.slices[planned].to_vec(),
                 ..w.unit.clone()
             };
+            // What every write's operator envelope carries, made as `volume
+            // write` makes it: the on-tape `catalog.db` and the cross-volume
+            // index with this tape's run of the set (a rebuild refuses a tape
+            // without them).
+            let extras_dir = tempfile::tempdir().unwrap();
+            let catalog_db = extras_dir.path().join("catalog.db");
+            db::ontape_catalog::write(&w.src, &[unit.stage_set_id], &catalog_db).unwrap();
+            let run = crate::policy::coverage::IndexRun {
+                stage_set_id: unit.stage_set_id,
+                slices: Some((
+                    unit.slices.first().unwrap().slice_number,
+                    unit.slices.last().unwrap().slice_number,
+                )),
+            };
+            let index = crate::volume::index::generate_files_for_runs(
+                &w.src,
+                &crate::policy::coverage::IndexThisTape {
+                    label,
+                    uuid,
+                    cartridge_serial: "",
+                    generation: "LTO-6",
+                },
+                &[run],
+                &extras_dir.path().join("index"),
+            )
+            .unwrap();
             let inputs = BuildInputs {
+                tables: None,
                 label: label.to_string(),
                 volume_uuid: uuid.to_string(),
                 media_type: "LTO-6".to_string(),
@@ -1748,8 +1795,8 @@ mod tests {
                 }],
                 operator_public_keys: vec![w.operator.public_key.clone()],
                 escrow_public_key: None,
-                catalog_db_path: None,
-                index: None,
+                catalog_db_path: Some(catalog_db),
+                index: Some(index),
             };
             let session_dir = tempfile::tempdir().unwrap();
             let built = build::build(&inputs, session_dir.path()).unwrap();
@@ -1867,14 +1914,14 @@ mod tests {
             (conn, report)
         }
 
-        /// `(writes.status, may_span, snapshots.status)` of the unit's row on
+        /// `(writes.status, snapshots.status)` of the unit's row on
         /// `volume_id`.
-        fn row(conn: &rusqlite::Connection, volume_id: i64) -> (String, bool, String) {
+        fn row(conn: &rusqlite::Connection, volume_id: i64) -> (String, String) {
             conn.query_row(
-                "SELECT w.status, w.may_span, s.status FROM writes w
+                "SELECT w.status, s.status FROM writes w
                    JOIN snapshots s ON s.id = w.snapshot_id WHERE w.volume_id = ?1",
                 params![volume_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap()
         }
@@ -1918,7 +1965,7 @@ mod tests {
             assert!(report.ended_after_recorded);
             assert_eq!(
                 row(&conn, volume_id),
-                ("range".to_string(), true, "staged".to_string())
+                ("range".to_string(), "staged".to_string())
             );
             assert!(is_lost_write(&conn, volume_id).unwrap());
 
@@ -1935,12 +1982,12 @@ mod tests {
             assert_eq!(ended_after, report.ended_after.map(|k| k as i64));
             assert_eq!(
                 row(&conn, volume_id),
-                ("range".to_string(), true, "staged".to_string()),
+                ("range".to_string(), "staged".to_string()),
                 "slice 3 is on no sealed volume: the version is not promoted"
             );
             let detail = last_write_completed(&conn);
             assert_eq!(detail["ending"], "short");
-            assert_eq!(detail["cut_units"], serde_json::json!([]));
+            assert_eq!(detail["unwritten_units"], serde_json::json!([]));
             assert_eq!(
                 detail["range_units"],
                 serde_json::json!([{"unit": UNIT, "first_slice": 1, "last_slice": 2}])
@@ -2005,7 +2052,7 @@ mod tests {
             assert!(report.versions_promoted.is_empty(), "{report:?}");
             assert_eq!(
                 row(&conn, volume_id),
-                ("range".to_string(), true, "staged".to_string()),
+                ("range".to_string(), "staged".to_string()),
                 "the rebuild counts no volume the catalog does not record sealed"
             );
             assert!(promotion_events(&conn).is_empty());
@@ -2014,7 +2061,7 @@ mod tests {
             assert_eq!(verdict, LostAdoption::Adopted { slices: 1 });
             assert_eq!(
                 row(&conn, volume_id),
-                ("range".to_string(), true, "current".to_string())
+                ("range".to_string(), "current".to_string())
             );
             assert_eq!(
                 promotion_events(&conn),
@@ -2055,14 +2102,14 @@ mod tests {
             assert_eq!(report.found_volume_status.as_deref(), Some("initialized"));
             assert_eq!(
                 row(&conn, volume_id),
-                ("completed".to_string(), true, "staged".to_string())
+                ("completed".to_string(), "staged".to_string())
             );
 
             let verdict = adopt(&conn, &mut store, volume_id, "SPAN01", BS).unwrap();
             assert_eq!(verdict, LostAdoption::Adopted { slices: 3 });
             assert_eq!(
                 row(&conn, volume_id),
-                ("completed".to_string(), true, "current".to_string())
+                ("completed".to_string(), "current".to_string())
             );
             let detail: String = conn
                 .query_row(
@@ -2121,6 +2168,52 @@ mod tests {
                 .unwrap();
             assert_eq!(status, "initialized", "nothing adopted");
         }
+
+        /// Item 265 (#557), T4.9: a staging the tape holds must still have its
+        /// file table in the catalog the adoption records it in. A catalog that
+        /// lost the table is refused, naming the staging and the remedy, and
+        /// nothing is adopted; the adoption reads no payload to say so (the
+        /// tape is never asked for a slice).
+        #[test]
+        fn a_staging_whose_file_table_is_gone_is_not_adopted() {
+            let mut w = world();
+            let (mut store, volume_id, backup) = write_tape(
+                &mut w,
+                "SPAN01",
+                "47800000-0000-4000-8000-000000000365",
+                0..3,
+                None,
+            );
+            let (conn, _) = restored_rebuilt_verified(
+                &backup,
+                &mut store,
+                "SPAN01",
+                volume_id,
+                &w.operator.secret_key,
+            );
+            let held: i64 = conn
+                .query_row("SELECT COUNT(*) FROM stage_files", [], |r| r.get(0))
+                .unwrap();
+            assert!(held > 0, "the restored catalog holds the staging's table");
+            conn.execute("DELETE FROM stage_files", []).unwrap();
+            let LostAdoption::NotWhatThisCatalogStaged { why } =
+                adopt(&conn, &mut store, volume_id, "SPAN01", BS).unwrap()
+            else {
+                panic!("a staging with no table must be refused");
+            };
+            assert!(
+                why.contains(UNIT) && why.contains("file table") && why.contains("stage set"),
+                "{why}"
+            );
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "initialized", "nothing adopted");
+        }
     }
 
     /// #420: the lost write of a tape that sealed short. The restored
@@ -2162,6 +2255,11 @@ mod tests {
                 report.ended_after_recorded,
                 "the found row takes the tape's ending: {report:?}"
             );
+            // This fixture's stagings are by hand (no tar stream), so the
+            // restored catalog holds no file table and the tape's
+            // `catalog.db` none to put back; the write-path fixtures' own
+            // support makes one, as `stage create` would have (item 265).
+            crate::volume::write::fixture_file_tables(&conn);
             conn.execute(
                 "UPDATE events SET timestamp = datetime(timestamp, '-1 minute')
                  WHERE action = 'catalog_rebuild'",
@@ -2186,7 +2284,7 @@ mod tests {
         }
 
         #[test]
-        fn a_lost_write_that_sealed_short_is_adopted_with_its_cut_units_cut() {
+        fn a_lost_write_that_sealed_short_is_adopted_with_its_unwritten_units_given_no_row() {
             let mut lost = rebuilt_and_verified();
             let k = lost.t.ended_after;
             assert!(is_lost_write(&lost.conn, lost.t.volume_id).unwrap());
@@ -2204,10 +2302,10 @@ mod tests {
                 lost.t.rows(&lost.conn),
                 vec![
                     ("alpha".into(), "completed".into(), "current".into()),
-                    ("bravo".into(), "cut".into(), "staged".into()),
-                    ("charlie".into(), "cut".into(), "staged".into()),
+                    ("bravo".into(), "range".into(), "staged".into()),
                 ],
-                "a cut unit's version is not promoted"
+                "item 288: the unit the warning interrupted is a range, the one after \
+                 it has no row, and neither is promoted"
             );
             let (status, ended_after, files): (String, Option<i64>, i64) = lost
                 .conn
@@ -2235,7 +2333,15 @@ mod tests {
             let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
             assert_eq!(detail["ending"], "short");
             assert_eq!(detail["ended_after"], k);
-            assert_eq!(detail["cut_units"], serde_json::json!(["bravo", "charlie"]));
+            assert_eq!(
+                detail["unwritten_units"],
+                serde_json::json!([]),
+                "the rows say nothing of a set the tape took none of"
+            );
+            assert_eq!(
+                detail["range_units"],
+                serde_json::json!([{"unit": "bravo", "first_slice": 1, "last_slice": 1}])
+            );
             assert!(
                 detail["adopted"]
                     .as_str()
@@ -2264,7 +2370,8 @@ mod tests {
             else {
                 panic!("a completed row past the end must be refused");
             };
-            assert!(why.contains("it is cut"), "{why}");
+            assert!(why.contains("holds slice 1 of its 2"), "{why}");
+            assert!(why.contains("it is `range`"), "{why}");
 
             let mut lost = rebuilt_and_verified();
             lost.conn

@@ -81,23 +81,21 @@ pub(crate) fn record_after_verify(
     if !counts_as_copy {
         return Ok(None);
     }
-    // #420: a `cut` write (the early end of a short tape cut its unit) is
-    // as much this catalog's write as a `completed` one, and a sealed volume
-    // whose warning came inside its first unit holds only cut writes: its
-    // figures are still the tape's. A cut write records no completion time.
-    // #478 (ADR-0012 item 127): so is a `range` write, whose slices on the
-    // tape are its `written` positions; a continuation tape may hold nothing
-    // else.
+    // #478 (ADR-0012 items 127 and 288): a `range` write is as much this
+    // catalog's write as a `completed` one, and its slices on the tape are
+    // its `written` positions; a sealed volume whose warning came inside its
+    // first unit holds only a range, and a continuation tape may hold
+    // nothing else.
     let (written, begun_here, last_completed): (i64, i64, Option<String>) = conn.query_row(
         "SELECT COUNT(*), COUNT(started_at), MAX(completed_at)
-         FROM writes WHERE volume_id = ?1 AND status IN ('completed', 'cut', 'range')",
+         FROM writes WHERE volume_id = ?1 AND status IN ('completed', 'range')",
         params![volume_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     if written == 0 || begun_here != written {
         return Ok(None);
     }
-    // #420 (`volume-format-v2.md` §4.2): where a short tape ended. The
+    // #420 (`volume-format-v3.md` §5.1): where a short tape ended. The
     // front index is the plan; only its slices at or before `ended_after`
     // are on the tape, and the verify read only those.
     let ended_after: Option<i64> = conn.query_row(
@@ -264,11 +262,9 @@ struct TapeSlice<'a> {
 /// filled differently (the either-match `read_slices` uses, issue #86).
 ///
 /// On a tape that ended early (#420, `ended_after = Some(K)`), the slices
-/// this catalog wrote there are those of its `completed`, `cut` and `range`
-/// (#478) writes at or before K: a cut write's slices that reached the tape
-/// are on it (and stay recorded, ADR-0012 item 112), and its positions after
-/// K never were. A range's positions after K are `pending` (item 121): they
-/// never reached the tape either.
+/// this catalog wrote there are those of its `completed` and `range` (#478)
+/// writes at or before K. A range's positions after K are `pending` (item
+/// 121): they never reached the tape.
 fn disagreement(
     conn: &Connection,
     volume_id: i64,
@@ -281,7 +277,7 @@ fn disagreement(
              FROM write_positions wp
              JOIN writes w ON w.id = wp.write_id
              JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-             WHERE w.volume_id = ?1 AND w.status IN ('completed', 'cut', 'range')
+             WHERE w.volume_id = ?1 AND w.status IN ('completed', 'range')
                AND (?2 IS NULL OR CAST(wp.position AS INTEGER) <= ?2)",
         )?
         .query_map(params![volume_id, ended_after], |r| {
@@ -406,16 +402,16 @@ mod tests {
     }
 
     /// The warning inside the first unit: a sealed volume holding no unit
-    /// whole, every write `cut`. It is still a sealed tape with figures.
+    /// whole, its one write a `range`. It is still a sealed tape with figures.
     #[test]
-    fn a_sealed_volume_with_only_cut_writes_gets_its_figures() {
-        let mut t = short_tape::cut_only_tape();
+    fn a_sealed_volume_with_only_a_range_gets_its_figures() {
+        let mut t = short_tape::range_only_tape();
         assert_eq!(
             t.rows(&t.conn)
                 .into_iter()
                 .map(|(_, w, _)| w)
                 .collect::<Vec<_>>(),
-            vec!["cut", "cut", "cut"]
+            vec!["range"]
         );
         full_verify(&mut t);
         assert!(recorded(&t));

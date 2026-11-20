@@ -377,9 +377,13 @@ and the rule that chose it: `--home`, `TAPECTL_HOME`, the directory of
 the default `~/.tapectl` ([configuration.md](configuration.md#where-the-configuration-lives)).
 Its last sentence says what to do:
 
-- **`To start a new archive there: tapectl init.`** Nothing named a home and
-  the host has no home pointer, so this looks like a new machine: run
-  [`tapectl init`](cli/init.md#tapectl-init) if it is one.
+- **`To start a new archive there: tapectl init, which mints a NEW escrow
+  identity …`** Nothing named a home and the host has no home pointer, so this
+  looks like a new machine: run [`tapectl init`](cli/init.md#tapectl-init) if it
+  is one. If you are reading tapes of an archive that already exists (an heir, or
+  a rebuilt host), do not: run the form the message names next,
+  `tapectl init --operator NAME --escrow-public-key KEY`, with the escrow public
+  key from the Heir Kit's sheet, so the home adopts the identity the tapes know.
 - **`TAPECTL_HOME is set, so the archive is meant to be there already`**, or
   **`This host has a home pointer (…), so its archive is meant to exist
   already`**: tapectl offers no `init`, because one would make a second archive
@@ -1021,7 +1025,7 @@ Recover with `tapectl snapshot delete photos --version 1`, then `tapectl snapsho
 
 A `snapshot create` from a tapectl before 1.0.2 wrote its file list one row at
 a time, so a Ctrl-C or a busy catalog could leave the snapshot with only part
-of it. `stage create` refuses such a snapshot before running dar. Delete it
+of it. `stage create` refuses such a snapshot before running tar. Delete it
 and take it again; nothing has been staged or written from it:
 
 ```bash
@@ -1041,7 +1045,7 @@ public key with `tapectl key import --escrow <age1...>`
 ```
 
 This home was created with `init --no-escrow`. `stage create` refuses before
-running dar, so no time is lost. Register the escrow recipient once:
+running tar, so no time is lost. Register the escrow recipient once:
 
 ```bash
 tapectl key generate --escrow
@@ -1058,7 +1062,7 @@ error: tenant for unit "<unit>" has no active keys — refusing to encrypt (the 
 data); run `tapectl key rotate` or restore the tenant's keys first
 ```
 
-`stage create` checks every recipient before it runs dar or records a stage
+`stage create` checks every recipient before it runs tar or records a stage
 set, so this refusal costs nothing. A malformed public key in the catalog is
 refused at the same point. Give the tenant a key and stage again:
 
@@ -1068,24 +1072,34 @@ tapectl key rotate --tenant <tenant>
 tapectl stage create <unit>
 ```
 
-### dar is missing or too old
+### tar is missing, or below the writer's floor
 
 ```text
-error: dar not found at configured path: <binary>
-error: dar version <found> below minimum 2.6
+error: tar not found: <binary>
+error: GNU tar 1.30 at <binary> is below the writer's floor; the writer's floor is GNU tar 1.35 or later, built with ACL support. Nothing was staged.
+error: <binary> is not GNU tar (it says "bsdtar 3.7"); the writer's floor is GNU tar 1.35 or later, built with ACL support. Nothing was staged.
+error: GNU tar 1.35 at <binary> does not store an ACL by number (<why>); the writer's floor is GNU tar 1.35 or later, built with ACL support. Nothing was staged.
 ```
 
-Both come from `[dar] binary` in config.toml (default `dar`, looked up on
-`PATH`). Install dar 2.6 or newer (2.7.20+ recommended), or point `binary` at
-it. `tapectl config check` prints the dar it found and whether it meets the
-minimum:
+All four come from `[tar] binary` in config.toml (default `tar`, looked up on `PATH`).
+tapectl writes each unit with GNU tar and holds it to a floor: GNU tar 1.35 built with
+ACL support. Below 1.35, `--numeric-owner` does not reach an ACL entry, so a user's or
+group's name would be written into the stream; a 1.35 built without libacl writes no
+ACL at all, and the version number alone cannot tell the two apart, so tapectl also
+archives a probe file that has an ACL and looks at what tar wrote. Install a tar at the
+floor (Debian 13 and Ubuntu 24.04 and later ship one; on an older host build it into
+`/usr/local`, see [install.md](install.md#the-writers-tar)) or point `binary` at it.
+`tapectl config check`, `init` and `setup` probe the same way and say so beforehand:
 
 ```text
-dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
+tar: tar (GNU tar) 1.35 at '/usr/bin/tar' (meets the writer's floor, GNU tar 1.35 with ACL support)
+warning: stage create would refuse this tar: GNU tar 1.30 at /usr/bin/tar is below the writer's floor; ...
 ```
 
-A dar that exists but fails while archiving shows up as `dar error: dar -c
-failed (exit <status>): <first lines of dar's stderr>`.
+The floor binds the host that writes. Reading needs no particular tar, so an heir's
+`RESTORE.sh` runs with whatever `tar` the machine has. A tar that exists and meets the
+floor but fails while archiving shows up as `tar failed archiving unit "<unit>" (exit
+<status>)` followed by what tar said.
 
 ### The staging directory cannot be created or written
 
@@ -1111,20 +1125,20 @@ root partition.
 ### Staging space: asked about
 
 Staging holds a unit's encrypted slices and nothing else: at most about the
-unit's size, plus dar's own records for each file, for which the check allows
-up to 1 KiB a file. `stage create` compares that figure with the free space in
+unit's stream (its files plus tar's headers), and about 1/4096 more for age's
+tags. `stage create` compares that figure with the free space in
 `[staging] directory` before it reads anything.
 
 **It fits.** Nothing is said.
 
 **It may not fit.** You are asked (Tier 2). The figure is an upper bound:
-dar stores runs of zeros as holes and a hard-linked file once, and with
+tar stores a hard-linked file once, and with
 compression on, nothing can say in advance how well the data will compress.
 So a short staging directory is never refused outright:
 
 ```text
 staging directory <directory> may be too small for unit "<unit>": 1.0 MiB free, and staging it needs up to 5.7
-MiB, its encrypted slices at the snapshot's full size (less if dar stores runs of zeros as holes and a
+MiB, its encrypted slices at the snapshot's full size (less if tar stores a
 hard-linked file once); if it runs out, the stage stops there and its partial slices are removed.
 `tapectl stage list` shows what staging holds; a bare `tapectl stage clean` frees what failed
 stages left and what is already on tape
@@ -1158,7 +1172,7 @@ A refused attempt leaves nothing to clean up. If the disk fills during a
 stage that went ahead, the failure names the slice being written:
 
 ```text
-error: cannot write staged slice <directory>/<slice>.dar.age: No space left on device (os error 28)
+error: cannot write staged slice <directory>/<slice>.tar.age: No space left on device (os error 28)
 ```
 
 The half-built stage set's files are removed, and the next tapectl command
@@ -1170,33 +1184,30 @@ is already on tape.
 
 A stage that fails part-way — a full disk, a source file that changed, a
 stop, a crash — is staged again from the start: `stage create` makes a new
-stage set, and dar reads the whole unit again. Keeping the slices already
+stage set, and tar reads the whole unit again. Keeping the slices already
 encrypted and finishing only the rest is not possible while staging writes no
 plaintext (ADR-0012, 2026-10-06, item 4):
 
-- dar writes the archive once, to standard output, and tapectl encrypts each
-  slice as it is cut; no copy of the archive stays on any disk. The rest of
-  the archive can only come from dar again, and dar makes an archive only
-  from its beginning: it has no way to start at a given file or offset.
-- A second dar run is a different archive. dar draws a new random internal
-  name and data name for every archive; they are in every slice's header and
-  in the archive itself, and dar refuses to read slices, or to use an
-  isolated catalogue, from two different runs as one archive. So the first
-  run's slices cannot be joined to the end of a second run's.
-- The names cannot be made to match: dar has no option to set them, and
-  rewriting them inside dar's archive would rely on dar's internal layout,
-  which tapectl does not guess at.
+- tar writes the stream once, to standard output, and tapectl cuts, compresses
+  and encrypts each slice as it passes; no copy of the stream stays on any
+  disk. The rest of the stream can only come from tar again, and tar makes a
+  stream only from its beginning.
+- A second tar run is a different stream: the files may have changed since the
+  first, the file table's offsets and every slice's hashes belong to one run, and
+  tapectl checks each stream as it passes against the list and the per-file sha256s
+  of its own run. So the first run's slices cannot be joined to the end of a
+  second run's.
 
 What tapectl does instead is keep a late failure from happening, and keep
 what is already finished when it can:
 
 - the staging-space check counts what other stages running at the same time
-  may still write, so a full disk is asked about before dar starts, not found
+  may still write, so a full disk is asked about before tar starts, not found
   at slice 120 of 130;
 - every catalog write a stage makes waits out a busy catalog (another stage
   or command writing) for up to ten minutes rather than failing, and a set
   that reached `staged` is never removed;
-- dar's exit 11 (a file changed while dar read it) is refused as that, by
+- tar's exit 1 (a file changed while tar read it) is refused as that, by
   name, with what to do;
 - each encrypted slice is on disk (synced) before it is recorded.
 
@@ -1205,16 +1216,12 @@ kept. `tapectl report failed-stages` lists every stage attempt that failed,
 with the hours each lost (ADR-0012 item 91), so the cost can be judged from
 the record.
 
-Earlier versions also counted the unit's non-zero bytes in a read before
-dar and refused outright below them. The source is now read once, while dar
-runs, so there is no such count before dar.
-
 ### The source changed after the snapshot
 
 `stage create` checks every file against the snapshot. A file missing or at
-another size is refused before dar starts; the content is hashed as dar reads
-it, so a file whose content changed at the same size (BITROT suspected) is
-refused while dar runs, and dar is stopped:
+another size is refused before tar starts; the content is hashed as it passes in
+tar's stream, so a file whose content changed at the same size (BITROT suspected)
+is refused when the stream reaches it:
 
 ```text
 error: DIRTY: source file size changed: <path> (expected <n> bytes, found <n> bytes) — a real edit (size and
@@ -1227,24 +1234,24 @@ every file against its recorded baseline).
 ```
 
 A file that changes while staging reads it refuses the stage too. Each file is
-read once from disk: tapectl hashes it within 128 MiB of dar reading it, and
-after dar has finished checks that every file still has the size and change
-time it had when it was hashed. A file that changed in between is refused:
+read once from disk, by tar. Before tar starts, tapectl notes each file's device,
+inode, size, modification time and change time; after tar has exited, every file
+must still have them, **whatever tar said** (and a file changed in the last moments
+before the scan is hashed again from disk and must hash as the stream did). A file
+that changed in between is refused:
 
 ```text
-error: DIRTY: source file changed while staging read it: <path> (it changed after it was hashed). Its recorded
-sha256 would not be of the bytes dar archived, so nothing was staged. Stage again once the source is quiet; if
+error: DIRTY: source file changed while staging read it: <path> (it changed while tar read it). Its recorded
+sha256 would not be of the bytes archived, so nothing was staged. Stage again once the source is quiet; if
 the change is real, take a new snapshot (`tapectl snapshot create <unit>`) and stage that.
 ```
 
-A change during dar's own read of a file is caught by dar: tapectl runs dar
-with `--retry-on-change 0`, so dar saves no half-changed copy and exits 11,
-which `stage create` reports as:
+tar itself notices some changes: it exits 1 for a file that changed as it read it,
+and `stage create` reports that as:
 
 ```text
-error: DIRTY: a source file of unit "<unit>" changed while dar was reading it (dar exit 11). tapectl runs dar
-with --retry-on-change 0, so a file caught mid-change is refused rather than archived half-changed. dar said:
-<dar's lines>
+error: DIRTY: a source file of unit "<unit>" changed while tar was reading it (tar exit 1), so it is refused rather than archived half-changed. tar said:
+<tar's lines>
 Nothing was staged. Stage again once the source is quiet; if the change is real, take a new snapshot (`tapectl
 snapshot create <unit>`) and stage that.
 ```
@@ -1292,50 +1299,38 @@ version recorded with no modified times cannot tell the two apart: its report
 says `CHANGED or BITROT (no mtime recorded)` and counts the file with `BITROT`,
 and calls a size change `SIZE_MISMATCH`.
 
-### The stage would not archive what the snapshot lists (1.1.2)
-
-Three refusals and one warning keep the catalogue and the tape saying the same
-thing (#464, #465). Each refuses before the stage set is marked staged, so
-nothing is staged and the source is untouched.
+### The tar stream is refused
 
 ```text
-error: the snapshot lists 1 file the unit's exclude patterns now exclude: <path>. dar would skip
-them, but the catalogue would record them as archived. ...
+error: the tar stream is refused at byte <n>, "<path>": <rule>: <what was seen>
 ```
 
-An exclude pattern (the unit's `.tapectl-unit.toml` `[excludes]`, or
-`[defaults] global_excludes`) changed after the snapshot. Take a new snapshot
-(`tapectl snapshot create <unit>`) and stage that, or remove the exclude.
+tapectl reads the stream tar writes as it passes and checks it against the exact list
+of files it gave tar (ADR-0012 items 253, 270, 274; `volume-format-v3.md` §3.2). A
+refusal names the byte, the path and the rule, and nothing is staged; the source is
+untouched. The rules:
 
-```text
-error: dar's catalogue does not list the files the stage hashed, so the stage set is not marked
-staged. Nothing was staged. dar did not archive 1 file that were hashed: <path>. ...
-```
+| Rule | What it means | What to do |
+|---|---|---|
+| a member is not the next entry of the list | tar wrote a different path, kind or size than the list says | a file changed or appeared under tar: stage again once the source is quiet, or from a snapshot |
+| a header names a user or group, or an extended header names one | a name was written where only a number belongs: the tar is below the floor, or ignored `--numeric-owner` | use a GNU tar at the floor ([tar is missing, or below the writer's floor](#tar-is-missing-or-below-the-writers-floor)) |
+| an ACL entry's qualifier is not a number | the same cause, in an ACL record | the same |
+| a file's ACL is missing from the stream | the file had an ACL on disk and the stream carries none: a GNU tar 1.35 built without ACL support | build tar with `libacl1-dev` installed; `config check` names the tar |
+| a global extended header, a GNU long-name member, a header whose checksum is wrong, a member of a type the reader does not know, something other than zeros after the end, the stream is cut short, a listed entry is not in the stream, a hard link's target is not a file listed earlier, a header that cannot be read | tar wrote something tapectl's reader will not carry | note the line and stage again; if it repeats on the same unit, keep the message and report it |
 
-After dar ran, the files its catalogue lists were compared with the files the
-stage hashed, and they differ. The usual cause is an exclude pattern with a
-wildcard inside a directory name (`a*b/`): tapectl matches it one path component
-at a time, but dar's `*` spans `/`, so dar prunes more. Use a pattern without a
-wildcard inside a directory name. A file that appeared in the source while dar
-was reading it is refused the same way: stage a living source from a snapshot
-(the operator guide's "Staging a source that is in use").
+A tar that exits non-zero after a good stream is refused too (`tar failed archiving
+unit "<unit>" (exit <status>)`).
 
-```text
-error: cannot record the file name "caf\xE9.txt" under <unit path>: it is not valid UTF-8, ...
-```
+**What the snapshot leaves out.** tar is given the exact list, so there is one matcher,
+tapectl's: an exclude pattern is applied when the snapshot is taken, and `snapshot create`
+reports what each pattern left out. If an exclude pattern (the unit's `[excludes]`, or
+`[defaults] global_excludes`) changed after the snapshot, take a new snapshot (`tapectl
+snapshot create <unit>`) and stage that. A socket is always left out and reported with the
+reason "socket", because tar writes none.
 
-`snapshot create` refuses a file name that is not valid UTF-8, because tapectl
-records and looks up names as text. Rename it (`convmv -f latin1 -t utf8 -r
---notest <dir>`) or move it out of the unit, then snapshot again.
-
-```text
-warning: dar -c (pid <n>) is running without the fadvise filter (Seccomp: <m> ...)
-```
-
-The filter that keeps dar from evicting the source's pages did not take in the
-dar child (#441, #447). The stage carries on and is correct; the source is read
-from disk twice, as before 1.1.1. A dar with file capabilities (`setcap`) also
-loses them under the filter's `no_new_privs`, so run a plain dar binary.
+**A file name that is not valid UTF-8** is carried by its bytes, and shown escaped
+everywhere (`caf\xe9.txt`): in `catalog list`, in the file table, in `RESTORE.sh --list`.
+Type a name the same way to `restore file --file` or `RESTORE.sh --path`.
 
 ### `collection run`: snapshot hook refusals (1.2.0)
 
@@ -1414,48 +1409,17 @@ before a long batch.
 
 ### A unit larger than one cartridge
 
-```text
-error: unit "<unit>" is <size> bytes (<size, binary>), <over> bytes (<over, binary>) more than one cartridge
-can take — one LTO-6 tape takes 2.42 TB (2424947571200 bytes): its 2.50 TB capacity at the 97% fill ceiling,
-less the 50.0 MiB end-of-tape reserve. A unit that does not allow spanning (allow_spanning) is never split
-across cartridges (ADR-0012), so it cannot be written; nothing was staged. To let it span cartridges, set
-`allow_spanning = true` in the [policy] of its .tapectl-unit.toml, in its archive set or in [defaults]; a span
-is written only by a drive whose `[[backends.lto]]` entry declares `post_warning_bytes`. The fill ceiling is
-the drive's `fill_ceiling` in its `[[backends.lto]]` entry of config.toml (default 97%).
-```
+A unit larger than one cartridge is not refused, and nothing is set to allow it (ADR-0012
+items 288 and 289): every unit continues on the next cartridge at the drive's early
+warning. Its slices run across tapes, each tape ending its run at the warning, and
+restoring it takes every one of those tapes, in slice order. Do not split a unit by hand.
 
-A write session fills one cartridge, and a unit that does not allow spanning
-is never split across two (ADR-0012, 2026-10-06). `stage create` refuses such
-a unit before dar runs, so it costs no staging time; `collection plan` and
-`collection run` refuse it the same way, naming the per-tape budget, by how
-much the unit is over, and the same key. The limit is the largest generation
-any configured drive writes, times the
-[fill ceiling](#over-full-plan-the-pre-flight-capacity-gate), less the
-`enospc_buffer` reserve; with no drive configured, `stage create` has no
-generation to name and the check is left to `volume write`'s pre-flight gate.
-The size checked is the unit's source size, the same figure `collection plan`
-uses, whatever compression would later make of it.
-
-From 1.7.0 a unit may span cartridges if its policy allows it
-([`allow_spanning`](configuration.md#defaults), off by default): its slices
-then run across tapes, each tape ending its run at the drive's early warning,
-and restoring it takes every one of those tapes, in slice order. A span is
-written only by a drive that declares `post_warning_bytes`
-([below](#a-unit-that-allows-spanning-would-pass-the-fill-ceiling)). Do not
-split a unit by hand.
-
-A unit that allows spanning is admitted whatever its size against one tape,
-but it is staged whole before its first tape is written, and its slices are
-released only as each tape gives them their copies. So one larger than the
-staging area is refused:
+What does refuse a unit is the staging area. A unit is staged whole before its first
+tape is written, and its slices are released only as each tape gives them their copies, so
+one larger than the staging area is refused:
 
 ```text
-error: unit "<unit>" allows spanning (allow_spanning) and is <size> bytes (<size, binary>), larger than the
-staging area: the filesystem of staging directory <directory> is <total> bytes (<total, binary>) in all. A unit
-that spans cartridges is staged whole before its first tape is written, and its slices are released only as
-each tape gives them their copies (ADR-0012 items 85 and 94), so it cannot be staged here; nothing was staged.
-It can be once the staging area is larger than the unit: grow that filesystem, or point `[staging] directory`
-in config.toml at a larger one.
+error: unit "<unit>" is <size> bytes (<size, binary>), larger than the staging area: the filesystem of staging directory <directory> is <total> bytes (<total, binary>) in all. A unit is staged whole before its first tape is written, and its slices are released only as each tape gives them their copies (ADR-0012 items 85 and 129), so it cannot be staged here; nothing was staged. It can be once the staging area is larger than the unit: grow that filesystem, or point `[staging] directory` in config.toml at a larger one.
 ```
 
 The staging area is the staging filesystem's total size, not its free space
@@ -1923,15 +1887,17 @@ at all. On such a host, watching disk load during a write is up to you.
 ### Over-full plan: the pre-flight capacity gate
 
 ```text
-error: volume "<label>" failed pre-write validation: capacity exceeded: the layout needs <needed> bytes on tape plus a <reserve>-byte end-of-tape reserve, <over> bytes (<over, binary>) over the <available> bytes this volume may be filled to; the fill ceiling is 97% of this volume's 2.50 TB capacity (ADR-0012). Write less to this volume — a unit that does not allow spanning (allow_spanning) is never split — or, if you know this cartridge can take it, raise the ceiling for this write with --fill-ceiling
+error: volume "<label>" failed pre-write validation: capacity exceeded: the layout needs <needed> bytes on tape plus a <reserve>-byte end-of-tape reserve, <over> bytes (<over, binary>) over the <available> bytes this volume may be filled to; the fill ceiling is 97% of this volume's 2.50 TB capacity (ADR-0012). Write less to this volume, or, if you know this cartridge can take it, raise the ceiling for this write with --fill-ceiling
 ```
 
 tapectl has no end-of-tape salvage, so the capacity gate is its only defence
 against running out of tape. It compares the whole planned layout with the
 capacity decided **at `volume init`**: the cartridge's detected generation,
 times the **fill ceiling** (`fill_ceiling`, 97% by default), less the
-`enospc_buffer` reserve. The staged batch does not fit on this cartridge, by the
-amount the message names. Nothing has been written.
+`enospc_buffer` reserve. The planned layout does not fit on this cartridge, by the
+amount the message names. Nothing has been written. A write plans the queue only as far
+as the cartridge takes it and leaves the rest staged for the next cartridge (ADR-0012
+items 288 and 289), so a batch that is merely larger than one tape is not this refusal.
 
 The ceiling exists because usable capacity is not fixed: a worn cartridge, or an
 irregular feed, costs tape the plan assumed it had, and a real end of tape aborts
@@ -1957,23 +1923,27 @@ along. Or split the work across cartridges. The
 [Collection](cli/collection.md#tapectl-collection) commands batch
 folder-per-unit archives to fit.
 
-### A unit that allows spanning would pass the fill ceiling
+### A drive with no `post_warning_bytes`
+
+No refusal names the key: a unit that would pass the fill ceiling is not refused on a drive
+whose `[[backends.lto]]` entry lacks `post_warning_bytes` (ADR-0012 item 289). On a drive
+that declares it, the plan reaches past the fill ceiling to the cartridge's nominal capacity
+and the unit that carries it past is planned to its end, so the drive's early warning ends
+the tape inside it. Without the key the plan stops at the last slice that fits the fill
+ceiling, inside a unit if that is where it falls, and the rest continues on the next
+cartridge; nothing is written past the ceiling.
+
+`tapectl config check` says so, once per such drive:
 
 ```text
-error: volume "<label>" failed pre-write validation: capacity exceeded: a unit that allows spanning would pass the fill ceiling: the layout needs <needed> bytes on tape plus a <reserve>-byte end-of-tape reserve, <over> bytes (<over, binary>) over the <available> bytes this volume may be filled to. A unit that allows spanning is planned past the fill ceiling, to the drive's early warning, only when the drive declares post_warning_bytes in its [[backends.lto]] entry of config.toml (ADR-0012 item 123)
+note: drive "<name>" has no post_warning_bytes, so a write's plan stops at the fill ceiling (97% of the cartridge) instead of using the room past the drive's early warning (ADR-0012 item 113), and no slice cap keeps a slice and the seal inside that room (item 100). scripts/lto-profile.sh measures it (docs/lto-profiling.md); then `tapectl config set 'backends.lto[<name>].post_warning_bytes' <measured>`
 ```
 
-The batch holds a unit that allows spanning (`allow_spanning`), and the
-drive's `[[backends.lto]]` entry does not declare `post_warning_bytes`. A tape
-that holds a span is planned past the fill ceiling and ended by the drive's
-early warning, not by the plan, which is safe only when the drive's room past
-its warning has been measured (ADR-0012 items 84 and 123). Nothing has been
-written. Either give the drive its measured figure
+Give the drive its measured figure
 ([`post_warning_bytes`](configuration.md#backendslto), which
-`scripts/lto-profile.sh --emit` prints), or keep the unit whole on one tape
-with `allow_spanning = false`. With one drive configured the bare key names it;
-with several, `backends.lto[NAME].post_warning_bytes`, where `NAME` is the
-`name` of the drive's table:
+`scripts/lto-profile.sh --emit` prints) to let a tape fill to the early warning. With one
+drive configured the bare key names it; with several,
+`backends.lto[NAME].post_warning_bytes`, where `NAME` is the `name` of the drive's table:
 
 ```bash
 tapectl config set post_warning_bytes 99008M
@@ -1983,11 +1953,7 @@ tapectl config check
 `99008M` is home2's HP LTO-6 figure; use your own drive's. On a host installed
 by `scripts/first-run.sh`, put the figure in the host profile's
 `POST_WARNING_BYTES` instead, and step 8 writes it onto the drive
-([install.md](install.md)). `collection plan`
-and `collection run` refuse the same unit before anything is staged: "it
-allows spanning (allow_spanning), but a span is written only by a drive whose
-`[[backends.lto]]` entry declares `post_warning_bytes` (ADR-0012 item 123),
-and this one does not".
+([install.md](install.md)).
 
 ### A span would continue onto another LTO generation
 
@@ -2002,10 +1968,10 @@ the generation the message names last.
 ### A slice a span owes was released from staging
 
 ```text
-error: refusing to write: "<unit>" v<n> (stage set <id>) may span, and this tape plans its slice <s>, whose staged file was released from staging. A range is one unbroken run of a unit's slices, so the slice is never skipped. Nothing was written and the drive was not touched. Stage it again, then write: tapectl volume read-slices <unit> --from <holder> --version <n>
+error: refusing to write: "<unit>" v<n> (stage set <id>) is planned on this tape with its slice <s>, whose staged file was released from staging. A range is one unbroken run of a unit's slices, so the slice is never skipped. Nothing was written and the drive was not touched. Stage it again, then write: tapectl volume read-slices <unit> --from <holder> --version <n>
 ```
 
-Staging is released slice by slice for a unit that spans cartridges, once
+Staging is released slice by slice for a unit held across cartridges, once
 each slice has its copies. This tape needs one of those slices again, for
 example to make a further copy. Run the command the message ends with: it
 reads the slice back into staging from a tape that holds it. When no tape
@@ -2331,9 +2297,9 @@ error](#restoresh-every-read-fails-with-an-io-error)).
 ### A real end of tape during the write
 
 The drive's early warning is not this. Since 1.6.0 a write that reaches the
-warning finishes the slice in flight, seals the tape short and exits 0; from
-1.7.0 a unit that allows spanning is continued on the next cartridge, and any
-other unit after the warning is written whole on another one. This section is
+warning finishes the slice in flight, seals the tape short and exits 0; the unit
+it interrupted is a `range` on that tape and continues on the next cartridge, and a unit
+planned after the warning has no row and stays staged (ADR-0012 items 288 and 289). This section is
 the medium's hard end past the warning (more than 16 refusals of one block in
 a row), a refused filemark, or a warning before the first data slice.
 
@@ -2440,12 +2406,12 @@ seal marker at position <n> (ADR-0003: sealed volumes are immutable)`.
 
 ### `volume rewrite`
 
-- **`volume rewrite refused: volume "<label>" holds a range`** (from 1.7.0): the volume holds
-  a run of the slices of a unit that spans cartridges, named with its version and slices. A
-  rewrite plans every unit whole and never writes a range, and carrying a range forward is not
-  built (ADR-0012 items 133 and 142). Nothing was changed. `volume compact-read`, `volume
-  compact-finish` and `volume compact` refuse such a volume the same way, before the drive is
-  opened, and `report compaction-candidates` leaves it out.
+- **A source that holds a range** (a unit's slices that the tape took before its early
+  warning) is carried like any other volume: the rewrite writes the slices the source
+  holds, and a set it never took has no row (its slices stay staged until their version is
+  whole elsewhere; `--with-staged` carries them). `volume compact-read`, `volume
+  compact-finish` and `volume compact` carry it the same way. There is no refusal to look
+  for.
 - **"refused: some of this volume's live data has no copy on any other volume"**: expected when
   the volume holds the only copy. Give `--only-copy-on-staging <SOURCE_LABEL>` (or type the label
   at a terminal) if you accept the window in which the staging disk holds the only copy.
@@ -2679,54 +2645,48 @@ tapectl volume identify
 
 ### A unit held across cartridges
 
-From 1.7.0 a version of a unit that allows spanning may be held as ranges,
-runs of its slices on several tapes. `restore unit` and `restore file` read
-it across cartridges: they start on the cartridge that holds slice 1, ask for
-each further one by label, sticker and chip serial, and feed every slice into
-one dar run (`--spool` reads them all into scratch space first). `catalog
-locate <unit>` shows which tapes hold which slices (its `Holds` column). Three
-refusals come before any slice is read.
-
-Started on a cartridge that does not hold slice 1:
-
-```text
-error: unit "<unit>" version <n> is held across cartridges, and a restore of it starts on the cartridge that
-holds its slice 1, then reads the others in slice order (volume-format-v2.md §4.4): volume "<label>" holds only
-slices <a> to <b> of it. Slice 1 is on "<other>" (cartridge <barcode>, chip serial <serial>): start the restore
-there (`--from <other>`, or load it and give no --from). Nothing was read from tape.
-```
+A version of a unit may be held as ranges, runs of its slices on several
+tapes: every unit continues on the next cartridge when a tape reaches the
+drive's early warning. `restore unit` and `restore file` read it across
+cartridges, and **may start on any tape that holds part of it**: they take the
+files that tape holds whole, ask for each further cartridge by label, sticker and
+chip serial, and feed the members to one `tar` run. The answer "skip" at the
+prompt (I do not have it), or nobody at the terminal, restores the files this tape
+holds whole and lists the rest with the tapes that hold them. `catalog locate
+<unit>` shows which tapes hold which slices (its `Holds` column). Two refusals
+come before any slice is read.
 
 A slice no live volume holds:
 
 ```text
 error: unit "<unit>" version <n> cannot be restored: slices <a> to <b> of it are on no live volume, and a
-restore of a version held across cartridges needs every slice, in slice order (volume-format-v2.md §4.4 R7).
-Where the catalog saw them: "<label>" is given up (retired or erased) (slices <a> to <b>). A tape this catalog
-does not know that holds them is brought into it by `tapectl catalog rebuild --from-volume`. Nothing was read
-from tape.
+restore of a version held across cartridges needs every slice, in slice order. Where the catalog saw them:
+"<label>" is given up (retired or erased) (slices <a> to <b>). A tape this catalog does not know that holds
+them is brought into it by `tapectl catalog rebuild --from-volume`. Nothing was read from tape.
 ```
 
 When those slices are still staged, the message says so instead: an ordinary
 `tapectl volume write` writes them onto another cartridge first.
 
-No one at the terminal (a script, a timer, a pipe on stdin):
+No one at the terminal (a script, a timer, a pipe on stdin), where the version is
+held across cartridges:
 
 ```text
-error: unit "<unit>" version <n> is held across cartridges, and this restore reads slices 1 to <k> from "<label>"
-(cartridge <barcode>, chip serial <serial>), then slices <k+1> to <n> from "<other>" (…). tapectl swaps no
-cartridge without a person at the terminal, and --yes cannot load one: run it from a terminal and it asks for
-each cartridge in turn. Nothing was read from tape but File 0.
+error: unit "<unit>" version <n> is held across cartridges, and tapectl swaps no cartridge without a person at
+the terminal, and --yes cannot load one: run it from a terminal and it asks for each cartridge in turn. ...
 ```
 
-Run it from a terminal. A version a single tape holds whole restores from
-that tape alone, with no prompt. `restore volume` restores only the units a
-tape holds whole, and names each unit it holds only a range of with the
-`restore unit` command that reads it across cartridges.
+Run it from a terminal. A version a single tape holds whole restores from that
+tape alone, with no prompt. `restore volume` restores only the units a tape holds
+whole, and names each unit it holds only a range of with the `restore unit`
+command that reads it across cartridges. RESTORE.sh has the same prompt: press
+ENTER when the cartridge is loaded, type `done` and ENTER if you do not have it,
+`quit` to stop.
 
 ### The destination is not empty
 
 ```text
-error: refusing to restore into <dest>: it is not empty (it holds "<entry>", and maybe more). dar would keep every
+error: refusing to restore into <dest>: it is not empty (it holds "<entry>", and maybe more). tar would keep every
 existing file that collides with one from the tape, so the result would not be what is on tape. Restore into an
 empty or new directory, or pass --overwrite to replace what collides. Nothing was read from tape.
 ```
@@ -2743,24 +2703,12 @@ pass --overwrite to replace it. Nothing was read from tape.
 
 ### The restore is INCOMPLETE: the destination was not empty
 
-```text
-error: restore into "<dest>" is INCOMPLETE: dar declined to overwrite <n> file(s) that already existed, and would
-otherwise have reported success. The stale copies are still in place — the restored data is NOT what is on tape.
-Skipped: <paths>. Restore into an empty directory, or remove those files first.
-```
-
-When dar meets a file that already exists, it keeps the old one. A
-destination that is not empty is refused before the tape is read (above), so
-this now means a file appeared in `--to` while the restore ran. Restore into an
+A destination that is not empty is refused before the tape is read (above), so a
+file that already exists in `--to` is not the usual cause. If one appeared in
+`--to` while the restore ran, `tar` keeps the old one, and the restore's own check
+of every restored file against the unit's file table names it as damaged or
+missing (see "The restore is INCOMPLETE: damaged files" below). Restore into an
 empty directory, or pass `--overwrite`.
-
-When a slice had holes (a chunk or a whole slice that would not authenticate,
-and no other copy to take it from), the same dar behaviour reads differently.
-Under "dar could not read the archive through the holes" the line is "dar exited
-0 but did not restore <n> file(s) ("not restored (user choice)"): <paths>".
-Those files are dar's own partial output from this restore, not an earlier
-restore's. The damaged-or-missing list that follows is what to act on: restore
-the unit again from another copy.
 
 ### `restore volume`: some units were not restored
 
@@ -2821,40 +2769,27 @@ from it.
 
 ```text
 error: not enough disk space in <dir> for this restore: it needs about <size>, and <size> is free. Nothing was read
-from tape. <why>. Free space there, choose a larger disk with --to, or put any decrypted slices on another disk
+from tape. <why>. Free space there, choose a larger disk with --to, or put the scratch directory on another disk
 with --scratch DIR. (--no-space-check skips this check, for a filesystem that holds more than it reports free,
 such as a compressed or thin-provisioned one.)
 ```
 
-`<why>` names which of three restores this is, because they need different
-room:
+`<why>` names which of two restores this is, because they need different room:
 
-- **Streamed** (`restore unit` or `restore volume`, with the unit's isolated
-  catalogue from `stage create` still under `<home>/catalogs/`, and dar 2.7.9
-  or newer): each slice goes from the tape straight into dar, joined into the
-  one stream dar wrote (on its standard input; through a named pipe per slice
-  before 1.7.2), so only about the unit's size is needed in `--to`.
-- **Spooled** (otherwise, for example after `catalog rebuild`, which has no
-  catalogues, or with `--spool`): every slice is decrypted into a
-  `.tapectl-restore-tmp` directory inside `--to` (never the system temp
-  directory) before dar extracts them, so with both on one disk the unit's
-  size about twice over. With `--scratch DIR` the slices wait in `DIR`
-  instead, and each disk is checked for its own share.
-- **`restore file`**: the slices it reads (with the catalogue, only those
-  that hold the file, its directories and the last; without, all of them),
-  plus the file.
+- **A unit** (`restore unit` or `restore volume`): each slice is decrypted (and
+  decompressed) in memory off the tape and its members are fed to `tar`, so only
+  about the unit's size is needed in `--to` ("bytes of stream" in `stage info`,
+  compressed or not); no slice is written to disk.
+- **`restore file`**: the file is extracted in the scratch directory and moved
+  into place, so it needs the file's size on the scratch disk and in `--to`. Only the
+  slices that hold it are read.
 
-RESTORE.sh, the heir's path, always spools and asks for one slice more.
+A repair of a damaged file from another copy extracts that copy's file in the scratch
+directory first, inside `--to` or inside `--scratch DIR` when you name one. RESTORE.sh,
+the heir's path, asks for the units' size plus about two slices in its work directory
+(`--work DIR`).
 
-`restore volume` checks the whole set at once: every unit it restores stays,
-and the units run one after another, so only the largest unit's spooled
-slices count on top.
-
-A restore streams when the unit's catalogue files
-(`<home>/catalogs/<dir>/<name>.N.dar`, named by the stage set's
-`catalog_path`) are there. `--spool` on `restore unit` or `restore volume`
-makes it spool anyway, for example to get round a streaming problem or to
-rehearse the path a rebuilt catalog takes. It needs the larger space above.
+`restore volume` checks the whole set at once: every unit it restores stays.
 
 ### A scratch directory already exists
 
@@ -2878,7 +2813,9 @@ once, before the restore:
 note: restoring as a non-root user, so the restored files are owned by you, not by the owners the archive recorded
 ```
 
-The contents are exact. Only ownership differs. If the original owners
+The contents are exact, and the files come back by the numeric ids the stream
+recorded; `restore` prints the unit's id map (each id with the name the writing host
+gave it, or none) and never acts on it. Only ownership differs. If the original owners
 matter, run the restore as root. The service user of a first-run install is
 not root. On a host with a home pointer, a command run as root is refused unless
 `--home` or `TAPECTL_HOME` names the home
@@ -2921,53 +2858,28 @@ error: slice <n> checksum mismatch on tape: expected <sha>..., got <sha>...
 ```
 
 The ciphertext read off the tape differs from the checksum recorded when it
-was staged. Since 1.3.0 tapectl does not stop there. If another cartridge holds
+was staged. tapectl does not stop there. If another cartridge holds
 an identical copy of the slice (`catalog locate` lists them), it asks for that
 cartridge by label, sticker and chip serial (see "A damaged slice: tapectl asks
-for another cartridge"). Scratch space for decrypted slices is removed when a
-restore fails. If tapectl cannot remove it, it warns and names the path, because
-that directory may hold decrypted data. Only chunks that authenticate are ever
-written, so nothing that reached dar was damaged. If no copy can give the slice
-whole, its bad 64 KiB chunks are written as zeros and the restore ends
-INCOMPLETE (see below). Run a full `volume verify` on the damaged volume.
-
-### `dar stopped reading slice <n>` on a unit restored whole (before 1.7.0)
-
-```text
-error: dar error: dar stopped reading slice <n>. dar was extracting the unit into <dir> as its slices arrived, so that directory may now hold a partial restore: ...
-error: dar error: dar stopped before it read slice <n>. ...
-```
-
-tapectl before 1.7.0 (#497). Given the unit's isolated catalogue, dar stops
-reading where the file data ends and exits 0: it never reads the archive's own
-catalogue at the end of the last slice, or the last slices whole when that
-catalogue is bigger than a slice. A unit of more than a few hundred files leaves
-more of it unread than a pipe holds, and tapectl took dar's closed pipe for a
-failure. The files dar restored are whole: every byte it read was authenticated
-as it was decrypted. For a restore that finishes and checks every slice, run it
-again into an empty directory with `--spool`, which decrypts the slices to the
-scratch directory first and needs room for them as well as the files:
-
-```bash
-tapectl restore unit --unit <unit> --to <empty dir> --spool
-```
-
-`restore volume --spool` does the same for a whole tape. From 1.7.0 tapectl
-reads what dar leaves to its end, checks it, and judges the restore by dar's
-exit status.
+for another cartridge"). Only chunks that authenticate are ever fed to `tar`, so
+nothing damaged reached it. If no copy can give the slice whole, the members in
+its bad 64 KiB chunks are left out, **never zero filled**, and the restore ends
+INCOMPLETE (see below); in a compressed slice nothing after the bad chunk decodes,
+so the members from the chunk to the slice's end are left out. Run a full
+`volume verify` on the damaged volume.
 
 ### A damaged slice: tapectl asks for another cartridge
 
 ```text
 Slice <n> of unit "<unit>" v<v> is damaged on <label>: slice <n> checksum mismatch on tape: …
 <label2> holds an identical copy of it (cartridge <sticker>, chip serial <serial>).
-Unload the cartridge in <device> (`tapectl drive eject`), load <label2>, and press Enter. Type "skip" to leave a hole where the slice is damaged, or "stop" to give up (what is restored so far stays).
+Unload the cartridge in <device> (`tapectl drive eject`), load <label2>, and press Enter. Type "skip" to leave out the members the damage touches, or "stop" to give up (what is restored so far stays).
 ```
 
 Load the cartridge named and press Enter. tapectl checks that it is that volume
 (File 0, chip serial, `requires`) and says so if it is not, then asks again.
 That cartridge keeps serving while it holds what is wanted, so several bad
-slices in a row cost one swap. `skip` writes the damaged chunks as zeros and
+slices in a row cost one swap. `skip` leaves out the members in the damaged chunks (never zero filled) and
 carries on. `stop` ends the restore; what was restored stays. A volume marked
 "last resort" is quarantined (a verify proved its medium bad); it is asked for
 only when nothing else holds the slice.
@@ -2983,20 +2895,21 @@ was written; what was restored before that slice stays.
 
 ```text
 restore of unit "<unit>" v<v> into <dest> is INCOMPLETE
-  slice <n> on <label>: <k> hole(s) of zeros, <bytes> byte(s) in all, at plaintext byte(s) <a>..<b> — …; the slice as a whole is unproven, …
+  slice <n> on <label>: <k> hole(s), <bytes> byte(s) in all, at plaintext byte(s) <a>..<b> — …; the members they touch are left out, and the slice as a whole is unproven, …
   slice <n> on <label>: unproven, not shown to be the slice the catalog recorded — …
   <m> file(s) damaged or missing:
     <path> (<why>)
 ```
 
-No copy could give those chunks, so they are zeros, and dar's per-file check (or
-the version's recorded sha256) names the files they fell in. Everything else is
-whole. Damaged files are left as written; do not trust them. tapectl first tries
-to fill them from another copy of the same version (a different stage set); the
-lines "does not match the version's recorded checksum … not kept" and "another
-copy could not be used" say what happened. Restore the lost paths from another
-cartridge, or replace the file from the source. All lost paths are in the
-session log.
+No copy could give those chunks, so the members they touch were **left out**: nothing
+is filled in with zeros, and `tar` was never given a damaged byte. The per-file check
+(each restored file hashed on disk against the sha256 in the unit's file table) names
+what is missing or differs. Everything else is whole. tapectl first tries to fill the
+listed paths from another copy of the same version (a different stage set), through
+that copy's file table; the lines "does not match the version's recorded checksum … not
+kept" and "another copy could not be used" say what happened. Restore the lost paths
+from another cartridge, or replace the file from the source. All lost paths are in the
+session log and in `.tapectl-damaged-files.txt` in the restored directory.
 
 ### A slice is "unproven"
 
@@ -3004,17 +2917,15 @@ A line that says a slice is unproven means tapectl could not show it to be the
 slice the catalog recorded. A chunk's tag proves only that it was encrypted for
 one of your keys; any other age file written for the same key authenticates
 just as well. So a slice is whole only when its checksum matches the one
-recorded at staging or, if that does not match, when its decrypted contents
-match the plaintext checksum recorded for it. It stays unproven when it has
-holes, when the catalog records no plaintext checksum for it, or when the
-restore was streamed into dar (the default) and the first read of the slice
-went into dar before anything was hashing it.
+recorded at staging or, if that does not match, when its decrypted (and
+decompressed) contents match the plain checksum recorded for it. It stays unproven
+when it has holes, or when the catalog records no plain checksum for it.
 
 Unproven is not lost. The files in the slice are checked one by one against
-the sha256 recorded for each (dar's own check where none is recorded), and the
-restore ends whole only if they all match. Trust the file list, not the slice.
-To have the slice itself proven, or another copy tried in its place, restore
-again with `--spool`.
+the sha256 recorded for each in the unit's file table, and the restore ends whole
+only if they all match. Trust the file list, not the slice. To have the slice
+itself proven, or another copy tried in its place, restore again from another
+cartridge that holds it.
 
 ### `slice <n> of unit … cannot be completed: the cartridge in the drive holds a different age file for it`
 
@@ -3023,11 +2934,9 @@ are never mixed, because each authenticates under its own key and neither
 vouches for the other. This copy's file has a different header and nonce from
 the part already read. If the message says "this copy's checksum matches the
 catalog, so the part already read is not the slice", the first read was the
-wrong file (a wrong tape position or a wrong catalog entry) and its bytes are
-already in dar, which cannot take them back in a streamed restore. Restore
-again with `--spool`, which drops the wrong part and reads this copy afresh, or
-restore from that cartridge directly with `--from`. Otherwise neither copy can
-be shown to be the slice; restore from another cartridge.
+wrong file (a wrong tape position or a wrong catalog entry). Restore again from
+that cartridge directly with `--from`. Otherwise neither copy can be shown to be
+the slice; restore from another cartridge.
 
 ### `… file(s) can be filled from another copy of this version, held by …`
 
@@ -3038,7 +2947,7 @@ never used as a source, even where the file is unchanged.
 ### `<path>: the copy on <label> does not match the version's recorded checksum (…); not kept`
 
 The other copy's file differs from the sha256 staging recorded, so it was not
-written over the damaged one. The destination keeps what dar wrote.
+written over the damaged one. The destination keeps what `tar` wrote.
 
 ### `restore of unit … stopped at the operator's request while waiting for <label>`
 
@@ -3048,201 +2957,82 @@ before stays; run the restore again.
 ### RESTORE.sh: not enough disk space, or OUT OF DISK SPACE
 
 ```text
-FATAL: not enough disk space in /restore to restore this unit:
-       it needs about 50.0 GiB, and 8.0 GiB is free.
-       No slice has been read yet. ...
+FATAL: unit <unit> needs its files, and the work directory one slice twice: /restore has 8589934592 bytes
+free and this needs about 53687091200. Nothing has been read from a slice yet. Free space there, or choose a
+larger disk with --to or --work DIR; --no-space-check skips this check.
 ```
 
-The heir script off tapes written by tapectl 1.1.0 and later
-(`RESTORE.sh --restore`) streams each slice from the tape through age into
-dar, so `--to` needs about the unit's size free and nothing decrypted waits on
-disk. `--restore --path` keeps the few slices it reads in a scratch directory
-inside `--to` (or `--scratch DIR`), so it asks for those as well. The script
-measures this after it has picked the version and before it reads any slice,
-and prints what it needs either way (`Disk space: needs about …`). Free space
-or choose a larger disk with `--to`. `--no-space-check` skips the check, for a
+RESTORE.sh (`--restore`) reads one slice at a time, decrypts it (and decompresses it,
+for a compressed unit) into a work directory and gives it to `tar`. `--to` needs
+about the units' size ("bytes of stream" in `--list` and `--find-envelope`) and the
+work directory about twice the largest slice. The work directory is made inside `--to`
+(`.tapectl-work.` and some letters) for a restore, and under `$TMPDIR` (default `/tmp`)
+for the modes that only read; `--work DIR` puts it on another disk. The script measures
+this after it has picked the version and before it reads any slice. Free space, or
+choose a larger disk with `--to` or `--work`. `--no-space-check` skips the check, for a
 compressed or thin-provisioned filesystem that holds more than `df` reports.
 
-If the disk fills anyway, the message says `OUT OF DISK SPACE in <dir>` and
-names the step (`reading tape file N`, `decrypting slice N` or
-`dar extraction failed`). That is not a tape or key problem: free space and
-run the same command again with `--overwrite`, since `--to` now holds part of
-the unit. Tapes written by tapectl 1.0.x carry a RESTORE.sh that decrypted
-every slice to disk first and needed about twice the unit's size; tapes before
-1.0.0 put the slices in `/tmp`. Any layout-v2 tape can be read with the
-RESTORE.sh from a newer tape, or with `tapectl restore`.
+If the disk fills anyway, the message says the work directory "cannot take it: it is
+full, or not writable" and that nothing on the tape is wrong. That is not a tape or
+key problem: free space (or give `--work DIR` on a larger disk) and run the same
+command again with `--overwrite`, since `--to` now holds part of the unit.
 
-The `--to` figure is the slices' size on tape, encrypted. A unit that was stored
-compressed restores larger, so it may need more than the script says.
-
-**The work directory (tapes written by 1.2.0 or later).** Everything else the
-script decrypts goes to a work directory it makes in `${TMPDIR:-/tmp}`: the
-operator's `catalog.db` and the unit's dar catalogues, which grow with the number
-of files on the tape, and every envelope an `--all` run opens. No data slice goes
-there. `/tmp` can be a small RAM disk. When the front index says the envelopes
-may not fit, the script warns before it reads any of them:
-
-```text
-WARNING: the work directory /tmp/tapectl-restore.Ab12Cd has 120.0 MiB free, and reading the
-         envelopes on this tape may need up to 1.4 GiB there: each envelope is read whole,
-         and each one a key opens stays decrypted until the run ends. If it fills, the run
-         stops and says so; set TMPDIR to a directory on a larger disk to move the work
-         directory (a key that opens one small envelope needs far less than this).
-```
-
-It is an upper bound, and only a warning (`--no-space-check` silences it). If the
-directory does fill, the message is `OUT OF DISK SPACE in /tmp/…` and it says to set
-`TMPDIR` to a directory on a larger disk:
+**The work directory also holds the envelopes.** Everything else the script decrypts
+goes there too: the operator's `catalog.db` and each unit's file table, which grow
+with the number of files on the tape (a unit of millions of files has a table of
+hundreds of MiB), and every envelope an `--all` run opens. `/tmp` can be a small
+RAM disk, so for `--list`, `--find-envelope`, `--where` and `--find`, which keep it
+under `$TMPDIR`:
 
 ```bash
-TMPDIR=/mnt/big ./RESTORE.sh --restore --key your-key.age.key --to /destination
+TMPDIR=/mnt/big ./RESTORE.sh --list --key your-key.age.key
 ```
 
-### RESTORE.sh: `dar cannot start here: it was built with GPG support`
-
-The machine's dar (Debian's and Ubuntu's among them) was built with GPG
-support and asks, at startup, whether to carry on without the `gpg` program;
-under `-Q` it answers no and aborts ("INITIALIZATION FAILED FOR GPGME"). The
-script asks dar first and stops before the tape is read. Install gnupg
-(`apt install gnupg`) and run it again.
-
-### RESTORE.sh: `dar extraction failed (exit 0)` after a whole restore
+### RESTORE.sh: a slice is left out, and the restore is INCOMPLETE
 
 ```text
- ... inode(s) restored
- 0 inode(s) failed to restore (filesystem error)
- ...
-FATAL: dar extraction failed (exit 0) — dar's own message is above.
+RESTORE INCOMPLETE: <n> path(s) are damaged or left out; restore them from another copy (the list is the one repair: give it to --paths-from on a tape that holds the same version).
 ```
 
-The RESTORE.sh on every tape written by tapectl 1.1.0 through 1.6.x (#497),
-keepsake's L6-0001 and L6-0002 among them. Given the unit's isolated catalogue,
-dar stops reading where the file data ends and exits 0, before the archive's own
-catalogue at the end of the last slice. When that unread part is bigger than a
-pipe holds (a unit of more than a few hundred files), the script took dar's
-early stop for a failure. It is not damage: dar's summary just above says 0
-inode(s) failed, and the unit's files are restored and sound, because age
-authenticated every byte dar read. What the script did not do is check the last
-slices' sha256 and, from 1.3.0, run its per-file check; with `--all` it also
-stopped there, before the units after it.
+A slice that is not on this tape (a short tape, or a unit continued on another
+cartridge) or fails a check is left out; its files are listed, and everything else is
+restored. **Nothing is ever filled in with zeros.** After the restore, every regular
+file is hashed on disk against the unit's file table: that check, never `tar`'s exit
+status, decides what was restored. The files that fail it, or were left out, are in
+`.tapectl-damaged-files.txt` in the restored directory. To restore them, load another
+tape that holds the same unit and version (`--where UNIT` names the tapes) and run:
 
-To restore the units it did not reach, run it again for each one alone, with
-`--unit NAME` and a new, empty `--to` (`--list` names the units); a large one
-ends the same way, with its files restored. For a restore with every slice and
-file checked:
+```bash
+./RESTORE.sh --restore --paths-from /dest/UNIT/.tapectl-damaged-files.txt --key your.age.key --to /dest/UNIT
+```
 
-- If `./RESTORE.sh --help` lists `--slices-from` (tapes written by 1.3.0 or
-  later), add `--slices-from DIR` with an empty directory: the slices are read
-  off the tape, checked and decrypted into it first, and dar reads them from
-  there. It needs room for the unit's slices as well as its files.
-- Otherwise (keepsake's tapes carry 1.1.0's script, which has no
-  `--slices-from`), use tapectl: `restore unit --spool` in the operator's home,
-  or, for an heir, a new home with `init`, `catalog rebuild --from-volume --key`
-  and `restore volume --key` (the Heir Kit's cover sheet gives the commands). A
-  restore after a rebuild has no isolated catalogue and spools every slice.
+Only the listed paths are restored (and overwritten). A tape of another version is
+never a source. A unit continued on another cartridge asks for the next cartridge at
+its own prompt, where `done` goes on with what the cartridges so far hold.
 
-A RESTORE.sh written by 1.7.0 or later reads what dar leaves to its end, checks
-it, and judges the unit by dar's exit status. The Heir Kit generated by 1.7.0
-says all of this on its cover sheet (ADR-0012 item 178). A RESTORE.sh written by
-1.8.0 or later also reads past damage in that unread part without stopping, and
-says so (ADR-0012 item 182; the entry after the next).
-
-### RESTORE.sh or tapectl: dar reports `Bad CRC` while every slice's checksum matched
+### RESTORE.sh: `NOTE: this cartridge is a tapectl volume of Layout 2`
 
 ```text
-  checksum verified against front index
-...
-<path> : Bad CRC, data corruption occurred
-<path> : Error while reading FSA from archive: invalid FSA nature flag
- <n> inode(s) failed to restore (filesystem error)
+NOTE: this cartridge is a tapectl volume of Layout 2 (magic ...), label <label>; this RESTORE.sh reads Layout 3 only, so nothing is taken from it. Read it with the tapectl that wrote it or with the RESTORE.sh in its own File 2.
 ```
 
-The tape is sound: every slice matched the front index, and age authenticated
-every byte. dar itself misreads some archives when their slices reach it through
-named pipes, which is how RESTORE.sh's restore (1.1.0 to 1.7.x) and tapectl's
-streamed restore up to 1.7.1 feed it (#498). Where a read request of dar's ends exactly on a
-slice's last byte, dar takes that slice's one-byte trailer for data. It happens
-at a fixed place in a given archive, so the same unit fails the same way every
-time it is streamed, and it never happens when dar reads the slices from regular
-files. dar always says so (exit 5); it is never a silent wrong restore. dar
-2.7.13 names the file at that place, and dar 2.7.21 names that file and every
-file after it.
-
-Restore the unit, or the files dar named, from slices on disk:
-- **RESTORE.sh from 1.3.0 to 1.7.x:** the restore ends INCOMPLETE and writes
-  `.tapectl-damaged-files.txt`. Run the `--fill-from` command it prints with the
-  **same tape** still loaded. The fill reads the listed files' slices into
-  scratch first, then restores them and checks them. Or restore the unit again
-  into an empty directory with `--slices-from DIR` (an empty `DIR`).
-- **RESTORE.sh from 1.1.0 or 1.2.x** (keepsake's tapes): it ends
-  `FATAL: dar extraction failed (exit 5)`. Use tapectl, as the entry above says.
-- **tapectl 1.7.2 or later** does not meet it: it joins the slices back into
-  the one stream dar wrote and feeds that to dar's standard input, which dar
-  reads without this fault. Stream the unit again with it.
-- **RESTORE.sh from 1.8.0** does not meet it either: like tapectl from 1.7.2, it
-  joins the slices into one stream on dar's standard input (ADR-0012 item 181).
-- **tapectl 1.7.1 or earlier:** `restore unit --spool` (or `restore volume
-  --spool`). After a `catalog rebuild` there is no isolated catalogue on disk
-  and every restore spools already.
-
-### RESTORE.sh: `NOTE: slice <n> of '<unit>' (…) is damaged after the point this restore needed`
-
-```text
-NOTE: slice 3 of 'photos' (tape file 12 of L6-0003) is damaged after the point this restore needed: …
-...
->>> RESTORE COMPLETE
-...
->>> NOTE: slice 3 of 'photos' (tape file 12 of L6-0003) is damaged after the point this restore needed. Replace this tape.
-```
-
-A RESTORE.sh written by 1.8.0 or later (ADR-0012 item 182). Given the unit's
-isolated catalogue, dar stops reading where the file data ends (the entry on
-`dar extraction failed (exit 0)` above), and the script still reads, hashes and
-authenticates what dar left. Here that part failed: age could not authenticate
-it, or the slice's sha256 did not match the front index. dar did not need those
-bytes: the script closed dar's stream at the damage, or dar had already ended,
-and dar ended well. So the script went on, read and checked the
-slices after it, and checked every restored file against the sha256 the index
-records for it.
-
-- **RESTORE COMPLETE** means every restored file matched the index: the restore
-  is whole. The tape is not: run `volume verify` on it (exit 2: the medium is
-  proven bad and quarantined, so it no longer counts as a copy), then write a new
-  copy from another (`report needs` names what is short).
-- **RESTORE INCOMPLETE** means a file failed its check as well: it ends as for
-  any damage, with the list of damaged files and the `--fill-from` command.
-- **On a unit restored across tapes through scratch space**, the note says the
-  slice was read into the scratch directory from a named tape file. That slice
-  matched its tape's front index when it was read, so the tape is not what
-  changed: the scratch copy did, or every copy of the slice holds the same
-  damage. Check the other copies with `--verify`.
-
-Damage dar did read stops the restore as it always has (`did not decrypt`, or
-`checksum MISMATCH`).
-
-### RESTORE.sh: `dar refused the envelope's catalogue`
-
-The unit's dar catalogue in the envelope came from another staging run of the
-same snapshot (a re-staged snapshot, #419), and dar will not use it with these
-slices. Nothing was written; the script restores the unit without it: streamed
-on dar 2.7.21 or later, otherwise from slices decrypted to disk first, which
-needs room for them as well as the files.
+A cartridge written by tapectl 1.x has Layout 2, and Layout 3's script and tapectl
+read Layout 3 only. Read it with the RESTORE.sh in its own File 2 (the bytes of that
+tape's own script), or with tapectl 1.9.2, the last release that reads it.
 
 ### RESTORE.sh: `--to … is not empty`
 
 ```text
-FATAL: --to /restore is not empty.
-       dar keeps a file that is already there and still reports success, ...
+FATAL: --to /restore is not empty. Restore into an empty or new directory, or give --overwrite to replace files that are there (to finish a restore that stopped).
 ```
 
-dar under `-Q` answers "no" to every overwrite and exits 0, so a restore over
-an earlier one that stopped part way would leave its truncated files and
-report success. Restore into an empty or new directory; to finish an earlier
-restore of the same unit, run the same command with `--overwrite` (dar `-w`).
-A leftover `.tapectl-restore.*` directory is named and refused even with
-`--overwrite`: a killed `--path` restore may have left decrypted slices in it.
-Remove it and run again. If dar still declines a file, the restore fails as
-`INCOMPLETE` and names it.
+A restore over an earlier one that stopped part way would leave its truncated files
+beside the new ones, so the script refuses a directory with anything in it. Restore
+into an empty or new directory; to finish an earlier restore of the same unit, run the
+same command with `--overwrite`. The check after the restore (every file hashed on disk
+against the file table) fails the run as `INCOMPLETE` and names any file that is still
+wrong. The repair, `--paths-from LIST`, refuses a directory whose damaged-file list is
+not that unit's and version's.
 
 ### RESTORE.sh: every read fails with an I/O error
 
@@ -3265,28 +3055,24 @@ changing it. The Heir Kit's cover sheet says the same.
 ### RESTORE.sh: `missing required tool`
 
 ```text
-FATAL: missing required tool: truncate
+FATAL: missing required tool: tail
 ```
 
 RESTORE.sh checks for its tools when a mode starts, before it reads the tape, and
-names the first one it does not find. Install it (the name is a command; `truncate`,
-`head` and `mkfifo` are in coreutils, `mt` is the package `mt-st`) and run again.
-A tape written by 1.2.0 or later carries a script that checks only the tools the
-mode you ran uses, so a host can read and hash a tape with fewer tools than it needs
-to restore one:
+names the first one it does not find. Install it (the name is a command; `tail`
+and `head` are in coreutils, `mt` is the package `mt-st`) and run again.
+The script checks only the tools the mode you ran uses, so a host can read and
+hash a tape with fewer tools than it needs to restore one:
 
 | Mode | Tools checked (and `mt`) |
 |---|---|
 | `--info`, `--verify` | `dd`, `sha256sum`, `head` |
-| `--find-envelope` | those, and `age`, `truncate`, `tar` |
-| `--list` | those, and `dar` |
-| `--restore --path` | `--list`'s, and `tee` |
-| `--restore` (whole units) | all of them, and `mkfifo` |
+| `--find-envelope`, `--list`, `--where`, `--find`, `--restore` (whole units) | those, and `age`, `tar` |
+| `--restore --path`, `--restore --paths-from` | the whole-unit set, and `tail` |
 
-A script from an earlier tape checks every tool in every mode, and one from before
-2026-09-28 does not check for `tar`: a missing one shows up only after the envelope
-has been read and decrypted. A bare `RESTORE.sh`, `--help` and a mistyped mode check
-nothing.
+A unit stored compressed also needs the tool for its algorithm: `gzip`, `xz` or
+`zstd`, checked when the unit is chosen. A bare `RESTORE.sh`, `--help` and a mistyped
+mode check nothing.
 
 ### RESTORE.sh: `NOTE: only '<unit>' was restored`
 
@@ -3351,39 +3137,15 @@ owner's key or the escrow key restores what still opens.
 ### RESTORE.sh: `this tape is layout_version N`
 
 ```text
-FATAL: this tape is layout_version 3; this script reads layout v2 only.
+FATAL: this is a tapectl volume of Layout 2 (magic ...), label <label>. This RESTORE.sh reads Layout 3 only.
+       Read it with the tapectl that wrote it, or with the RESTORE.sh in its own File 2: ...
 ```
 
 A RESTORE.sh reads the layout it was written with. Every tape carries its own
 script at file 2, so read that one: `mt -f <dev> rewind && mt -f <dev> fsf 2`,
 then `dd if=<dev> bs=512k | tr -d '\0' > RESTORE.sh`. A tape whose File 0
 states no layout_version at all (a damaged ID thunk) only warns, and is read
-as layout v2.
-
-### dar refuses an envelope catalogue: `do not correspond to the same data`
-
-```text
-FATAL error, aborting operation: The archive and the isolated catalogue do not correspond to the same data, they are thus incompatible between them
-```
-
-Every envelope carries each unit's isolated dar catalogue in `catalogs/`. dar
-gives every archive a random label and accepts (`dar -A <catalogue>`) only
-the catalogue made from that same archive. Since issue #419, each stage set
-gets its own catalogue, made by its own dar run, so the catalogue in an
-envelope always fits the slices on the same tape.
-
-Before #419 the catalogue was made once per snapshot and reused when the same
-snapshot was staged again. On a tape written then, a unit whose snapshot had
-more than one stage set (`SELECT snapshot_id FROM stage_sets GROUP BY
-snapshot_id HAVING COUNT(*) > 1`) may carry the first run's catalogue with
-the second run's slices. For such a unit:
-
-- `dar -l <catalogue>` still lists the right files, because the content is the
-  same;
-- `dar -A <catalogue>` against the slices is refused with the message above,
-  so the catalogue cannot stand in for a damaged last slice;
-- a normal restore (tapectl or RESTORE.sh) is unaffected: it reads the
-  catalogue inside the last slice.
+as a Layout 3 tape.
 
 ### `catalog rebuild`: `the catalog's stage set is not the one on this tape`
 
@@ -3510,12 +3272,11 @@ below) run only for a whole-archive audit, not with `--unit`. The `short_seal` f
 | `no_full_verify` | warning | `volume "<label>" is sealed with no full readback recorded — its write confirmed the front index and seal only` | A write's confirm reads back only the front index and the seal marker unless `--full-confirm` was given (ADR-0012, 2026-10-06), so this volume counts as a copy with none of its data read back yet. Fix: `tapectl volume verify <label>` (full, the default); a passing one clears it, a `--quick` one does not. |
 | `volume_verify_age` | warning | `volume "<label>" (cartridge <barcode>, at <place>) was last read back in full on <date>, <n> days ago: past the <d>-day verify interval of the unit on it with the shortest one, whatever the unit's other copies show` | The per-volume clock (#454): `verify_age` is satisfied by the newest readback of any copy, so a fresh home copy would hide a stale offsite one. The interval is the shortest resolved `verify_interval_days` among the units on the volume (an archive set's, else `[defaults]`, 365 days when that is absent). A volume never read back in full is `no_full_verify`'s alone. Fix: fetch the cartridge from the place named and run `tapectl volume verify <label>`. |
 | `tape_alert` | warning | `volume "<label>": the drive raised a TapeAlert — <n> <flag>; … — at <time> during "<command>" with cartridge <barcode> loaded on drive <serial>` | A contact with this volume, or with the cartridge it is on (a [`drive poll`](operator-guide.md#the-daily-drive-poll) included), read page 0x2E with a flag raised, not before the volume's last passed full verify started (an alert raised during a readback, its own included, is not answered by it). Retired, erased and quarantined volumes are not named; an `initialized` one an interrupted write left is. A warning, never a violation: a flag may be the medium ("Media", "Read failure") or only the drive ("Cleaning required"), and the volume still counts as a copy. A cleaning flag (TapeAlert 20-23) is printed with its action, `<n> <flag> => clean the drive: …` (22 and 23 name the cleaning cartridge instead); the fix column is still the verify, which is what clears the warning. Fix: `tapectl volume verify <label>` — a pass clears it; a failure quarantines the volume and the copy checks take over. `report health` lists every sighting. |
-| `cut_without_ending` | warning | `` volume "<label>" has <n> writes recorded `cut` but no `ended_after`: a cut row exists only on a volume that sealed short, so this catalog does not say where that tape ended `` | One of the `short_seal` invariants (1.6.0, #420). A unit is `cut` only on a tape that sealed short, and the catalog records where such a tape ended (`volumes.ended_after`). Without it, `volume verify` would look for the seal at the planned position. Confirm, `catalog rebuild` and the adoption of a lost write never leave this, nor any of the five rows below: each means the catalog was edited around tapectl, or a bug. Fix: `tapectl volume verify <label>` (the `fix:` line): a full verify reads the tape's seal and names any disagreement with the catalog (`ended_after_disagrees`); report the finding. |
-| `completed_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes on it recorded `completed` have a slice past that (up to file <m>): those units are not on this tape whole, yet they count as copies `` | A `short_seal` invariant (1.6.0). A unit with a slice past where the tape ended is not on it whole, but the catalog counts it as a copy, so its copy count is too high. Fix: as for `cut_without_ending`. |
-| `range_without_may_span` | warning | `` volume "<label>" has <n> writes recorded `range` with `may_span` unset: only a write planned as spannable is ever a range, and the schema refuses this row, so the catalog was edited around it `` | A `short_seal` invariant (1.7.0). Migration 039's row check refuses such a row, so it exists only where someone edited around it. Fix: as for `cut_without_ending`. |
-| `range_written_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes recorded `range` on it record a slice `written` past that (up to file <m>): those slices are not on this tape, yet they count as copies of those slices `` | A `short_seal` invariant (1.7.0). Confirm records a range's slices past the tape's end as `pending`, never `written`. Fix: as for `cut_without_ending`. |
-| `range_not_one_run` | warning | `` volume "<label>" has <n> writes recorded `range` whose `written` slices are not one unbroken run: a volume holds at most one unbroken range of a stage set, so this catalog does not say which slices the tape holds `` | A `short_seal` invariant (1.7.0, ADR-0012 item 122). Fix: as for `cut_without_ending`. |
-| `range_without_written_slice` | warning | `` volume "<label>" has <n> writes recorded `range` with no slice `written`: a range is the slices the tape holds, and a write whose tape holds none of its set is `cut` `` | A `short_seal` invariant (1.7.0). Fix: as for `cut_without_ending`. |
+| `completed_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes on it recorded `completed` have a slice past that (up to file <m>): those units are not on this tape whole, yet they count as copies `` | A `short_seal` invariant (1.6.0). A unit with a slice past where the tape ended is not on it whole, but the catalog counts it as a copy, so its copy count is too high. Confirm, `catalog rebuild` and the adoption of a lost write never leave this, nor any of the rows below: each means the catalog was edited around tapectl, or a bug. Fix: `tapectl volume verify <label>` (the `fix:` line): a full verify reads the tape's seal and names any disagreement with the catalog (`ended_after_disagrees`); report the finding. |
+| `completed_without_every_slice` | warning | `` volume "<label>" has <n> writes recorded `completed` that lack a `written` position of some slice of their set: a `completed` write is a copy of every slice, 1 to N, so those units count copies that do not exist `` | A `short_seal` invariant (ADR-0012 item 288: a set is `completed` only when every slice of it is on the tape). Fix: as for `completed_past_ending`. |
+| `range_written_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes recorded `range` on it record a slice `written` past that (up to file <m>): those slices are not on this tape, yet they count as copies of those slices `` | A `short_seal` invariant (1.7.0). Confirm records a range's slices past the tape's end as `pending`, never `written`. Fix: as for `completed_past_ending`. |
+| `range_not_one_run` | warning | `` volume "<label>" has <n> writes recorded `range` whose `written` slices are not one unbroken run: a volume holds at most one unbroken range of a stage set, so this catalog does not say which slices the tape holds `` | A `short_seal` invariant (1.7.0, ADR-0012 item 122). Fix: as for `completed_past_ending`. |
+| `range_without_written_slice` | warning | `` volume "<label>" has <n> writes recorded `range` with no slice `written`: a range is the slices the tape holds, and a write whose tape holds none of its set has no row `` | A `short_seal` invariant (1.7.0). Fix: as for `completed_past_ending`. |
 | `span_in_progress` | warning | `` v<n> is a span still in progress: slices <runs> of <total> are on no sealed volume yet, and <label> (slices <a>-<b>) holds the rest. The version stays `staged`, and counts no copy, until every slice is on a sealed volume `` | From 1.7.0 (ADR-0012 item 128). A Version of a unit that spans cartridges is on tape in part: some of its slices are on sealed volumes, others are not yet on any. That is the normal state between two tapes of a span, not damage. Until the last slice is on a sealed volume the Version stays `staged`, `copy_count` does not count it, and the retire floor protects the tapes that hold its only copy of a slice. With several holders the message lists each with its run and says they "hold the rest"; with none, "no sealed volume holds a written slice of it". Fix: load a fresh cartridge and run `tapectl volume write <LABEL>`, as the `fix:` line says: it writes the slices the span still owes first. |
 
 ---
@@ -3655,7 +3416,7 @@ checkout and re-run from that step:
 - **A check that failed although the thing it checked was fine.** Checks of
   the form `cmd | grep -q X` fail under `pipefail` when `grep` exits early:
   `cmd` dies of SIGPIPE, and the pipeline reports failure. That is how a
-  correct dar 2.7.21 was reported as "not 2.7.21". Fixed. Such checks now read
+  correct tool version was reported as the wrong one. Fixed. Such checks now read
   their whole input.
 
 For anything else, the step that stopped says why, and

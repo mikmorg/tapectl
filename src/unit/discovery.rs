@@ -224,9 +224,9 @@ mod tests {
             archive_set: archive_set.map(|s| s.to_string()),
             checksum_mode: Some("mtime_size".to_string()),
             compression: Some("none".to_string()),
+            compression_level: None,
             slice_size: None,
             warehouse_copies: None,
-            allow_spanning: None,
             copies_at: None,
             exclude_patterns: vec![],
         };

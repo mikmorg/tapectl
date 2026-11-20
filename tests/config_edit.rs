@@ -1124,7 +1124,7 @@ fn config_check_notes_what_a_loadable_config_lacks_at_exit_0() {
         "problems",
         "tape_devices",
         "staging",
-        "dar",
+        "tar",
         "defaults",
         "ops",
     ] {
@@ -1170,4 +1170,45 @@ fn config_check_notes_what_a_loadable_config_lacks_at_exit_0() {
             .any(|l| l.starts_with("collection \"movies\" cannot run: tenant \"family\"")),
         "{n:?}"
     );
+}
+
+/// #571, ADR-0012 item 298: `config check` warns when a restore of what the
+/// config stages would hold more memory than the host has, and the warning is
+/// advisory (exit 0, `config: valid` still the first line). The figure is
+/// forced with a `slice_size` no host's memory holds, compressed (twice it),
+/// so the test does not depend on how much memory the machine has; the
+/// decision itself is tested through the pure function
+/// (`restore_memory_warning`) with the available memory passed in.
+#[test]
+fn config_check_warns_when_a_restore_would_hold_more_than_the_hosts_memory() {
+    let home = home();
+    let h = home.path();
+    // The defaults (1G, uncompressed) fit any host this suite runs on.
+    let quiet = String::from_utf8_lossy(&ok(h, &["--json", "config", "check"]).stdout).to_string();
+    let quiet: serde_json::Value = serde_json::from_str(&quiet).unwrap();
+    assert_eq!(quiet["restore_memory"], serde_json::json!([]), "{quiet}");
+
+    ok(h, &["config", "set", "defaults.slice_size", "1T"]);
+    ok(h, &["config", "set", "defaults.compression", "zstd"]);
+    let out = ok(h, &["config", "check"]);
+    let human = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(human.starts_with("config: valid\n"), "{}", text(&out));
+    let line = human
+        .lines()
+        .find(|l| l.starts_with("warning: a restore of slices of 1.00 TiB"))
+        .unwrap_or_else(|| panic!("{human}"));
+    for want in [
+        "holds up to 2.00 TiB in memory",
+        "compressed frame",
+        "MemAvailable",
+        "[defaults] slice_size = 1T",
+    ] {
+        assert!(line.contains(want), "{want}: {line}");
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&ok(h, &["--json", "config", "check"]).stdout).unwrap();
+    assert_eq!(json["valid"], true, "{json}");
+    let lines = json["restore_memory"].as_array().unwrap();
+    assert_eq!(lines.len(), 1, "{json}");
+    assert_eq!(lines[0].as_str().unwrap(), line, "human and --json agree");
 }

@@ -15,7 +15,6 @@ pub mod evidence;
 pub mod lenient_config;
 pub mod reclaimable;
 pub mod shadowing;
-pub mod subsumed;
 pub mod tape_alerts;
 pub mod tenancy;
 pub mod unknown_keys;
@@ -28,23 +27,21 @@ pub struct ResolvedPolicy {
     pub required_locations: Vec<String>,
     pub encrypt: bool,
     pub compression: String,
+    /// Item 287: the level `compression` packs at, resolved through the same
+    /// three layers as `compression` (the most specific that sets it wins).
+    /// `None`: the algorithm's own default. Judged against the resolved
+    /// algorithm where a slice is packed (`staging::pack`).
+    pub compression_level: Option<i64>,
     pub checksum_mode: String,
     pub slice_size: i64,
     pub verify_interval_days: Option<i64>,
     pub preserve_xattrs: bool,
     pub preserve_acls: bool,
-    pub preserve_fsa: bool,
     pub dirty_on_metadata_change: bool,
     /// ADR-0006: how many recorded WAREHOUSE deposits this unit should
     /// carry, on top of its tape copies. 0 (the default) means none are
     /// expected and `audit` says nothing about warehouses for this unit.
     pub warehouse_copies: i64,
-    /// #478 (ADR-0012 item 82): whether the unit may span tapes by its
-    /// slices. Off unless a layer turns it on (`[defaults]` is false when
-    /// the key is absent). Read at use, like every field here: a write that
-    /// may span must freeze it when it is planned (`writes.may_span`, item
-    /// 121), because the dotfile can change while a span is in progress.
-    pub allow_spanning: bool,
     /// #493 (ADR-0012 items 148, 149, 155, 156): how many copies the unit
     /// should hold at each named location. Empty when no layer sets a
     /// target: the unit then behaves exactly as before 1.7.x.
@@ -54,7 +51,7 @@ pub struct ResolvedPolicy {
     /// `[defaults] copies_at`. Maps never merge across layers: a dotfile that
     /// names only `offsite` drops a `home` its archive set named. An empty
     /// map is a setting too (an explicit "no targets" that hides the layers
-    /// below), as `allow_spanning = false` is a choice and not silence.
+    /// below).
     ///
     /// **An archive set's `required_locations` counts as `{name = 1}` at that
     /// set's layer** (item 156), with the set's own `copies_at` laid over it
@@ -149,6 +146,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         required_locations: Vec::new(),
         encrypt: defaults.encrypt,
         compression: defaults.compression.clone(),
+        compression_level: defaults.compression_level,
         checksum_mode: defaults.checksum_mode.clone(),
         slice_size: crate::staging::parse_size_to_bytes(&defaults.slice_size).map_err(|e| {
             TapectlError::PolicyUnresolvable {
@@ -163,10 +161,8 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         verify_interval_days: Some(defaults.verify_interval_days),
         preserve_xattrs: defaults.preserve_xattrs,
         preserve_acls: defaults.preserve_acls,
-        preserve_fsa: defaults.preserve_fsa,
         dirty_on_metadata_change: defaults.dirty_on_metadata_change,
         warehouse_copies: defaults.warehouse_copies,
-        allow_spanning: defaults.allow_spanning,
         copies_at: defaults.copies_at.clone(),
     };
     // Which layer set `policy.copies_at`, and the names in it that a
@@ -192,8 +188,8 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             .query_row(
                 "SELECT min_copies, required_locations, encrypt, compression, checksum_mode,
                     slice_size, verify_interval_days, preserve_xattrs, preserve_acls,
-                    preserve_fsa, dirty_on_metadata_change, warehouse_copies, allow_spanning,
-                    copies_at, name
+                    dirty_on_metadata_change, warehouse_copies,
+                    copies_at, name, compression_level
              FROM archive_sets WHERE id = ?1",
                 params![as_id],
                 |row| {
@@ -209,10 +205,9 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                         row.get::<_, Option<i64>>(8)?,
                         row.get::<_, Option<i64>>(9)?,
                         row.get::<_, Option<i64>>(10)?,
-                        row.get::<_, Option<i64>>(11)?,
-                        row.get::<_, Option<i64>>(12)?,
-                        row.get::<_, Option<String>>(13)?,
-                        row.get::<_, String>(14)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, Option<i64>>(13)?,
                     ))
                 },
             )
@@ -238,12 +233,11 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             verify_days,
             preserve_xattrs,
             preserve_acls,
-            preserve_fsa,
             dirty_on_meta,
             warehouse_copies,
-            allow_spanning,
             copies_at_json,
             set_name,
+            compression_level,
         ) = row;
 
         if let Some(v) = min_copies {
@@ -274,6 +268,9 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         if let Some(v) = compression {
             policy.compression = v;
         }
+        if compression_level.is_some() {
+            policy.compression_level = compression_level;
+        }
         if let Some(v) = checksum_mode {
             policy.checksum_mode = v;
         }
@@ -289,18 +286,11 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         if let Some(v) = preserve_acls {
             policy.preserve_acls = v != 0;
         }
-        if let Some(v) = preserve_fsa {
-            policy.preserve_fsa = v != 0;
-        }
         if let Some(v) = dirty_on_meta {
             policy.dirty_on_metadata_change = v != 0;
         }
         if let Some(v) = warehouse_copies {
             policy.warehouse_copies = v;
-        }
-        // NULL defers to `[defaults]` (migration 039), never reads as "off".
-        if let Some(v) = allow_spanning {
-            policy.allow_spanning = v != 0;
         }
         // #493: the set's map is its `required_locations` at one copy each,
         // with its own `copies_at` (migration 040; NULL defers) laid over
@@ -430,7 +420,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
 
                 // Issue #213: `checksum_mode`/`compression` used to be
                 // assigned straight through with no validation, so a typo
-                // surfaced hours later as a raw `dar` failure (compression)
+                // surfaced hours later as a raw failure (compression)
                 // or an opaque SQLite CHECK-constraint rejection (checksum
                 // mode) at stage time. Closed-set-validated here, at the
                 // same boundary `config.toml`'s `[defaults]` and
@@ -463,6 +453,12 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                     })?;
                     policy.compression = v;
                 }
+                // Item 287: beside `compression`, the most specific layer
+                // that sets it winning; its range is the resolved
+                // algorithm's, judged where a slice is packed.
+                if section.compression_level.is_some() {
+                    policy.compression_level = section.compression_level;
+                }
                 if let Some(v) = section.slice_size {
                     policy.slice_size = crate::staging::parse_size_to_bytes(&v).map_err(|e| {
                         TapectlError::PolicyUnresolvable {
@@ -474,6 +470,18 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                             ),
                         }
                     })?;
+                    // #562: a multiple of 512 wherever it is set.
+                    if let Some(e) = crate::config::slice_size_block_problem(policy.slice_size) {
+                        return Err(TapectlError::PolicyUnresolvable {
+                            layer: PolicyLayer::Dotfile,
+                            detail: format!(
+                                "unit \"{}\" has an invalid [policy] slice_size in {} \
+                                 (slice_size = {v:?}: {e})",
+                                unit.name,
+                                dotfile_path.display()
+                            ),
+                        });
+                    }
                 }
                 // ADR-0006 / issue #73. Absent means "defer to the archive
                 // set", so there is deliberately no default filled in
@@ -482,11 +490,6 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                 // silently outrank the archive set).
                 if let Some(v) = section.warehouse_copies {
                     policy.warehouse_copies = v;
-                }
-                // #478: absent defers to the archive set; `false` is a
-                // choice, and outranks a set that allows spanning.
-                if let Some(v) = section.allow_spanning {
-                    policy.allow_spanning = v;
                 }
                 // #493 (items 155, 156): present, the dotfile's map replaces
                 // the lower layers' whole; absent, they stand.
@@ -724,7 +727,7 @@ pub fn volume_verify_interval_days(
            JOIN snapshots s ON s.id = w.snapshot_id
            JOIN units u ON u.id = s.unit_id
            LEFT JOIN archive_sets a ON a.id = u.archive_set_id
-          WHERE w.volume_id = ?1 AND w.status <> 'cut'",
+          WHERE w.volume_id = ?1",
         params![volume_id, default_days],
         |r| r.get(0),
     )?)
@@ -997,107 +1000,6 @@ slice_size = "500M"
         let unit = make_unit(Some(as_id), Some(tmp.path().to_str().unwrap().to_string()));
         let p = resolve(&conn, &config, &unit).unwrap();
         assert_eq!(p.warehouse_copies, 4);
-    }
-
-    /// #478 (ADR-0012 item 82): `allow_spanning` resolves dotfile, then
-    /// archive set, then `[defaults]`, off by default, and each layer speaks
-    /// only when it was set: a NULL archive-set column defers, and so does
-    /// a dotfile without the key.
-    #[test]
-    fn allow_spanning_resolves_dotfile_over_archive_set_over_defaults() {
-        let conn = fresh_conn();
-        let dotfile = |text: &str| {
-            let tmp = TempDir::new().unwrap();
-            std::fs::write(tmp.path().join(".tapectl-unit.toml"), text).unwrap();
-            tmp
-        };
-        let resolved = |config: &Config, set: Option<i64>, dir: Option<&TempDir>| {
-            let path = dir.map(|d| d.path().to_str().unwrap().to_string());
-            resolve(&conn, config, &make_unit(set, path))
-                .unwrap()
-                .allow_spanning
-        };
-        conn.execute(
-            "INSERT INTO archive_sets (name, allow_spanning) VALUES ('whole', 0)",
-            [],
-        )
-        .unwrap();
-        let whole = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO archive_sets (name, allow_spanning) VALUES ('span', 1)",
-            [],
-        )
-        .unwrap();
-        let span = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO archive_sets (name, min_copies) VALUES ('silent', 3)",
-            [],
-        )
-        .unwrap();
-        let silent = conn.last_insert_rowid();
-        let off = Config::default();
-        let mut on = Config::default();
-        on.defaults.allow_spanning = true;
-
-        // Off when nothing sets it.
-        assert!(!resolved(&off, None, None), "default off");
-        assert!(
-            !resolved(&off, Some(silent), None),
-            "a NULL column is not on"
-        );
-        // `[defaults]` alone, and through a set that does not say.
-        assert!(resolved(&on, None, None), "defaults alone");
-        assert!(
-            resolved(&on, Some(silent), None),
-            "a NULL archive-set column defers to [defaults], never reads as off"
-        );
-        // The archive set over `[defaults]`, either way.
-        assert!(resolved(&off, Some(span), None), "set on over defaults off");
-        assert!(
-            !resolved(&on, Some(whole), None),
-            "set off over defaults on"
-        );
-        // The dotfile over the archive set over `[defaults]`, either way.
-        let span_here = dotfile("[policy]\nallow_spanning = true\n");
-        let whole_here = dotfile("[policy]\nallow_spanning = false\n");
-        let says_nothing = dotfile("[policy]\nslice_size = \"500M\"\n");
-        assert!(
-            resolved(&off, Some(whole), Some(&span_here)),
-            "dotfile true over set false over defaults false"
-        );
-        assert!(
-            !resolved(&on, Some(span), Some(&whole_here)),
-            "dotfile false over set true over defaults true"
-        );
-        assert!(
-            resolved(&off, Some(span), Some(&says_nothing)),
-            "a dotfile without the key defers to the set"
-        );
-        assert!(
-            resolved(&on, Some(silent), Some(&says_nothing)),
-            "...and through a silent set to [defaults]"
-        );
-    }
-
-    /// #478: a misspelled spanning key in a dotfile makes the unit's policy
-    /// unresolvable, naming the key, rather than reading as "not set"
-    /// (issue #211's rule).
-    #[test]
-    fn resolve_refuses_a_misspelled_allow_spanning_in_a_dotfile() {
-        let conn = fresh_conn();
-        let config = Config::default();
-        for bad in ["allow_span", "allowSpanning"] {
-            let tmp = TempDir::new().unwrap();
-            std::fs::write(
-                tmp.path().join(".tapectl-unit.toml"),
-                format!("[policy]\n{bad} = true\n"),
-            )
-            .unwrap();
-            let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
-            let msg = resolve(&conn, &config, &unit).unwrap_err().to_string();
-            assert!(msg.contains(bad), "{bad}: {msg}");
-            assert!(msg.contains(".tapectl-unit.toml"), "{bad}: {msg}");
-        }
     }
 
     /// A map of location to count, for the `copies_at` tests.
@@ -1633,7 +1535,7 @@ slice_size = "500M"
     /// resolve time -- the same closed-set validation ADR-0012 already
     /// requires for `config.toml [defaults]` and `archive-set create/edit`
     /// -- rather than assigned straight through to surface hours later as a
-    /// raw `dar -z` failure mid-`stage create`.
+    /// raw failure mid-`stage create`.
     #[test]
     fn resolve_rejects_an_invalid_dotfile_compression_value() {
         let conn = fresh_conn();
@@ -1648,7 +1550,7 @@ slice_size = "500M"
 
         let err = resolve(&conn, &config, &unit).expect_err(
             "an invalid [policy] compression must be refused at resolve time (issue #213), \
-             not assigned straight through to surface later as a raw dar failure",
+             not assigned straight through to surface later as a raw failure",
         );
         assert!(err.to_string().contains("compression"), "got: {err}");
     }
@@ -1676,14 +1578,15 @@ slice_size = "500M"
         assert!(err.to_string().contains("checksum_mode"), "got: {err}");
     }
 
-    /// #420: a volume's verify interval is the strictest of the units it
-    /// holds a copy of; a unit the early end of its tape cut is not one of
-    /// them, and a volume holding only cut writes has no interval.
+    /// #420, item 288: a volume's verify interval is the strictest of the
+    /// units it holds a write of: a unit the tape holds a range of binds it
+    /// as a whole one does (its slices are on the tape to be verified), and
+    /// a unit planned and not written, which has no row, does not.
     #[test]
-    fn a_cut_write_gives_its_volume_no_verify_interval() {
+    fn a_range_binds_its_volumes_verify_interval_and_an_unwritten_unit_does_not() {
         use crate::volume::restore::short_tape;
         let t = short_tape::short_tape();
-        // bravo (cut) asks for a far tighter interval than the default.
+        // bravo (a range) asks for a far tighter interval than the default.
         t.conn
             .execute(
                 "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('tight', 7)",
@@ -1698,23 +1601,34 @@ slice_size = "500M"
             .unwrap();
         assert_eq!(
             volume_verify_interval_days(&t.conn, t.volume_id, Some(365)).unwrap(),
-            Some(365),
-            "alpha's, the unit the tape holds whole"
+            Some(7),
+            "bravo's range binds the volume"
         );
-        // The positive control: were bravo's write a copy, its 7 days would
-        // bind the volume.
+        // charlie has no row: its tight interval binds nothing.
         t.conn
-            .execute("UPDATE writes SET status = 'completed'", [])
+            .execute(
+                "UPDATE units SET archive_set_id = (SELECT id FROM archive_sets WHERE name = 'tight')
+                 WHERE name = 'charlie'",
+                [],
+            )
+            .unwrap();
+        t.conn
+            .execute(
+                "UPDATE units SET archive_set_id = NULL WHERE name = 'bravo'",
+                [],
+            )
             .unwrap();
         assert_eq!(
             volume_verify_interval_days(&t.conn, t.volume_id, Some(365)).unwrap(),
-            Some(7)
+            Some(365),
+            "charlie was planned and not written: no row, no interval"
         );
 
-        let cut_only = short_tape::cut_only_tape();
+        let range_only = short_tape::range_only_tape();
         assert_eq!(
-            volume_verify_interval_days(&cut_only.conn, cut_only.volume_id, Some(365)).unwrap(),
-            None
+            volume_verify_interval_days(&range_only.conn, range_only.volume_id, Some(365)).unwrap(),
+            Some(365),
+            "a volume holding only a range still has its interval"
         );
     }
 }

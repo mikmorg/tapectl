@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-volume \- Restore several units from one volume in one pass over the tape
 .SH SYNOPSIS
-\fBtapectl restore volume\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-unit\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-home\fR] [\fB\-\-spool\fR] [\fB\-\-fail\-fast\fR] [\fB\-\-key\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
+\fBtapectl restore volume\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-unit\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-home\fR] [\fB\-\-no\-file\-check\fR] [\fB\-\-fail\-fast\fR] [\fB\-\-key\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
 .SH DESCRIPTION
 Restore several units from one volume in one pass over the tape
 .PP
@@ -21,7 +21,7 @@ Destination directory: each unit is restored into `DIR/<unit name>`, which must 
 \fB\-\-unit\fR \fI<NAME>\fR
 A unit to restore; repeat for several.
 
-Without it, every unit the volume holds whole: on a tape that ended early (a short seal), the units the end cut are named, with a volume that holds each whole, and left out; so is a unit of which the tape holds only a range (a version held across cartridges), with the `restore unit` that reads it. A unit named that the tape does not hold whole is refused before the drive is opened
+Without it, every unit the volume holds a written slice of: a unit of which the tape holds only a range (the one a short seal ended inside, say) is read across cartridges. A unit named that the tape holds nothing of is refused before the drive is opened
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
 Tape device (by\-id path).
@@ -29,9 +29,9 @@ Tape device (by\-id path).
 Defaults to the only configured drive; required when more than one is configured.
 .TP
 \fB\-\-scratch\fR \fI<DIR>\fR
-Where each unit\*(Aqs scratch directory is made (default: inside its own directory).
+Where a repair from another copy keeps what it reads (default: inside each unit\*(Aqs directory).
 
-Where each unit\*(Aqs scratch directory is made, one at a time (removed when that unit ends); defaults to inside the unit\*(Aqs own directory, never the system temp directory
+Where each unit\*(Aqs scratch directory is made, one at a time (removed when that unit ends); defaults to inside the unit\*(Aqs own directory, never the system temp directory. See `restore unit \-\-scratch`
 .TP
 \fB\-\-overwrite\fR
 Restore into unit directories that already hold files, replacing any that collide.
@@ -41,12 +41,12 @@ Without it a unit directory that is not empty is refused before the tape is touc
 \fB\-\-no\-space\-check\fR
 Skip the free\-space check of the whole set.
 
-Skip the free\-space check of the whole set (every restored unit, plus the largest unit\*(Aqs spooled slices)
+Skip the free\-space check of the whole set (every restored unit)
 .TP
-\fB\-\-spool\fR
-Spool every unit\*(Aqs slices to the scratch directory instead of streaming them.
+\fB\-\-no\-file\-check\fR
+Do not hash every restored file on disk once tar has ended.
 
-Spool every unit\*(Aqs slices to the scratch directory instead of streaming them into dar (see `restore unit \-\-spool`)
+See `restore unit \-\-no\-file\-check`
 .TP
 \fB\-\-fail\-fast\fR
 Stop at the first unit that fails; the units after it are not attempted.

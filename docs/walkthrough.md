@@ -94,7 +94,7 @@ tapectl initialized at ~/.tapectl
   config:   ~/.tapectl/config.toml
   escrow:   age1eykxeg5equrmykz4a9xa98ak0qamfhgsy4qn5mlc4zr3m0w2kahqp3xx8a
             (the SECRET was printed above — transcribe it now onto paper; ADR-0005)
-  dar:      dar (found at /usr/bin/dar)
+  tar:      tar (GNU tar) 1.35 (found at /usr/bin/tar)
 
 next steps:
   a tenant, whose data is archived    tapectl tenant add <TENANT>
@@ -141,7 +141,7 @@ tapectl config check
 ```text
 config: valid
 home: ~/.tapectl (this account's ~/.tapectl)
-dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
+tar: tar (GNU tar) 1.35 at '/usr/bin/tar' (meets the writer's floor, GNU tar 1.35 with ACL support)
 staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
 note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst`
@@ -310,9 +310,9 @@ snapshot created: work/invoices-2024 v1 (2 files, 219 B)
 ## 7. Stage
 
 `stage create` does the expensive work: it reads every file, checks that it still
-matches the snapshot and records its sha256, runs `dar` over the unit, encrypts the
-archive to the tenant's, the operator's and the escrow keys, and writes the encrypted
-**slices** to staging. It also leaves a short **stage report** for each unit (its
+matches the snapshot and records its sha256, runs GNU tar over the unit's exact file list and checks the stream
+as it passes, cuts it into **slices** at file boundaries, encrypts each to the tenant's, the
+operator's and the escrow keys, and writes the encrypted slices to staging. It also leaves a short **stage report** for each unit (its
 slices' sizes and hashes) in `~/.tapectl/stage-reports/`. A unit whose version waits
 in staging for a copy it is still owed is **staged**.
 
@@ -331,10 +331,10 @@ staging photos/2020-garden (3 of 4)
 staged photos/2020-garden (stage set 3)
 staging work/invoices-2024 (4 of 4)
 staged work/invoices-2024 (stage set 4)
-staged: family/letters (1 slice, 1.1 KiB dar, 1.8 KiB encrypted)
-staged: photos/2019-italy (1 slice, 1.1 MiB dar, 1.1 MiB encrypted)
-staged: photos/2020-garden (1 slice, 587.3 KiB dar, 588.2 KiB encrypted)
-staged: work/invoices-2024 (1 slice, 1.1 KiB dar, 1.7 KiB encrypted)
+staged: family/letters (1 slice, 1.1 KiB stream, 1.8 KiB encrypted)
+staged: photos/2019-italy (1 slice, 1.1 MiB stream, 1.1 MiB encrypted)
+staged: photos/2020-garden (1 slice, 587.3 KiB stream, 588.2 KiB encrypted)
+staged: work/invoices-2024 (1 slice, 1.1 KiB stream, 1.7 KiB encrypted)
 
 volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
   photos/2019-italy v1: 1 slice, 1.1 MiB
@@ -649,8 +649,8 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
-  tapectl-1.9.1    the program that made this kit, …, sha256 … (named on the sheet)
-note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/v1.9.1/tapectl-1.9.1-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
+  tapectl-X.Y.Z    the program that made this kit, …, sha256 … (named on the sheet)
+note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/vX.Y.Z/tapectl-X.Y.Z-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -662,8 +662,8 @@ still to do, and only you can do it:
 ```
 
 The kit also carries a copy of the tapectl program that made it (the fourth file, with
-its size and sha256 on the cover sheet), so the heir's one tool for reading around a
-damaged slice does not depend on a repository still existing.
+its size and sha256 on the cover sheet), so the heir's one tool that reads a tape the way tapectl does
+(and asks for the next cartridge of a unit that spans) does not depend on a repository still existing.
 
 Regenerate it after every write session. The escrow secret opens every tape ever
 written, old and new; what goes stale is the kit's encrypted catalog, which lists only
@@ -711,7 +711,7 @@ tapectl initialized at ~/.tapectl
   database: ~/.tapectl/tapectl.db
   config:   ~/.tapectl/config.toml
   escrow:   adopted age1eykxeg5equrmykz4a9xa98ak0qamfhgsy4qn5mlc4zr3m0w2kahqp3xx8a (imported — its secret lives on the heir kit, not here)
-  dar:      dar (found at /usr/bin/dar)
+  tar:      tar (GNU tar) 1.35 (found at /usr/bin/tar)
 
 next steps:
   …
@@ -725,7 +725,7 @@ rebuilt from volume "L8-0002" (uuid 9c3e2533-2b67-4d1d-ae22-def47129577b), 3 env
   inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
             4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
   cartridge "L8-0002" registered from this tape's own identity and bound
-  dar catalogues: 4 stage sets got theirs back from the operator envelope, so a copy written from them carries it again
+  file tables: 4 stage sets got theirs (and the id map) back from the operator envelope, so a copy written from them carries them again
   cross-volume index: this tape names 1 other volume this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); load each and run `tapectl catalog rebuild --from-volume --key <key>`:
     L8-0001  (uuid 45ae9801-8301-457d-847c-0b70c09177e7; cartridge serial E01010L8_1775794348; LTO-8; sealed 2026-11-05T03:42:07Z)
       family: family/letters v1

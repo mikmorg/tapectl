@@ -1212,10 +1212,10 @@ pub(crate) mod tests {
         conn.last_insert_rowid()
     }
 
-    // ── migration 023, to the #227/#264 standard ──
+    // ── the journal's schema, to the #227/#264 standard ──
 
     #[test]
-    fn migration_023_creates_the_journal_with_its_columns_and_indexes() {
+    fn the_journal_has_its_columns_and_indexes() {
         let conn = crate::db::open_memory().unwrap();
         let cols: Vec<(String, String, i64, Option<String>)> = {
             let mut stmt = conn.prepare("PRAGMA table_info(log_page_journal)").unwrap();
@@ -1298,7 +1298,7 @@ pub(crate) mod tests {
         );
 
         let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
-        assert!(report.integrity_ok, "integrity_check after 023");
+        assert!(report.integrity_ok, "integrity_check on a fresh catalog");
         assert!(report.issues.is_empty(), "{:?}", report.issues);
     }
 
@@ -2708,8 +2708,8 @@ pub(crate) mod tests {
     /// The real offline decoder over every fixture's bytes reproduces the
     /// recorded decode exactly — proving the decode argv (`--pdt=1`
     /// especially) is the one the fixtures were made with. It touches no
-    /// device (`--in=FILE`). sg3-utils is not a test dependency (only dar is,
-    /// `tests/test_dependencies.rs`), so without `sg_logs` this says so and
+    /// device (`--in=FILE`). sg3-utils is not a test dependency (only tar and the
+    /// compressors are, `tests/test_dependencies.rs`), so without `sg_logs` this says so and
     /// returns.
     ///
     /// The recorded text is the oracle only for the decoder that made it:

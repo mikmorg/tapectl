@@ -100,7 +100,8 @@
 #            --keep             (keep the run directory even when green)
 #
 # Needs: mhvtl loaded, sudo, the `tapectl` service user (first-run.sh step 5
-# creates it when absent), dar, age, lsscsi, mtx, mt, python3, cargo.
+# creates it when absent), GNU tar 1.35 or later with ACL support (step 2's floor), setfacl, age,
+# lsscsi, mtx, mt, python3, cargo.
 # Exit: 0 green, 1 a check failed (the run directory is kept), 2 a
 # precondition failed (nothing was written).
 set -uo pipefail
@@ -150,9 +151,18 @@ for f in /dev/tape/by-id/*XYZZY*-nst; do
 done
 [ "$IS_MHVTL" = 1 ] || die "$DEVICE ($DEV_REAL) is not an mhvtl drive (no /dev/tape/by-id/*XYZZY*-nst names it) — refusing"
 grep -q '^mhvtl ' /proc/modules || die "mhvtl module not loaded — systemctl start mhvtl.target"
-for bin in lsscsi mtx mt dar age sha256sum python3 cargo flock sudo; do
+for bin in lsscsi mtx mt tar setfacl age sha256sum python3 cargo flock sudo; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
+# Step 2 of first-run.sh holds the writer's tar to GNU tar 1.35 built with ACL support and dies
+# under --auto when it is below; say so here, before the build, not at step 2.
+TAR_FIRST="$(tar --version </dev/null 2>&1 | head -1)"
+case "$TAR_FIRST" in "tar (GNU tar) "*) ;; *) die "tar on PATH is '$TAR_FIRST': tapectl 2.0.0 writes with GNU tar 1.35 or later (first-run.sh --tar names another)" ;; esac
+python3 - "${TAR_FIRST#tar (GNU tar) }" <<'PY' || die "tar on PATH is '$TAR_FIRST', below GNU tar 1.35, the writer's floor (ADR-0012 item 274); build one into /usr/local or give first-run.sh --tar"
+import sys
+v = tuple(int(x) for x in sys.argv[1].split()[0].split(".")[:2] if x.isdigit())
+sys.exit(0 if v >= (1, 35) else 1)
+PY
 id "$SVC_USER" >/dev/null 2>&1 || die "no '$SVC_USER' service user — run scripts/first-run.sh --from 5 --to 5 once, or create it"
 sudo -n true 2>/dev/null || die "sudo needs a password here; first-run.sh and the catalog reads need non-interactive sudo"
 # The positive control only means something if this shell is NOT already at the
@@ -199,7 +209,7 @@ DGEN="$DGEN"
 OPERATOR="$USER"
 WORK_DIR="$RUN/work"
 STAGING_DIR="$RUN/staging"
-DAR_BIN="$(command -v dar)"
+TAR_BIN="$(command -v tar)"
 BACKUP_DIR="$RUN/backups"
 KIT_OUT="$RUN/kit"
 LOCATIONS=(

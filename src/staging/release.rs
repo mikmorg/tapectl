@@ -4,7 +4,7 @@
 //!
 //! `clean_staging` stays policy-free (ADR-0012's #244 amendment): it knows
 //! which stage sets are safe to delete (a completed write, and every other
-//! row completed or `cut`), not which are *worth* deleting. This module is
+//! row completed), not which are *worth* deleting. This module is
 //! the gate in front of it. Two
 //! callers share it: `collection run`'s batch (via
 //! `collection::batch::release_if_covered`) and `volume write` / `volume
@@ -26,12 +26,11 @@
 //! all-or-nothing rule wrote two covered units a third time, held back by a
 //! third unit that was short.
 //!
-//! A `cut` write (1.6.0, issue #420; ADR-0012 item 112) is no write here: a
-//! stage set planned past where its tape sealed short. It never counts as a
-//! copy (`copy_count_expr` counts only `completed` writes), so a cut unit is
-//! short and keeps its staging; and it never holds the staging either
-//! (`clean_staging`'s guard skips it), so once the version has a `completed`
-//! write elsewhere it is released by the same rule as any other.
+//! A stage set the tape was planned to take and did not (ADR-0012 item 288)
+//! has no row. It never counts as a copy (`copy_count_expr` counts only
+//! `completed` writes), so its unit is short and keeps its staging; and once
+//! the version has a `completed` write elsewhere it is released by the same
+//! rule as any other.
 //!
 //! A stage set that holds a `range` (1.7.0, issue #478; ADR-0012 items 85,
 //! 121 and 129) is released slice by slice instead, each slice once its
@@ -156,8 +155,8 @@ pub struct ReleaseOutcome {
 ///
 /// The release itself is `clean_staging(force = false, CleanScope::Units)`
 /// over the covered units, so its own guard still applies and is what keeps
-/// a set that has no completed write — or any write that is neither
-/// `completed` nor `cut` — staged. This function adds the policy question
+/// a set that has no completed write — or any write that is not
+/// `completed` (or a `range`) — staged. This function adds the policy question
 /// that guard cannot answer (issue #229's second half): after one copy of a
 /// unit whose floor is 2, the guard passes vacuously (one `writes` row,
 /// `completed`) and would release the only cheap route to the second copy.
@@ -552,7 +551,7 @@ pub fn under_copied_units(
 /// or `volume resume` of that volume has just put on tape, and so the units
 /// [`release_if_covered`] must judge together. A `range` write (1.7.0, issue
 /// #478; ADR-0012 item 121) put some of its set's slices on the tape, and
-/// those slices may now have their copies (item 129). A `cut` one put none.
+/// those slices may now have their copies (item 129).
 ///
 /// This is a lookup, not a decision: it says which units the gate looks at
 /// and which stage sets `clean_staging` is allowed to consider, never
@@ -708,12 +707,21 @@ pub(crate) mod fixtures {
         .unwrap();
     }
 
-    /// `staged`'s stage set cut from the volume `label`, which sealed short
-    /// with `ended_after` (1.6.0, ADR-0012 item 112): a `cut` row on a
-    /// `sealed` volume whose `ended_after` is set, the only shape the spec
-    /// allows a `cut` row in.
-    pub(crate) fn cut_from(conn: &Connection, staged: &Staged, label: &str, ended_after: i64) {
-        add_write(conn, staged, label, "sealed", "cut");
+    /// A `sealed` volume `label` whose tape ended after `ended_after`, with
+    /// `staged`'s stage set planned onto it and not written: no `writes` row
+    /// (ADR-0012 item 288; before it a `cut` row said so).
+    pub(crate) fn sealed_short_without(
+        conn: &Connection,
+        _staged: &Staged,
+        label: &str,
+        ended_after: i64,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES (?1, 'lto', 'p', 10485760, 'sealed')",
+            params![label],
+        )
+        .unwrap();
         conn.execute(
             "UPDATE volumes SET ended_after = ?2, sealed_at = datetime('now') WHERE label = ?1",
             params![label, ended_after],
@@ -772,8 +780,8 @@ pub(crate) mod fixtures {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-             SELECT ?1, ?2, id, 'range', 1 FROM volumes WHERE label = ?3",
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT ?1, ?2, id, 'range' FROM volumes WHERE label = ?3",
             params![staged.stage_set_id, staged.snapshot_id, label],
         )
         .unwrap();
@@ -1103,134 +1111,6 @@ mod tests {
 
     // --- `cut` (1.6.0, issue #420; ADR-0012 item 112) ---
 
-    /// A `cut` write is never a copy, even of a version that reads
-    /// `current`, so it never makes a unit covered and never releases its
-    /// staging. The positive control is the same row `completed`: one copy,
-    /// at the floor, released.
-    #[test]
-    fn a_cut_write_is_never_a_copy_and_keeps_the_staging() {
-        let conn = db::open_memory().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let config = config(dir.path(), 1);
-        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
-        let s = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
-        cut_from(&conn, &s, "V-SHORT", 9);
-
-        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
-
-        assert!(
-            out.cleaned.is_none(),
-            "a cut is not a copy: nothing released"
-        );
-        assert_eq!(
-            out.under_copied
-                .iter()
-                .map(|p| p.describe())
-                .collect::<Vec<_>>(),
-            ["unit testlib/alpha has 0 copies, needs 1"]
-        );
-        assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
-        assert!(s.file.exists(), "the next volume write reads these slices");
-
-        conn.execute("UPDATE writes SET status = 'completed'", [])
-            .unwrap();
-        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
-        assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
-        assert_eq!(out.cleaned.expect("released").sets_cleaned, 1);
-        assert!(!s.file.exists());
-    }
-
-    /// The cut unit is written whole on another cartridge, and from then on
-    /// it is released by the same rule as any other: the `cut` row does not
-    /// hold the staging the way an unfinished write would.
-    #[test]
-    fn a_cut_set_is_released_once_its_version_is_completed_elsewhere() {
-        let conn = db::open_memory().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let config = config(dir.path(), 1);
-        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
-        let s = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
-        cut_from(&conn, &s, "V-SHORT", 9);
-        add_write(&conn, &s, "V-NEXT", "sealed", "completed");
-
-        assert_eq!(unit_ids_written_to(&conn, "V-NEXT").unwrap(), [alpha]);
-        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
-
-        assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
-        let cleaned = out.cleaned.expect("released");
-        assert_eq!((cleaned.sets_cleaned, cleaned.files_removed), (1, 1));
-        assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
-        assert!(!s.file.exists());
-    }
-
-    /// The shape a short seal leaves when a unit's newer version is the one
-    /// cut: version 1 is written and current, version 2 was cut and is
-    /// still `staged`. The unit is covered by version 1, so the gate passes
-    /// and version 1's staging goes; version 2's stays for the next write.
-    #[test]
-    fn a_cut_newer_version_stays_staged_while_the_written_one_is_released() {
-        let conn = db::open_memory().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let config = config(dir.path(), 1);
-        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
-        let v1 = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
-        let v2 = staged_version(&conn, alpha, 2, "staged", dir.path(), 0);
-        cut_from(&conn, &v2, "V-SHORT", 9);
-
-        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
-
-        assert!(out.under_copied.is_empty(), "v1 alone is current");
-        assert_eq!(out.cleaned.expect("released").sets_cleaned, 1);
-        assert_eq!(stage_set_status(&conn, v1.stage_set_id), "cleaned");
-        assert_eq!(stage_set_status(&conn, v2.stage_set_id), "staged");
-        assert!(v2.file.exists());
-    }
-
-    /// A batch whose write sealed short holds a unit with no copy at all --
-    /// its only version was cut, so it has no `current` snapshot and reads
-    /// 0, never NULL. Judged together, per unit (ADR-0012 item 217): the
-    /// written unit is released and the cut one keeps its staging, named.
-    /// `volume write` judges only the units it completed on the volume
-    /// (`unit_ids_written_to`), which leaves the cut one out.
-    #[test]
-    fn a_cut_unit_judged_with_a_written_one_keeps_only_its_own_staging() {
-        let conn = db::open_memory().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let config = config(dir.path(), 1);
-        let t = tenant(&conn);
-        let alpha = unit(&conn, t, "testlib/alpha");
-        let beta = unit(&conn, t, "testlib/beta");
-        let a = staged_version(&conn, alpha, 1, "staged", dir.path(), 0);
-        let b = staged_version(&conn, beta, 1, "staged", dir.path(), 0);
-        add_write(&conn, &a, "V-SHORT", "sealed", "completed");
-        conn.execute(
-            "UPDATE snapshots SET status = 'current' WHERE id = ?1",
-            params![a.snapshot_id],
-        )
-        .unwrap();
-        cut_from(&conn, &b, "V-SHORT", 9);
-
-        let out = release_if_covered(&conn, &config, &[alpha, beta]).unwrap();
-
-        assert_eq!(
-            out.under_copied
-                .iter()
-                .map(|p| p.describe())
-                .collect::<Vec<_>>(),
-            ["unit testlib/beta has 0 copies, needs 1"]
-        );
-        assert_eq!(out.released_units, ["testlib/alpha"]);
-        assert!(!a.file.exists());
-        assert!(b.file.exists(), "the cut unit's staging stays");
-        assert_eq!(stage_set_status(&conn, b.stage_set_id), "staged");
-
-        assert_eq!(
-            unit_ids_written_to(&conn, "V-SHORT").unwrap(),
-            [alpha],
-            "the cut unit is not one the short-sealed volume was written for"
-        );
-    }
-
     // --- `range` (1.7.0, issue #478; ADR-0012 items 121, 127-129) ---
 
     fn files_exist(files: &[std::path::PathBuf]) -> Vec<bool> {
@@ -1464,46 +1344,37 @@ mod tests {
         );
     }
 
-    /// A set with no `range` row releases exactly as in 1.6.0, whether or
-    /// not its write was planned spannable: whole, every path cleared, no
+    /// A set with no `range` row releases whole: every path cleared, no
     /// `released_at` set, nothing in `slices`.
     #[test]
-    fn a_set_with_no_range_row_releases_exactly_as_in_1_6_0() {
-        for may_span in [0, 1] {
-            let conn = db::open_memory().unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let config = config(dir.path(), 1);
-            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
-            let (s, files) = staged_span(&conn, alpha, 1, "current", dir.path(), 3);
-            add_write(&conn, &s, "V-ONE", "sealed", "completed");
-            conn.execute("UPDATE writes SET may_span = ?1", params![may_span])
-                .unwrap();
+    fn a_set_with_no_range_row_releases_whole() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 1);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let (s, files) = staged_span(&conn, alpha, 1, "current", dir.path(), 3);
+        add_write(&conn, &s, "V-ONE", "sealed", "completed");
 
-            let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
-            let cleaned = out.cleaned.expect("released");
-            assert_eq!(
-                (cleaned.sets_cleaned, cleaned.files_removed),
-                (1, 3),
-                "may_span={may_span}"
-            );
-            assert!(out.slices.slices_released.is_empty() && out.slices.files_removed == 0);
-            assert_eq!(files_exist(&files), [false; 3]);
-            let (paths, released): (i64, i64) = conn
-                .query_row(
-                    "SELECT COUNT(staging_path), COUNT(released_at) FROM stage_slices",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!((paths, released), (0, 0), "may_span={may_span}");
-            assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
-        }
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+        let cleaned = out.cleaned.expect("released");
+        assert_eq!((cleaned.sets_cleaned, cleaned.files_removed), (1, 3));
+        assert!(out.slices.slices_released.is_empty() && out.slices.files_removed == 0);
+        assert_eq!(files_exist(&files), [false; 3]);
+        let (paths, released): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(staging_path), COUNT(released_at) FROM stage_slices",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((paths, released), (0, 0));
+        assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
     }
 
     /// `unit_ids_written_to` counts a `range` write as a write to the tape,
     /// and still never a `cut` one.
     #[test]
-    fn unit_ids_written_to_includes_range_writes_and_never_cut_ones() {
+    fn unit_ids_written_to_includes_range_writes_and_never_an_unwritten_set() {
         let conn = db::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let t = tenant(&conn);
@@ -1512,7 +1383,7 @@ mod tests {
         let (a, _f) = staged_span(&conn, alpha, 1, "staged", dir.path(), 3);
         let b = staged_version(&conn, beta, 1, "staged", dir.path(), 0);
         range_on(&conn, &a, "V-T1", 1..=2);
-        cut_from(&conn, &b, "V-T1", 9);
+        sealed_short_without(&conn, &b, "V-T1", 9);
         assert_eq!(unit_ids_written_to(&conn, "V-T1").unwrap(), [alpha]);
     }
 

@@ -16,13 +16,13 @@ tapectl stage [OPTIONS] <COMMAND>
 - [`for-location`](#tapectl-stage-for-location) — Stage what a location needs, packed into one volume bound there
 - [`list`](#tapectl-stage-list) — List the stage sets held in staging, with each version's copies
 - [`clean`](#tapectl-stage-clean) — Release staged slices from disk
-- [`info`](#tapectl-stage-info) — Show a version's newest stage set: its dar, sizes and slices
+- [`info`](#tapectl-stage-info) — Show a version's newest stage set: its tar, sizes and slices
 
 ### tapectl stage create
 
 Archive and encrypt each unit's newest snapshot into staging
 
-Each unit's sources are hashed as dar reads them once, and dar's archive is cut into slices and age-encrypted in memory: no plaintext reaches staging. Several units may be named; `--jobs` stages that many at once. Every name is checked before any unit is staged. Under --json, an array of one object per unit, printed only when every unit was staged.
+GNU tar archives each unit's files from its snapshot's exact list; its stream is checked and hashed as it passes, cut into slices of whole files, packed alone when compressed and age-encrypted in memory: no plaintext reaches staging. Several units may be named; `--jobs` stages that many at once. Every name is checked before any unit is staged. Under --json, an array of one object per unit, printed only when every unit was staged.
 
 Exit status: 0 = every unit staged; 2 = a unit failed or was refused (the error names each unit staged, failed and not started).
 
@@ -113,7 +113,7 @@ tapectl stage clean [OPTIONS]
 
 ### tapectl stage info
 
-Show a version's newest stage set: its dar, sizes and slices
+Show a version's newest stage set: its tar, sizes and slices
 
 ```text
 tapectl stage info [OPTIONS] --version <VERSION> <NAME>

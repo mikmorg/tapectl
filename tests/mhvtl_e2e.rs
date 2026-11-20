@@ -26,8 +26,8 @@ use tapectl::config::{Config, LtoBackendConfig, StagingConfig, TapectlPaths};
 use tapectl::store::{Evidence, MismatchKind, Store, TapeStore, Tier};
 use tapectl::volume::format::{self, ParsedIndexEntry};
 use tapectl::volume::layout::{
-    generate_front_index, generate_id_thunk_v2, generate_restore_script_v2, generate_seal_marker,
-    generate_system_guide_v2, FrontIndexFile, IdThunkV2Params,
+    generate_front_index, generate_id_thunk_v2, generate_seal_marker, generate_system_guide_v2,
+    FrontIndexFile, IdThunkV2Params,
 };
 use tapectl::volume::layout_model::{CapacityBudget, ContentSource, Layout, LayoutEntry, ZoneKind};
 use tapectl::{db, staging, tenant, unit, volume};
@@ -130,16 +130,6 @@ fn tape_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-// Config::default() points at /opt/dar/bin/dar; on dev VMs dar lives in /usr/bin.
-fn find_dar() -> String {
-    for p in ["/opt/dar/bin/dar", "/usr/local/bin/dar", "/usr/bin/dar"] {
-        if Path::new(p).exists() {
-            return p.into();
-        }
-    }
-    "dar".into()
-}
-
 /// Ensure a GENERATION-MATCHED cartridge is loaded (issue #111).
 ///
 /// This used to issue a bare `mtx load 1` — whatever is in slot 1, which on a
@@ -234,10 +224,11 @@ fn setup_mhvtl(name: &str) -> Harness {
 
     let conn = db::open(&paths.db_file).unwrap();
 
-    let mut config = Config::default();
-    config.dar.binary = find_dar();
-    config.staging = StagingConfig {
-        directory: staging_dir.to_string_lossy().into_owned(),
+    let mut config = Config {
+        staging: StagingConfig {
+            directory: staging_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
         ..Default::default()
     };
     config.defaults.slice_size = "50M".into();
@@ -331,7 +322,7 @@ fn add_unit(
 /// Like `add_unit`, but also drops one distinctively-named file into the
 /// unit's source directory before staging. The v2 leak-scan leg (T9 leg 2,
 /// `volume-format-v2.md` sec 2's isolation invariant) needs a real source
-/// FILENAME to travel through dar's catalog so it can assert that filename
+/// FILENAME to travel through the file table so it can assert that filename
 /// never surfaces in plaintext — not just tenant/unit names. `.pdf` is
 /// deliberate: it must not collide with the default staging excludes
 /// (`*.nfo`, `*.tmp`, `Thumbs.db`, `.DS_Store`) or it would silently vanish
@@ -495,7 +486,7 @@ fn mhvtl_full_round_trip() {
 
     let dest = h.root.path().join("restored-alice");
     restore_to(&h, "alice-unit", label, &dest);
-    // dar is invoked with -R <unit_path>, so extracted files land directly in dest.
+    // The restore extracts relative to the destination, so files land directly in dest.
     assert!(
         diff_recursive(h.source(1), &dest),
         "restored content differs from source"
@@ -822,7 +813,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     let _g = tape_lock();
 
     // Use names/filenames with no plausible substring collision against the
-    // volume label, tapectl boilerplate, or dar/age headers. If any of these
+    // volume label, tapectl boilerplate, or tar/age headers. If any of these
     // strings (or an expected sha256_plain digest) show up in a plaintext
     // file on tape, isolation is broken.
     let label = "MHVTLI";
@@ -919,8 +910,8 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     let id_text = std::str::from_utf8(&id_thunk).expect("id thunk utf8");
     assert!(id_text.contains(label));
     assert!(
-        id_text.contains("tapectl-volume-v2"),
-        "id thunk must carry the v2 magic"
+        id_text.contains("magic = \"tapectl-volume-v3\""),
+        "id thunk must carry the Layout 3 magic"
     );
     let total_files = parse_i32_field(id_text, "total_files").expect("total_files");
     let front_index_pos = parse_i32_field(id_text, "front_index").expect("front_index");
@@ -1434,7 +1425,7 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_good_tape() {
     let script_text = extract_restore_sh(&tape_dev(), BLOCK_SIZE, &script_path);
     assert!(
         script_text.contains("--verify"),
-        "extracted File 2 does not look like RESTORE.sh v2 (no --verify mode found)"
+        "extracted File 2 does not look like RESTORE.sh (no --verify mode found)"
     );
 
     let output = run_restore_sh_verify(&script_path, &tape_dev());
@@ -1445,8 +1436,8 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_good_tape() {
         "RESTORE.sh --verify must PASS on a good tape\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("VERIFY: PASS"),
-        "expected a VERIFY: PASS line, got:\n{stdout}"
+        stdout.contains("VERIFY PASSED"),
+        "expected a VERIFY PASSED line (tests/heir_restore.rs asserts it), got:\n{stdout}"
     );
 }
 
@@ -1487,7 +1478,7 @@ fn write_hand_corrupted_volume(device: &str, block_size: usize, label: &str) -> 
         cartridge_identity_source: None,
     });
     let guide_text = generate_system_guide_v2(label, TOTAL_FILES);
-    let restore_text = generate_restore_script_v2(label, TOTAL_FILES);
+    let restore_text = tapectl::volume::heir::RESTORE_SH.to_string();
 
     // Two data slices; arbitrary bytes are fine — `--verify`/`chain_walk`
     // never attempts decryption, only ciphertext-hash comparison
@@ -1759,18 +1750,18 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position() {
         "RESTORE.sh --verify must FAIL on the hand-corrupted tape\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        !stdout.contains("VERIFY: PASS"),
-        "must not print VERIFY: PASS on a corrupted tape:\n{stdout}"
+        !stdout.contains("VERIFY PASSED") && stdout.contains("VERIFY FAILED: 1 file(s)"),
+        "must print VERIFY FAILED, never VERIFY PASSED, on a corrupted tape:\n{stdout}"
     );
 
-    // Per-file lines are `printf "FAIL  file %3d  %-24s  ..."` — token 0 is
-    // "FAIL", token 1 is "file", token 2 is the position. Parsed rather than
+    // Per-file lines are `FAIL     5  data_slice  ...` — token 0 is "FAIL",
+    // token 1 is the position. Parsed rather than
     // matched as an exact-width substring so this isn't brittle to printf's
     // padding.
     let fail_positions: Vec<i32> = stdout
         .lines()
         .filter(|l| l.trim_start().starts_with("FAIL"))
-        .filter_map(|l| l.split_whitespace().nth(2))
+        .filter_map(|l| l.split_whitespace().nth(1))
         .filter_map(|s| s.parse::<i32>().ok())
         .collect();
     assert!(
@@ -2072,16 +2063,16 @@ fn swap_cartridge(d: &MhvtlDevices, unload: &str, load: &str) {
 /// (planned after). Then, over the real tape:
 /// - `volume write` seals short and returns Ok (exit 0): the event names K,
 ///   `volumes.ended_after` is K, K is a slice of `sb-cut` before its last,
-///   the rows are completed/completed/cut/cut, and end of data is right
+///   the rows are completed/completed/range (sc-after has none), and end of data is right
 ///   after the seal at K+1, which states it;
 /// - `volume verify` (full) passes, reading the seal at K+1;
-/// - RESTORE.sh with the real `mt`, `dd`, `age`, `dar` and `tar`: `--info`
+/// - RESTORE.sh with the real `mt`, `dd`, `age` and `tar`: `--info`
 ///   says SEALED and where the tape ended, `--verify` passes with NOT ON
 ///   TAPE for the files after K, a whole unit restores byte for byte, and
-///   the cut unit is refused by name before any slice is read;
+///   the range unit restores what the tape holds and lists the rest;
 /// - tapectl restores the whole unit;
-/// - the cut units go whole onto a second cartridge with an ordinary
-///   `volume write`, which seals full, and `sb-cut` restores from it.
+/// - the owed slices of `sb-cut` and `sc-after` go onto a second cartridge
+///   with an ordinary `volume write`, which seals full (item 288).
 #[test]
 #[ignore]
 fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
@@ -2171,9 +2162,9 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
         [
             ("op-unit".to_string(), "completed".to_string()),
             ("sa-whole".to_string(), "completed".to_string()),
-            ("sb-cut".to_string(), "cut".to_string()),
-            ("sc-after".to_string(), "cut".to_string()),
-        ]
+            ("sb-cut".to_string(), "range".to_string()),
+        ],
+        "sc-after was planned after the warning and has no row (item 288)"
     );
 
     // The tape: the short seal at K+1, and nothing after it.
@@ -2210,18 +2201,18 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
     let info = restore_sh(&script, &tape_dev(), &["--info"]);
     let out = String::from_utf8_lossy(&info.stdout);
     assert!(info.status.success(), "{info:?}");
-    assert!(out.contains("Verdict: SEALED"), "{out}");
     assert!(
-        out.contains(&format!("The tape ended early, after file {k}:")),
+        out.contains(&format!("Seal marker: present (file {})", k + 1)),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("this tape ended EARLY, after file {k}.")),
         "{out}"
     );
     let verify = restore_sh(&script, &tape_dev(), &["--verify"]);
     let out = String::from_utf8_lossy(&verify.stdout);
     assert!(verify.status.success(), "{verify:?}");
-    assert!(
-        out.contains("VERIFY: PASS — every file on this tape matches the front index. The tape ended early, after"),
-        "{out}"
-    );
+    assert!(out.contains("VERIFY PASSED: "), "{out}");
     // One line for the planned files after the end (ADR-0012 item 140).
     assert!(
         out.contains(&format!("NOT ON TAPE  files {} to ", k + 1)),
@@ -2270,29 +2261,38 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
         String::from_utf8_lossy(&refused.stdout),
         String::from_utf8_lossy(&refused.stderr)
     );
+    // Layout 3: the script restores what this tape holds of the unit, leaves
+    // out the members of the slices it does not hold, lists them, and says the
+    // restore is incomplete (item 264; tests/heir_restore.rs asserts these
+    // texts). It never reports a part as the whole.
     assert!(
         !refused.status.success(),
-        "the cut unit must be refused: {said}"
+        "a unit this tape holds in part is no whole restore: {said}"
     );
     for want in [
-        "unit 'sb-cut'",
-        "is not on this tape whole: the tape ended early,",
-        "--where 'sb-cut'",
-        "No slice has been read.",
+        "NOT ON THIS CARTRIDGE: slices ",
+        " of 13 of unit sb-cut (version 1)",
+        "RESTORE INCOMPLETE: 2 path(s)",
     ] {
         assert!(said.contains(want), "{want:?} not in: {said}");
     }
-    assert!(
-        fs::read_dir(&heir_cut).map_or(true, |mut d| d.next().is_none()),
-        "nothing of the cut unit is restored"
-    );
+    let damaged = fs::read_to_string(heir_cut.join(".tapectl-damaged-files.txt"))
+        .expect("the damaged-file list is written in --to");
+    for name in ["forty-megs.bin", "small.txt"] {
+        assert!(
+            damaged.lines().any(|l| l == name),
+            "{name} is on the damaged-file list: {damaged}"
+        );
+    }
 
     // tapectl restores the whole unit.
     let dest = root.join("tapectl-sa-whole");
     restore_to(&h, "sa-whole", label, &dest);
     assert!(diff_recursive(&src_whole, &dest));
 
-    // The cut units, whole, on a second cartridge.
+    // The owed slices of sb-cut and sc-after, on a second cartridge (item
+    // 288: every unit continues; nothing is rewritten whole). T5.1 could not
+    // run this on mhvtl: the coordinator checks this half on the tape.
     let (first, second) = cartridge_slots(&devs);
     swap_cartridge(&devs, &first, &second);
     let _ = Command::new("mt")
@@ -2324,34 +2324,21 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
             true,
         )
     })();
-    let dest = root.join("tapectl-sb-cut");
-    let restored = second_write.and_then(|()| {
-        fs::create_dir_all(&dest).unwrap();
-        volume::restore::restore_unit(
-            &h.conn,
-            &h.paths,
-            &h.config,
-            "sb-cut",
-            label2,
-            &dest.to_string_lossy(),
-            &tape_dev(),
-            BLOCK_SIZE,
-            None,
-            false,
-            &volume::restore::RestoreOptions::default(),
-        )
-    });
     // The first cartridge back in the drive, whatever happened.
     swap_cartridge(&devs, &second, &first);
-    restored.expect("the cut unit written whole to a second cartridge, and restored from it");
-    assert!(diff_recursive(&src_cut, &dest));
+    second_write.expect("the rest of the staged sets is written to a second cartridge");
+    // The home's copy floor is the default 2, so every slice is still owed:
+    // the whole units have one copy, sb-cut's slices 1 to 7 one and the rest
+    // none. sb-cut's owed run is then its whole set, from its lowest owed
+    // slice, and the second cartridge is item 93's middle tape: it holds
+    // every set whole (ADR-0012 items 93, 122 and 288; plan T5.1, "The plan,
+    // exactly").
     let on_second = write_statuses(&h.conn, label2);
-    for unit in ["sb-cut", "sc-after"] {
-        assert!(
-            on_second.contains(&(unit.to_string(), "completed".to_string())),
-            "{unit} on {label2}: {on_second:?}"
-        );
-    }
+    let expected: Vec<(String, String)> = ["op-unit", "sa-whole", "sb-cut", "sc-after"]
+        .iter()
+        .map(|u| (u.to_string(), "completed".to_string()))
+        .collect();
+    assert_eq!(on_second, expected, "the rows on {label2}");
     let ended_after2: Option<i64> = h
         .conn
         .query_row(
@@ -2443,7 +2430,7 @@ fn synthetic_unit(
         set_id,
         &[
             ("snapshot_id", Value::Integer(snapshot)),
-            ("total_dar_size", Value::Integer(size as i64)),
+            ("stream_bytes", Value::Integer(size as i64)),
             ("total_encrypted_size", Value::Integer(size as i64)),
         ],
     );
@@ -2460,6 +2447,20 @@ fn synthetic_unit(
             ("staging_path", text(&slice.to_string_lossy())),
         ],
     );
+    // A write refuses a unit with no file table (item 265, §1.6), so the copy
+    // carries the source's file table and id map: this test is about the end
+    // of the cartridge, never about what the slices hold.
+    for table in [
+        "stage_files (stage_set_id, seq, kind, slice, path_id, size, sha256, start, \"end\", link_path_id) \
+         SELECT ?2, seq, kind, slice, path_id, size, sha256, start, \"end\", link_path_id FROM stage_files",
+        "stage_ids (stage_set_id, kind, id, name) SELECT ?2, kind, id, name FROM stage_ids",
+    ] {
+        conn.execute(
+            &format!("INSERT INTO {table} WHERE stage_set_id = ?1"),
+            rusqlite::params![set_id, set],
+        )
+        .unwrap();
+    }
 }
 
 /// **A seal lost past the cartridge's end never seals** (#420; plan §5, the

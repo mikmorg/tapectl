@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-archive\-set\-edit \- Edit an existing archive set (flags left out are left unchanged)
 .SH SYNOPSIS
-\fBtapectl archive\-set edit\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-checksum\-mode\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-slice\-size\fR] [\fB\-\-home\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-\-preserve\-xattrs\fR] [\fB\-\-preserve\-acls\fR] [\fB\-\-preserve\-fsa\fR] [\fB\-\-dirty\-on\-metadata\-change\fR] [\fB\-\-allow\-spanning\fR] [\fB\-\-copies\-at\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl archive\-set edit\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-compression\-level\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-checksum\-mode\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-\-slice\-size\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-\-preserve\-xattrs\fR] [\fB\-\-preserve\-acls\fR] [\fB\-\-dirty\-on\-metadata\-change\fR] [\fB\-\-copies\-at\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Edit an existing archive set (flags left out are left unchanged)
 .SH OPTIONS
@@ -21,7 +21,14 @@ Each must be a registered location (`tapectl location add`).
 Encryption enabled (true/false)
 .TP
 \fB\-\-compression\fR \fI<MODE>\fR
-Compression mode
+Compression mode: none, gzip, xz or zstd
+
+Each slice is packed alone, after the cut and before it is encrypted.
+.TP
+\fB\-\-compression\-level\fR \fI<N>\fR
+Compression level (gzip 1\-9, xz 0\-9, zstd 1\-19)
+
+Never set means the algorithm\*(Aqs own default (gzip 6, xz 6, zstd 3).
 .TP
 \fB\-\-checksum\-mode\fR \fI<MODE>\fR
 Checksum mode
@@ -40,25 +47,17 @@ Never set means "defer to the system default".
 \fB\-\-preserve\-xattrs\fR \fI<BOOL>\fR
 Keep extended attributes (true/false)
 
-And the POSIX ACLs stored as them; false drops them all.
+tar\*(Aqs \-\-xattrs; the raw POSIX ACL attribute is never among them.
 .TP
 \fB\-\-preserve\-acls\fR \fI<BOOL>\fR
-Keep POSIX ACLs (true/false; with \-\-preserve\-xattrs)
+Keep POSIX ACLs (true/false)
 
-No effect of its own: ACLs are kept or dropped with the extended attributes they are stored as.
-.TP
-\fB\-\-preserve\-fsa\fR \fI<BOOL>\fR
-Keep filesystem attributes, chattr flags (true/false)
+tar\*(Aqs \-\-acls: the text ACL record, every entry by number.
 .TP
 \fB\-\-dirty\-on\-metadata\-change\fR \fI<BOOL>\fR
 A metadata change makes a unit dirty (true/false)
 
 Not read yet: dirty detection compares path, size and mtime only.
-.TP
-\fB\-\-allow\-spanning\fR \fI<BOOL>\fR
-Units may span tapes by their slices (true/false)
-
-From tapectl 1.7.0. Never set means "defer to [defaults]", which is off.
 .TP
 \fB\-\-copies\-at\fR \fI<NAME=N>\fR
 Copies at a location, NAME=N (repeatable)

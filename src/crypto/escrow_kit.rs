@@ -1021,55 +1021,52 @@ if that lists one unit, only that unit is restored and nothing
 is said of the rest of the tape. --list first shows what the
 tape holds.
 
-A restore needs free disk space of about one unit's size where
---to points (all of them together, with --all): RESTORE.sh
-streams each slice from the tape through age into dar, so only
-the restored files are written. It measures this before it
-reads any slice. Decrypted slices are kept on disk only for
---path (one file or folder) and for a dar older than 2.7.9 (or
-than 2.7.21, for a unit with no catalogue); --scratch DIR puts
-those on another disk. A tape written by tapectl before 1.1.0
-carries an older script that decrypts every slice first and
-needs about twice that. Do not restore into /tmp, which is RAM
-on many systems.
+A restore needs free disk space of about the size of the units
+restored, where --to points (all of them together, with --all),
+and room for about two slices more in a work directory that
+RESTORE.sh makes inside --to; --work DIR puts it on another
+disk. --list prints each unit's size. RESTORE.sh measures this
+before it reads any slice. It reads one slice at a time, checks
+it, decrypts it, decompresses it if the unit was compressed, and
+gives it to tar. Do not restore into /tmp, which is RAM on many
+systems.
 
-IF RESTORE.sh STOPS: \"dar extraction failed (exit 0)\"
------------------------------------------------------
-The RESTORE.sh on a tape written before tapectl 1.7.0 can end a
-unit of many files this way, just after dar's own summary. If
-that summary says 0 inode(s) failed to restore, it is a known
-fault of that script, fixed in tapectl 1.7.0, and not damage:
-the unit's files are restored and sound. age checked every byte
-dar read, and dar stopped only before the archive's own index
-at its end, which it does not need. With --all the script
-stops at that unit: restore each unit it did not reach on its
-own, with --unit NAME and a new, empty --to folder (--list
-names the units).
+IF RESTORE.sh LISTS FILES IT LEFT OUT
+-------------------------------------
+A slice that is not on the tape in the drive, or that fails a
+check, is left out. Nothing is filled in with zeros: every other
+file is restored, and the files left out are written to
+.tapectl-damaged-files.txt in the restored folder. A unit that
+continues on another cartridge asks for that cartridge at a
+prompt: load it and press ENTER; type done if you do not have
+it, or quit to stop. The files left out are restored from
+another copy of the same unit (another cartridge that holds it),
+with that list:
 
-If `./RESTORE.sh --help` lists --slices-from, adding
---slices-from DIR with an empty folder DIR restores the unit
-with every slice and file checked (it needs room for the
-unit's slices too). If not, tapectl reads the whole tape
-without this fault, every slice checked. In a new, empty
-folder for its home (export TAPECTL_HOME=/recovery/home):
+    ./RESTORE.sh --restore \\
+        --paths-from ./out/UNIT/.tapectl-damaged-files.txt \\
+        --key escrow.key --to ./out/UNIT
 
-    tapectl init --operator ANY_NAME --escrow-public-key \\
-        {key}
+After a restore, RESTORE.sh hashes every restored file against
+the unit's file table. That check decides what was restored, not
+tar's exit status.
+
+IF YOU HAVE tapectl: THE SAME RECOVERY WITHOUT THE SCRIPT
+---------------------------------------------------------
+tapectl reads a tape of Layout 3 without RESTORE.sh, and reads
+around a damaged chunk of a slice, which the script cannot. Give
+it a home first, as step 5 of WHAT TO DO FIRST says (an init
+that adopts the identity above), then:
+
     tapectl catalog rebuild --from-volume --device /dev/nst0 \\
         --key escrow.key
     tapectl restore volume --device /dev/nst0 --to ./out \\
         --key escrow.key
 
-IF dar SAYS \"Bad CRC\" BUT EVERY SLICE SAID \"checksum verified\"
---------------------------------------------------------------
-The tape is sound. dar misreads some archives when it is fed
-their slices through pipes, as RESTORE.sh's restore does, and
-then reports files it got wrong (\"Bad CRC, data corruption
-occurred\", \"invalid FSA ... flag\"). Restore those files from
-slices on disk instead. If the script wrote a list of damaged
-files and printed a --fill-from command, run that command with
-the SAME tape still loaded: the fill reads the slices to disk
-first. Otherwise use --slices-from or tapectl, as above.
+A tape of Layout 2, written by an earlier tapectl, carries its
+own RESTORE.sh and guide with other options: use that tape's
+own files (File 0 says which layout it is), not the commands on
+this sheet.
 
 WHAT ELSE IS IN THIS ENVELOPE
 -----------------------------
@@ -1102,17 +1099,17 @@ WHAT TO DO FIRST
    RESTORE.sh checks for its tools before it reads the tape and
    names any that is missing. It needs:
      mt     package mt-st (it can set the tape's block size)
-     dd, head, truncate, tar, mkfifo, tee, sha256sum
-            standard on Linux (coreutils, tar)
+     dd, head, tail, truncate, tar, sha256sum
+            standard on Linux (coreutils, tar). Any tar reads the
+            tape; it need not be GNU tar.
      age    age-encryption.org. The files are in the stable age v1
             format, which the `age` program and `rage` both read.
             RESTORE.sh runs a program named `age`: if you have
             only rage, link it under that name.
-     dar    dar.linux.free.fr. 2.7.9 or later needs the least
-            disk space (see above).
-     gpg    package gnupg, only if your dar was built with GPG
-            support (Debian's and Ubuntu's is): that dar refuses
-            to start without it.
+     gzip, xz, zstd
+            only for a unit that was stored compressed (its guide
+            and RECOVERY.md say which one): the one it names,
+            packages gzip, xz-utils and zstd.
 
    If every read of a tape fails with an I/O error, and tapectl
    crashed or was killed on that machine just before, switch the
@@ -1120,13 +1117,31 @@ WHAT TO DO FIRST
    drive's block-protection check on; a power cycle clears it.
    Nothing on the tape is harmed.
 
-4. If you do have tapectl, the first commands are:
+4. Reading File 0 of a tape needs a block size set first, or
+   `dd` answers \"Cannot allocate memory\":
 
-       tapectl restore raw-volume --device /dev/nst0 --to ./out
+       mt -f /dev/nst0 setblk 524288
+       dd if=/dev/nst0 bs=512k | tr -d '\\0'
+
+   /dev/nst0 is only an example: `ls -l /dev/tape/by-id/` lists
+   the drives you have.
+
+5. If you do have tapectl, give it a home of its own FIRST, with
+   this archive's escrow identity. Every command but `init`
+   stops without one, and a plain `tapectl init` would make a
+   NEW escrow identity that no tape knows, with a new secret:
+   never run it here without --escrow-public-key.
+
+       export TAPECTL_HOME=/recovery/home
+       tapectl init --operator ANY_NAME --escrow-public-key \\
+           {key}
+
+   Then these two commands need no key and no catalog that knows
+   the tape. The first prints File 0 of the loaded tape, the
+   second copies every file off the tape as it is:
+
        tapectl volume identify --device /dev/nst0
-
-   The first works with no database at all. /dev/nst0 is only an
-   example: `ls -l /dev/tape/by-id/` lists the drives you have.
+       tapectl restore raw-volume --device /dev/nst0 --to ./out
 {program_hint}
 {warehouse}CUSTODY -- FOR WHOEVER MAINTAINS THIS
 -------------------------------------
@@ -1248,7 +1263,7 @@ fn program_entry(p: Option<&ProgramFact>, s: Option<&StaticFact>) -> String {
     out
 }
 
-/// What step 4 of WHAT TO DO FIRST adds when the kit carries tapectl.
+/// What step 5 of WHAT TO DO FIRST adds when the kit carries tapectl.
 fn program_hint(p: Option<&ProgramFact>, s: Option<&StaticFact>) -> String {
     let Some(p) = p else {
         return String::new();
@@ -2229,74 +2244,102 @@ mod tests {
         }
     }
 
-    /// #497, ADR-0012 item 178: tapes written before 1.7.0 keep a RESTORE.sh
-    /// that ends a big unit `dar extraction failed (exit 0)` after a whole
-    /// restore. The sheet names it, says the files are sound, and gives a
-    /// checked way that works on every such tape: `--slices-from` only where
-    /// the script offers it (1.3.0 on; keepsake's tapes are 1.1.0), else
-    /// tapectl, whose commands are real ones.
+    /// Layout 3's restore, as the sheet tells it (T4.14): a slice that fails a
+    /// check or is not on the tape is left out and listed, nothing is zero
+    /// filled, the one repair is `--paths-from` from another copy, and the
+    /// per-file check decides. None of dar's words, nor a spelling the script
+    /// no longer has, remains.
     #[test]
-    fn the_cover_sheet_says_what_dar_extraction_failed_exit_0_means() {
+    fn the_cover_sheet_tells_layout_3s_damage_handling() {
         let txt = render_cover_text(&facts_for(&[], &[]));
         let prose = flat(&txt);
         for required in [
-            "IF RESTORE.sh STOPS: \"dar extraction failed (exit 0)\"",
-            "0 inode(s) failed to restore",
-            "a known fault of that script, fixed in tapectl 1.7.0, and not damage",
-            "the unit's files are restored and sound",
-            "With --all the script stops at that unit",
-            "If `./RESTORE.sh --help` lists --slices-from",
+            "IF RESTORE.sh LISTS FILES IT LEFT OUT",
+            "Nothing is filled in with zeros",
+            ".tapectl-damaged-files.txt",
+            "asks for that cartridge at a prompt",
+            "type done if you do not have it, or quit to stop",
+            "another copy of the same unit",
+            "That check decides what was restored, not tar's exit status",
+            "A tape of Layout 2",
+            "IF YOU HAVE tapectl: THE SAME RECOVERY WITHOUT THE SCRIPT",
         ] {
             assert!(prose.contains(required), "missing {required:?}");
         }
+        assert!(
+            txt.contains(
+                "./RESTORE.sh --restore \\\n        \
+                 --paths-from ./out/UNIT/.tapectl-damaged-files.txt \\\n        \
+                 --key escrow.key --to ./out/UNIT"
+            ),
+            "the repair is the one RESTORE.sh has"
+        );
         for command in [
-            "tapectl init --operator ANY_NAME --escrow-public-key \\",
-            "tapectl catalog rebuild --from-volume --device /dev/nst0 \\",
-            "tapectl restore volume --device /dev/nst0 --to ./out \\",
+            "tapectl catalog rebuild --from-volume --device /dev/nst0 \\\n        --key escrow.key",
+            "tapectl restore volume --device /dev/nst0 --to ./out \\\n        --key escrow.key",
         ] {
             assert!(txt.contains(command), "missing {command:?}");
         }
+        for gone in [
+            "--slices-from",
+            "--swap-tapes",
+            "--fill-from",
+            "--stream-tapes",
+            "--scratch",
+            "--spool",
+            "Bad CRC",
+        ] {
+            assert!(!prose.contains(gone), "{gone:?} is not in Layout 3's sheet");
+        }
         assert!(
-            txt.contains(&format!("--escrow-public-key \\\n        {ESCROW}\n")),
-            "init is given this archive's escrow identity"
+            !prose
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| w.eq_ignore_ascii_case("dar")),
+            "dar is not in Layout 3's sheet"
         );
     }
 
-    /// #498: dar misreads some archives through the pipes a streamed restore
-    /// feeds it, and reports files it got wrong while every slice's checksum
-    /// matched. The sheet says the tape is sound and sends the heir to a read
-    /// from slices on disk: the fill with the same tape, `--slices-from`, or
-    /// tapectl.
+    /// #524: step 4 gives File 0's two commands (the block size, then `dd`
+    /// at 512 KiB); the tapectl step starts with `init --operator NAME
+    /// --escrow-public-key ...` with this archive's identity, says what a
+    /// plain `init` would mint, and no longer says any command works "with
+    /// no database at all".
     #[test]
-    fn the_cover_sheet_says_bad_crc_over_verified_slices_is_not_the_tape() {
-        let prose = flat(&render_cover_text(&facts_for(&[], &[])));
+    fn the_cover_sheet_reads_file_0_and_starts_tapectl_with_the_identity() {
+        let txt = render_cover_text(&facts_for(&[], &[]));
+        let prose = flat(&txt);
+        assert!(txt.contains("mt -f /dev/nst0 setblk 524288"), "{txt}");
+        assert!(txt.contains("dd if=/dev/nst0 bs=512k"), "{txt}");
+        assert!(prose.contains("Cannot allocate memory"));
+        assert!(!prose.contains("no database at all"), "the false claim");
+        let init = txt
+            .find("tapectl init --operator ANY_NAME --escrow-public-key \\\n")
+            .expect("the first tapectl command is init with the identity");
+        let raw = txt.find("restore raw-volume").unwrap();
+        assert!(init < raw, "init comes before every other tapectl command");
+        assert!(
+            txt[init..].contains(&format!("\\\n           {ESCROW}\n")),
+            "init is given this archive's escrow identity"
+        );
         for required in [
-            "IF dar SAYS \"Bad CRC\" BUT EVERY SLICE SAID \"checksum verified\"",
-            "The tape is sound.",
-            "dar misreads some archives when it is fed their slices through pipes",
-            "run that command with the SAME tape still loaded",
-            "Otherwise use --slices-from or tapectl, as above.",
+            "a plain `tapectl init` would make a NEW escrow identity that no tape knows",
+            "never run it here without --escrow-public-key",
         ] {
             assert!(prose.contains(required), "missing {required:?}");
         }
     }
 
-    /// Issue #448 item 3: the 1.1.0 restore streams (RESTORE.sh checks for
-    /// about one unit's size, not twice), and `--scratch` matters only for
-    /// `--path` and the old-dar fallback.
+    /// Layout 3's disk space: the units' size and a work directory inside
+    /// `--to` for about two slices, `--work DIR` for another disk; no
+    /// `--scratch`, no dar.
     #[test]
-    fn the_disk_space_paragraph_is_the_streaming_restore_not_the_pre_1_1_0_one() {
+    fn the_disk_space_paragraph_is_layout_3s() {
         let prose = flat(&render_cover_text(&facts_for(&[], &[])));
-        assert!(
-            !prose.contains("twice the unit"),
-            "the pre-1.1.0 'twice the unit's size' is gone"
-        );
         for required in [
-            "about one unit's size",
-            "streams each slice from the tape through age into dar",
-            "only for --path (one file or folder) and for a dar older than 2.7.9",
-            "--scratch DIR puts those on another disk",
-            "A tape written by tapectl before 1.1.0 carries an older script",
+            "about the size of the units restored",
+            "room for about two slices more in a work directory",
+            "--work DIR puts it on another disk",
+            "decompresses it if the unit was compressed",
         ] {
             assert!(prose.contains(required), "missing {required:?}: {prose}");
         }
@@ -2320,7 +2363,7 @@ mod tests {
             assert!(prose.contains(required), "missing {required:?}");
         }
         let start = txt.find("If every read of a tape fails").unwrap();
-        let end = start + txt[start..].find("4. If you do have tapectl").unwrap();
+        let end = start + txt[start..].find("4. Reading File 0").unwrap();
         let step3 = txt.find("3. Every cartridge is SELF-DESCRIBING").unwrap();
         assert!(step3 < start, "the line belongs with step 3, before step 4");
         for line in txt[start..end].lines() {
@@ -2332,14 +2375,13 @@ mod tests {
     }
 
     /// Issue #448 item 4: one tool list, from RESTORE.sh's own prerequisite
-    /// loop. The test READS the loop out of the generated script, so a tool
-    /// added to it and not to the sheet fails here.
+    /// table. The test READS the table out of the script (File 2, one file in
+    /// the tree), so a tool added to it and not to the sheet fails here.
     #[test]
     fn the_tool_list_covers_every_tool_restore_sh_checks_for() {
-        // Since 1.2.0 each RESTORE.sh mode checks its own tools (#449 item 2);
-        // the set `--restore` checks is the union of them all, and the one
-        // list this sheet must cover.
-        let script = crate::volume::layout::generate_restore_script_v2("L6-0001", 3);
+        // Each RESTORE.sh mode checks its own tools; the set `--restore`
+        // checks is the one list this sheet must cover.
+        let script = crate::volume::heir::RESTORE_SH;
         let line = script
             .lines()
             .find(|l| l.starts_with("TOOLS_RESTORE=("))
@@ -2352,14 +2394,15 @@ mod tests {
             .split_whitespace()
             .collect();
         assert!(
-            tools.len() >= 9 && tools.contains(&"mkfifo") && tools.contains(&"tee"),
+            tools.contains(&"age") && tools.contains(&"tar") && tools.contains(&"sha256sum"),
             "parsed the wrong line: {line:?}"
         );
-        assert_eq!(
-            tools,
-            crate::volume::layout::restore_sh_tools(),
-            "the --restore set is the union the table names"
-        );
+        for tool in &tools {
+            assert!(
+                crate::volume::layout::restore_sh_tools().contains(tool),
+                "the script checks for {tool:?}, which the tool table behind File 1 does not name"
+            );
+        }
         let txt = render_cover_text(&facts_for(&[], &[]));
         for tool in &tools {
             assert!(
@@ -2372,13 +2415,15 @@ mod tests {
             "mt package mt-st",
             "stable age v1 format",
             "`age` program and `rage` both read.",
-            "only if your dar was built with GPG support",
+            "only for a unit that was stored compressed",
+            "packages gzip, xz-utils and zstd",
+            "Any tar reads the tape",
         ] {
             assert!(prose.contains(required), "missing {required:?}");
         }
         assert!(
-            !prose.contains("(tar, age, dar)"),
-            "the three-tool list was the drift"
+            !prose.contains("(tar, age, dar)") && !prose.contains("mkfifo"),
+            "the old tool lists were the drift"
         );
     }
 

@@ -69,10 +69,6 @@ pub enum UnitCommands {
         dirty: bool,
     },
 
-    /// Removed in 1.9.0: `unit info` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true)]
-    Status(crate::cli::renamed::Removed),
-
     /// Copy a unit's staged slices, still encrypted, to a directory
     ///
     /// The slices of the unit's newest staged stage set, as they lie in the
@@ -390,8 +386,6 @@ pub fn run(
                 println!("{}", unit_table(&rows, crate::render::terminal_width()));
             }
         }
-
-        UnitCommands::Status(_) => return Err(crate::cli::renamed::refused(&["unit", "status"])),
 
         UnitCommands::Export { unit, to } => {
             crate::cli::operations::export_unit(conn, unit, to, json_output, dry_run)?;
@@ -1121,7 +1115,7 @@ mod tag_tests {
         let dotfile_path = src.join(".tapectl-unit.toml");
         // Hand-set a policy key, to prove the rewrite round-trips it.
         let mut raw = std::fs::read_to_string(&dotfile_path).unwrap();
-        raw.push_str("\n[policy]\nslice_size = \"500M\"\nallow_spanning = false\n");
+        raw.push_str("\n[policy]\nslice_size = \"500M\"\n");
         std::fs::write(&dotfile_path, raw).unwrap();
 
         run_cmd(
@@ -1145,9 +1139,6 @@ mod tag_tests {
             Some("500M"),
             "rewriting the tags must not drop a [policy] key"
         );
-        // #478 (ADR-0012 item 82): an explicit `false` is kept as `false`,
-        // not dropped to "not set".
-        assert_eq!(df.allow_spanning, Some(false), "nor the spanning key");
         let unit = queries::get_unit_by_name(&conn, "photos").unwrap().unwrap();
         assert_eq!(queries::get_tags_for_unit(&conn, unit.id).unwrap(), df.tags);
     }
@@ -1376,9 +1367,9 @@ mod checksum_mode_tests {
                 archive_set: None,
                 checksum_mode: None,
                 compression: None,
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec![],
             },
@@ -1418,9 +1409,9 @@ mod checksum_mode_tests {
                 archive_set: None,
                 checksum_mode: Some("mtime_size".into()),
                 compression: None,
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
-                allow_spanning: None,
                 copies_at: None,
                 exclude_patterns: vec![],
             },

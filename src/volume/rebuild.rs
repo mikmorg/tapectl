@@ -16,12 +16,13 @@
 //! | unit name/uuid, version, slice map, `sha256_plain` | envelope `MANIFEST.toml` | the front index may carry none of it (sacred invariant), and the on-tape `catalog.db` omits `sha256_plain` |
 //! | tenant name per unit | each tenant envelope's manifest | the operator manifest files every unit under the placeholder tenant `"operator"` |
 //! | per-file index, `source_path`, sizes | operator envelope's `catalog.db` (#83), via `db::ontape_catalog` | no manifest carries files |
+//! | each staging's file table and id map | operator envelope's `catalog.db` (`stage_files`, `stage_ids`; `volume-format-v3.md` §1.4), and nowhere else | a tenant envelope's text is for the heir and for a restore given a tenant's key; a second source would give two answers (T4.9, ADR-0012 items 265, 276) |
+//! | a staging's stream length, compression and writer's tar | the same `catalog.db`'s `stage_sets` (item 295), the manifest block as the fallback | a copy's file table and MANIFEST state them |
 //!
-//! `db::ontape_catalog::Generation` is how an old tape's `catalog.db` (no
-//! `tenants`, no `key_fingerprints`, no `sha256_plain`; or, before 1.1.0, no
-//! file kinds or link targets) is told apart from a current one — probed
-//! from the file's actual shape, never from a version number (see that
-//! module's doc for why, and `volume-format-v2.md` §1.4).
+//! The `catalog.db` is read in the one shape this tapectl writes; a file of
+//! any other shape (those written before 1.1.0 among them) is refused,
+//! naming what was found (`db::ontape_catalog::check_shape`,
+//! `volume-format-v3.md` §1.4; ADR-0012 item 258(d)).
 //!
 //! # What it deliberately does not do
 //!
@@ -44,13 +45,15 @@
 //! nothing counts it as a copy. A seal this tapectl must not interpret (an
 //! unknown `requires`) refuses the rebuild instead.
 //!
-//! **A tape that ended early is read by its seal** (#420; `volume-format-v2.md`
-//! §1.2 rule 6, §4.2). The seal is located as the last file when the medium
-//! ends before File 0's pointer ([`locate_and_judge_seal`]), and a short seal
-//! is accepted only on a tape that requires `short-seal`. Its `ended_after`
-//! K is recorded on an inserted volume row, a unit with every slice at or
-//! before K is `completed`, every other is `cut`, positions after K are
-//! `pending`, and nothing after K is read. A full seal rebuilds as before.
+//! **A tape that ended early is read by its seal** (#420; `volume-format-v3.md`
+//! §1.2 rule 6, §5.2). The seal is located as the last file when the medium
+//! ends before File 0's pointer ([`locate_and_judge_seal`]). Its `ended_after`
+//! K is recorded on an inserted volume row, and every block is split by its
+//! positions and the seal (§5.3, ADR-0012 item 288): a staging with every
+//! slice at or before K is `completed`, one with some of them is a `range`,
+//! one with none gets no `writes` row (it was planned and not written, and
+//! its slices stay staged), positions after K are `pending`, and nothing
+//! after K is read. A full seal rebuilds as before.
 //!
 //! **It inserts only what is missing, and never edits what it finds.** Run it
 //! over ten cartridges in any order, twice, and the result is the same
@@ -92,6 +95,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::files as files_db;
 use crate::db::ontape_catalog;
+use crate::db::stage_files as stage_files_db;
+use crate::db::stage_ids as stage_ids_db;
 use crate::error::{Result, TapectlError};
 use crate::store::{Store, TapeStore};
 use crate::volume::envelope::{self, EnvelopeManifest, OpenError, OpenedEnvelope};
@@ -114,14 +119,14 @@ pub struct RebuildReport {
     pub positions: usize,
     pub files: usize,
     pub volume_inserted: bool,
-    /// False when the operator envelope carried no `catalog.db` — a tape
-    /// written before #83. The restore path is fully rebuilt either way;
-    /// what is lost is the per-file index (`catalog list`/`search`) and each
-    /// snapshot's original `source_path`.
+    /// Whether the operator envelope carried `catalog.db`. True on every
+    /// report: a tape without one is refused (ADR-0012 item 258(d)). Kept
+    /// because `catalog rebuild --json` states it.
     pub had_catalog_db: bool,
-    /// True when `catalog.db` carried a `tenants` table (written after the
-    /// 2026-09-11 decision), so ownership came from one file rather than from
-    /// decrypting every tenant envelope.
+    /// Whether ownership came from `catalog.db`'s `tenants` table rather than
+    /// from decrypting every tenant envelope. True on every report: the one
+    /// shape of `catalog.db` this tapectl reads carries it. Kept because
+    /// `catalog rebuild --json` states it.
     pub tenants_from_catalog_db: bool,
     /// Stage sets whose escrow receipt (`key_fingerprints`) rode the tape in
     /// `catalog.db`. For those, #137 does not arise: coverage is recorded,
@@ -258,7 +263,7 @@ pub struct RebuildReport {
     /// catalog holds as `sealed` is told apart from one under `initialized`.
     pub found_volume_status: Option<String>,
 
-    // --- where the tape ended (#420, `volume-format-v2.md` §4.2) -------------
+    // --- where the tape ended (#420, `volume-format-v3.md` §5.1) -------------
     //
     // A 1.6.0 tape may end early, at a short seal; the seal is found by §1.2
     // rule 6 and trusted over the plan.
@@ -267,24 +272,24 @@ pub struct RebuildReport {
     /// for a full seal, and for an unsealed tape. An inserted row records it
     /// as `volumes.ended_after`.
     pub ended_after: Option<u64>,
-    /// Units, as `<unit> v<N>`, that the early end of the tape cut: a slice
-    /// of theirs is planned after [`Self::ended_after`]. Their writes are
-    /// `cut` (ADR-0012 item 112): never a copy, positions after the end not
-    /// `written`. A tape fact, listed whether or not this run inserted rows.
-    pub cut_units: Vec<String>,
-    /// The entries of [`Self::cut_units`] whose block states `may_span`
-    /// (#478): a spannable set the tape holds none of. Unlike a whole unit,
-    /// such a version restores from tapes whose ranges together hold every
-    /// slice, not only from a tape that holds it whole (ADR-0012 items 101
-    /// and 131).
-    pub cut_spanning_units: Vec<String>,
+    /// Units, as `<unit> v<N>`, the tape's plan listed and its early end
+    /// withdrew: every slice of theirs is planned after [`Self::ended_after`].
+    /// They get no `writes` row (ADR-0012 item 288): never a copy here. A tape
+    /// fact, listed whether or not this run inserted rows.
+    pub unwritten_units: Vec<String>,
+    /// The entries of [`Self::unwritten_units`] whose block gives some slice
+    /// no position on this tape (#478): a set the tape holds none of whose
+    /// other slices are planned on other tapes. Such a version restores from
+    /// tapes whose ranges together hold every slice (ADR-0012 items 101 and
+    /// 131).
+    pub unwritten_spanning_units: Vec<String>,
 
     // --- spanning (#478, ADR-0012 items 121, 128 and 130) -------------------
     //
-    // `volume-format-v2.md` §4.4: a block that states `may_span` splits three
-    // ways, as confirm splits the row (`layout-session.md`, "A write that may
-    // span"): `completed` when the tape holds every slice of the set,
-    // `range` when it holds some, `cut` when it holds none.
+    // `volume-format-v3.md` §5.3: a block splits three ways, as confirm
+    // splits the row (`layout-session.md`, "Confirm of a short ending"):
+    // `completed` when the tape holds every slice of the set, `range` when it
+    // holds some, and no row when it holds none.
     /// The spannable sets this tape holds as a range: some, not all, of the
     /// set's slices have a `tape_position` at or before `ended_after` (every
     /// planned position, on a full seal). Their writes are `range`: never a
@@ -303,7 +308,7 @@ pub struct RebuildReport {
     pub versions_promoted: Vec<String>,
     /// The spannable versions on this tape that some slice of is still on
     /// no tape this catalog records, after this run: the to-do list's span
-    /// half (item 130, `volume-format-v2.md` §1.5). Each names the missing
+    /// half (item 130, `volume-format-v3.md` §1.5). Each names the missing
     /// slices and the volumes this tape's cross-volume index says hold them.
     /// Such a version stays `staged` and reads 0 copies until they are
     /// rebuilt (item 128).
@@ -347,8 +352,8 @@ pub struct RebuildReport {
     /// A `cartridge_volumes` mount was opened this run. `false` on an
     /// idempotent re-run that found the volume already mounted to the same
     /// cartridge, and `false` when [`Self::unbound_reason`] is set — a
-    /// legacy tape whose identity File 0 cannot attest is inserted unbound,
-    /// on purpose (do not force one).
+    /// tape whose identity File 0 cannot attest is inserted unbound, on
+    /// purpose (do not force one).
     pub cartridge_bound: bool,
     /// The bound cartridge row had no `serial_number` recorded, and this
     /// contact separately observed one and recorded it (`NULL` → value,
@@ -408,37 +413,37 @@ pub struct RebuildReport {
     /// never flips the status back to `in_use`: no amount of contact makes a
     /// medium declared permanently unfit fit again (ADR-0011).
     pub cartridge_retired: bool,
-    /// Why the volume was inserted with NO cartridge binding at all: File 0
-    /// carries no `[media]` table (pre-ADR-0010), an empty `cartridge_serial`
-    /// (a legacy write with nothing to attest), or a non-empty serial with no
-    /// `cartridge_identity_source` (written in the ADR-0010-to-#192 window —
-    /// UNKNOWN, and never assumed to be `"mam"`; `volume-format-v2.md` §1.1).
+    /// Why the volume was inserted with NO cartridge binding at all: File 0's
+    /// `[media]` records an empty `cartridge_serial` (a write with nothing to
+    /// attest), or a non-empty serial with no `cartridge_identity_source`
+    /// (the writer omits it when the volume's binding recorded none —
+    /// UNKNOWN, and never assumed to be `"mam"`; `volume-format-v3.md` §1.1).
+    /// A File 0 with no `[media]` table is refused, never inserted.
     /// `None` whenever a cartridge WAS resolved (bound, registered, or
     /// refused outright).
     pub unbound_reason: Option<String>,
-    /// Stage sets that got their dar catalogue back this run (issue #473):
-    /// the operator envelope's `catalogs/<uuid8>_v<N>.<k>.dar` files copied
-    /// into `<home>/catalogs/<uuid8>/s<id>/` and `stage_sets.catalog_path`
-    /// set, exactly as `stage create` leaves them — so a copy written after
-    /// `volume read-slices` carries the catalogue in its envelopes again.
-    pub catalogues_restored: usize,
-    /// `<unit> v<N>` of each rebuilt stage set of this volume that has no
-    /// catalogue after this run (issue #473): the operator envelope carried
-    /// none for it (a tape written from a set that had none), it could not be
-    /// placed, or the catalog's home is unknown. Their next copy has no
-    /// catalogue in its envelopes (RESTORE.sh `--list` says so, and `--path`
-    /// is refused); `volume write` says so too. Whole-unit restore is
+    /// Stage sets that got their file table back this run (ADR-0012 item
+    /// 265, #557): the rows of the operator envelope's `catalog.db`
+    /// (`stage_files`, with the `stage_ids` id map of item 276) put into the
+    /// catalog, so a copy written after `volume read-slices` carries the
+    /// table and the map in its envelopes again. A stage set the catalog
+    /// already held a table for is not counted: a found row is never edited.
+    pub tables_restored: usize,
+    /// `<unit> v<N>` of each stage set of this volume that has no file table
+    /// after this run: this tape's `catalog.db` carried none for it (a tape
+    /// no tapectl 2.0.0 wrote). A write refuses it by name until it is
+    /// staged again (item 265); a restore of the unit's whole stream is
     /// unaffected.
-    pub sets_without_catalogue: Vec<String>,
+    pub sets_without_table: Vec<String>,
 
-    // --- the cross-volume index (#418 R4, `volume-format-v2.md` §1.5) -------
+    // --- the cross-volume index (#418 R4, `volume-format-v3.md` §1.5) -------
     //
     // A to-do list, never a source of rows: ADR-0001 has a claim about a tape
     // need contact with that tape, and this tape's index is a claim about
     // other tapes. Nothing below creates or changes a catalog row.
-    /// True when the operator envelope carried the index's `index/units.tsv`
-    /// (a tape written by 1.3.0 or later). A tape without it is read as it
-    /// always was.
+    /// Whether the operator envelope carried the index's `index/units.tsv`.
+    /// True on every report: a tape without it is refused (ADR-0012 item
+    /// 258(d)). Kept because `catalog rebuild --json` states it.
     pub had_index: bool,
     /// Why the index could not be used, when it was there and unreadable. The
     /// rebuild itself is not affected: the index is an aid, and a damaged
@@ -504,12 +509,12 @@ pub struct IndexedUnit {
 }
 
 /// A spannable set this tape holds as a range (#478, ADR-0012 item 121;
-/// `volume-format-v2.md` §4.4): the run of its stage set's slices on the tape.
+/// `volume-format-v3.md` §5.3): the run of its stage set's slices on the tape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuiltRange {
     pub unit: String,
     pub version: i64,
-    /// The lowest slice number of the run (dar's, 1-based).
+    /// The lowest slice number of the run (1-based).
     pub first_slice: i64,
     /// The highest slice number of the run.
     pub last_slice: i64,
@@ -543,8 +548,8 @@ pub struct SpanInProgress {
     pub missing: Vec<i64>,
     /// The volumes other than this tape that this tape's cross-volume index
     /// (`index/units.tsv`, §1.5) names as holding one of [`Self::missing`],
-    /// with the run each holds. Empty when the tape has no index or its
-    /// index names none (a tape never names a tape written after it,
+    /// with the run each holds. Empty when the tape's index is unreadable or
+    /// names none (a tape never names a tape written after it,
     /// ADR-0001).
     pub holders: Vec<SpanHolder>,
 }
@@ -673,7 +678,7 @@ impl RebuildReport {
             && self.positions == 0
             && self.files == 0
             && self.attested == 0
-            && self.catalogues_restored == 0
+            && self.tables_restored == 0
             && !self.cartridge_registered
             && !self.cartridge_bound
             && !self.serial_learned
@@ -849,12 +854,19 @@ fn rebuild_contacted(
     let ident = format::parse_id_thunk_identity(&thunk_text)?;
     let pointers = format::parse_id_thunk_layout_pointers(&thunk_text)?;
     let meta = format::parse_id_thunk_volume_meta(&thunk_text)?;
-    // Absent/malformed `[media]` is an ABSENCE (`format::parse_id_thunk_media`'s
-    // own fail-safe convention), never a reason to fail the rebuild — the
-    // legacy tapes this covers are exactly what issue #165's "insert unbound"
-    // path exists for.
-    let media = format::parse_id_thunk_media(&thunk_text).ok();
-    let identity = classify_media(media.as_ref());
+    // Every File 0 this tapectl writes carries `[media]` (ADR-0010); one
+    // without it, or with one that does not parse, is not a tape this
+    // tapectl reads (ADR-0012 item 258(d)), and is refused before anything
+    // is recorded.
+    let media = format::parse_id_thunk_media(&thunk_text).map_err(|e| {
+        TapectlError::Other(format!(
+            "this tape's File 0 has no readable [media] table ({e}), which every tape this \
+             tapectl writes carries (volume-format-v3.md §1.1): this tapectl does not read \
+             it. RESTORE.sh (tape file 2) with a tenant key or the escrow key still restores \
+             what opens"
+        ))
+    })?;
+    let identity = classify_media(&media);
 
     // Item 4 (issue #165): a `mam`-sourced File 0 that disagrees with a
     // serial THIS CONTACT actually observed is refused before any write.
@@ -936,7 +948,7 @@ fn rebuild_contacted(
     // and after the envelopes (the seal marker is the last file, so reading
     // it earlier would pass the head over the slices twice; `volume::
     // cost_budget` pins the motion). The same read dates the tape (#305).
-    // #420: located by `volume-format-v2.md` §1.2 rule 6, so a tape that
+    // #420: located by `volume-format-v3.md` §1.2 rule 6, so a tape that
     // ended early is read as sealed at its short seal, with `ended_after`.
     let LocatedSeal {
         verdict: seal,
@@ -945,7 +957,7 @@ fn rebuild_contacted(
     } = read_seal(store, &pointers, &thunk_text, &fi, &ident.label);
     if let format::SealVerdict::Refused(why) = &seal {
         // Before the transaction, as every other reader of a tape refuses
-        // one it must not interpret (`volume-format-v2.md` §1.2 rule 1).
+        // one it must not interpret (`volume-format-v3.md` §1.2 rule 1).
         return Err(TapectlError::Other(why.clone()));
     }
     let dates = tape_dates(&thunk_text, &entries, &seal, ended_after);
@@ -960,12 +972,42 @@ fn rebuild_contacted(
                 .to_string(),
         )
     })?;
+    // Every operator envelope this tapectl writes carries `catalog.db` (§1.4)
+    // and the cross-volume index (§1.5). One that lacks either is not a tape
+    // this tapectl reads (ADR-0012 item 258(d)): refused, naming what is
+    // missing, before anything is recorded.
+    let missing: Vec<&str> = [
+        (
+            operator.catalog_db.is_none(),
+            "catalog.db (volume-format-v3.md §1.4)",
+        ),
+        (
+            operator.index_units.is_none(),
+            "cross-volume index (index/units.tsv, volume-format-v3.md §1.5)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(absent, what)| absent.then_some(what))
+    .collect();
+    let Some(catalog_db) = operator
+        .catalog_db
+        .as_deref()
+        .filter(|_| missing.is_empty())
+    else {
+        return Err(TapectlError::Other(format!(
+            "this tape's operator envelope (tape file {}) carries no {}, which every tape this \
+             tapectl writes carries: this tapectl does not read it. RESTORE.sh (tape file 2) \
+             with a tenant key or the escrow key still restores what opens",
+            operator.position,
+            missing.join(" and no ")
+        )));
+    };
 
     let mut report = RebuildReport {
         label: ident.label.clone(),
         uuid: ident.uuid.clone(),
         envelopes_opened: opened.len(),
-        had_catalog_db: operator.catalog_db.is_some(),
+        had_catalog_db: true,
         serial_checked: medium_serial.is_some(),
         // Issue #221: a serial can be learnt at the pre-transaction
         // corroboration above, before `resolve_operator_identity` (which
@@ -984,27 +1026,12 @@ fn rebuild_contacted(
         ..Default::default()
     };
 
-    let supplement = match operator.catalog_db.as_deref() {
-        Some(path) => Supplement::load(path)?,
-        None => Supplement::default(),
-    };
+    let supplement = Supplement::load(catalog_db)?;
     // Issue #451: a tenant envelope that no copy of could be read is not
-    // needed when the operator envelope's `catalog.db` names each unit's
-    // owner (generation 2 or 3): the operator manifest lists every unit and
-    // every slice, and the receipts ride in `catalog.db`. Without that
-    // table the tenant envelopes are the only record of ownership, and the
-    // rebuild would silently file those units under `--tenant`: refuse, as
-    // before.
-    if let Some(first) = unreadable.first() {
-        if !supplement.has_tenants {
-            return Err(TapectlError::Other(format!(
-                "{} A catalog.db this old (or none at all) does not name which tenant owns \
-                 each unit, so the tenant envelopes are the only record of it and the rebuild \
-                 needs every one. Use another copy of this volume; RESTORE.sh (tape file 2) \
-                 with a tenant key or the escrow key still restores what opens.",
-                first.message
-            )));
-        }
+    // needed: the operator envelope's `catalog.db` names each unit's owner,
+    // the operator manifest lists every unit and every slice, and the
+    // receipts ride in `catalog.db`.
+    if !unreadable.is_empty() {
         for u in &unreadable {
             tracing::warn!(
                 position = u.position,
@@ -1017,7 +1044,7 @@ fn rebuild_contacted(
         report.unreadable_tenant_envelopes = unreadable.iter().map(|u| u.describe()).collect();
     }
     let tenant_of = tenant_index(&opened, &supplement);
-    report.tenants_from_catalog_db = supplement.has_tenants;
+    report.tenants_from_catalog_db = true;
 
     // `unchecked_transaction` matches the codebase's convention (session,
     // write, key, operations): the CLI holds a shared `Connection`, and
@@ -1050,7 +1077,7 @@ fn rebuild_contacted(
         &identity,
         medium_serial,
         &meta,
-        media.as_ref(),
+        &media,
         &mut report,
     )?;
     tx.commit()?;
@@ -1080,11 +1107,10 @@ fn rebuild_contacted(
         }
     }
 
-    // Issue #473: the dar catalogues, after the rows are committed (files
-    // placed inside the transaction would be orphaned by a rollback, and
-    // `stage clean` would not know them). Best effort per set: a set that
-    // cannot get its catalogue is named in the report, never a failed rebuild.
-    restore_catalogues(conn, operator, &inserted.sets, &mut report);
+    // Issue #473's catalogues (1.x's archives) are not put back: no Layout 3 envelope
+    // carries one (`volume-format-v3.md` §9). The file table and id map a
+    // rebuild restores come from the operator envelope's `catalog.db`
+    // (§1.4), which is T4.9's to port.
 
     // The cross-volume index (§1.5): after the rows above are committed, so
     // this tape itself is never listed as missing. Read-only on the catalog.
@@ -1106,14 +1132,14 @@ fn rebuild_contacted(
     let attested = attest_escrow(conn, store, identities, &operator.manifest, &mut report);
 
     let tx = crate::db::busy::immediate_tx(conn)?;
-    // A `cut` set (#420) is not counted: it is no copy on this tape, and its
-    // slice header may lie past where the tape ended, so attestation from
-    // this tape is not the remedy for it.
+    // A set the tape did not take (#420, item 288) has no `writes` row and is
+    // not counted: it is no copy on this tape, and its slice header may lie
+    // past where the tape ended, so attestation from this tape is not the
+    // remedy for it.
     report.unknown_remaining = tx.query_row(
         "SELECT COUNT(*) FROM stage_sets ss
          JOIN writes w ON w.stage_set_id = ss.id
-         WHERE w.volume_id = ?1 AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL
-           AND w.status <> 'cut'",
+         WHERE w.volume_id = ?1 AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL",
         params![volume_id],
         |r| r.get(0),
     )?;
@@ -1143,6 +1169,8 @@ fn index_to_do(
     this_uuid: &str,
     report: &mut RebuildReport,
 ) -> Vec<crate::volume::index::UnitsRow> {
+    // Present on every tape this reads: one without is refused before it
+    // gets here.
     let Some(path) = &operator.index_units else {
         return Vec::new();
     };
@@ -1247,8 +1275,8 @@ fn is_this_tape(row: &crate::volume::index::UnitsRow, this_label: &str, this_uui
         || (!row.volume_uuid.is_empty() && row.volume_uuid == this_uuid)
 }
 
-/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v2.md`
-/// §1.5 and §4.4): for each spannable set on this tape, the slices no tape
+/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v3.md`
+/// §1.5 and §5.3): for each spannable set on this tape, the slices no tape
 /// this catalog records holds after this rebuild, and the volumes this tape's
 /// index (`index`, its rows) names as holding them. A version with such a
 /// slice stays `staged` and reads 0 copies until they are rebuilt (item 128).
@@ -1269,7 +1297,7 @@ fn span_to_do(
     this_uuid: &str,
     report: &mut RebuildReport,
 ) {
-    for set in sets.iter().filter(|s| s.may_span) {
+    for set in sets.iter().filter(|s| s.in_part) {
         let copies = match crate::policy::coverage::slice_copies(conn, set.stage_set_id) {
             Ok(copies) => copies,
             Err(e) => {
@@ -1392,11 +1420,11 @@ fn attest_escrow(
     // head and rewinds for one behind it). The manifest lists units in the
     // order they were laid out, so this is normally that order already.
     //
-    // #420 (`volume-format-v2.md` §4.2 R3): on a tape that ended early no
+    // #420 (`volume-format-v3.md` §5.1 R3): on a tape that ended early no
     // position after `ended_after` is read. A unit whose first slice lies
     // past it is not on this tape at all, and stays unknown here.
     //
-    // #478 (ADR-0012 items 125 and 130, `volume-format-v2.md` §4.4 R6): a
+    // #478 (ADR-0012 items 125 and 130, `volume-format-v3.md` §5.3 R6): a
     // slice with no `tape_position` (a range's slice planned on another
     // tape) is not on this tape either, so the slice read is the lowest-
     // numbered one THIS tape holds: slice 1 for a whole unit and for a range
@@ -1491,7 +1519,7 @@ fn attest_escrow(
 /// The operator envelope failing to open is the one case worth a specific
 /// diagnosis, because it is what a tenant key looks like from here.
 ///
-/// Every envelope has a backup copy (`volume-format-v2.md` §1.3: the
+/// Every envelope has a backup copy (`volume-format-v3.md` §1.3: the
 /// operator's since v2's first write, each tenant's since 1.1.0), the same
 /// bytes under the same front-index hash. A backup is opened only when the
 /// envelope it copies could not be — it did not read, did not match the
@@ -1515,7 +1543,7 @@ fn attest_escrow(
 /// `{:04}_{}.bin` shape `raw::dump` uses, so renaming the zone updates this
 /// message instead of silently re-breaking it.
 fn tenant_key_refusal_message() -> String {
-    // Position 2 is fixed by the format itself (`volume-format-v2.md`: 0 ID
+    // Position 2 is fixed by the format itself (`volume-format-v3.md` §1: 0 ID
     // thunk, 1 system guide, 2 RESTORE.sh, 3 front index) and is pinned by
     // `tests/on_tape_golden.rs`, so it is a literal. The LABEL is the half
     // that drifted, so it is derived.
@@ -1545,7 +1573,7 @@ fn tenant_key_refusal_message() -> String {
 }
 
 /// The front-index kinds that are envelopes: every primary and its backup
-/// (`volume-format-v2.md` §1.3).
+/// (`volume-format-v3.md` §1.3).
 fn is_envelope_label(label: &str) -> bool {
     matches!(
         label,
@@ -1742,12 +1770,11 @@ fn open_all_envelopes(
 /// Map each unit's uuid to the tenant that owns it (#527: a unit is its
 /// uuid, never its name).
 ///
-/// From `catalog.db` when it carries `tenants` (tapes written after
-/// 2026-09-11), else from the tenant envelopes — the operator envelope files
-/// every unit under the placeholder tenant `"operator"` and so cannot answer
-/// this. On a new-shape tape the envelopes are still opened (they are how a
-/// tenant key would be refused, and they are cheap), but ownership is taken
-/// from the one file that states it.
+/// From `catalog.db`'s `tenants`, the one file that states it; a unit it
+/// does not name is taken from the tenant envelopes (the operator envelope
+/// files every unit under the placeholder tenant `"operator"` and so cannot
+/// answer this). The envelopes are still opened: they are how a tenant key
+/// would be refused, and they are cheap.
 fn tenant_index(opened: &[OpenedEnvelope], supplement: &Supplement) -> HashMap<String, String> {
     let mut map = supplement.tenant_of.clone();
     for env in opened {
@@ -1785,16 +1812,18 @@ struct Supplement {
     /// (issue #413). A version with no rows on tape has no entry.
     file_snapshot: HashMap<(String, i64), i64>,
     /// The open `catalog.db`, when the tape carries one, and where each
-    /// version's file rows lie in it, whatever its generation.
+    /// version's file rows lie in it.
     db: Option<(Connection, ontape_catalog::FileSpans)>,
     /// unit uuid -> owning tenant name, when `catalog.db` carries `tenants`.
     tenant_of: HashMap<String, String>,
     /// (unit uuid, stage_set_id) -> that stage set's recorded recipient list
     /// JSON, when `catalog.db` carries `stage_sets.key_fingerprints`.
     key_fingerprints: HashMap<(String, i64), String>,
-    /// Whether the `tenants` table was present at all — distinguishes "no
-    /// tenants on this write" from "an older catalog.db".
-    has_tenants: bool,
+    /// (unit uuid, stage_set_id) -> the staging's own row in `catalog.db`:
+    /// the facts a rebuilt stage set records beside its slices (the tar
+    /// stream's length, the compression, the writer's tar), which only the
+    /// catalog knew until Layout 3 put them here (item 295).
+    staging: HashMap<(String, i64), ontape_catalog::StageSetRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -1865,6 +1894,7 @@ impl Supplement {
                 ))
             })?;
             out.slice_size.insert((uuid.clone(), ss.id), slice_size);
+            out.staging.insert((uuid.clone(), ss.id), ss.clone());
             if let Some(fp) = &ss.key_fingerprints {
                 out.key_fingerprints
                     .insert((uuid.clone(), ss.id), fp.clone());
@@ -1872,7 +1902,7 @@ impl Supplement {
         }
 
         // Only where each version's rows lie: `ensure_files` streams them.
-        let spans = ontape_catalog::FileSpans::read(&db, cat.generation)?;
+        let spans = ontape_catalog::FileSpans::read(&db)?;
         out.file_snapshot = snapshot_key
             .into_iter()
             .filter(|(id, _)| spans.contains(*id))
@@ -1880,12 +1910,9 @@ impl Supplement {
             .collect();
         out.db = Some((db, spans));
 
-        out.has_tenants = cat.generation.carries_ownership_and_receipts();
-        if out.has_tenants {
-            for u in &cat.units {
-                if let Some(tname) = tenant_name.get(&u.tenant_id) {
-                    out.tenant_of.insert(u.uuid.clone(), tname.clone());
-                }
+        for u in &cat.units {
+            if let Some(tname) = tenant_name.get(&u.tenant_id) {
+                out.tenant_of.insert(u.uuid.clone(), tname.clone());
             }
         }
 
@@ -1909,9 +1936,13 @@ struct TapeDates {
     sealed_at: Option<String>,
     load_count_at_write: Option<i64>,
     data_files: i64,
+    /// The front index's `sha256_encrypted` for the `restore_sh` entry (an
+    /// unencrypted file: the hash of the script itself). Read from the index
+    /// the rebuild already holds; no tape read (#548, D18).
+    restore_sh_sha256: Option<String>,
 }
 
-/// What `volume-format-v2.md` §1.2 rule 6 found at the end of a tape and
+/// What `volume-format-v3.md` §1.2 rule 6 found at the end of a tape and
 /// accepts as its seal, judged against the front index beside it (#420): the
 /// one judgement `catalog rebuild`, the adoption of a lost write
 /// ([`crate::volume::adopt_lost`]) and `restore raw-volume` share, so the
@@ -1924,8 +1955,8 @@ pub(crate) struct LocatedSeal {
     /// Where the seal was read: the planned position, or the last file on a
     /// medium that ends before it. `None` when no file was there at all.
     pub position: Option<u32>,
-    /// `Some(K)` for an accepted SHORT seal at K+1 (§4.1): every planned
-    /// position after K is not on the tape (§4.2). `None` for a full seal,
+    /// `Some(K)` for an accepted SHORT seal at K+1 (§5): every planned
+    /// position after K is not on the tape (§5.1). `None` for a full seal,
     /// and for no seal.
     pub ended_after: Option<u32>,
 }
@@ -1940,18 +1971,18 @@ impl LocatedSeal {
     }
 }
 
-/// Find the seal by `volume-format-v2.md` §1.2 rule 6 ([`crate::store::
+/// Find the seal by `volume-format-v3.md` §1.2 rule 6 ([`crate::store::
 /// locate_seal`]: at `planned`, File 0's `[layout] seal_marker`, or, on a
 /// medium that ends before it, the last file), judge it against the front
 /// index (`front_index` = File 3's true bytes, at `front_index_position`) by
 /// [`format::judge_seal`], and accept it as rule 6 does:
 ///
 /// - **at the planned position**, a seal whose `file_count` is the plan's
-///   (`planned + 1`): the full seal (§4.1 "Classification");
-/// - **before it**, only on a tape that requires `short-seal` (File 0's
-///   `requires`; the seal's own when File 0's claims do not parse), a seal
-///   that itself requires it, keeps §4.1's parse rules (it parsed) and states
-///   `file_count = N` for the N files on the medium. Its `ended_after` is K.
+///   (`planned + 1`): the full seal (§5 "Classification");
+/// - **before it**, on every Layout 3 tape (`volume-format-v3.md` §1.2 rule
+///   6, D1: no `requires` entry), a seal that keeps §5's parse rules (it
+///   parsed) and states `file_count = N` for the N files on the medium. Its
+///   `ended_after` is K. `_file0` is no longer read for it.
 ///
 /// Anything else is [`format::SealVerdict::Unsealed`], naming why: a reader
 /// of a catalog row only ever records a tape sealed on a seal it accepts. A
@@ -1961,7 +1992,7 @@ impl LocatedSeal {
 /// tape, and an unsealed reading records no copy (#458).
 pub(crate) fn locate_and_judge_seal(
     store: &mut dyn Store,
-    file0: &str,
+    _file0: &str,
     front_index: &[u8],
     front_index_position: u32,
     planned: u32,
@@ -2025,36 +2056,17 @@ pub(crate) fn locate_and_judge_seal(
             ),
         };
     }
-    // Before the planned position: the short seal, on a tape that says it may
-    // end early, and only one that says the same and counts the medium.
-    let tape_requires_short_seal = match format::parse_id_thunk_claims(file0) {
-        Ok(claims) => claims.requires.iter().any(|f| f == format::SHORT_SEAL),
-        Err(_) => seal.requires_short_seal(),
-    };
-    if !tape_requires_short_seal {
-        return LocatedSeal::unsealed(
-            Some(position),
-            format!(
-                "the tape ends at file {position}, before the seal marker File 0 plans at file \
-                 {planned}, and File 0 does not require \"{}\": a tape that does not say it may \
-                 end early has no seal there",
-                format::SHORT_SEAL
-            ),
-        );
-    }
-    if !seal.requires_short_seal() || i64::from(seal.file_count) != i64::from(position) + 1 {
+    // Before the planned position: the short seal, which every Layout 3
+    // tape may end with (`volume-format-v3.md` §1.2 rule 6, D1), when it
+    // counts the medium.
+    if !seal.is_short_seal_at(position) {
         return LocatedSeal::unsealed(
             Some(position),
             format!(
                 "the last file on the tape (file {position}) is a seal marker that does not seal \
-                 a tape ending there (it states file_count = {}{}), so it is no short seal \
-                 (volume-format-v2.md §1.2 rule 6)",
+                 a tape ending there (it states file_count = {}), so it is no short seal \
+                 (volume-format-v3.md §1.2 rule 6)",
                 seal.file_count,
-                if seal.requires_short_seal() {
-                    String::new()
-                } else {
-                    format!(" and does not require \"{}\"", format::SHORT_SEAL)
-                }
             ),
         );
     }
@@ -2084,7 +2096,7 @@ pub(crate) fn locate_and_judge_seal(
     }
 }
 
-/// Read the seal marker (issue #458): located by `volume-format-v2.md` §1.2
+/// Read the seal marker (issue #458): located by `volume-format-v3.md` §1.2
 /// rule 6 from File 0's `[layout]` pointer, and judged by
 /// [`locate_and_judge_seal`] against the front index already in hand (`fi`,
 /// as read, block padding included).
@@ -2162,6 +2174,15 @@ fn tape_dates(
                 ) && ended_after.is_none_or(|k| i64::from(e.position) <= i64::from(k))
             })
             .count() as i64,
+        restore_sh_sha256: entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    crate::volume::layout_model::ZoneKind::from_type_label(&e.type_label),
+                    Some(crate::volume::layout_model::ZoneKind::RestoreSh)
+                )
+            })
+            .and_then(|e| e.sha256_encrypted.clone()),
     }
 }
 
@@ -2300,9 +2321,9 @@ fn insert_all(
                 "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
                                       capacity_bytes, mam_capacity_bytes, has_manifest, status,
                                       created_at, first_write, sealed_at, last_write,
-                                      num_data_files, ended_after)
+                                      num_data_files, ended_after, restore_sh_sha256)
                  VALUES (?1, ?2, 'lto', ?3, ?4, ?5, ?6, 1, ?10,
-                         COALESCE(?7, datetime('now')), ?7, ?8, ?8, ?9, ?11)",
+                         COALESCE(?7, datetime('now')), ?7, ?8, ?8, ?9, ?11, ?12)",
                 params![
                     label,
                     uuid,
@@ -2315,6 +2336,7 @@ fn insert_all(
                     if sealed { dates.data_files } else { 0 },
                     if sealed { "sealed" } else { "initialized" },
                     ended_after,
+                    dates.restore_sh_sha256,
                 ],
             )?;
             report.volume_inserted = true;
@@ -2357,20 +2379,18 @@ fn insert_all(
                 insert_unit(tx, unit, tenant_id, report)?
             }
         };
-        // #420 (`volume-format-v2.md` §4.2; layout-session.md "Later
-        // contacts"): on a short tape a unit is on it whole only when every
-        // slice lies at or before `ended_after`, as a passing short confirm
-        // splits the rows; every other unit is cut. #478 (§4.4, ADR-0012
-        // items 121 and 130): a block that states `may_span` splits three
-        // ways instead, as confirm splits its row ([`tape_split`]).
+        // Every block splits three ways, by its positions and the seal
+        // (`volume-format-v3.md` §5.3, ADR-0012 items 130 and 288): `completed`
+        // when the tape holds every slice of the staging, `range` when it
+        // holds some, and no row when it holds none ([`tape_split`]).
         let written = tape_split(unit, sealed, ended_after);
         match written {
-            Written::Cut => {
-                let cut = format!("{} v{}", unit.name, unit.snapshot_version);
-                if unit.may_span {
-                    report.cut_spanning_units.push(cut.clone());
+            Written::Unwritten => {
+                let name = format!("{} v{}", unit.name, unit.snapshot_version);
+                if held_in_part(unit) {
+                    report.unwritten_spanning_units.push(name.clone());
                 }
-                report.cut_units.push(cut);
+                report.unwritten_units.push(name);
             }
             Written::Range {
                 first_slice,
@@ -2386,7 +2406,7 @@ fn insert_all(
         }
 
         let (snapshot_id, snapshot_inserted) =
-            ensure_snapshot(tx, unit, unit_id, supplement, report)?;
+            ensure_snapshot(tx, unit, unit_id, written, supplement, report)?;
         let stage_set_id = ensure_stage_set(tx, unit, snapshot_id, volume_id, supplement, report)?;
 
         let mut slice_ids = Vec::with_capacity(unit.slices.len());
@@ -2394,43 +2414,43 @@ fn insert_all(
             slice_ids.push((slice, ensure_slice(tx, unit, slice, stage_set_id, report)?));
         }
 
-        let write_id = ensure_write(
-            tx,
-            stage_set_id,
-            snapshot_id,
-            volume_id,
-            written,
-            unit.may_span,
-            report,
-        )?;
-        for (slice, slice_id) in slice_ids {
-            let laid_down = sealed && slice_on_tape(slice, ended_after);
-            ensure_position(tx, write_id, slice_id, slice, laid_down, report)?;
+        // A staging the tape holds none of has no write on it, and so no
+        // positions: its slices stay staged for another tape (item 288).
+        if written != Written::Unwritten {
+            let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, written, report)?;
+            for (slice, slice_id) in slice_ids {
+                let laid_down = sealed && slice_on_tape(slice, ended_after);
+                ensure_position(tx, write_id, slice_id, slice, laid_down, report)?;
+            }
         }
         // X24: after the positions, which are what the rule reads. The order
         // matters: the volume row is written at the top of this function, so
         // a tape this run records `sealed` is a sealed volume by the time the
         // rule is asked; a found row keeps the status it had (#158), and
-        // counts only if that is `sealed`.
-        if unit.may_span {
-            promote_spanning_version(
-                tx,
-                unit,
-                snapshot_id,
-                stage_set_id,
-                snapshot_inserted,
-                report,
-                &mut promoted,
-            )?;
-        }
+        // counts only if that is `sealed`. Item 144's promotion serves any
+        // unit (item 288): the rule itself says whether a version is whole.
+        promote_spanning_version(
+            tx,
+            unit,
+            snapshot_id,
+            stage_set_id,
+            snapshot_inserted,
+            report,
+            &mut promoted,
+        )?;
 
         ensure_files(tx, unit, snapshot_id, supplement, report)?;
+        // The staging's file table and id map, from the operator envelope's
+        // `catalog.db` and from nowhere else (T4.9; #557, #564). After
+        // `ensure_files`, so that the version's paths keep the order the
+        // writing catalog interned them in.
+        ensure_tables(tx, unit, stage_set_id, supplement, report)?;
         sets.push(RebuiltSet {
             stage_set_id,
             unit_name: unit.name.clone(),
             unit_uuid: unit.uuid.clone(),
             version: unit.snapshot_version,
-            may_span: unit.may_span,
+            in_part: matches!(written, Written::Range { .. }) || held_in_part(unit),
             num_slices: unit.slices.len() as i64,
             held_here: unit
                 .slices
@@ -2467,177 +2487,15 @@ struct RebuiltSet {
     /// same one: a unit is found by its uuid alone (#527).
     unit_uuid: String,
     version: i64,
-    /// The block states `may_span` (#478).
-    may_span: bool,
+    /// This tape holds the staging in part: a `range`, or a block that gives
+    /// some slice no position (#478, item 130). Only these sets have a
+    /// to-do list of slices on other tapes ([`span_to_do`]).
+    in_part: bool,
     /// N: the slices the block lists.
     num_slices: i64,
     /// The slice numbers this tape holds, on a tape whose seal was read: the
     /// ones its rows record `written`.
     held_here: Vec<i64>,
-}
-
-/// The tapectl home the catalog lives in, as `<home>/tapectl.db`'s directory
-/// — the rule `stage clean` uses for the lockfiles and its leftovers.
-/// `None` for an in-memory catalog, which has no home.
-fn catalog_home(conn: &Connection) -> Option<std::path::PathBuf> {
-    let db = conn.path().filter(|p| !p.is_empty())?;
-    let parent = Path::new(db).parent()?;
-    Some(if parent.as_os_str().is_empty() {
-        std::path::PathBuf::from(".")
-    } else {
-        parent.to_path_buf()
-    })
-}
-
-/// Give each rebuilt stage set the dar catalogue its tape carried (issue
-/// #473): the operator envelope's `catalogs/<uuid8>_v<N>.<k>.dar` members,
-/// copied into `<home>/catalogs/<uuid8>/s<id>/` at 0600 (0700 directories)
-/// and recorded in `stage_sets.catalog_path` as the stem `stage create`
-/// records.
-///
-/// `catalog rebuild` used to leave `catalog_path` NULL and write nothing, so
-/// a set brought back with `volume read-slices` and written to a second tape
-/// had no catalogue in its envelopes — though that tape's RECOVERY.md still
-/// says it does — and RESTORE.sh `--path` died on it.
-///
-/// A set that already has a catalogue on disk is left alone (never
-/// overwritten: it may be a live set's own). A set the catalog knew before
-/// and that still lacks one gets it now, which is how a second `catalog
-/// rebuild` of the same tape heals a catalog rebuilt before this existed.
-/// Sets still without one are named in `report.sets_without_catalogue`.
-fn restore_catalogues(
-    conn: &Connection,
-    operator: &OpenedEnvelope,
-    sets: &[RebuiltSet],
-    report: &mut RebuildReport,
-) {
-    let home = catalog_home(conn);
-    let paths = home.map(crate::config::TapectlPaths::new);
-    let mut done: HashSet<i64> = HashSet::new();
-    for set in sets {
-        if !done.insert(set.stage_set_id) {
-            continue;
-        }
-        let label = format!("{} v{}", set.unit_name, set.version);
-        match place_catalogue(conn, operator, set, paths.as_ref()) {
-            Ok(Placed::Restored) => report.catalogues_restored += 1,
-            Ok(Placed::AlreadyThere) => {}
-            Ok(Placed::NotOnTape) => report.sets_without_catalogue.push(label),
-            Err(why) => {
-                tracing::warn!(
-                    unit = %set.unit_name,
-                    version = set.version,
-                    error = %why,
-                    "rebuild: could not put the dar catalogue back; the set has none"
-                );
-                report.sets_without_catalogue.push(label);
-            }
-        }
-    }
-}
-
-enum Placed {
-    Restored,
-    AlreadyThere,
-    NotOnTape,
-}
-
-fn place_catalogue(
-    conn: &Connection,
-    operator: &OpenedEnvelope,
-    set: &RebuiltSet,
-    paths: Option<&crate::config::TapectlPaths>,
-) -> Result<Placed> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT catalog_path FROM stage_sets WHERE id = ?1",
-            params![set.stage_set_id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    if existing.as_deref().is_some_and(envelope::catalogue_on_disk) {
-        return Ok(Placed::AlreadyThere);
-    }
-
-    // The tape's name for this set's catalogue: `<uuid8>_v<version>`.
-    let stem = format!(
-        "{}_v{}",
-        set.unit_uuid.get(..8).unwrap_or(&set.unit_uuid),
-        set.version
-    );
-    let members: Vec<&envelope::ExtractedCatalogue> = operator
-        .catalogues
-        .iter()
-        .filter(|c| envelope::catalogue_stem(&c.file_name) == Some(stem.as_str()))
-        .collect();
-    if members.is_empty() {
-        return Ok(Placed::NotOnTape);
-    }
-    let Some(paths) = paths else {
-        return Err(TapectlError::Other(
-            "the catalog is in memory, so there is no tapectl home to put a catalogue in"
-                .to_string(),
-        ));
-    };
-
-    // The directory is named by the LOCAL unit's uuid, as `stage create`
-    // and `stage clean` derive it.
-    let local_uuid: String = conn.query_row(
-        "SELECT u.uuid FROM stage_sets ss
-         JOIN snapshots sn ON sn.id = ss.snapshot_id
-         JOIN units u ON u.id = sn.unit_id
-         WHERE ss.id = ?1",
-        params![set.stage_set_id],
-        |r| r.get(0),
-    )?;
-    let dir = crate::staging::stage_set_catalogue_dir(paths, &local_uuid, set.stage_set_id);
-    // Named by the LOCAL unit's uuid too: the next copy's MANIFEST.toml lists
-    // the local uuid, and its RECOVERY.md and RESTORE.sh look for
-    // `catalogs/<first 8 of that uuid>_v<N>.1.dar`. Since #527 the two are
-    // always equal (a unit is found by its uuid alone, and a unit of the
-    // same name under another uuid is refused); the local one is still what
-    // the name must follow. dar does not bind a catalogue to its file name.
-    let local_stem = format!(
-        "{}_v{}",
-        local_uuid.get(..8).unwrap_or(&local_uuid),
-        set.version
-    );
-    let created = !dir.exists();
-    let copied = (|| -> Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        if let Some(unit_dir) = dir.parent() {
-            crate::config::secure_path(unit_dir, 0o700);
-        }
-        crate::config::secure_path(&dir, 0o700);
-        for member in &members {
-            // `.<k>.dar`: the tape's stem is a prefix of every member name.
-            let suffix = &member.file_name[stem.len()..];
-            let to = dir.join(format!("{local_stem}{suffix}"));
-            std::fs::copy(&member.path, &to)?;
-            crate::config::secure_path(&to, 0o600);
-            std::fs::File::open(&to)?.sync_all()?;
-        }
-        Ok(())
-    })();
-    if let Err(e) = copied {
-        if created {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-        return Err(e);
-    }
-    let catalog_path = dir.join(&local_stem);
-    crate::db::busy::retry(
-        crate::db::busy::BusyPolicy::DEFAULT,
-        "the rebuilt stage set's catalogue",
-        || {
-            Ok(conn.execute(
-                "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
-                params![catalog_path.to_string_lossy().to_string(), set.stage_set_id],
-            )?)
-        },
-    )?;
-    Ok(Placed::Restored)
 }
 
 fn existing_id(tx: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Option<i64>> {
@@ -2747,6 +2605,7 @@ fn ensure_snapshot(
     tx: &Connection,
     unit: &envelope::ManifestUnit,
     unit_id: i64,
+    written: Written,
     supplement: &Supplement,
     report: &mut RebuildReport,
 ) -> Result<(i64, bool)> {
@@ -2760,12 +2619,13 @@ fn ensure_snapshot(
     let facts = supplement
         .snapshots
         .get(&(unit.uuid.clone(), unit.snapshot_version));
-    // `source_path` is NOT NULL and is only in `catalog.db`. On a pre-#83
-    // tape it is genuinely unknown, and an invented path would be a lie a
-    // later `snapshot create` could act on — so say so in the column.
-    let source_path = facts
-        .map(|f| f.source_path.clone())
-        .unwrap_or_else(|| "(unknown: rebuilt from a tape carrying no catalog.db)".to_string());
+    // `source_path` is NOT NULL and is only in `catalog.db`. A version the
+    // manifest names and `catalog.db` has no row for has it genuinely
+    // unknown, and an invented path would be a lie a later `snapshot create`
+    // could act on — so say so in the column.
+    let source_path = facts.map(|f| f.source_path.clone()).unwrap_or_else(|| {
+        "(unknown: this tape's catalog.db has no row for this version)".to_string()
+    });
     let snapshot_type = facts
         .map(|f| f.snapshot_type.clone())
         .unwrap_or_else(|| "full".to_string());
@@ -2779,7 +2639,12 @@ fn ensure_snapshot(
     // only the positions inserted after this row can show. It is inserted
     // `staged`, as the writing catalog holds it before its tapes seal, and
     // [`promote_spanning_version`] makes it `current` when the rule holds.
-    let status = if unit.may_span { "staged" } else { "current" };
+    let status =
+        if held_in_part(unit) || matches!(written, Written::Range { .. } | Written::Unwritten) {
+            "staged"
+        } else {
+            "current"
+        };
     tx.execute(
         "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path,
                                 total_size, file_count)
@@ -2960,21 +2825,38 @@ fn ensure_stage_set(
     if receipt.is_some() {
         report.receipts_from_tape += 1;
     }
+    // What the staging itself recorded (item 295): the tar stream's length
+    // (a write states it in the file table's header), how each slice was
+    // compressed and the writer's tar. The manifest block states the same
+    // three, so the one without the other row still gives them.
+    let facts = supplement.staging.get(&staging);
+    let stream_bytes = facts
+        .and_then(|f| f.stream_bytes)
+        .or(Some(unit.stream_bytes).filter(|b| *b > 0));
+    let compression = facts
+        .and_then(|f| f.compression.clone())
+        .or_else(|| unit.compression.clone());
+    let tar_version = facts
+        .and_then(|f| f.tar_version.clone())
+        .or_else(|| unit.tar_version.clone());
     tx.execute(
-        "INSERT INTO stage_sets (snapshot_id, status, origin, dar_version, dar_command, slice_size,
-                                 num_slices, total_dar_size, total_encrypted_size, staged_at, notes,
-                                 key_fingerprints)
-         VALUES (?1, 'cleaned', 'rebuilt', ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8, ?9)",
+        "INSERT INTO stage_sets (snapshot_id, status, origin, slice_size,
+                                 num_slices, total_encrypted_size, staged_at, notes,
+                                 key_fingerprints, stream_bytes, compression, compression_level,
+                                 tar_version)
+         VALUES (?1, 'cleaned', 'rebuilt', ?2, ?3, ?4, datetime('now'), ?5, ?6,
+                 ?7, ?8, ?9, ?10)",
         params![
             snapshot_id,
-            unit.dar_version,
-            unit.dar_command,
             slice_size,
             unit.slices.len() as i64,
-            unit.slices.iter().map(|s| s.size_bytes).sum::<i64>(),
             unit.slices.iter().map(|s| s.encrypted_bytes).sum::<i64>(),
             "rebuilt from the volume's envelope manifest; slices live on tape only",
             receipt,
+            stream_bytes,
+            compression,
+            facts.and_then(|f| f.compression_level),
+            tar_version,
         ],
     )?;
     report.stage_sets += 1;
@@ -3022,8 +2904,8 @@ fn ensure_slice(
     // existed on this machine.
     tx.execute(
         "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
-                                   sha256_plain, sha256_encrypted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                   sha256_plain, sha256_encrypted, continues)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             stage_set_id,
             slice.number,
@@ -3031,6 +2913,7 @@ fn ensure_slice(
             slice.encrypted_bytes,
             slice.sha256_plain,
             slice.sha256_encrypted,
+            slice.continues,
         ],
     )?;
     report.slices += 1;
@@ -3042,19 +2925,19 @@ fn ensure_slice(
 enum Written {
     /// The tape is sealed and holds the unit whole: `completed`.
     Completed,
-    /// The tape is sealed and holds some, not all, of a spannable set's
-    /// slices (#478, ADR-0012 items 121 and 130): `range`, the run from
-    /// `first_slice` to `last_slice`. Only for a block that states
-    /// `may_span`.
+    /// The tape is sealed and holds some, not all, of a staging's slices
+    /// (ADR-0012 items 130 and 288): `range`, the run from `first_slice` to
+    /// `last_slice`. Any staging, including the one the early warning
+    /// interrupted.
     Range { first_slice: i64, last_slice: i64 },
-    /// The tape sealed short before the unit's last slice (#420), or, for a
-    /// block that states `may_span`, holds none of its slices: `cut`.
-    Cut,
+    /// The tape is sealed and holds none of the staging's slices, all
+    /// planned after its end: no `writes` row (item 288).
+    Unwritten,
     /// No seal marker sealed the tape (#458): `aborted`.
     Aborted,
 }
 
-/// Whether `slice` is on this tape (`volume-format-v2.md` §4.2 R3, §4.4 R6):
+/// Whether `slice` is on this tape (`volume-format-v3.md` §5.1 R3, §5.3 R6):
 /// it has a `tape_position` (a range's slice planned on another tape has
 /// none, ADR-0012 item 125), at or before a short seal's `ended_after`.
 fn slice_on_tape(slice: &envelope::ManifestSlice, ended_after: Option<i64>) -> bool {
@@ -3063,18 +2946,20 @@ fn slice_on_tape(slice: &envelope::ManifestSlice, ended_after: Option<i64>) -> b
         .is_some_and(|p| ended_after.is_none_or(|k| p <= k))
 }
 
-/// The row a sealed tape gives one manifest block, by the rule confirm
-/// records (`layout-session.md` "Confirm of a short ending" and "A write
-/// that may span"; `volume-format-v2.md` §4.2, §4.4).
+/// The row a sealed tape gives one manifest block (`volume-format-v3.md`
+/// §5.3, ADR-0012 item 288; `layout-session.md` "Confirm"): every block is
+/// split by its positions and the seal alone.
+/// Of the staging's slices, those with a `tape_position` at or before the
+/// seal's `ended_after` (every planned position, on a full seal) are on the
+/// tape.
 ///
 /// - A tape with no seal it read: `aborted` (#458).
-/// - Every slice of the block on the tape: `completed`. For a block that
-///   states `may_span` that is every slice of the stage set, 1 to N (item
-///   93's middle tape); a set with no slices is whole, as confirm's
-///   `span_split` reads one.
-/// - Otherwise a whole unit's block is `cut` (#420), and a spannable set's
-///   is `range` when the tape holds some of its slices, the run from the
-///   lowest to the highest of them, and `cut` when it holds none (X2).
+/// - All N: `completed`, a copy of the version (a staging with no slices is
+///   whole, as confirm's `span_split` reads one).
+/// - Some, not all: `range`, the run from the lowest to the highest of them.
+///   A unit the early warning interrupted is this, under item 288.
+/// - None: [`Written::Unwritten`], the staging is not on this tape (§5.1);
+///   its positions lie after the end.
 fn tape_split(unit: &envelope::ManifestUnit, sealed: bool, ended_after: Option<i64>) -> Written {
     if !sealed {
         return Written::Aborted;
@@ -3088,15 +2973,12 @@ fn tape_split(unit: &envelope::ManifestUnit, sealed: bool, ended_after: Option<i
     if held.len() == unit.slices.len() {
         return Written::Completed;
     }
-    if !unit.may_span {
-        return Written::Cut;
-    }
     match (held.iter().min(), held.iter().max()) {
         (Some(&first_slice), Some(&last_slice)) => Written::Range {
             first_slice,
             last_slice,
         },
-        _ => Written::Cut,
+        _ => Written::Unwritten,
     }
 }
 
@@ -3106,9 +2988,6 @@ fn ensure_write(
     snapshot_id: i64,
     volume_id: i64,
     written: Written,
-    // The block's `may_span` (ADR-0012 item 121): frozen into the row as the
-    // writer froze it, so a later write of the set reads it from the row.
-    may_span: bool,
     report: &mut RebuildReport,
 ) -> Result<i64> {
     if let Some(id) = existing_id(
@@ -3128,10 +3007,6 @@ fn ensure_write(
     // completion time. `docs/design/layout-session.md`: an aborted session's
     // tape "is not a copy".
     //
-    // #420 (ADR-0012 item 112): a unit the early end of a sealed tape cut is
-    // `cut`, as a passing short confirm records it: never a copy, and with
-    // no completion time either.
-    //
     // #478 (item 121): a range is terminal like a completed write and gets
     // its completion time as confirm gives it one. It is not a copy on its
     // own: its slices count one by one (item 127).
@@ -3146,11 +3021,9 @@ fn ensure_write(
              slices, not the whole set, so the write is not a copy on its own; never verified \
              by a read-back",
         ),
-        Written::Cut => (
-            "cut",
-            "rebuilt from the volume itself; the tape sealed short, ending before this unit's \
-             last slice, so the write is recorded as cut and is not a copy",
-        ),
+        Written::Unwritten => {
+            unreachable!("a staging the tape holds none of has no write row to insert")
+        }
         Written::Aborted => (
             "aborted",
             "rebuilt from the volume itself; the tape carries no valid seal marker, so the \
@@ -3159,17 +3032,10 @@ fn ensure_write(
     };
     tx.execute(
         "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified,
-                             completed_at, notes, may_span)
+                             completed_at, notes)
          VALUES (?1, ?2, ?3, ?4, 0,
-                 CASE WHEN ?4 IN ('completed', 'range') THEN datetime('now') END, ?5, ?6)",
-        params![
-            stage_set_id,
-            snapshot_id,
-            volume_id,
-            status,
-            notes,
-            may_span
-        ],
+                 CASE WHEN ?4 IN ('completed', 'range') THEN datetime('now') END, ?5)",
+        params![stage_set_id, snapshot_id, volume_id, status, notes],
     )?;
     report.writes += 1;
     Ok(tx.last_insert_rowid())
@@ -3209,7 +3075,7 @@ fn ensure_position(
     // On an unsealed one the manifest and the front index are the PLAN —
     // envelopes precede the slices — so the position is recorded `pending`,
     // with nothing measured on the volume, not `written`. So is a position
-    // after a short seal's `ended_after` (#420, §4.2): not on this tape,
+    // after a short seal's `ended_after` (#420, §5.1): not on this tape,
     // `pending` as the session that wrote the tape left it.
     if laid_down {
         tx.execute(
@@ -3231,6 +3097,77 @@ fn ensure_position(
         )?;
     }
     report.positions += 1;
+    Ok(())
+}
+
+/// Put a staging's file table and id map back into the catalog from the
+/// operator envelope's `catalog.db` (`volume-format-v3.md` §1.4; ADR-0012
+/// items 265 and 276; #557, #564). **That file is the only source**: a
+/// tenant envelope's text is for the heir and for a restore given a tenant's
+/// key, and a second source would give two answers.
+///
+/// A stage set the catalog already holds a table for keeps it, as every
+/// found row is kept (a rebuild only adds); one tape of a staging's several
+/// serves them all, since the table depends on no tape position. A tape whose
+/// `catalog.db` has no table for a staging it holds is not refused (a
+/// rebuild is a recovery, and the slices and the manifest are worth
+/// recording): the staging is named in the report and the next write of it
+/// refuses by name (`volume::write::check_file_tables`).
+fn ensure_tables(
+    tx: &Connection,
+    unit: &envelope::ManifestUnit,
+    stage_set_id: i64,
+    supplement: &Supplement,
+    report: &mut RebuildReport,
+) -> Result<()> {
+    let named = || format!("{} v{}", unit.name, unit.snapshot_version);
+    let held_already = stage_files_db::exists(tx, stage_set_id)?;
+    let Some((db, _)) = supplement.db.as_ref() else {
+        if !held_already {
+            report.sets_without_table.push(named());
+        }
+        return Ok(());
+    };
+    // The staging's id in the writing catalog, which the block states and
+    // `catalog.db` keys its rows by; checked against the unit's uuid so a
+    // block never reads another unit's rows.
+    let on_tape = unit.stage_set_id;
+    if !supplement
+        .staging
+        .contains_key(&(unit.uuid.clone(), on_tape))
+    {
+        if !held_already {
+            report.sets_without_table.push(named());
+        }
+        return Ok(());
+    }
+    let in_version = |e: TapectlError| {
+        TapectlError::Other(format!("{} v{}: {e}", unit.name, unit.snapshot_version))
+    };
+    let mut restored = false;
+    if !held_already && stage_files_db::exists(db, on_tape)? {
+        let mut query = ontape_catalog::file_table(db)?;
+        stage_files_db::insert(
+            tx,
+            stage_set_id,
+            query.rows(on_tape)?.map(|r| r.map_err(in_version)),
+        )?;
+        restored = true;
+    }
+    // The map is the table's companion: restored whenever the catalog lacks
+    // one for this staging and the tape has one, so a catalog that kept a
+    // table but lost its map is made whole too.
+    if !stage_ids_db::exists(tx, stage_set_id)? && stage_ids_db::exists(db, on_tape)? {
+        let ids = ontape_catalog::id_map(db, on_tape)?;
+        stage_ids_db::insert(tx, stage_set_id, &ids)?;
+        restored = true;
+    }
+    if restored {
+        report.tables_restored += 1;
+    }
+    if !stage_files_db::exists(tx, stage_set_id)? {
+        report.sets_without_table.push(named());
+    }
     Ok(())
 }
 
@@ -3257,7 +3194,7 @@ fn ensure_files(
     // Generation 3 (tapectl 1.1.0 on) records each entry's kind and link
     // target, so the rebuilt rows keep them. Generations 1 and 2 record
     // only `is_directory` (#381): a symlink or special file on those tapes
-    // is rebuilt as regular — dar's catalogue still holds its real type.
+    // is rebuilt as regular — the file table still holds its real type.
     //
     // HAZARD for rows rebuilt from such a tape: a rebuilt row says `Regular`
     // for what may be a FIFO, a device or a symlink, so whatever trusts the
@@ -3345,15 +3282,18 @@ fn record_event(
     // asserted `sealed` says it read a seal; one that did not says so.
     let seal_clause = match &report.unsealed_reason {
         // #420: a short seal is a seal; the ledger says where the tape ended
-        // and which units it cut.
+        // and which units it took none of.
         None => match report.ended_after {
             None => String::new(),
             Some(k) => format!(
                 "; SEALED SHORT after file {k}{}{}",
-                if report.cut_units.is_empty() {
+                if report.unwritten_units.is_empty() {
                     String::new()
                 } else {
-                    format!(": cut (not a copy here) {}", report.cut_units.join(", "))
+                    format!(
+                        ": planned and not written (not a copy here) {}",
+                        report.unwritten_units.join(", ")
+                    )
                 },
                 if report.ended_after_recorded {
                     "; ended_after recorded on the existing volume row"
@@ -3448,11 +3388,8 @@ fn record_event(
         report.files,
         report.receipts_from_tape,
         report.attested,
-        if report.had_catalog_db {
-            "present"
-        } else {
-            "absent (a tape written before catalog.db rode on tape): no file index, no source paths"
-        },
+        // A tape without one is refused before anything is recorded.
+        "present",
     );
     crate::db::events::log_event(
         tx,
@@ -3500,23 +3437,15 @@ enum RebuildIdentity {
     Operator(String),
     /// No identity this rebuild can safely assume, with the reason so the
     /// operator-facing warning can say which. Never treated as `Mam`:
-    /// `docs/design/volume-format-v2.md` §1.1 forbids defaulting an absent
+    /// `docs/design/volume-format-v3.md` §1.1 forbids defaulting an absent
     /// `cartridge_identity_source` to `"mam"`.
     Unknown(String),
 }
 
-/// Classify File 0's `[media]` claim. `media = None` covers both "no
-/// `[media]` table at all" (pre-ADR-0010) and "the table was unparseable" —
-/// `rebuild_from_store` folds `parse_id_thunk_media`'s `Err` into `None` via
-/// `.ok()` before calling this, matching every other absence in this format
-/// (`format.rs`'s fail-safe convention: absent/malformed is an `Err`, and the
-/// caller decides what absence means).
-fn classify_media(media: Option<&format::IdThunkMedia>) -> RebuildIdentity {
-    let Some(media) = media else {
-        return RebuildIdentity::Unknown(
-            "this tape's File 0 carries no [media] table (written before ADR-0010)".to_string(),
-        );
-    };
+/// Classify File 0's `[media]` claim. A File 0 with no `[media]` table, or
+/// one that does not parse, never reaches here: `rebuild_from_store` refuses
+/// it first.
+fn classify_media(media: &format::IdThunkMedia) -> RebuildIdentity {
     if media.cartridge_serial.is_empty() {
         return RebuildIdentity::Unknown(
             "this tape's File 0 [media] table records no cartridge identity \
@@ -3529,7 +3458,7 @@ fn classify_media(media: Option<&format::IdThunkMedia>) -> RebuildIdentity {
         Some("operator") => RebuildIdentity::Operator(media.cartridge_serial.clone()),
         _ => RebuildIdentity::Unknown(format!(
             "this tape's File 0 records cartridge_serial \"{}\" but no \
-             cartridge_identity_source (written by an older tapectl) — it cannot be told \
+             cartridge_identity_source (the volume's binding recorded none) — it cannot be told \
              apart from an operator-typed barcode, so it is not assumed to be a \
              chip-verified serial",
             media.cartridge_serial
@@ -3582,7 +3511,7 @@ fn resolve_and_bind_cartridge(
     identity: &RebuildIdentity,
     observed_serial: Option<&str>,
     meta: &format::IdThunkVolumeMeta,
-    media: Option<&format::IdThunkMedia>,
+    media: &format::IdThunkMedia,
     report: &mut RebuildReport,
 ) -> Result<()> {
     let unknown_reason = match identity {
@@ -3590,8 +3519,8 @@ fn resolve_and_bind_cartridge(
         _ => None,
     };
     if let Some(reason) = unknown_reason {
-        // The explicit trap this item calls out: a legacy File 0 must not
-        // fail the rebuild. The volume `insert_all` just wrote stays
+        // The explicit trap this item calls out: a File 0 with no identity to
+        // attest must not fail the rebuild. The volume `insert_all` just wrote stays
         // unbound; warn (via the report — `cli::catalog` prints it) and say
         // why. A later run that observes a real identity binds it, because
         // rebuild "only inserts what is missing" (this module's own "What it
@@ -3827,7 +3756,7 @@ fn resolve_mam_identity(
     serial: &str,
     label: &str,
     meta: &format::IdThunkVolumeMeta,
-    media: Option<&format::IdThunkMedia>,
+    media: &format::IdThunkMedia,
     report: &mut RebuildReport,
 ) -> Result<ResolvedCartridge> {
     if let Some(row) = crate::volume::binding::select_cartridge(tx, "serial_number", serial)? {
@@ -3939,8 +3868,8 @@ fn resolve_mam_identity(
         )));
     }
 
-    let manufacturer = media.and_then(|m| m.cartridge_manufacturer.as_deref());
-    let length = media.and_then(|m| m.tape_length_meters);
+    let manufacturer = media.cartridge_manufacturer.as_deref();
+    let length = media.tape_length_meters;
     // `total_load_count` bound explicitly to `NULL`, not left to the
     // schema's `DEFAULT 0` (issue #184): rebuild has no live load-count
     // reading at all, and the schema default would assert a false "zero
@@ -4003,7 +3932,7 @@ fn resolve_operator_identity(
     barcode: &str,
     observed_serial: Option<&str>,
     meta: &format::IdThunkVolumeMeta,
-    media: Option<&format::IdThunkMedia>,
+    media: &format::IdThunkMedia,
     report: &mut RebuildReport,
 ) -> Result<ResolvedCartridge> {
     if let Some(observed) = observed_serial {
@@ -4074,9 +4003,9 @@ fn resolve_operator_identity(
                 params![
                     barcode,
                     meta.media_type,
-                    media.and_then(|m| m.cartridge_manufacturer.as_deref()),
+                    media.cartridge_manufacturer.as_deref(),
                     observed_serial,
-                    media.and_then(|m| m.tape_length_meters),
+                    media.tape_length_meters,
                     cartridge_capacity_bytes(meta),
                 ],
             )?;
@@ -4091,6 +4020,16 @@ fn resolve_operator_identity(
             })
         }
     }
+}
+
+/// Whether a manifest block gives some of its staging's slices no
+/// `tape_position`: this tape's plan holds only a run of them. Layout 3 has
+/// no spanning key (`volume-format-v3.md` §1.9, item 288); a block is
+/// split by [`tape_split`], and this only says the staging's other slices
+/// are planned on other tapes, for the report's to-do list ([`span_to_do`])
+/// and for a version that cannot be `current` until they are written.
+fn held_in_part(unit: &envelope::ManifestUnit) -> bool {
+    unit.slices.iter().any(|s| s.tape_position.is_none())
 }
 
 #[cfg(test)]
@@ -4178,6 +4117,17 @@ mod tests {
         );
     }
 
+    /// A File 0 `[media]` table with nothing for a drill to register from:
+    /// no manufacturer, no length.
+    fn no_facts_media() -> format::IdThunkMedia {
+        format::IdThunkMedia {
+            cartridge_serial: "HU1234ABCD".to_string(),
+            cartridge_identity_source: Some("mam".to_string()),
+            cartridge_manufacturer: None,
+            tape_length_meters: None,
+        }
+    }
+
     /// The File 0 `[volume]` meta every `resolve_mam_identity` drill below
     /// needs — none of them look at it, but the auto-register arm binds it
     /// into the `cartridges` INSERT, so it has to be real.
@@ -4223,15 +4173,19 @@ mod tests {
             encrypted_bytes: 200,
             sha256_plain: "a".repeat(64),
             sha256_encrypted: "b".repeat(64),
+            continues: false,
         };
         let unit_at = |name: &str, position: i64| envelope::ManifestUnit {
             name: name.to_string(),
             uuid: format!("{name}-uuid"),
             snapshot_version: 1,
             stage_set_id: 0,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
+            payload: "tar".to_string(),
+            stream_bytes: 0,
+            file_table: None,
+            id_map: None,
+            tar_version: None,
+            compression: None,
             slices: vec![slice_at(position)],
         };
         let manifest = EnvelopeManifest {
@@ -4459,7 +4413,7 @@ mod tests {
             "HU1234ABCD",
             "L6-0001",
             &mam_drill_meta(),
-            None,
+            &no_facts_media(),
             &mut report,
         );
         let err = match err {
@@ -4504,7 +4458,7 @@ mod tests {
             "HU1234ABCD",
             "L6-0001",
             &mam_drill_meta(),
-            None,
+            &no_facts_media(),
             &mut report,
         )
         .unwrap();
@@ -4542,7 +4496,7 @@ mod tests {
             "HU1234ABCD",
             "L6-0001",
             &mam_drill_meta(),
-            None,
+            &no_facts_media(),
             &mut report,
         );
         let err = match err {
@@ -4650,8 +4604,8 @@ mod tests {
         }
 
         /// THE pin: a rebuild of a short tape gives the rows the write that
-        /// made it gave — each unit `completed` or `cut` alike, the same
-        /// positions `written` (at or before K) and `pending` (after it),
+        /// made it gave — each unit `completed`, `range` or no row alike, the
+        /// same positions `written` (at or before K) and `pending` (after it),
         /// and the same `ended_after` — so the catalog says the same thing
         /// about the tape whether it wrote it or read it back
         /// (layout-session.md "Later contacts").
@@ -4664,7 +4618,19 @@ mod tests {
 
             assert_eq!(report.unsealed_reason, None, "a short seal is a seal");
             assert_eq!(report.ended_after, Some(u64::from(k)));
-            assert_eq!(report.cut_units, vec!["bravo v1", "charlie v1"]);
+            // Item 288: the unit the early warning interrupted holds its
+            // first slice, so it is a range; only the one after it is
+            // planned and not written, and has no row.
+            assert_eq!(report.unwritten_units, vec!["charlie v1"]);
+            assert_eq!(report.range_units.len(), 1, "{report:?}");
+            assert_eq!(
+                (
+                    report.range_units[0].unit.as_str(),
+                    report.range_units[0].first_slice,
+                    report.range_units[0].last_slice
+                ),
+                ("bravo", 1, 1)
+            );
             assert!(report.volume_inserted);
 
             let written = rows_and_positions(&t.conn);
@@ -4673,11 +4639,14 @@ mod tests {
                 rebuilt.0,
                 vec![
                     ("alpha".to_string(), "completed".to_string()),
-                    ("bravo".to_string(), "cut".to_string()),
-                    ("charlie".to_string(), "cut".to_string()),
+                    ("bravo".to_string(), "range".to_string()),
                 ]
             );
-            assert_eq!(rebuilt, written, "the rebuild and the write agree");
+            // The write gives every unit the same three-way split (item
+            // 288), with no exception: what the rebuild records, the write
+            // recorded, every position and its status included.
+            assert_eq!(written.0, rebuilt.0, "the rows agree");
+            assert_eq!(rebuilt.1, written.1, "the positions agree");
             for (unit, position, status) in &rebuilt.1 {
                 let expect = if *position <= i64::from(k) {
                     "written"
@@ -4704,7 +4673,7 @@ mod tests {
                 "the write recorded the same ending"
             );
 
-            // Nothing about a cut unit counts as a copy.
+            // Nothing about a unit the tape did not take counts as a copy.
             let copies = |unit: &str| -> i64 {
                 let id: i64 = fresh
                     .query_row("SELECT id FROM units WHERE name = ?1", [unit], |r| r.get(0))
@@ -4731,7 +4700,7 @@ mod tests {
             let report = rebuild_into(&fresh, &mut t);
             assert_eq!(report.unsealed_reason, None);
             assert_eq!(report.ended_after, None);
-            assert!(report.cut_units.is_empty());
+            assert!(report.unwritten_units.is_empty());
             let (writes, positions) = rows_and_positions(&fresh);
             assert!(writes.iter().all(|(_, s)| s == "completed"), "{writes:?}");
             assert!(
@@ -4785,17 +4754,19 @@ mod tests {
             );
         }
 
-        /// §1.2 rule 6's acceptance, through [`locate_and_judge_seal`]: an
-        /// early seal is a short seal only on a tape whose File 0 requires
-        /// `short-seal`; on any other tape it is no seal.
+        /// §1.2 rule 6's acceptance, through [`locate_and_judge_seal`]: on a
+        /// Layout 3 tape an early seal that counts the medium is the short
+        /// seal, and File 0 needs no `requires` entry for it (D1; the
+        /// Layout 2 rule that asked for `short-seal` is gone).
         #[test]
-        fn an_early_seal_on_a_tape_that_does_not_require_short_seal_is_no_seal() {
+        fn an_early_seal_that_counts_the_medium_is_the_short_seal() {
             let mut t = short_tape::short_tape();
             let k = t.ended_after;
             let file0 = String::from_utf8(
                 crate::store::read_small_bytes(&mut t.store, 0, "File 0").unwrap(),
             )
             .unwrap();
+            assert!(file0.contains("requires = []"), "D1: {file0}");
             let fi_raw = crate::store::read_small_bytes(&mut t.store, 3, "File 3").unwrap();
             let fi = format::without_nul_padding(&fi_raw).to_vec();
 
@@ -4803,19 +4774,6 @@ mod tests {
             assert!(matches!(located.verdict, format::SealVerdict::Sealed(_)));
             assert_eq!(located.ended_after, Some(k));
             assert_eq!(located.position, Some(k + 1));
-
-            // The same tape, its File 0 stating it requires nothing.
-            let file0_old = file0.replace("requires = [\"short-seal\"]", "requires = []");
-            assert_ne!(
-                file0_old, file0,
-                "positive control: File 0 requires short-seal"
-            );
-            let located = locate_and_judge_seal(&mut t.store, &file0_old, &fi, 3, t.planned_seal);
-            let format::SealVerdict::Unsealed(why) = &located.verdict else {
-                panic!("an early seal there is no seal: {located:?}");
-            };
-            assert!(why.contains("does not require"), "{why}");
-            assert_eq!(located.ended_after, None);
 
             // A seal found at the planned position that states another
             // count is the two ends disagreeing, not a full seal.

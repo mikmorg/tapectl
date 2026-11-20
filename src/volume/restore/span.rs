@@ -1,16 +1,16 @@
 //! A version read across cartridges (#478, tapectl 1.7.0;
-//! `volume-format-v2.md` §4.4, ADR-0012 items 89 and 131).
+//! `volume-format-v3.md` §5.3, ADR-0012 items 89, 131 and 266).
 //!
-//! A spanning version's slices are held as ranges on several volumes, and a
-//! tape that holds a range restores the version only together with tapes
-//! that hold its other slices (R7). `restore unit` and `restore file` of such
-//! a version are planned here, before the first cartridge is asked for:
+//! A staging's slices may be held as ranges on several volumes (any staging
+//! may be, item 288). `restore unit`, `restore file` and `restore volume` of
+//! such a version are planned here, before the first cartridge is asked for:
 //!
-//! - **The start.** The restore starts on the cartridge it was named
-//!   (`--from`) or found loaded, and that cartridge must hold slice 1: a
-//!   range that starts at slice 1 (a tape that holds the version whole is
-//!   never routed here; it restores alone, as in 1.6.0). Otherwise it is
-//!   refused, naming the cartridges that hold slice 1.
+//! - **The start.** A restore may start on any tape of the span (item 266,
+//!   R7): the cartridge it was named (`--from`) or found loaded, whatever it
+//!   holds. It is read for the slices it holds when they come, and the
+//!   others are asked for in slice order. Where the other cartridges are not
+//!   offered (nobody at the terminal, or the answer "I do not have it") the
+//!   restore takes the files this tape holds whole and lists the rest.
 //! - **Every slice somewhere.** A version with any slice on no live volume
 //!   is refused, naming the slices and where the catalog last saw them.
 //! - **The fewest cartridges, in slice order.** From the start, each next
@@ -23,7 +23,7 @@
 //! Who holds a slice is [`slice_holders::holders_of_set`]'s answer, the same
 //! test the repair of a damaged slice asks ([`slice_holders::holders_of`]):
 //! a `completed` or `range` write with the slice `written`, at or before the
-//! tape's end as the catalog recorded its seal (§4.2 R1 and R5), on a live
+//! tape's end as the catalog recorded its seal (§5.1 R3 and R5), on a live
 //! volume. The plan is the restore's positions, one per slice in slice order,
 //! each naming the volume it is read from; the supply asks for each next
 //! cartridge as it comes to it.
@@ -105,6 +105,7 @@ fn numbers_phrase(numbers: &[i64]) -> String {
 /// One slice of the stage set, as `stage create` recorded it.
 struct SliceRow {
     number: i64,
+    size_bytes: i64,
     sha256_plain: String,
     sha256_encrypted: String,
     encrypted_bytes: i64,
@@ -158,18 +159,6 @@ pub(super) fn plan_across(
             stage_set_id,
             &missing,
         )?);
-    }
-
-    // The start holds slice 1.
-    if !on_start.contains_key(&1) {
-        return Err(start_refusal(
-            conn,
-            unit_name,
-            version,
-            start_label,
-            &on_start,
-            by_slice.get(&1).map(Vec::as_slice).unwrap_or_default(),
-        ));
     }
 
     let n = slices.len() as i64;
@@ -234,6 +223,7 @@ pub(super) fn plan_across(
                 sha256_plain: s.sha256_plain.clone(),
                 sha256_encrypted: s.sha256_encrypted.clone(),
                 encrypted_bytes: s.encrypted_bytes,
+                size_bytes: s.size_bytes,
             });
         }
         next = last + 1;
@@ -244,7 +234,7 @@ pub(super) fn plan_across(
 /// The stage set's slices, in slice order.
 fn slices_of(conn: &Connection, stage_set_id: i64) -> Result<Vec<SliceRow>> {
     let mut stmt = conn.prepare(
-        "SELECT slice_number, sha256_plain, sha256_encrypted, encrypted_bytes
+        "SELECT slice_number, sha256_plain, sha256_encrypted, encrypted_bytes, size_bytes
            FROM stage_slices WHERE stage_set_id = ?1
           ORDER BY slice_number",
     )?;
@@ -255,54 +245,11 @@ fn slices_of(conn: &Connection, stage_set_id: i64) -> Result<Vec<SliceRow>> {
                 sha256_plain: r.get(1)?,
                 sha256_encrypted: r.get(2)?,
                 encrypted_bytes: r.get(3)?,
+                size_bytes: r.get(4)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
-}
-
-/// `L6-0001 (cartridge LTO6-0001, chip serial HUM1)`, and a quarantined
-/// holder said to be the last resort.
-fn holder_phrase(conn: &Connection, h: &Holder) -> String {
-    format!(
-        "\"{}\" ({}{})",
-        h.label,
-        slice_holders::shelf_of(conn, h.volume_id, &h.label).describe(),
-        if h.standing == Standing::Quarantined {
-            "; quarantined, a last resort"
-        } else {
-            ""
-        }
-    )
-}
-
-/// The refusal for a restore started on a cartridge that does not hold the
-/// version's slice 1 (§4.4: the restore starts on the tape holding slice 1).
-fn start_refusal(
-    conn: &Connection,
-    unit_name: &str,
-    version: i64,
-    start_label: &str,
-    on_start: &BTreeMap<i64, WritePositionInfo>,
-    slice_one: &[Holder],
-) -> TapectlError {
-    let here = match (on_start.keys().next(), on_start.keys().next_back()) {
-        (Some(&first), Some(&last)) => slices_phrase(first, last),
-        _ => "none of the slices".to_string(),
-    };
-    let holders: Vec<String> = slice_one.iter().map(|h| holder_phrase(conn, h)).collect();
-    let first = slice_one
-        .first()
-        .map(|h| h.label.as_str())
-        .unwrap_or_default();
-    TapectlError::Other(format!(
-        "unit \"{unit_name}\" version {version} is held across cartridges, and a restore of it \
-         starts on the cartridge that holds its slice 1, then reads the others in slice order \
-         (volume-format-v2.md §4.4): volume \"{start_label}\" holds only {here} of it. Slice 1 \
-         is on {}: start the restore there (`--from {first}`, or load it and give no --from). \
-         Nothing was read from tape.",
-        holders.join(", ")
-    ))
 }
 
 /// The refusal for a version with slices on no live volume (ADR-0012 items
@@ -324,8 +271,6 @@ fn missing_refusal(
             "is given up (retired or erased)".to_string()
         } else if t.position_status == "pending" {
             "planned it, but its tape ended before it".to_string()
-        } else if t.write_status == "cut" {
-            "holds it in a write the end of its tape cut, which is never read".to_string()
         } else if t.write_status != "completed" && t.write_status != "range" {
             format!("holds it in a write that is {}", t.write_status)
         } else if t.position_status != "written" {
@@ -385,16 +330,17 @@ fn missing_refusal(
     Ok(TapectlError::Other(format!(
         "unit \"{unit_name}\" version {version} cannot be restored: {} of it {} on no live \
          volume, and a restore of a version held across cartridges needs every slice, in slice \
-         order (volume-format-v2.md §4.4 R7).{saw}{next} Nothing was read from tape.",
+         order (volume-format-v3.md §5.3 R7).{saw}{next} Nothing was read from tape.",
         numbers_phrase(missing),
         if missing.len() == 1 { "is" } else { "are" },
     )))
 }
 
-/// The refusal for a restore across cartridges with nobody at the terminal
-/// to change them (#478): `subject` is held on `runs`, and tapectl swaps no
-/// cartridge without a person (`--yes` cannot load one).
-pub(super) fn unattended_refusal(conn: &Connection, subject: &str, runs: &[Run]) -> TapectlError {
+/// What a restore across cartridges says when nobody is at the terminal to
+/// change them (#478, item 266): `subject` is held on `runs`, tapectl swaps
+/// no cartridge without a person (`--yes` cannot load one), so it restores
+/// the files its own cartridge holds whole and lists the rest.
+pub(super) fn unattended_note(conn: &Connection, subject: &str, runs: &[Run]) -> String {
     let cartridges: Vec<String> = runs
         .iter()
         .map(|r| {
@@ -412,12 +358,13 @@ pub(super) fn unattended_refusal(conn: &Connection, subject: &str, runs: &[Run])
             )
         })
         .collect();
-    TapectlError::Other(format!(
-        "{subject} is held across cartridges, and this restore reads {}. tapectl swaps no \
-         cartridge without a person at the terminal, and --yes cannot load one: run it from a \
-         terminal and it asks for each cartridge in turn. Nothing was read from tape but File 0.",
+    format!(
+        "{subject} is held across cartridges ({}), and tapectl swaps no cartridge without a \
+         person at the terminal (--yes cannot load one): the files this cartridge holds whole \
+         are restored and the rest are listed, with the cartridges that hold them. Run it from \
+         a terminal and it asks for each cartridge in turn.",
         cartridges.join(", then ")
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -433,6 +380,7 @@ mod tests {
             sha256_plain: String::new(),
             sha256_encrypted: String::new(),
             encrypted_bytes: 0,
+            size_bytes: 0,
         }
     }
 

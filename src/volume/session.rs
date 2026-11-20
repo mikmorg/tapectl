@@ -89,7 +89,7 @@ use super::layout_model::{
 
 // ── the ending (#420, 1.6.0) ──
 
-/// How a write session's tape ends (`volume-format-v2.md` §4.1, §4.3 W4;
+/// How a write session's tape ends (`volume-format-v3.md` §5, §5.2 W4;
 /// `layout-session.md` "The short ending"). Decided once: by `run_entries`
 /// after the entry in which the drive's early warning came, by a resume from
 /// the recorded warning or the seal it found, and never changed after.
@@ -133,7 +133,7 @@ impl Ending {
 }
 
 /// Test support (#420): the embedded copy of a seal that keeps
-/// `volume-format-v2.md` §4.1's rules S1-S5, for fixtures that put a seal on
+/// `volume-format-v3.md` §5's rules S1-S5, for fixtures that put a seal on
 /// a tape by hand: Files 0-2, File 3 (filled in), data slices from 4, through
 /// `ended_after`. A 1.6.0 seal with an empty or inconsistent copy is
 /// unparseable (rule S6), which is the unsealed signal, so a fixture that
@@ -161,16 +161,11 @@ pub(crate) fn fixture_seal_files(ended_after: u32) -> Vec<layout::FrontIndexFile
 /// `front_index_sha256`, over [`fixture_seal_files`]; unpadded bytes.
 #[cfg(test)]
 pub(crate) fn fixture_seal(label: &str, seal_position: u32, front_index_sha256: &str) -> Vec<u8> {
-    fixture_seal_requiring(
-        label,
-        seal_position,
-        front_index_sha256,
-        layout::REQUIRES_WHOLE,
-    )
+    fixture_seal_requiring(label, seal_position, front_index_sha256, layout::REQUIRES)
 }
 
-/// Test support (#478): [`fixture_seal`] stating `features` in `requires`
-/// (a span tape's seal states [`layout::REQUIRES_SPAN`], ADR-0012 item 124).
+/// Test support: [`fixture_seal`] stating `features` in `requires` (a later
+/// feature's fence; every Layout 3 tape states [`layout::REQUIRES`]).
 #[cfg(test)]
 pub(crate) fn fixture_seal_requiring(
     label: &str,
@@ -203,16 +198,11 @@ pub(crate) fn fixture_short_seal(
     ended_after: u32,
     front_index_sha256: &str,
 ) -> Vec<u8> {
-    fixture_short_seal_requiring(
-        label,
-        ended_after,
-        front_index_sha256,
-        layout::REQUIRES_WHOLE,
-    )
+    fixture_short_seal_requiring(label, ended_after, front_index_sha256, layout::REQUIRES)
 }
 
-/// Test support (#478): [`fixture_short_seal`] stating `features` in
-/// `requires` (a span tape's: ADR-0012 item 124).
+/// Test support: [`fixture_short_seal`] stating `features` in `requires` (a
+/// later feature's fence).
 #[cfg(test)]
 pub(crate) fn fixture_short_seal_requiring(
     label: &str,
@@ -395,8 +385,7 @@ impl ValidatedLayout {
     }
 }
 
-/// `plan`'s rows: one `writes` row per unit, `may_span` set for a unit whose
-/// write may span ([`BuildUnit::span`]), and one `write_positions` row
+/// `plan`'s rows: one `writes` row per unit and one `write_positions` row
 /// per slice entry, on `tx`. Returns the `(write_id, snapshot_id)` pairs and
 /// the `stage_slice_id -> write_id` map the session carries.
 #[allow(clippy::type_complexity)]
@@ -410,21 +399,10 @@ fn insert_plan_rows(
     let mut write_ids = Vec::with_capacity(units.len());
     let mut slice_write_id = HashMap::new();
     for u in units {
-        // `writes.may_span` (ADR-0012 item 121, migration 039): whether this
-        // write may span is frozen here, from the unit's span, which is what
-        // `build` fenced File 0 and the seal placeholder with (item 124).
-        // Everything after the plan reads the row, never the policy again.
         tx.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir,
-                                 may_span)
-             VALUES (?1, ?2, ?3, 'planned', ?4, ?5)",
-            params![
-                u.stage_set_id,
-                u.snapshot_id,
-                volume_id,
-                session_dir,
-                u.span.is_some()
-            ],
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+             VALUES (?1, ?2, ?3, 'planned', ?4)",
+            params![u.stage_set_id, u.snapshot_id, volume_id, session_dir],
         )?;
         let write_id = tx.last_insert_rowid();
         write_ids.push((write_id, u.snapshot_id));
@@ -614,7 +592,7 @@ pub struct ReadyToSeal {
     ending: Ending,
     /// The drive's early warning came in a data slice (W4's first two
     /// cases): the confirm reads back the entry at `ended_after` and the
-    /// seal under every tier (§4.3 W9, ADR-0012 item 114).
+    /// seal under every tier (§5.2 W9, ADR-0012 item 114).
     warning_in_data: bool,
     /// This run already spent item 174's one retry after a write the drive
     /// refused with Logical Block Protection armed (#388).
@@ -838,17 +816,18 @@ pub struct SealedSession {
     pub label: String,
     /// How the tape ended (#420).
     pub ending: Ending,
-    /// The units whose rows the pass made `cut`, by name, in plan order:
-    /// on a short seal, the unit the early warning interrupted and every unit
-    /// planned after it (`layout-session.md`, "Confirm of a short ending").
-    /// Empty on a full seal.
-    pub cut_units: Vec<String>,
+    /// The units planned and not written, by name, in plan order: on a short
+    /// seal, every unit planned after the one the early warning interrupted,
+    /// none of whose slices reached the tape (item 288:
+    /// their rows are deleted, and their slices stay staged). Empty on a full
+    /// seal.
+    pub unwritten_units: Vec<String>,
     /// The units whose rows the pass made `range`, in plan order, each with
-    /// the slices this tape holds (#478, ADR-0012 item 121;
-    /// `layout-session.md`, "A write that may span"): a write that may span
-    /// with some, not all, of its stage set's slices on this tape. On a short
-    /// seal the unit the early warning ended inside; on either ending a run
-    /// that continues a span. Empty when no write of the session may span.
+    /// the slices this tape holds (#478, ADR-0012 items 121 and 288;
+    /// `layout-session.md`, "Confirm of a short ending"): a unit with some,
+    /// not all, of its stage set's slices on this tape. On a short seal the
+    /// unit the early warning ended inside; on either ending a run that
+    /// continues one.
     pub range_units: Vec<RangeUnit>,
 }
 
@@ -858,7 +837,7 @@ pub struct SealedSession {
 pub struct RangeUnit {
     /// The unit's name.
     pub unit: String,
-    /// The lowest slice number of the run (dar's slice number, 1-based).
+    /// The lowest slice number of the run (1-based).
     pub first_slice: i64,
     /// The highest slice number of the run.
     pub last_slice: i64,
@@ -880,44 +859,45 @@ impl RangeUnit {
 
 impl SealedSession {
     /// What the operator is told after a short seal (`layout-session.md`,
-    /// "After a short seal"): where the tape ended, the cut units, and the
-    /// command that writes them; from 1.7.0 also each unit the tape ended in
-    /// as a range, with the slices it holds, and what continues it. `None`
-    /// on a full seal. A short seal is a success: the command exits 0.
+    /// "After a short seal"): where the tape ended, each unit it holds as a
+    /// range with the slices it holds, each unit planned and not written, and
+    /// the command that continues them (ADR-0012 item 288). `None` on a full
+    /// seal. A short seal is a success: the command exits 0.
     pub fn short_ending_report(&self) -> Option<String> {
         let Ending::Short { ended_after } = self.ending else {
             return None;
         };
-        let units = if self.cut_units.is_empty() {
-            "none".to_string()
-        } else {
-            self.cut_units.join(", ")
-        };
         let mut report = format!(
             "volume \"{label}\" sealed short: the drive's early warning came in tape file \
              {ended_after}, so the tape ends after it. Every unit wholly before it is on this \
-             tape and counts as a copy. Cut (not on this tape, still staged): {units}. Write \
-             them whole onto another cartridge with an ordinary `tapectl volume write <label>` \
-             (`--init` initialises a new one).",
+             tape and counts as a copy.",
             label = self.label,
         );
         if !self.range_units.is_empty() {
             let ranges: Vec<String> = self.range_units.iter().map(RangeUnit::describe).collect();
             report.push_str(&format!(
-                " Held here as a range, the rest of each still staged: {}. An ordinary \
-                 `tapectl volume write <label>` onto another cartridge of the same generation \
-                 continues it.",
+                " Held here as a range, the rest of each still staged: {}.",
                 ranges.join(", ")
             ));
         }
+        if !self.unwritten_units.is_empty() {
+            report.push_str(&format!(
+                " Planned and not written (still staged): {}.",
+                self.unwritten_units.join(", ")
+            ));
+        }
+        report.push_str(
+            " An ordinary `tapectl volume write <label>` onto another cartridge of the same \
+             generation continues them (`--init` initialises a new one).",
+        );
         Some(report)
     }
 
     /// The `write_completed` event's `details` (#420, #478;
     /// `layout-session.md` "Confirm of a short ending": the event names the
-    /// short ending and the cut units, and from 1.7.0 the range units with
-    /// their slice runs). A short seal: `{"ending": "short", "ended_after":
-    /// K, "cut_units": [..]}`, with `"range_units": [{"unit", "first_slice",
+    /// short ending and the units planned and not written, and the range
+    /// units with their slice runs). A short seal: `{"ending": "short",
+    /// "ended_after": K, "unwritten_units": [..]}`, with `"range_units": [{"unit", "first_slice",
     /// "last_slice"}, ..]` after it when the tape holds a range. A full seal
     /// with a range: `{"ending": "full", "range_units": [..]}`. `None` on a
     /// full seal with no range, whose event is what it was before 1.6.0; a
@@ -939,7 +919,7 @@ impl SealedSession {
             Ending::Short { ended_after } => serde_json::json!({
                 "ending": "short",
                 "ended_after": ended_after,
-                "cut_units": self.cut_units,
+                "unwritten_units": self.unwritten_units,
             }),
             Ending::Full if self.range_units.is_empty() => return None,
             Ending::Full => serde_json::json!({ "ending": "full" }),
@@ -1042,6 +1022,15 @@ pub enum ContactOutcome {
     /// nothing. `position` is where it was read: File 0's own seal
     /// pointer, or the caller's.
     SealUnreadable { position: u32, error: String },
+    /// File 0 is a tapectl ID thunk whose layout is not 3
+    /// (`volume-format-v3.md` §7.6; ADR-0012 item 269; #560): a Layout 1 or 2
+    /// tape, or one of a later layout. Only File 0's label and layout were
+    /// read: no seal, index or envelope of that layout is parsed, so no
+    /// caller can learn from this whether the tape is sealed. It is a
+    /// tapectl-written volume, never "not written by tapectl", never a plain
+    /// mismatch `--force` may overwrite: the way past it is `cartridge
+    /// erase` and the typed label.
+    OtherLayout(format::OtherLayout),
 }
 
 /// The one check both [`InterruptedSession::resume_checking`] and the
@@ -1068,7 +1057,7 @@ pub enum ContactOutcome {
 ///
 /// The two probes are independent: the seal-marker check runs whether or
 /// not File 0 was readable (a File-0-unreadable-but-sealed-tail tape is
-/// exactly the front/tail damage asymmetry `volume-format-v2.md` §4 designs
+/// exactly the front/tail damage asymmetry `volume-format-v3.md` §5 designs
 /// for), but not if File 0 was readable and already mismatched (no need —
 /// that already refuses).
 ///
@@ -1105,11 +1094,6 @@ pub(crate) struct ContactFacts {
     identity: Option<format::IdThunkIdentity>,
     /// File 0's own `[layout] seal_marker` pointer, when it parsed.
     seal_pointer: Option<i64>,
-    /// File 0's `requires`, when File 0 read and its claims parsed (#420):
-    /// `volume-format-v2.md` §1.2 rule 6 accepts a seal before the planned
-    /// position only on a tape that requires `short-seal`. `None` when File
-    /// 0 did not read or parse; the seal's own `requires` then decides.
-    file0_requires: Option<Vec<String>>,
     /// Every PLANNED seal position probed, where rule 6 found the seal's
     /// file for it (the planned position, or the last file on a medium that
     /// ends before it, `store::locate_seal`), and what was read there. Each
@@ -1137,7 +1121,7 @@ enum SealRead {
 /// [`ContactFacts::probe_seal`]'s answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SealProbe {
-    /// A seal marker that `volume-format-v2.md` §1.2 rule 6 accepts is at
+    /// A seal marker that `volume-format-v3.md` §1.2 rule 6 accepts is at
     /// `position`: the planned one, or K+1 on a tape that ended early.
     Parses { position: u32 },
     /// There is none, and positively so.
@@ -1153,7 +1137,7 @@ impl ContactFacts {
     /// (issue #403: resume used to read the same seal position up to three
     /// times, each a long locate).
     ///
-    /// The seal is found by `volume-format-v2.md` §1.2 rule 6
+    /// The seal is found by `volume-format-v3.md` §1.2 rule 6
     /// ([`crate::store::locate_seal`], #420): at `planned`, or, when the
     /// medium ends before it, as the last file on the medium. Before 1.6.0
     /// END OF DATA at `planned` read as "no seal", so a cartridge sealed
@@ -1214,28 +1198,18 @@ impl ContactFacts {
             .then_some((*position, seal))
     }
 
-    /// `volume-format-v2.md` §1.2 rule 6, "Which seal a reader accepts", for
+    /// `volume-format-v3.md` §1.2 rule 6, "Which seal a reader accepts", for
     /// a seal found at `position` for the planned position `planned`:
-    /// - at the planned position, any seal that parses, as before 1.6.0
-    ///   (the contact check refuses on it; confirm judges it);
-    /// - before it, only on a tape that requires `short-seal` (File 0's
-    ///   `requires`, or the seal's own when File 0 did not parse), a seal
-    ///   that itself requires it, keeps §4.1's rules (it parsed) and states
-    ///   `file_count = N` for the N files on the medium (`position = N-1`);
+    /// - at the planned position, any seal that parses (the contact check
+    ///   refuses on it; confirm judges it);
+    /// - before it, a seal that keeps §5's rules (it parsed) and states
+    ///   `file_count = N` for the N files on the medium (`position = N-1`),
+    ///   on every Layout 3 tape: no `requires` entry is asked for (D1);
     /// - before it, too, a seal this tapectl must not interpret (a feature it
     ///   does not know, §1.2 rule 1): it may be a newer tapectl's sealed
     ///   tape, and a write fails closed on it (ADR-0003).
     fn accepts(&self, seal: &format::ParsedSeal, position: u32, planned: u32) -> bool {
-        if position >= planned || seal.refusal().is_some() {
-            return true;
-        }
-        let tape_requires_short_seal = match &self.file0_requires {
-            Some(requires) => requires.iter().any(|f| f == format::SHORT_SEAL),
-            None => true,
-        };
-        tape_requires_short_seal
-            && seal.requires_short_seal()
-            && i64::from(seal.file_count) == i64::from(position) + 1
+        position >= planned || seal.refusal().is_some() || seal.is_short_seal_at(position)
     }
 
     /// The bytes this contact read at tape position `position`, if it read
@@ -1272,13 +1246,20 @@ pub(crate) fn contact_report(
         Ok(crate::store::SmallRead::Bytes(id_thunk_bytes)) => {
             facts.file0 = Some(id_thunk_bytes.clone());
             let text = String::from_utf8_lossy(&id_thunk_bytes);
-            // #420: what File 0 requires decides whether a seal before its
-            // own pointer can be this tape's (rule 6).
-            facts.file0_requires = format::parse_id_thunk_claims(&text)
-                .ok()
-                .map(|claims| claims.requires);
             let identity = format::parse_id_thunk_identity(&text);
             facts.identity = identity.as_ref().ok().cloned();
+            // `volume-format-v3.md` §7.6: a volume of another layout
+            // is known by File 0's label and layout alone, BEFORE anything
+            // else of it is read: its seal pointer and seal are of a layout
+            // this tapectl does not parse, so they are not asked.
+            if identity.is_ok() {
+                if let Some(other) = format::parse_id_thunk_claims(&text)
+                    .ok()
+                    .and_then(|claims| claims.other_layout())
+                {
+                    return (ContactOutcome::OtherLayout(other), facts);
+                }
+            }
             let matches = matches!(
                 &identity,
                 Ok(id) if id.label == expected_label && id.uuid == expected_uuid
@@ -1366,7 +1347,7 @@ pub(crate) fn contact_report(
     // Issue #400: an unreadable File 0 is blank only on positive evidence,
     // asked of the medium itself. Asked before the seal probe below, which
     // stays independent of it: a File-0-unreadable-but-sealed-tail tape is
-    // exactly the front/tail damage asymmetry `volume-format-v2.md` §4
+    // exactly the front/tail damage asymmetry `volume-format-v3.md` §5
     // designs for.
     let blank = file_zero_error.is_some() && store.blank_at_bot().unwrap_or(false);
 
@@ -2575,10 +2556,14 @@ impl InterruptedSession {
                     self.built.layout.label, self.built.layout.label
                 )));
             }
-            contact @ (ContactOutcome::IdentityMismatch { .. } | ContactOutcome::EmptyFileZero) => {
+            contact @ (ContactOutcome::IdentityMismatch { .. }
+            | ContactOutcome::EmptyFileZero
+            | ContactOutcome::OtherLayout(_)) => {
                 // Issue #327: an empty File 0 at resume is divergence too —
                 // this session wrote a real ID thunk there. It quarantines
-                // exactly as an unparseable File 0 does (`found: None`).
+                // exactly as an unparseable File 0 does (`found: None`). So
+                // does another layout's (#560): this session wrote a Layout 3
+                // File 0 there, and what is there now is not it.
                 let found = match contact {
                     ContactOutcome::IdentityMismatch { found } => found,
                     _ => None,
@@ -2839,8 +2824,8 @@ impl InterruptedSession {
             let reason = format!(
                 "the drive's early warning was recorded in tape file {warned_at}, but the tape \
                  holds only {seal_at} file(s), so a seal now would end it before its first data \
-                 slice: a tape that ends inside its metadata holds no unit (volume-format-v2.md \
-                 §4.3 W6). The session aborts and the tape is left unsealed; write these units \
+                 slice: a tape that ends inside its metadata holds no unit (volume-format-v3.md \
+                 §5.2 W6). The session aborts and the tape is left unsealed; write these units \
                  to another cartridge"
             );
             crate::progress::log(&reason);
@@ -3135,7 +3120,7 @@ impl ReadyToSeal {
         let placeholder_len = seal_entry.size_bytes.ok_or_else(|| {
             TapectlError::Other("seal: seal_marker entry has no recorded size".into())
         })?;
-        // X7 (ADR-0012 item 124, `volume-format-v2.md` §1.2): the seal states
+        // X7 (ADR-0012 item 124, `volume-format-v3.md` §1.2): the seal states
         // the `requires` File 0 states, and `build` sized the placeholder
         // with the same features. Read from the frozen File 0, so a session
         // rehydrated after a restart states it too, and never resolved again.
@@ -3144,7 +3129,7 @@ impl ReadyToSeal {
         // The embedded copy: File 3's own entry gets its real size+hash
         // (known now); the seal marker's own entry stays bare (self-reference)
         // — same construction `build()` used for the placeholder
-        // (`volume-format-v2.md` §4), reconstructed here from the Layout's
+        // (`volume-format-v3.md` §5), reconstructed here from the Layout's
         // own entries rather than carried as extra state, since
         // `layout.entries` already has everything (verified: `build.rs`'s
         // `front_index_layout_entry_carries_its_true_size_and_hash` test
@@ -3184,7 +3169,7 @@ impl ReadyToSeal {
                 }
                 real
             }
-            // §4.1: the plan's entries 0 to K (File 3's filled in), then the
+            // §5: the plan's entries 0 to K (File 3's filled in), then the
             // seal's own at K+1. The Layout — File 3 — is unchanged: a short
             // seal binds the same front index a full one would have.
             Ending::Short { ended_after } => {
@@ -3195,7 +3180,7 @@ impl ReadyToSeal {
                 {
                     return Err(TapectlError::Other(format!(
                         "seal: a short seal ends after a data slice before the last one \
-                         (volume-format-v2.md §4.1), but ended_after = {ended_after} is {} on a \
+                         (volume-format-v3.md §5), but ended_after = {ended_after} is {} on a \
                          Layout whose seal is planned at {planned}",
                         at_k.map_or("not a position of the Layout", |f| f.type_label)
                     )));
@@ -3211,13 +3196,13 @@ impl ReadyToSeal {
                     &through_k,
                     features,
                 );
-                // §4.1 "Length": never longer than the placeholder build
+                // §5 "Length": never longer than the placeholder build
                 // sized; never required to be equal.
                 if real.len() as u64 > placeholder_len {
                     return Err(TapectlError::Other(format!(
                         "seal: the short seal ({} bytes) is longer than the frozen placeholder \
                          ({placeholder_len} bytes) build sized for the full one — \
-                         volume-format-v2.md §4.1 says it never is",
+                         volume-format-v3.md §5 says it never is",
                         real.len()
                     )));
                 }
@@ -3699,7 +3684,7 @@ pub struct SealedPending {
     /// How the tape ended: the seal is at M (full) or K+1 (short).
     ending: Ending,
     /// The early warning came in a data slice: the readback past it is owed
-    /// under every tier (§4.3 W9, ADR-0012 item 114).
+    /// under every tier (§5.2 W9, ADR-0012 item 114).
     warning_in_data: bool,
 }
 
@@ -3713,8 +3698,8 @@ impl SealedPending {
     }
 
     /// Whether the drive's early warning came in a data slice of this
-    /// session (§4.3 W4's first two cases), so its confirm owes the readback
-    /// of the entry at `ended_after` and the seal under every tier (§4.3 W9,
+    /// session (§5.2 W4's first two cases), so its confirm owes the readback
+    /// of the entry at `ended_after` and the seal under every tier (§5.2 W9,
     /// ADR-0012 item 114).
     pub fn readback_past_warning(&self) -> bool {
         self.warning_in_data
@@ -3725,8 +3710,9 @@ impl SealedPending {
     /// Integrity -> 'full', Navigable -> 'quick', ADR-0001), then three
     /// outcomes, not two (ADR-0012's 2026-09-18 amendment, issues
     /// #260/#267): pass => ONE transaction flipping `writes` 'completed'
-    /// (on a short seal 'cut' for a set not wholly on the tape, #420; for a
-    /// write that may span 'range' when some of its set is here, #478),
+    /// ('range' when some, not all, of its set is here, #478 and ADR-0012
+    /// item 288; a set none of which is on the tape, planned and not written,
+    /// has no row after it),
     /// `snapshots` 'current' (a range's only by ADR-0012 item 128),
     /// `volumes` 'sealed'; a mismatch that
     /// `Evidence::proves_medium_bad` => `volumes.observed_condition`
@@ -3797,18 +3783,15 @@ impl SealedPending {
         // `aborted` for a session `adopt_aborted` picked up (#280). The seal
         // transaction below completes a row only if it still reads the same,
         // so an abort that landed during the readback is reported, never
-        // overwritten. Read with it, from the same row: `may_span`, frozen
-        // when the write was planned (ADR-0012 item 121), which decides how
-        // the pass splits the row. A rehydrated session reads it here as a
-        // fresh one does, and never resolves the policy again.
-        let entry_statuses: Vec<(String, bool)> = self
+        // overwritten.
+        let entry_statuses: Vec<String> = self
             .write_ids
             .iter()
             .map(|(write_id, _)| {
                 conn.query_row(
-                    "SELECT status, may_span FROM writes WHERE id = ?1",
+                    "SELECT status FROM writes WHERE id = ?1",
                     params![write_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| r.get(0),
                 )
             })
             .collect::<rusqlite::Result<_>>()?;
@@ -3837,9 +3820,9 @@ impl SealedPending {
             Tier::Navigable => plan,
         };
         // #420: the walk reads the seal at K+1 on a short ending and nothing
-        // after K (§4.2, §5), and after a warning in a data slice it reads
+        // after K (§5.1, §6), and after a warning in a data slice it reads
         // back the entry at `ended_after` (K, or M-1 when the warning came in
-        // the last slice) under every tier (§4.3 W9, ADR-0012 item 114).
+        // the last slice) under every tier (§5.2 W9, ADR-0012 item 114).
         let ended_after = self.ending.recorded_ended_after();
         let readback = if self.warning_in_data {
             match ended_after {
@@ -3911,21 +3894,16 @@ impl SealedPending {
                 Ending::Short { ended_after } => ended_after,
                 Ending::Full => planned_seal_position(&self.built.layout)?.saturating_sub(1),
             };
-            let (promoted, cut_units, range_units) =
+            let (promoted, unwritten_units, range_units) =
                 busy::retry(BusyPolicy::DEFAULT, "the seal", || {
                     let tx = busy::immediate_tx(conn)?;
-                    // #420 (`layout-session.md`, "Confirm of a short ending"): on
-                    // a short seal a stage set is on this tape only when every
-                    // slice of it is at or before `ended_after`; every other set
-                    // of the session is `cut` — the one the warning interrupted
-                    // and every one planned after it. `cut` is written here and
-                    // nowhere else in the session.
-                    //
-                    // #478 (ADR-0012 item 121, "A write that may span"): a row
-                    // whose `may_span` is set splits three ways instead, on either
-                    // ending ([`span_split`]): `completed` when the whole set is
-                    // here, `range` when some of it is, `cut` when none is. `range`
-                    // too is written here and nowhere else.
+                    // #478 and ADR-0012 items 121 and 288 (`layout-session.md`,
+                    // "Confirm of a short ending"): every row of the session
+                    // splits three ways, on either ending ([`span_split`]):
+                    // `completed` when the whole set is here, `range` when some
+                    // of it is, and when none is, the row and its positions are
+                    // deleted: the plan listed the set and the seal withdrew
+                    // it. `range` is written here and nowhere else.
                     let unit_name = |snapshot_id: i64| -> Result<String> {
                         Ok(tx
                             .query_row(
@@ -3938,28 +3916,13 @@ impl SealedPending {
                             .unwrap_or_else(|| format!("snapshot {snapshot_id}")))
                     };
                     let mut whole_snapshots: Vec<i64> = Vec::with_capacity(self.write_ids.len());
-                    let mut cut_units: Vec<String> = Vec::new();
+                    let mut unwritten_units: Vec<String> = Vec::new();
                     let mut range_units: Vec<RangeUnit> = Vec::new();
                     let mut range_writes: Vec<(i64, i64)> = Vec::new();
-                    for ((write_id, snapshot_id), (entered, may_span)) in
+                    for ((write_id, snapshot_id), entered) in
                         self.write_ids.iter().zip(&entry_statuses)
                     {
-                        let split = if *may_span {
-                            span_split(&tx, *write_id, counted_through)?
-                        } else {
-                            let whole = match self.ending {
-                                Ending::Full => true,
-                                Ending::Short { ended_after } => {
-                                    last_slice_position(&tx, *write_id)?
-                                        .is_none_or(|last| last <= i64::from(ended_after))
-                                }
-                            };
-                            if whole {
-                                Split::Completed
-                            } else {
-                                Split::Cut
-                            }
-                        };
+                        let split = span_split(&tx, *write_id, counted_through)?;
                         // ADR-0012 2026-10-06 item 24: `write_verified` means
                         // fully read back — an Integrity confirm, never a quick one.
                         // A range is terminal like a completed write (item 121),
@@ -3992,10 +3955,26 @@ impl SealedPending {
                                 params![write_id, entered, tier == Tier::Integrity],
                             )?
                         }
-                        Split::Cut => tx.execute(
-                            "UPDATE writes SET status = 'cut' WHERE id = ?1 AND status = ?2",
-                            params![write_id, entered],
-                        )?,
+                        Split::Unwritten => {
+                            // Nothing of the set counts on this tape: the row
+                            // and its positions go, and the set's slices stay
+                            // staged for the next write (item 288).
+                            let row = tx.query_row(
+                                "SELECT status FROM writes WHERE id = ?1",
+                                params![write_id],
+                                |r| r.get::<_, String>(0),
+                            )
+                            .optional()?;
+                            if row.as_deref() == Some(entered.as_str()) {
+                                tx.execute(
+                                    "DELETE FROM write_positions WHERE write_id = ?1",
+                                    params![write_id],
+                                )?;
+                                tx.execute("DELETE FROM writes WHERE id = ?1", params![write_id])?
+                            } else {
+                                0
+                            }
+                        }
                     };
                         if completed > 0 {
                             match split {
@@ -4011,7 +3990,7 @@ impl SealedPending {
                                     });
                                     range_writes.push((*write_id, *snapshot_id));
                                 }
-                                Split::Cut => cut_units.push(unit_name(*snapshot_id)?),
+                                Split::Unwritten => unwritten_units.push(unit_name(*snapshot_id)?),
                             }
                         }
                         if completed == 0 {
@@ -4065,8 +4044,8 @@ impl SealedPending {
                     // rather than guessing, and so nothing is logged when the
                     // guard matches no row.
                     // Only a set this tape holds whole, or a range that makes its
-                    // set whole on sealed volumes, promotes its snapshot: a cut
-                    // one's version is not written yet (#420).
+                    // set whole on sealed volumes, promotes its snapshot: a set
+                    // not written has no copy yet (#420).
                     let mut promoted: Vec<(i64, String, String, i64)> = Vec::new();
                     for snapshot_id in &whole_snapshots {
                         let before: Option<(String, String, i64)> = tx
@@ -4130,7 +4109,7 @@ impl SealedPending {
                         )));
                     }
                     tx.commit()?;
-                    Ok((promoted, cut_units, range_units))
+                    Ok((promoted, unwritten_units, range_units))
                 })?;
 
             // Audit rows are emitted AFTER the commit, deliberately, and a
@@ -4168,7 +4147,7 @@ impl SealedPending {
                 volume_id: self.volume_id,
                 label: self.built.layout.label.clone(),
                 ending: self.ending,
-                cut_units,
+                unwritten_units,
                 range_units,
             };
             if let Some(report) = sealed.short_ending_report() {
@@ -4741,7 +4720,7 @@ fn run_entries(
             }
         }
 
-        // #420 (`volume-format-v2.md` §4.3 W4; `layout-session.md` "Deciding
+        // #420 (`volume-format-v3.md` §5.2 W4; `layout-session.md` "Deciding
         // the ending"): after every `Written` entry, the store's early
         // warning. The store retried every refused block itself (W2), so
         // this entry is whole, its filemark included. The warning is sticky
@@ -4762,7 +4741,7 @@ fn run_entries(
                     "the drive's early warning (the end of the medium is near) came in tape \
                      file {position} ({}), before the first data slice: a tape that ends inside \
                      its metadata holds no unit, so the session aborts and the tape is left \
-                     unsealed (volume-format-v2.md §4.3 W6). {} block write(s) were refused and \
+                     unsealed (volume-format-v3.md §5.2 W6). {} block write(s) were refused and \
                      retried; the warning came {} bytes into the tape. Write these units to \
                      another cartridge",
                     entry.kind.type_label(),
@@ -4917,8 +4896,8 @@ fn record_quarantine(
 /// a 5-second lock wait would leave the rows claiming a state the tape is
 /// not in. Idempotent, so safe to retry.
 ///
-/// Never a `cut` or `range` row, and never TO either (#420, ADR-0012 items
-/// 112 and 121): both are terminal and are written only inside a passing
+/// Never a `range` row, and never TO one (ADR-0012 items 121 and 288): it is
+/// terminal and written only inside a passing
 /// confirm's transaction, so an Inconclusive confirm's `interrupted` (or any
 /// later mark) leaves them as they are.
 ///
@@ -4940,14 +4919,14 @@ fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Res
 /// commits ([`record_quarantine`]'s).
 fn mark_writes_on(tx: &Connection, write_ids: &[(i64, i64)], status: &str) -> Result<()> {
     debug_assert!(
-        status != "cut" && status != "range",
-        "cut and range are written only by a passing confirm"
+        status != "range",
+        "range is written only by a passing confirm"
     );
     for (write_id, _) in write_ids {
-        // `cut` (#420) and `range` (#478, ADR-0012 item 121) are terminal
-        // outcomes of a passing confirm: nothing after it moves them.
+        // `range` (#478, ADR-0012 item 121) is a terminal outcome of a
+        // passing confirm: nothing after it moves it.
         tx.execute(
-            "UPDATE writes SET status = ?1 WHERE id = ?2 AND status NOT IN ('cut', 'range')",
+            "UPDATE writes SET status = ?1 WHERE id = ?2 AND status <> 'range'",
             params![status, write_id],
         )?;
     }
@@ -4955,18 +4934,17 @@ fn mark_writes_on(tx: &Connection, write_ids: &[(i64, i64)], status: &str) -> Re
 }
 
 /// The features the session's frozen File 0 states in `requires`, which the
-/// seal must state too (`volume-format-v2.md` §1.2: File 0's `[volume]` and
-/// the seal's `[seal]` both state it; ADR-0012 item 124, coordinator ruling
-/// X7). `build` took File 0's and the seal placeholder's from one fact
-/// ([`layout::tape_requires`]: whether the plan holds a slice of a spannable
-/// set), so this is the placeholder's too, and the full seal fits it.
+/// seal must state too (`volume-format-v3.md` §1.2: File 0's `[volume]` and
+/// the seal's `[seal]` both state it). Every Layout 3 tape states
+/// [`layout::REQUIRES`], the empty list (D1), and `build` took File 0's and
+/// the seal placeholder's from it, so the full seal fits the placeholder.
 ///
 /// Read from the materialized File 0 `build` froze, never from a new Layout
 /// field (X7), so a session `rehydrate` rebuilt after a restart reads the
 /// same bytes the tape holds. Plain `std::fs`: this is not a staged-file
 /// read (`pass_count`). Fails closed: a File 0 that does not read, does not
 /// parse, or states a list this tapectl never writes is an error before the
-/// seal's first block, never a guess at one feature.
+/// seal's first block, never a guess.
 fn frozen_requires(layout: &super::layout_model::Layout) -> Result<&'static [&'static str]> {
     let entry = layout
         .entries
@@ -4994,7 +4972,7 @@ fn frozen_requires(layout: &super::layout_model::Layout) -> Result<&'static [&'s
                     path.display()
                 ))
             })?;
-    let features = layout::tape_requires(claims.requires.iter().any(|f| f == format::SPANNING));
+    let features = layout::REQUIRES;
     if !claims
         .requires
         .iter()
@@ -5002,13 +4980,12 @@ fn frozen_requires(layout: &super::layout_model::Layout) -> Result<&'static [&'s
         .eq(features.iter().copied())
     {
         return Err(TapectlError::Other(format!(
-            "seal: the frozen File 0 at {} states requires = {:?}, which is neither list this \
-             tapectl writes ({:?} or {:?}); the seal must state what File 0 states, so it is \
-             not written",
+            "seal: the frozen File 0 at {} states requires = {:?}, which is not the list this \
+             tapectl writes ({:?}); the seal must state what File 0 states, so it is not \
+             written",
             path.display(),
             claims.requires,
-            layout::REQUIRES_WHOLE,
-            layout::REQUIRES_SPAN,
+            layout::REQUIRES,
         )));
     }
     Ok(features)
@@ -5024,38 +5001,26 @@ fn planned_seal_position(layout: &super::layout_model::Layout) -> Result<u32> {
         .ok_or_else(|| TapectlError::Other("layout has no seal_marker entry".into()))
 }
 
-/// The Layout position of the last slice of `write_id`'s stage set, from its
-/// `write_positions` rows (`plan` inserts one per slice, at its Layout
-/// position). `None` for a set with no slice.
-fn last_slice_position(conn: &Connection, write_id: i64) -> Result<Option<i64>> {
-    Ok(conn.query_row(
-        "SELECT MAX(CAST(position AS INTEGER)) FROM write_positions WHERE write_id = ?1",
-        params![write_id],
-        |r| r.get(0),
-    )?)
-}
-
 /// What a passing confirm records for one `writes` row (#420, #478).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Split {
     /// The tape holds the stage set whole: a copy of it.
     Completed,
     /// The tape holds some, not all, of the set's slices: the run from
-    /// `first_slice` to `last_slice` (ADR-0012 item 121; only a write that
-    /// may span).
+    /// `first_slice` to `last_slice` (ADR-0012 items 121 and 288).
     Range { first_slice: i64, last_slice: i64 },
-    /// Nothing of the set counts on this tape.
-    Cut,
+    /// Nothing of the set counts on this tape: planned and not written.
+    Unwritten,
 }
 
-/// The three-way split of a write that may span (#478; ADR-0012 items 121
-/// and 128, `layout-session.md` "A write that may span",
-/// `volume-format-v2.md` §4.4): of every slice of `write_id`'s stage set, 1
+/// The three-way split of every row of a write (#478; ADR-0012 items 121,
+/// 128 and 288, `layout-session.md` "Confirm of a short ending",
+/// `volume-format-v3.md` §5.3): of every slice of `write_id`'s stage set, 1
 /// to N, those `written` on this volume at a position at or before
 /// `ended_after` (K on a short seal, M-1 on a full one). All N: `completed`
 /// (item 93's middle tape). At least one: `range`, the run from the lowest
-/// to the highest of them. None: `cut`. A set with no slice rows has every
-/// slice here, as the 1.6.0 rule reads it.
+/// to the highest of them. None: [`Split::Unwritten`]. A set with no slice
+/// rows has every slice here.
 pub(crate) fn span_split(conn: &Connection, write_id: i64, ended_after: u32) -> Result<Split> {
     let (slices, held, first, last): (i64, i64, Option<i64>, Option<i64>) = conn.query_row(
         "SELECT COUNT(DISTINCT sl.id), COUNT(DISTINCT wp.stage_slice_id),
@@ -5076,12 +5041,12 @@ pub(crate) fn span_split(conn: &Connection, write_id: i64, ended_after: u32) -> 
             first_slice,
             last_slice,
         },
-        _ => Split::Cut,
+        _ => Split::Unwritten,
     })
 }
 
 /// The `write_early_warning` event (`layout-session.md`, "The
-/// `write_early_warning` event"; §4.3 W5): one `events` row, committed after
+/// `write_early_warning` event"; §5.2 W5): one `events` row, committed after
 /// entry K's cursor row is `written` and before the seal's first block goes
 /// to the store. `new_value` is K, the `ended_after` the session seals at;
 /// `details` is the wear record of ADR-0012 item 98, in the spec's key
@@ -5362,15 +5327,16 @@ mod tests {
             unit_name: "unit-alpha".to_string(),
             unit_uuid: "unit-uuid-1".to_string(),
             tenant_id,
-            dar_version: Some("2.7.20".to_string()),
-            dar_command: Some("dar -c base -R /src".to_string()),
-            catalog_path: None,
+            tar_version: None,
+            stream_bytes: 0,
+            compression: None,
             snapshot_version: 1,
             slices: vec![slice_1, slice_2],
             span: None,
         };
 
         let inputs = BuildInputs {
+            tables: None,
             label: "SESSTEST".to_string(),
             volume_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             media_type: "LTO-6".to_string(),
@@ -5461,6 +5427,7 @@ mod tests {
         .unwrap();
 
         BuildSlice {
+            continues: false,
             slice_id,
             slice_number,
             size_bytes: content.len() as i64,
@@ -9278,6 +9245,76 @@ mod tests {
         assert_eq!(outcome, ContactOutcome::Matches);
     }
 
+    /// `volume-format-v3.md` §7.6 (item 269; #560): File 0 of another
+    /// layout's volume, with its seal at file 5, is known by its
+    /// label and layout and nothing else. The seal is not located, read or
+    /// parsed: no caller can take "sealed" or "unsealed" from it.
+    #[test]
+    fn check_tape_contact_a_tapectl_volume_of_another_layout_is_named_and_its_seal_unread() {
+        use crate::volume::format::foreign_layouts as f;
+        for (layout, file0, seal) in [
+            (
+                2,
+                f::LAYOUT_2_FILE_0.to_string(),
+                f::LAYOUT_2_SEAL.to_string(),
+            ),
+            (4, f::layout_4_file_0(), f::layout_4_seal()),
+        ] {
+            for seal_position in [None, Some(5), Some(9)] {
+                let mut store = MemStore::new(BS as usize);
+                let mut f0 = file0.clone().into_bytes();
+                f0.resize(BS as usize, 0);
+                put_file(&mut store, 0, f0);
+                let mut sl = seal.clone().into_bytes();
+                sl.resize(BS as usize, 0);
+                put_file(&mut store, 5, sl);
+                let (outcome, facts) =
+                    contact_report(&mut store, CONTACT_LABEL, CONTACT_UUID, seal_position);
+                assert_eq!(
+                    outcome,
+                    ContactOutcome::OtherLayout(format::OtherLayout {
+                        layout,
+                        label: Some(f::LABEL.to_string()),
+                    }),
+                    "layout {layout}, {seal_position:?}"
+                );
+                assert!(
+                    facts.seal_bytes(5).is_none(),
+                    "layout {layout}: the seal was read"
+                );
+            }
+        }
+    }
+
+    /// The same label and uuid as the caller's own, on another layout: still
+    /// another layout, never `Matches` (a resume would write over it).
+    #[test]
+    fn check_tape_contact_another_layout_with_the_callers_own_identity_is_not_a_match() {
+        use crate::volume::format::foreign_layouts as f;
+        let mut store = MemStore::new(BS as usize);
+        let mut f0 = f::LAYOUT_2_FILE_0.as_bytes().to_vec();
+        f0.resize(BS as usize, 0);
+        put_file(&mut store, 0, f0);
+        let outcome = check_tape_contact(&mut store, f::LABEL, f::UUID, Some(5));
+        assert!(
+            matches!(outcome, ContactOutcome::OtherLayout(_)),
+            "{outcome:?}"
+        );
+    }
+
+    /// A File 0 that is not tapectl's stays "not written by tapectl", even
+    /// when it happens to say `layout_version` (positive control for the
+    /// classification: it needs a tapectl identity, not a number).
+    #[test]
+    fn check_tape_contact_a_foreign_file_zero_stating_a_layout_is_still_foreign() {
+        let mut store = MemStore::new(BS as usize);
+        let mut f0 = b"[volume]\nlayout_version = 9\nsomething = 1\n".to_vec();
+        f0.resize(BS as usize, 0);
+        put_file(&mut store, 0, f0);
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None);
+        assert_eq!(outcome, ContactOutcome::IdentityMismatch { found: None });
+    }
+
     #[test]
     fn check_tape_contact_matches_when_identity_agrees_and_no_seal_position_given() {
         let mut store = MemStore::new(BS as usize);
@@ -11406,7 +11443,7 @@ mod tests {
         }
     }
 
-    // ── #420: the short ending (volume-format-v2.md §4.1-§4.3, §5;
+    // ── #420: the short ending (volume-format-v3.md §5-§5.2, §6;
     // layout-session.md "The short ending") ──
     mod short_ending {
         use super::*;
@@ -11532,9 +11569,9 @@ mod tests {
                     unit_name: name.to_string(),
                     unit_uuid: format!("uuid-{name}"),
                     tenant_id,
-                    dar_version: Some("2.7.20".to_string()),
-                    dar_command: Some("dar -c base -R /src".to_string()),
-                    catalog_path: None,
+                    tar_version: None,
+                    stream_bytes: 0,
+                    compression: None,
                     snapshot_version: 1,
                     slices,
                     span,
@@ -11580,6 +11617,7 @@ mod tests {
             let (_, operator_key) = key_of(true);
             let (tenant_id, tenant_key) = key_of(false);
             let inputs = BuildInputs {
+                tables: None,
                 label: label.to_string(),
                 volume_uuid: volume_uuid.to_string(),
                 media_type: "LTO-6".to_string(),
@@ -11821,20 +11859,14 @@ mod tests {
                 .unwrap()
         }
 
-        /// File 0 requiring `short-seal`, as every 1.6.0 tape's does (ADR-0012
-        /// item 111) — the rewrite until the generator writes it (worker D),
-        /// a no-op after. Padded back to the length it had.
+        /// File 0 as every Layout 3 tape states it, which needs no feature
+        /// for a short seal (D1, `volume-format-v3.md` §1.2): `requires =
+        /// []`. A no-op that checks it; it was 1.6.0's rewrite to
+        /// `["short-seal"]`.
         fn requiring_short_seal(file0: &[u8]) -> Vec<u8> {
             let text = String::from_utf8_lossy(format::without_nul_padding(file0)).to_string();
-            let text = if text.contains("\nrequires = []\n") {
-                text.replacen("\nrequires = []\n", "\nrequires = [\"short-seal\"]\n", 1)
-            } else {
-                assert!(text.contains("\nrequires = [\"short-seal\"]\n"), "{text}");
-                text
-            };
-            let mut bytes = text.into_bytes();
-            bytes.resize(bytes.len().max(file0.len()), 0);
-            bytes
+            assert!(text.contains("\nrequires = []\n"), "{text}");
+            file0.to_vec()
         }
 
         fn parsed_seal(bytes: &[u8]) -> format::ParsedSeal {
@@ -11896,7 +11928,10 @@ mod tests {
             let seal = parsed_seal(&store.files[k as usize + 1]);
             assert_eq!(seal.ended_after, Some(u64::from(k)));
             assert_eq!(seal.file_count as u32, k + 2);
-            assert!(seal.requires_short_seal());
+            assert!(
+                seal.requires.is_empty(),
+                "D1: a Layout 3 seal states no feature"
+            );
             assert_eq!(
                 seal.ending(u64::from(m) + 1),
                 format::SealEnding::Short {
@@ -11922,21 +11957,21 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(done.ending, Ending::Short { ended_after: k });
-            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
             assert_eq!(
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "cut", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
             assert_eq!(
                 volume(&s),
                 ("sealed".into(), Some(i64::from(k)), "ok".into())
             );
-            // A cut unit's slice that reached the tape stays recorded; the
-            // ones that did not stay pending.
+            // The range's slice that reached the tape stays recorded; the
+            // one that did not stays pending. A unit planned and not written
+            // has no row and no positions.
             assert_eq!(
                 positions(&s, 1),
                 [
@@ -11944,15 +11979,15 @@ mod tests {
                     (i64::from(k) + 1, "pending".to_string())
                 ]
             );
-            assert_eq!(
-                positions(&s, 2),
-                [(i64::from(k) + 2, "pending".to_string())]
-            );
+            assert_eq!(positions(&s, 2), []);
 
             let report = done.short_ending_report().unwrap();
             assert!(report.contains("sealed short"), "{report}");
             assert!(report.contains(&format!("tape file {k}")), "{report}");
-            assert!(report.contains("b, c"), "names the cut units: {report}");
+            assert!(
+                report.contains("Planned and not written (still staged): c."),
+                "{report}"
+            );
             assert!(
                 report.contains("`tapectl volume write <label>`"),
                 "{report}"
@@ -11976,13 +12011,12 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert_eq!(done.cut_units, ["c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
             assert_eq!(
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "completed", "current"),
-                    row("c", "cut", "staged")
+                    row("b", "completed", "current")
                 ]
             );
             assert_eq!(volume(&s).1, Some(i64::from(k)));
@@ -12022,7 +12056,7 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(done.ending, Ending::Full);
-            assert!(done.cut_units.is_empty());
+            assert!(done.unwritten_units.is_empty());
             assert_eq!(done.short_ending_report(), None);
             assert!(rows(&s)
                 .iter()
@@ -12204,7 +12238,7 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Integrity)
                     .unwrap(),
             );
-            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
         }
 
         /// What `volume resume` finds after a crash between the event and
@@ -12311,13 +12345,12 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
             assert_eq!(
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "cut", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
             assert_eq!(volume(&s).1, Some(i64::from(k)));
@@ -12371,11 +12404,8 @@ mod tests {
             );
             assert_eq!(
                 rows(&s),
-                [
-                    row("a", "completed", "current"),
-                    row("b", "cut", "staged"),
-                    row("c", "cut", "staged")
-                ]
+                [row("a", "completed", "current")],
+                "b and c were planned and not written: no row"
             );
             assert_eq!(volume(&s).1, Some(i64::from(a_last)));
         }
@@ -12478,7 +12508,7 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
         }
 
         /// Step 1: `sealed_at` and `ended_after` are recorded, and the seal
@@ -12525,46 +12555,6 @@ mod tests {
             );
         }
 
-        /// `cut` is written only inside the passing confirm's transaction
-        /// (#420, ADR-0012 item 112). An Inconclusive confirm's
-        /// `interrupted` never overwrites a `cut` row: here the readback
-        /// fails at File 3 (the drive, not the medium), on a session one of
-        /// whose rows is already `cut`.
-        #[test]
-        fn an_inconclusive_confirm_never_overwrites_a_cut_row() {
-            let s = three_units();
-            let k = slice_at(&s, 1, 0);
-            let mut store = warning_in(&s, k);
-            let (s, outcome) = execute(s, &mut store);
-            let pending = ready(outcome).seal(&mut store).unwrap();
-            s.conn
-                .execute(
-                    "UPDATE writes SET status = 'cut' WHERE stage_set_id = ?1",
-                    params![s.units[2].stage_set_id],
-                )
-                .unwrap();
-            let mut failing = unreadable_at(store, 3);
-            let outcome = pending
-                .confirm(&s.conn, &mut failing, Tier::Navigable)
-                .unwrap();
-            assert!(matches!(outcome, ConfirmOutcome::Inconclusive(_)));
-            assert_eq!(
-                rows(&s).into_iter().map(|(_, w, _)| w).collect::<Vec<_>>(),
-                ["interrupted", "interrupted", "cut"]
-            );
-            // And `mark_writes` itself never writes over one.
-            let ids: Vec<(i64, i64)> = s
-                .conn
-                .prepare("SELECT id, snapshot_id FROM writes WHERE volume_id = ?1 ORDER BY id")
-                .unwrap()
-                .query_map(params![s.volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            mark_writes(&s.conn, &ids, "aborted").unwrap();
-            assert_eq!(rows(&s)[2].1, "cut");
-        }
-
         /// A short-sealed cartridge on a MemStore: files 0 to K of a plan
         /// whose seal is planned at `m`, the short seal at K+1, File 0
         /// identifying `label`/`uuid` and requiring `requires`.
@@ -12580,10 +12570,9 @@ mod tests {
             let thunk = match file0 {
                 "short-seal" => requiring_short_seal(&thunk),
                 "nothing" => {
-                    let text = String::from_utf8_lossy(format::without_nul_padding(&thunk))
-                        .replacen("\nrequires = [\"short-seal\"]\n", "\nrequires = []\n", 1);
+                    let text = String::from_utf8_lossy(format::without_nul_padding(&thunk));
                     assert!(text.contains("\nrequires = []\n"));
-                    text.into_bytes()
+                    text.into_owned().into_bytes()
                 }
                 other => panic!("{other}"),
             };
@@ -12633,10 +12622,11 @@ mod tests {
                 }
             );
 
-            // A File 0 that does not require short-seal (a tape before
-            // 1.6.0) never has a seal before its planned position: rule 6
-            // reads that file as no seal.
+            // Rule 6 (`volume-format-v3.md` §1.2) asks no `requires` entry of
+            // a Layout 3 tape (D1), only that the seal counts the medium: a
+            // seal at K+1 that seals a tape ending a file earlier is no seal.
             let mut store = short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "nothing");
+            store.files[k as usize + 1] = fixture_short_seal(CONTACT_LABEL, k - 1, "deadbeef");
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
                 ContactOutcome::Matches
@@ -12691,11 +12681,7 @@ mod tests {
             let mut store = short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "nothing");
             let seal = String::from_utf8(store.files[k as usize + 1].clone())
                 .unwrap()
-                .replacen(
-                    "requires = [\"short-seal\"]",
-                    "requires = [\"unknown-feature\"]",
-                    1,
-                );
+                .replacen("requires = []", "requires = [\"unknown-feature\"]", 1);
             store.files[k as usize + 1] = seal.into_bytes();
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
@@ -12714,22 +12700,6 @@ mod tests {
             )))
             .unwrap()
             .requires
-        }
-
-        /// Each unit's `writes.may_span` on `s`'s volume, in plan order.
-        fn may_span_rows(s: &Short) -> Vec<(String, bool)> {
-            s.conn
-                .prepare(
-                    "SELECT u.name, w.may_span FROM writes w
-                     JOIN snapshots sn ON sn.id = w.snapshot_id
-                     JOIN units u ON u.id = sn.unit_id
-                     WHERE w.volume_id = ?1 ORDER BY w.id",
-                )
-                .unwrap()
-                .query_map(params![s.volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
         }
 
         /// `writes.write_verified` of unit `unit`'s row on `s`'s volume.
@@ -12781,24 +12751,6 @@ mod tests {
             )
         }
 
-        /// `plan` freezes whether each write may span into its row
-        /// (ADR-0012 item 121): set for the unit with a span, not for the
-        /// others.
-        #[test]
-        fn plan_records_may_span_from_the_units_span() {
-            let s = a_span_between_whole_units();
-            let mut store = MemStore::new(SBS as usize);
-            let (s, _) = execute(s, &mut store);
-            assert_eq!(
-                may_span_rows(&s),
-                [
-                    ("a".to_string(), false),
-                    ("b".to_string(), true),
-                    ("c".to_string(), false)
-                ]
-            );
-        }
-
         /// The early warning inside a spannable set (item 121, X2): the slice
         /// in flight finishes, the tape seals short after it, and the set is
         /// a `range` — its written positions are at or before K, the one
@@ -12815,7 +12767,7 @@ mod tests {
             let (s, outcome) = execute(s, &mut store);
             let pending = ready(outcome).seal(&mut store).unwrap();
             assert_eq!(pending.ending(), Ending::Short { ended_after: k });
-            assert_eq!(file0_requires(&store), layout::REQUIRES_SPAN);
+            assert_eq!(file0_requires(&store), layout::REQUIRES);
             let seal = parsed_seal(&store.files[k as usize + 1]);
             assert_eq!(seal.requires, file0_requires(&store), "item 124");
             assert_eq!(seal.ended_after, Some(u64::from(k)));
@@ -12825,13 +12777,12 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(done.range_units, [range("b", 1, 2)]);
-            assert_eq!(done.cut_units, ["c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
             assert_eq!(
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "range", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
             assert_eq!(
@@ -12852,7 +12803,7 @@ mod tests {
             assert!(report.contains("b (slices 1-2)"), "{report}");
             assert!(report.contains("same generation"), "{report}");
             assert!(
-                report.contains("Cut (not on this tape, still staged): c."),
+                report.contains("Planned and not written (still staged): c."),
                 "{report}"
             );
             let details: serde_json::Value =
@@ -12862,7 +12813,7 @@ mod tests {
                 serde_json::json!({
                     "ending": "short",
                     "ended_after": k,
-                    "cut_units": ["c"],
+                    "unwritten_units": ["c"],
                     "range_units": [{"unit": "b", "first_slice": 1, "last_slice": 2}],
                 })
             );
@@ -12883,14 +12834,14 @@ mod tests {
             assert_eq!(pending.ending(), Ending::Full);
             let seal = parsed_seal(&store.files[m as usize]);
             assert_eq!(seal.file_count as u32, m + 1, "the full seal");
-            assert_eq!(seal.requires, layout::REQUIRES_SPAN);
-            assert_eq!(file0_requires(&store), layout::REQUIRES_SPAN);
+            assert_eq!(seal.requires, layout::REQUIRES);
+            assert_eq!(file0_requires(&store), layout::REQUIRES);
             let done = sealed(
                 pending
                     .confirm(&s.conn, &mut store, Tier::Integrity)
                     .unwrap(),
             );
-            assert!(done.range_units.is_empty() && done.cut_units.is_empty());
+            assert!(done.range_units.is_empty() && done.unwritten_units.is_empty());
             assert_eq!(
                 rows(&s),
                 [
@@ -12908,7 +12859,7 @@ mod tests {
         /// before K and its row is `completed`, promoted as today, on a short
         /// seal that states both features.
         #[test]
-        fn a_spannable_set_wholly_before_the_warning_is_completed_on_a_short_tape() {
+        fn a_set_wholly_before_the_warning_is_completed_on_a_short_tape() {
             let s = span_fixture(&[("b", &[SLICE, SLICE]), ("c", &[SLICE, SLICE])], &["b"]);
             let k = slice_at(&s, 1, 0);
             let mut store = warning_in(&s, k);
@@ -12917,27 +12868,30 @@ mod tests {
             assert_eq!(pending.ending(), Ending::Short { ended_after: k });
             assert_eq!(
                 parsed_seal(&store.files[k as usize + 1]).requires,
-                layout::REQUIRES_SPAN
+                layout::REQUIRES
             );
             let done = sealed(
                 pending
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert!(done.range_units.is_empty());
-            assert_eq!(done.cut_units, ["c"]);
+            assert_eq!(done.range_units, [range("c", 1, 1)]);
+            assert!(done.unwritten_units.is_empty());
             assert_eq!(
                 rows(&s),
-                [row("b", "completed", "current"), row("c", "cut", "staged")]
+                [
+                    row("b", "completed", "current"),
+                    row("c", "range", "staged")
+                ]
             );
         }
 
         /// The early warning before a spannable set's first slice: the tape
         /// holds none of it, so it is `cut` (X2), like a whole unit. The tape
         /// still states `spanning`: the fence follows the plan
-        /// (`volume-format-v2.md` §1.2).
+        /// (`volume-format-v3.md` §1.2).
         #[test]
-        fn the_early_warning_before_a_spannable_sets_first_slice_cuts_it() {
+        fn the_early_warning_before_a_sets_first_slice_leaves_it_unwritten() {
             let s = span_fixture(&[("a", &[SLICE, SLICE]), ("b", &[SLICE, SLICE])], &["b"]);
             let k = slice_at(&s, 0, 1);
             let mut store = warning_in(&s, k);
@@ -12946,7 +12900,7 @@ mod tests {
             assert_eq!(pending.ending(), Ending::Short { ended_after: k });
             assert_eq!(
                 parsed_seal(&store.files[k as usize + 1]).requires,
-                layout::REQUIRES_SPAN
+                layout::REQUIRES
             );
             let done = sealed(
                 pending
@@ -12954,10 +12908,11 @@ mod tests {
                     .unwrap(),
             );
             assert!(done.range_units.is_empty());
-            assert_eq!(done.cut_units, ["b"]);
+            assert_eq!(done.unwritten_units, ["b"]);
             assert_eq!(
                 rows(&s),
-                [row("a", "completed", "current"), row("b", "cut", "staged")]
+                [row("a", "completed", "current")],
+                "b was planned and not written: no row"
             );
             assert!(!done.short_ending_report().unwrap().contains("range"));
         }
@@ -12999,7 +12954,7 @@ mod tests {
                 parsed_seal(&store.files[m as usize]).requires,
                 file0_requires(&store)
             );
-            assert_eq!(file0_requires(&store), layout::REQUIRES_SPAN);
+            assert_eq!(file0_requires(&store), layout::REQUIRES);
             let done = sealed(
                 pending
                     .confirm(&s.conn, &mut store, Tier::Navigable)
@@ -13074,7 +13029,7 @@ mod tests {
         /// (`layout-session.md`, "Resume after a crash past the warning"
         /// step 3): the rehydrated session seals short at K+1 stating the
         /// two features its frozen File 0 states, and confirm records the
-        /// range from the rows' `may_span`.
+        /// range from the plan (a unit with some slices written and some not).
         #[test]
         fn a_resume_after_a_crash_past_the_warning_records_the_range() {
             let s = a_span_between_whole_units();
@@ -13092,7 +13047,7 @@ mod tests {
             let pending = ready.seal(&mut store).unwrap();
             assert_eq!(
                 parsed_seal(&store.inner.files[k as usize + 1]).requires,
-                layout::REQUIRES_SPAN
+                layout::REQUIRES
             );
             let done = sealed(
                 pending
@@ -13104,8 +13059,7 @@ mod tests {
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "range", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
             assert_eq!(warning_events(&s).len(), 1, "no second event");
@@ -13135,7 +13089,7 @@ mod tests {
                     warned,
                     "{what}"
                 );
-                let expected = layout::tape_requires(spannable);
+                let expected = layout::REQUIRES;
                 assert_eq!(file0_requires(&store), expected, "{what}");
                 assert_eq!(
                     parsed_seal(&store.files[at as usize]).requires,
@@ -13200,51 +13154,54 @@ mod tests {
         /// completed/cut, no range is named, and the event's details are
         /// 1.6.0's bytes, which `write::write_completed_details` now passes on.
         #[test]
-        fn a_write_with_no_spannable_unit_is_1_6_0s() {
+        fn a_short_write_names_its_range_and_its_unwritten_units_in_its_details() {
             let s = three_units();
             let k = slice_at(&s, 1, 0);
             let mut store = warning_in(&s, k);
             let (s, outcome) = execute(s, &mut store);
             let pending = ready(outcome).seal(&mut store).unwrap();
-            assert!(may_span_rows(&s).iter().all(|(_, may)| !may));
             let seal_text = String::from_utf8(store.files[k as usize + 1].clone()).unwrap();
             assert!(
-                seal_text.contains("\nrequires = [\"short-seal\"]\n")
-                    && !seal_text.contains("spanning"),
+                seal_text.contains("\nrequires = []\n") && !seal_text.contains("spanning"),
                 "{seal_text}"
             );
-            assert_eq!(file0_requires(&store), layout::REQUIRES_WHOLE);
+            assert_eq!(file0_requires(&store), layout::REQUIRES);
             let done = sealed(
                 pending
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert!(done.range_units.is_empty());
+            assert_eq!(done.range_units, [range("b", 1, 1)]);
             assert_eq!(
                 rows(&s),
                 [
                     row("a", "completed", "current"),
-                    row("b", "cut", "staged"),
-                    row("c", "cut", "staged")
+                    row("b", "range", "staged")
                 ]
             );
-            // 1.6.0's details, built as `write::write_completed_details` built
-            // them before it delegated to the session (#478).
+            // The event's details (ADR-0012 item 288): the ending, the units
+            // planned and not written, and the ranges.
             let Ending::Short { ended_after } = done.ending else {
                 panic!("a short seal");
             };
-            let v1_6_0 = serde_json::json!({
+            let details = serde_json::json!({
                 "ending": "short",
                 "ended_after": ended_after,
-                "cut_units": done.cut_units,
+                "unwritten_units": ["c"],
+                "range_units": [{"unit": "b", "first_slice": 1, "last_slice": 1}],
             })
             .to_string();
-            assert_eq!(done.write_completed_details(), Some(v1_6_0.clone()));
+            assert_eq!(done.write_completed_details(), Some(details.clone()));
             assert_eq!(
                 crate::volume::write::write_completed_details(&done),
-                Some(v1_6_0)
+                Some(details)
             );
-            assert!(!done.short_ending_report().unwrap().contains("range"));
+            let report = done.short_ending_report().unwrap();
+            assert!(report.contains("Held here as a range"), "{report}");
+            assert!(
+                report.contains("Planned and not written (still staged): c."),
+                "{report}"
+            );
 
             // And a full seal: no details, as before 1.6.0.
             let s = three_units();
@@ -13322,7 +13279,7 @@ mod tests {
                         created_at: "2026-10-23T00:00:00Z",
                         cartridge_identity_source: None,
                     },
-                    layout::REQUIRES_SPAN,
+                    layout::REQUIRES,
                 );
                 thunk.into_bytes()
             };
@@ -13335,7 +13292,7 @@ mod tests {
             put_file(
                 &mut store,
                 k as usize + 1,
-                fixture_short_seal_requiring(CONTACT_LABEL, k, "deadbeef", layout::REQUIRES_SPAN),
+                fixture_short_seal_requiring(CONTACT_LABEL, k, "deadbeef", layout::REQUIRES),
             );
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
@@ -13352,7 +13309,7 @@ mod tests {
             put_file(
                 &mut store,
                 m as usize,
-                fixture_seal_requiring(CONTACT_LABEL, m, "deadbeef", layout::REQUIRES_SPAN),
+                fixture_seal_requiring(CONTACT_LABEL, m, "deadbeef", layout::REQUIRES),
             );
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
@@ -13360,7 +13317,7 @@ mod tests {
             );
             assert_eq!(
                 parsed_seal(&store.files[m as usize]).requires,
-                layout::REQUIRES_SPAN
+                layout::REQUIRES
             );
         }
 
@@ -13552,8 +13509,7 @@ mod tests {
                     rows(&s),
                     [
                         row("a", "completed", "current"),
-                        row("b", "cut", "staged"),
-                        row("c", "cut", "staged"),
+                        row("b", "range", "staged"),
                     ],
                     "torn={torn}"
                 );

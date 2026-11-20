@@ -3,15 +3,9 @@
 //! Distinct from [`crate::policy::decorative`], which surfaces keys that ARE
 //! parsed but have no reader yet. These are never parsed at all. Since issue
 //! #171 an unknown key is a hard load error, so `config check` already reports
-//! it as a problem; what this scan adds is the REMEDIATION for keys whose
-//! history is known.
-//!
-//! The keys with a history are the two issue #348 renamed:
-//! `min_copies_for_tape_only` → `min_copies` and `min_locations_for_tape_only`
-//! → `min_locations` (the list lives in `config::RENAMED_DEFAULTS_KEYS`, shared
-//! with the load-time refusal). Before that rename, issue #129 had the inverse
-//! problem — `[defaults] min_copies` read like the copy requirement and was
-//! not one; it now is.
+//! it as a problem; what this scan adds is `[defaults]`-scoped wording. A key
+//! 1.x renamed (`min_copies_for_tape_only`, …) has no hint of its own since
+//! 2.0 (ADR-0012 item 258(d)): it is an unknown key like any other.
 //!
 //! Advisory only, like every other scan here: it never changes `config check`'s
 //! exit code (ADR-0004's spirit — reporting, not blocking).
@@ -41,7 +35,6 @@ const DEFAULTS_FIELDS: &[&str] = &[
     "encrypt",
     "preserve_xattrs",
     "preserve_acls",
-    "preserve_fsa",
     "dirty_on_metadata_change",
     "global_excludes",
     "large_file_warn_threshold",
@@ -49,7 +42,6 @@ const DEFAULTS_FIELDS: &[&str] = &[
     "min_locations",
     "warehouse_copies",
     "verify_interval_days",
-    "allow_spanning",
     "copies_at",
 ];
 
@@ -97,36 +89,23 @@ pub fn describe(hit: &UnknownKeyHit) -> String {
     // hard load error. Saying it now contradicts the refusal printed inches
     // above this line in the same `config check` output, and would send an
     // operator looking for a subtle behaviour change when the config simply
-    // will not load. What this adds over the generic refusal is the
-    // REMEDIATION, which is the only reason the scan survives #173.
-    let key = hit.key.trim_start_matches("defaults.");
-    if let Some((old, new)) = crate::config::RENAMED_DEFAULTS_KEYS
-        .iter()
-        .find(|(old, _)| *old == key)
-    {
-        format!(
-            "[defaults].{old} was renamed to [defaults].{new} — the config will not \
-             load while the old name is present. Rename the key; its meaning and value \
-             are unchanged."
-        )
-    } else {
-        format!(
-            "[defaults].{} is not a recognised setting — the config will not load while \
-             it is present; check the spelling, or remove it.",
-            hit.key.trim_start_matches("defaults."),
-        )
-    }
+    // will not load.
+    format!(
+        "[defaults].{} is not a recognised setting — the config will not load while \
+         it is present; check the spelling, or remove it.",
+        hit.key.trim_start_matches("defaults."),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Issue #348: the two renamed keys are reported with the new name to
-    /// use, and the new names themselves — `min_copies` was #129's
-    /// not-a-setting — are real fields now and report nothing.
+    /// The old tape-only names (renamed by #348 in 1.x) are unknown keys now:
+    /// reported like any other, with no rename hint, and the new names are
+    /// real fields that report nothing.
     #[test]
-    fn the_old_tape_only_names_are_reported_with_the_new_key_named() {
+    fn the_old_tape_only_names_are_reported_as_unknown_keys() {
         let hits = scan(
             "[defaults]\nmin_copies_for_tape_only = 2\nmin_locations_for_tape_only = 2\n\
              slice_size = \"10G\"\n",
@@ -142,14 +121,11 @@ mod tests {
                 },
             ]
         );
-        let msg = describe(&hits[0]);
-        assert!(msg.contains("renamed to [defaults].min_copies "), "{msg}");
-        let msg = describe(&hits[1]);
-        assert!(
-            msg.contains("renamed to [defaults].min_locations "),
-            "{msg}"
-        );
-
+        for hit in &hits {
+            let msg = describe(hit);
+            assert!(msg.contains("is not a recognised setting"), "{msg}");
+            assert!(!msg.contains("renamed"), "{msg}");
+        }
         assert!(scan("[defaults]\nmin_copies = 2\nmin_locations = 2\n").is_empty());
     }
 

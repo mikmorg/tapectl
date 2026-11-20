@@ -229,10 +229,10 @@ file:
 | Tape file | Encrypted to | Contains |
 |---|---|---|
 | File 0 ID thunk, File 1 guide, File 2 `RESTORE.sh`, File 3 front index, last-file seal marker | nobody (plaintext) | label, layout, sizes and ciphertext hashes. No names, no content |
-| Tenant envelope, one per tenant on the tape | that tenant's active keys **+** operator's active keys **+** escrow (keys active when the volume was written) | `MANIFEST.toml` (units, file list, slice positions, plaintext hashes), `RECOVERY.md`, dar catalogs |
+| Tenant envelope, one per tenant on the tape | that tenant's active keys **+** operator's active keys **+** escrow (keys active when the volume was written) | `MANIFEST.toml` (units, slice positions, plain and encrypted hashes), `RECOVERY.md`, each unit's file table (every file's path, slice and sha256) and id map, and the index of the archive |
 | Operator envelope and its backup | operator's active keys **+** escrow | the same for *every* tenant on the tape, plus `PLAN.toml` and `catalog.db` (ownership and escrow receipts, used by `catalog rebuild`) |
 | Tenant envelope backup, one per tenant envelope (tapes from 1.1.0) | as the tenant envelope | the same bytes as the tenant envelope it copies; `RESTORE.sh` and `catalog rebuild` read it only when that envelope is damaged or will not read; a tenant envelope unreadable in both copies does not stop a rebuild when the operator envelope's catalog.db names each unit's owner |
-| Data slice | owning tenant's active keys **+** operator's active keys **+** escrow (keys active when the unit was staged) | one dar archive slice |
+| Data slice | owning tenant's active keys **+** operator's active keys **+** escrow (keys active when the unit was staged) | one slice: whole members of a unit's tar stream, compressed first if the unit is |
 
 So:
 
@@ -283,7 +283,7 @@ keys alike. The directory is created mode 0700 and the private key files keep
 mode 0600. The command also logs a warning naming that directory.
 
 `db backup` copies `tapectl.db` and, with `--include-keys`, `keys/`. Nothing else
-in the home is copied: not `config.toml`, not the dar catalogs in `catalogs/`,
+in the home is copied: not `config.toml`,
 not the stage reports in `stage-reports/`. Only a tarball of the home carries
 those.
 
@@ -429,7 +429,7 @@ removes the past.
 |---|---|---|
 | **One tenant key file** (say `family-primary.age.key`) | Everything. The other pair, the operator keys and the escrow secret are all recipients of the same files | `tapectl key rotate --tenant family` so new data does not depend on a pair with a missing half. Keep the surviving old file: older tapes still need it |
 | **All of one tenant's key files** | tapectl's `restore` still reads that tenant's data using the operator keys; `RESTORE.sh` works with the operator key or escrow secret | `key rotate --tenant family`, then give the tenant their new files. They can no longer read old tapes independently; only the operator or escrow can |
-| **The whole home** (catalog, keys, config), escrow paper intact | Every tape is still readable with the escrow secret, through `RESTORE.sh --key`, or through `restore raw-volume` + `age` + `dar` once a new home carries the original escrow identity (runbook C, step 3). The catalog comes back from the kit's `catalog.db.age` and `catalog rebuild` | [Runbook C](#c-the-catalog-is-gone-and-you-hold-the-operator-or-escrow-key). tapectl's own `restore unit\|file\|volume` reads the old tapes when given the escrow secret with `--key escrow.key` (1.4.0): the file is used for that one command and never copied into `keys/`, where the escrow secret must never be put. `RESTORE.sh --key` needs no tapectl at all. Rotate every tenant and the operator before staging anything new |
+| **The whole home** (catalog, keys, config), escrow paper intact | Every tape is still readable with the escrow secret, through `RESTORE.sh --key`, or through `restore raw-volume` + `age` + `tar` once a new home carries the original escrow identity (runbook C, step 3). The catalog comes back from the kit's `catalog.db.age` and `catalog rebuild` | [Runbook C](#c-the-catalog-is-gone-and-you-hold-the-operator-or-escrow-key). tapectl's own `restore unit\|file\|volume` reads the old tapes when given the escrow secret with `--key escrow.key` (1.4.0): the file is used for that one command and never copied into `keys/`, where the escrow secret must never be put. `RESTORE.sh --key` needs no tapectl at all. Rotate every tenant and the operator before staging anything new |
 | **The escrow paper** (every copy), home intact | Everything, today: the operator and tenant keys open every tape | Make sure a key-bearing copy of the home exists off the machine, because it is now your only way back. The secret cannot be re-printed (it was never stored), and no command registers a replacement identity. Every future tape still carries the old escrow recipient, which nobody can use |
 | **The home and the escrow paper** | Only what survives elsewhere: a `db backup --include-keys` copy or a home tarball restores everything; a tenant holding their own key files can still restore their own data with `RESTORE.sh` | Without any of those, the data on tape cannot be decrypted by anyone. This is the loss the Heir Kit's two failure domains exist to prevent |
 
@@ -454,8 +454,8 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
-  tapectl-1.9.1    the program that made this kit, 39.3 MiB, sha256 3a7bd3e2… (named on the sheet)
-note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/v1.9.1/tapectl-1.9.1-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
+  tapectl-X.Y.Z    the program that made this kit, 39.3 MiB, sha256 3a7bd3e2… (named on the sheet)
+note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/vX.Y.Z/tapectl-X.Y.Z-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -488,7 +488,7 @@ only for a file it holds. The command then prints one line saying how to put it 
 the kit:
 
 ```bash
-tapectl key escrow-kit ~/heir-kit --static-binary ~/Downloads/tapectl-1.9.1-x86_64-linux-musl
+tapectl key escrow-kit ~/heir-kit --static-binary ~/Downloads/tapectl-X.Y.Z-x86_64-linux-musl
 ```
 
 When the tapectl making the kit is itself static, the sheet says so: its copy is the
@@ -638,26 +638,27 @@ a rotation in between needs nothing from you. Full reference:
 
 ### B. A tenant holding only their key files and a tape
 
-This is the Heir Path. It needs `mt` (package `mt-st`), `dd`, `head`, `truncate`, `tar`,
-`mkfifo`, `tee`, `sha256sum`, `age`, `dar`, `bash` and coreutils (and `gpg` only when the
-dar was built with GPG support). It does not need tapectl. A tape written by 1.2.0 or later
-has a RESTORE.sh that checks, when a mode starts and before it reads the tape, only the tools
-that mode runs, and stops with `FATAL: missing required tool: <name>`: `--info` and
-`--verify` need only `mt`, `dd`, `sha256sum` and `head`; `--find-envelope` adds `age`,
-`truncate` and `tar`; `--list` adds `dar`; `--restore --path` adds `tee`; a whole-unit
-`--restore` needs `tee` and `mkfifo` too. A RESTORE.sh from an earlier tape checks every
-tool in every mode (and before 2026-09-28 not `tar`: a missing one showed up only after the
-envelope had been decrypted).
+This is the Heir Path. It needs `mt` (package `mt-st`), `dd`, `head`, `tail`, `tar`,
+`sha256sum`, `age`, `bash` and coreutils, and `gzip`, `xz` or `zstd` only for a unit that
+was stored compressed (its `MANIFEST.toml` and `--list` name the algorithm). Any tar reads
+a tape: GNU tar 1.35's floor binds the host that *writes*, not the heir. It does not need
+tapectl. RESTORE.sh checks, when a mode starts and before it reads the tape, only the
+tools that mode runs, and stops with `FATAL: missing required tool: <name>`: `--info` and
+`--verify` need only `mt`, `dd`, `sha256sum` and `head`; `--find-envelope`, `--list`,
+`--where`, `--find` and a whole-unit `--restore` add `age` and `tar`; `--restore --path` and
+`--paths-from` add `tail`.
 
-On a tape written by 1.3.0 or later, RESTORE.sh also repairs what it can. A slice that fails
-its checksum is taken from another copy matched by its sha256 alone: from a directory of slice
-files copied off another tape (`--slices-from DIR`) or from a second tape (`--swap-tapes`); either
-restores slice by slice onto disk, about twice the unit's size. Every restored file is checked
-against the sha256 recorded for it (`--no-file-check` skips that). A file that could not be
-restored, or fails its check, is listed in `.tapectl-damaged-files.txt` in the unit's directory,
-and the run ends `RESTORE INCOMPLETE`; `--restore --unit UNIT --fill-from THAT_LIST --to THE_SAME_DIR`
-against another tape of the same unit and version restores only those files. Only the same unit
-and version is a copy: another version is never used.
+A restore reads one slice at a time, checks it against the front index and the manifest,
+decrypts it (and decompresses it, for a compressed unit) into a work directory and gives it
+to `tar`. A slice that is not on this tape or fails a check is left out, and **nothing is
+ever filled in with zeros**: its files are listed in `.tapectl-damaged-files.txt` in the
+restored directory, the rest is restored, and the run ends `RESTORE INCOMPLETE`. The one
+repair is `--restore --paths-from THAT_LIST --to THE_SAME_DIR` against another tape that
+holds the same unit and version, which restores only the listed paths. Only the same unit
+and version is a copy: another version is never used. Every restored file is checked against
+the sha256 recorded for it (`--no-file-check` skips that); that check, never `tar`'s exit
+status, decides what was restored. A unit that continues on another cartridge asks for the
+next one at a prompt (see step 5).
 
 1. **Read the tape's identity** (File 0) to confirm you have the right cartridge:
    ```bash
@@ -669,7 +670,7 @@ and version is a copy: another version is never used.
    same text, but only once tapectl has a home. Until then every command except
    `init` stops with an error that names the home it looked at and why that one:
    ```text
-   error: tapectl is not initialized at /home/heir/.tapectl: there is no catalog /home/heir/.tapectl/tapectl.db there. The home was chosen because nothing named a home (no --home, TAPECTL_HOME or --config, no ~/.tapectl and no home pointer), so it is ~/.tapectl. To start a new archive there: `tapectl init`.
+   error: tapectl is not initialized at /home/heir/.tapectl: there is no catalog /home/heir/.tapectl/tapectl.db there. The home was chosen because nothing named a home (no --home, TAPECTL_HOME or --config, no ~/.tapectl and no home pointer), so it is ~/.tapectl. To start a new archive there: `tapectl init`, which mints a NEW escrow identity with a new secret shown once, that no tape knows. To read tapes of an existing archive, give the home that archive's escrow public key (it is on the Heir Kit's sheet): `tapectl init --operator NAME --escrow-public-key KEY`.
    ```
    Do not answer that with a plain `init`, which mints a new escrow identity that
    none of the tapes know. With the Heir Kit cover sheet's `age1…` public key
@@ -721,46 +722,45 @@ and version is a copy: another version is never used.
    ```
    Without `--version N` the newest version on the tape is restored. Without
    `--unit` the script restores the unit if the envelope it opened holds only
-   one. On a 1.2.0 tape it then says, before RESTORE COMPLETE, how many other
+   one. It then says, before RESTORE COMPLETE, how many other
    envelopes your key opened and how many other units they list, and names `--list`
    and `--all`: an escrow or operator key opens every tenant's envelope, so look
    before you assume the tape held one unit. With several, it lists them and stops with `FATAL: multiple units found —
    specify one with --unit NAME` (exit 1). Run it again with `--unit`.
    Each slice is checked against the front index's hash before it is decrypted.
 
-   **Disk space.** On tapes written by tapectl 1.1.0 and later each slice
-   streams from the tape through age into dar, so `--to` needs about the
-   unit's size free; nothing decrypted waits on disk. (A 1.0.x tape's script
-   decrypts every slice to disk first and needs about twice the unit, plus
-   one slice; `--scratch DIR` puts those slices on another disk.) The script
-   measures this before it reads any slice and stops with
-   `not enough disk space` if it will not fit. Do not restore into `/tmp`,
-   which is RAM on many systems.
+   **Disk space.** `--to` needs the sum of the sizes of the units restored (`--find-envelope`
+   and `--list` print each unit's "bytes of stream", which is what the restored files take,
+   compressed or not), and the work directory needs about twice the largest slice of the
+   unit. The work directory is made INSIDE `--to` (`.tapectl-work.` and some letters), or
+   under `$TMPDIR` for the modes that only read; `--work DIR` puts it on another disk. It
+   holds the decrypted envelopes too, the unit's file table among them: a unit of millions
+   of files has a table of hundreds of MiB. The script measures this before it reads any
+   slice and stops with `not enough disk space` if it will not fit (`--no-space-check` skips
+   the check). Do not restore into `/tmp`, which is RAM on many systems.
 
-   The decrypted envelopes (the operator's catalog.db and the dar catalogues, which grow with the
-   number of files) go to a work directory under $TMPDIR (default /tmp); set TMPDIR to move it.
-   The script warns before reading them when that directory looks too small. The `--to` figure
-   counts the slices' encrypted size on tape, so a unit stored compressed may need more. A
-   1.2.0 RESTORE.sh sets LC_ALL=C so its reading of dar's messages holds in any locale.
+   **`--to` must be empty or new.** The script refuses a directory with anything in it. To
+   finish a restore that stopped part way, run the same command again with `--overwrite`.
 
-   If the envelope holds no usable dar catalogue for the unit and the
-   machine's dar is older than 2.7.21 (Debian's and Ubuntu's is 2.7.13),
-   the script decrypts the slices to disk first instead, and says so; that
-   needs room for the slices as well (`--scratch DIR` puts them elsewhere).
-   A dar built with GPG support will not start without `gpg` (package
-   `gnupg`); the script checks before it reads the tape.
+   **Several units, or one file.** `--all` restores every unit of the envelope, and
+   `--unit` may repeat; each goes to `--to/UNIT`, in one pass along the tape. `--list --key
+   … --unit UNIT` prints a unit's files from the file table in the envelope without
+   reading any slice, and `--restore … --unit UNIT --path some/file` restores just that
+   file, reading only the slices that hold it. `--path` is written as `--list` prints it,
+   escaped: a backslash in a name is typed `\\`, a tab `\t`, a newline `\n`, and a byte that
+   is not UTF-8 `\xHH`.
 
-   **`--to` must be empty or new.** dar keeps a file that already exists and
-   still reports success, so the script refuses a directory with anything in
-   it. To finish a restore that stopped part way, run the same command again
-   with `--overwrite`.
+   **A unit across cartridges.** When the next slice is not on the cartridge in the drive,
+   RESTORE.sh tells you to eject it, names the cartridge that holds the slice and waits.
+   Load it and press ENTER; type `done` and ENTER if you do not have it (the restore goes
+   on with what it has and lists the rest with the tapes that hold it), or `quit` to stop.
+   A restore may start on any tape of a span and takes the files that tape holds whole; a
+   later run into the same `--to`, from another tape of the same unit, adds that tape's
+   files and leaves alone those that already pass.
 
-   **Several units, or one file.** `--all` restores every unit of the
-   envelope, and `--unit` may repeat; each goes to `--to/UNIT`, in one pass
-   along the tape. `--list --key … --unit UNIT` prints a unit's files from the
-   dar catalogue in the envelope without reading any slice, and
-   `--restore … --unit UNIT --path some/file` restores just that file, reading
-   only the slices that hold it.
+   **Who owns the files.** Files come back by number, as the stream recorded them; as a
+   non-root user `tar` makes them yours. The id map in the envelope (`tables/*.ids.tsv`)
+   says which name the writing host gave each id; a restore shows it and never acts on it.
 
 The same steps work with the operator key or the escrow secret, which open every
 tenant's envelope. `--unit` then picks the right one, or `--list` first and
@@ -804,7 +804,7 @@ is the same procedure for a service-user host.
      database: ~/.tapectl-rebuilt/tapectl.db
      config:   ~/.tapectl-rebuilt/config.toml
      escrow:   adopted age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7 (imported — its secret lives on the heir kit, not here)
-     dar:      dar (found at /usr/bin/dar)
+     tar:      tar (GNU tar) 1.35 (found at /usr/bin/tar)
 
    next steps:
      a tenant, whose data is archived    tapectl tenant add <TENANT>
@@ -884,7 +884,7 @@ is the same procedure for a service-user host.
      inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
                4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
      cartridge "L8-0002" registered from this tape's own identity and bound
-     dar catalogues: 4 stage sets got theirs back from the operator envelope, so a copy written from them carries it again
+     file tables: 4 stage sets got theirs (and the id map) back from the operator envelope, so a copy written from them carries them again
      cross-volume index: this tape names 1 other volume this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); load each and run `tapectl catalog rebuild --from-volume --key <key>`:
        L8-0001  (uuid 45ae9801-8301-457d-847c-0b70c09177e7; cartridge serial E01010L8_1775794348; LTO-8; sealed 2026-11-05T03:42:07Z)
          family: family/letters v1
@@ -943,13 +943,12 @@ is the same procedure for a service-user host.
    tapectl restore volume L8-0002 --to /srv/restore --device "$TAPE" --dry-run
    tapectl restore volume L8-0002 --to /srv/restore --device "$TAPE"
    ```
-   `catalog rebuild` puts each stage set's dar catalogue back on disk from the
-   operator envelope (#473; every tape written by tapectl 1.0.0 or later carries
-   them), so those units stream. A unit whose set had none spools: each slice is
-   decrypted to disk before dar reads it, and the space check asks for every unit
-   plus the largest unit's slices (`--scratch DIR` puts those on another disk);
-   `catalog rebuild` names such sets. One unit's failure does not stop the rest; the report names
-   it, and the command exits non-zero.
+   `catalog rebuild` puts each stage set's file table and id map back in the catalog
+   from the operator envelope's `catalog.db`, so the restore reads only the slices it
+   needs, one at a time, and feeds `tar` whole members. A set whose table the tape
+   did not carry is named, and a write of it is refused until it is staged again.
+   One unit's failure does not stop the rest; the report names it, and the command
+   exits non-zero.
    A unit is its uuid. If the catalog already has a unit of the same name under another
    uuid (one renamed away and a new unit given its old name, or a catalog and a tape of
    different generations), the rebuild refuses that unit of the tape by name: nothing of it
@@ -1276,13 +1275,12 @@ tapectl, needs to know this:
   unit and the tapes holding it; `--where --all` lists every unit the index names, no
   limit, with the tapes that hold each; `--find TEXT` finds a path. The newest tape's index
   is the most complete.
-- **Tools:** `mt` (package `mt-st`), `dd`, `head`, `truncate`, `tar`, `mkfifo`,
-  `tee`, `sha256sum`, `age` and `age-keygen` ([age-encryption.org](https://age-encryption.org);
+- **Tools:** `mt` (package `mt-st`), `dd`, `head`, `tail`, `tar`,
+  `sha256sum`, `age` and `age-keygen` ([age-encryption.org](https://age-encryption.org);
   the files are age v1 format, which `rage` reads too, but RESTORE.sh runs a
-  program named `age`), `dar` ([dar.linux.free.fr](http://dar.linux.free.fr)),
-  `gpg` (package `gnupg`) only when the dar was built with GPG support, as
-  Debian's and Ubuntu's is, and `bash`. Any Linux machine has them or can
-  install them; RESTORE.sh (1.2.0 and later) checks, before it reads the tape,
+  program named `age`), `gzip`, `xz` or `zstd` only for a unit stored compressed,
+  and `bash`. Any Linux machine has them or can
+  install them; RESTORE.sh checks, before it reads the tape,
   the tools the mode you ran needs.
 - **The key is the secret handwritten on the cover sheet** (`AGE-SECRET-KEY-1…`).
   The printed `age1…` value is only a check. Type the secret on one line of a
@@ -1298,7 +1296,8 @@ tapectl, needs to know this:
   without it.
 - **With tapectl installed**, first give it a home: it refuses every other command
   until one exists (`error: tapectl is not initialized at <home>: …`, naming the
-  home and ending `To start a new archive there: tapectl init`).
+  home and naming both a plain `tapectl init`, which mints a new escrow identity,
+  and the recovery form `tapectl init --operator NAME --escrow-public-key KEY`).
   Do **not** run a plain `init`, which makes a new escrow identity that none of
   the tapes know. Use the identity printed on the cover sheet:
   `tapectl init --operator <name> --escrow-public-key age1…`

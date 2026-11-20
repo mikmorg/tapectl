@@ -279,7 +279,7 @@ def check_toml_blocks(binary, path):
         if lang != "toml":
             continue
         src = "\n".join(body)
-        if "check-docs: skip" in src or not re.search(r"^\[(dar|staging|defaults)\]", src, re.M):
+        if "check-docs: skip" in src or not re.search(r"^\[(tar|staging|defaults)\]", src, re.M):
             continue
         with tempfile.TemporaryDirectory() as home:
             subprocess.run([binary, "--home", home, "init", "--no-escrow"], capture_output=True)

@@ -25,8 +25,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// Files whose string literals are on-tape bytes (see the module doc).
-const ON_TAPE_TEXT: &[&str] = &["src/volume/layout.rs", "src/volume/restore_script.rs"];
+/// Files whose string literals are on-tape bytes and so keep their issue numbers (see the
+/// module doc). None now: since T4.10 RESTORE.sh is a shell file in the tree
+/// (`src/volume/heir/RESTORE.sh`), not Rust string literals, and `layout.rs`'s generated
+/// text names no issue. A file whose literals gain one again is listed here, and the
+/// positive control below then holds it to the scan seeing inside its raw strings.
+const ON_TAPE_TEXT: &[&str] = &[];
 
 /// One Rust source file, lexed: the string literals of its production code
 /// (with the line each starts on), and that code with every comment removed

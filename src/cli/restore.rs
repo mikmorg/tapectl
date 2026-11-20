@@ -45,10 +45,11 @@ pub enum RestoreCommands {
         /// Without it, --dry-run (which opens no drive) previews from the one
         /// volume this catalog has holding the unit, and names it; when several
         /// hold it they are listed, to name one here. For a version held across
-        /// cartridges (a range on this tape), this tape (or the loaded one)
-        /// must hold its slice 1: the others are asked for in slice order, by
-        /// label, sticker and chip serial, and a tape that does not hold slice
-        /// 1 is refused, naming the ones that do
+        /// cartridges (a range on this tape) the restore may start on any tape
+        /// of it: the others are asked for in slice order, by label, sticker
+        /// and chip serial, and the answer "skip" (I do not have it), or nobody
+        /// at the terminal, restores the files this tape holds whole and lists
+        /// the rest
         #[arg(long)]
         from: Option<String>,
         /// Destination directory
@@ -67,14 +68,13 @@ pub enum RestoreCommands {
         /// refused, naming the ones it does
         #[arg(long)]
         version: Option<i64>,
-        /// Where the restore's scratch directory is made (default: inside --to).
+        /// Where a repair from another copy keeps what it reads (default: inside --to).
         ///
-        /// Where the restore's scratch directory is made (removed when the
-        /// restore ends); defaults to inside --to, never the system temp
-        /// directory. A unit whose isolated catalogue from `stage create`
-        /// is on disk streams its slices into dar and puts only named
-        /// pipes there; otherwise (a rebuilt catalog, dar older than 2.7.9)
-        /// every decrypted slice waits there, as large as the unit
+        /// Where the scratch directory is made (removed when the restore
+        /// ends); defaults to inside --to, never the system temp directory.
+        /// A restore of a unit writes no slice to disk: each member goes to
+        /// tar as its slice is read. Only the repair of a damaged file from
+        /// another copy of the version extracts there first
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Restore into a destination that already holds files, replacing any that collide.
@@ -85,25 +85,19 @@ pub enum RestoreCommands {
         overwrite: bool,
         /// Skip the free-space check, for a filesystem that holds more than it reports.
         ///
-        /// Skip the free-space check (the unit's size when it streams;
-        /// about twice that when its slices are spooled, with the scratch
-        /// directory and --to on one disk), for a filesystem that holds
-        /// more than it reports free, such as a compressed or
-        /// thin-provisioned one
+        /// Skip the free-space check (the unit's size in --to), for a
+        /// filesystem that holds more than it reports free, such as a
+        /// compressed or thin-provisioned one
         #[arg(long)]
         no_space_check: bool,
-        /// Decrypt every slice to the scratch directory before dar extracts them.
+        /// Do not hash every restored file on disk once tar has ended.
         ///
-        /// Decrypt every slice to the scratch directory before dar extracts
-        /// them, even when the unit could stream (its isolated catalogue
-        /// on disk). Needs about twice the unit's size with the scratch
-        /// directory and --to on one disk. Across cartridges too: a version
-        /// held across cartridges is read from each in turn into the
-        /// scratch directory, and dar extracts once the last is read;
-        /// without it the slices stream into one extraction across the
-        /// swaps
+        /// Every member is still hashed against the file table as it is
+        /// handed to tar. The check on disk is a second read of what was
+        /// restored: it is what proves tar made each file whole, since tar's
+        /// exit status is never the verdict
         #[arg(long)]
-        spool: bool,
+        no_file_check: bool,
         /// An age identity file (a secret key) to decrypt with, in this command only.
         ///
         /// An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt
@@ -148,12 +142,10 @@ pub enum RestoreCommands {
         to: String,
         /// A unit to restore; repeat for several.
         ///
-        /// Without it, every unit the volume holds whole: on a tape that ended
-        /// early (a short seal), the units the end cut are named, with a volume
-        /// that holds each whole, and left out; so is a unit of which the tape
-        /// holds only a range (a version held across cartridges), with the
-        /// `restore unit` that reads it. A unit named that the tape does not
-        /// hold whole is refused before the drive is opened
+        /// Without it, every unit the volume holds a written slice of: a unit
+        /// of which the tape holds only a range (the one a short seal ended
+        /// inside, say) is read across cartridges. A unit named that the tape
+        /// holds nothing of is refused before the drive is opened
         #[arg(long = "unit", value_name = "NAME")]
         units: Vec<String>,
         /// Tape device (by-id path).
@@ -162,11 +154,12 @@ pub enum RestoreCommands {
         /// is configured.
         #[arg(long)]
         device: Option<String>,
-        /// Where each unit's scratch directory is made (default: inside its own directory).
+        /// Where a repair from another copy keeps what it reads (default: inside each unit's directory).
         ///
         /// Where each unit's scratch directory is made, one at a time
         /// (removed when that unit ends); defaults to inside the unit's own
-        /// directory, never the system temp directory
+        /// directory, never the system temp directory. See `restore unit
+        /// --scratch`
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Restore into unit directories that already hold files, replacing any that collide.
@@ -177,16 +170,14 @@ pub enum RestoreCommands {
         overwrite: bool,
         /// Skip the free-space check of the whole set.
         ///
-        /// Skip the free-space check of the whole set (every restored unit,
-        /// plus the largest unit's spooled slices)
+        /// Skip the free-space check of the whole set (every restored unit)
         #[arg(long)]
         no_space_check: bool,
-        /// Spool every unit's slices to the scratch directory instead of streaming them.
+        /// Do not hash every restored file on disk once tar has ended.
         ///
-        /// Spool every unit's slices to the scratch directory instead of
-        /// streaming them into dar (see `restore unit --spool`)
+        /// See `restore unit --no-file-check`
         #[arg(long)]
-        spool: bool,
+        no_file_check: bool,
         /// Stop at the first unit that fails; the units after it are not attempted.
         ///
         /// Without it every unit is tried
@@ -251,13 +242,12 @@ pub enum RestoreCommands {
         /// refused, naming the ones it does
         #[arg(long)]
         version: Option<i64>,
-        /// Where the decrypted slices wait for dar (default: inside --to).
+        /// Where the file is extracted before it is placed (default: inside --to).
         ///
-        /// Where the decrypted slices wait for dar: a scratch directory is
-        /// made inside DIR and removed when the restore ends. Defaults to
-        /// inside --to, never the system temp directory. With the unit's
-        /// isolated catalogue from `stage create` on disk only the slices
-        /// holding the file (and the last) are read; otherwise every slice
+        /// Where the file is extracted before it is placed: a scratch
+        /// directory is made inside DIR and removed when the restore ends.
+        /// Defaults to inside --to, never the system temp directory. Only the
+        /// slices that hold the file (and a hard link's target) are read
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Replace a file of the same name already in --to.
@@ -267,12 +257,17 @@ pub enum RestoreCommands {
         overwrite: bool,
         /// Skip the free-space check, for a filesystem that holds more than it reports.
         ///
-        /// Skip the free-space check (the decrypted slices read, plus the
-        /// file, with the scratch directory and --to on one disk), for a
-        /// filesystem that holds more than it reports free, such as a
-        /// compressed or thin-provisioned one
+        /// Skip the free-space check (the file's size), for a filesystem
+        /// that holds more than it reports free, such as a compressed or
+        /// thin-provisioned one
         #[arg(long)]
         no_space_check: bool,
+        /// Do not hash the restored file on disk once tar has ended.
+        ///
+        /// The member is still hashed against the file table as it is handed
+        /// to tar. The check on disk is a second read of what was restored
+        #[arg(long)]
+        no_file_check: bool,
         /// An age identity file (a secret key) to decrypt with, in this command only.
         ///
         /// An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt
@@ -376,8 +371,12 @@ impl From<&str> for UnitArg {
 pub struct UnitAndFile {
     /// Unit name. After --unit, the file's PATH instead
     #[arg(value_name = "UNIT", required_unless_present = "unit")]
-    first: Option<String>,
+    first: Option<std::ffi::OsString>,
     /// File path within the unit, relative to its root, as `catalog list` prints it.
+    ///
+    /// Typed as the shell has it: the name's own bytes, so a name that is not UTF-8
+    /// and one with a backslash are typed as they are. `catalog list` prints them
+    /// escaped (`\\` for a backslash, `\xHH` for a byte outside UTF-8).
     ///
     /// Checked against the catalog's file list for the version before the tape
     /// is touched; a directory is refused
@@ -386,28 +385,32 @@ pub struct UnitAndFile {
         required_unless_present_any = ["unit", "file"],
         conflicts_with_all = ["unit", "file"]
     )]
-    second: Option<String>,
+    second: Option<std::ffi::OsString>,
     /// The unit, as a flag: the same as UNIT
     #[arg(long = "unit", value_name = "UNIT")]
     unit: Option<String>,
     /// The file, as a flag: the same as PATH
     #[arg(long = "file", value_name = "PATH")]
-    file: Option<String>,
+    file: Option<std::ffi::OsString>,
 }
 
 impl UnitAndFile {
-    /// The unit named, however it was given.
+    /// The unit named, however it was given. A unit's name is UTF-8 text:
+    /// one that is not is "" here, and [`Self::resolve`] refuses it by name.
     pub fn name(&self) -> &str {
         self.unit
             .as_deref()
-            .or(self.first.as_deref())
-            .expect("clap requires UNIT or --unit")
+            .or(self.first.as_deref().and_then(|f| f.to_str()))
+            .unwrap_or("")
     }
 
     /// The unit and the file, however they were given. The two shapes clap
     /// cannot refuse on its own are refused here: `--unit` with no file, and
-    /// `--unit UNIT --file PATH` with a positional besides.
-    pub fn resolve(&self) -> Result<(&str, &str)> {
+    /// `--unit UNIT --file PATH` with a positional besides. The file is
+    /// returned in the escaped form (§1.5; ADR-0012 item 297): the operator
+    /// types a name's bytes, and the catalog and the file table spell them so.
+    pub fn resolve(&self) -> Result<(&str, String)> {
+        use crate::volume::index::escape_os;
         let file = match (&self.unit, &self.first, &self.second, &self.file) {
             (None, Some(_), Some(path), None) => path,
             (None, Some(_), None, Some(path)) => path,
@@ -421,8 +424,10 @@ impl UnitAndFile {
             }
             (Some(_), Some(extra), None, Some(path)) => {
                 return Err(TapectlError::Other(format!(
-                    "restore file: \"{extra}\" is one argument too many: --unit names the \
-                     unit and --file names \"{path}\""
+                    "restore file: \"{}\" is one argument too many: --unit names the \
+                     unit and --file names \"{}\"",
+                    escape_os(extra),
+                    escape_os(path)
                 )))
             }
             _ => {
@@ -433,7 +438,13 @@ impl UnitAndFile {
                 ))
             }
         };
-        Ok((self.name(), file.as_str()))
+        if self.unit.is_none() && self.first.as_deref().is_some_and(|f| f.to_str().is_none()) {
+            return Err(TapectlError::Other(format!(
+                "restore file: the unit name \"{}\" is not UTF-8; unit names are text",
+                escape_os(self.first.as_deref().expect("checked"))
+            )));
+        }
+        Ok((self.name(), escape_os(file).into_owned()))
     }
 }
 
@@ -461,7 +472,7 @@ pub fn run(
             scratch,
             overwrite,
             no_space_check,
-            spool,
+            no_file_check,
             key,
             dry_run,
         } => {
@@ -490,7 +501,7 @@ pub fn run(
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
-                spool: *spool,
+                no_file_check: *no_file_check,
                 keys,
             };
             let report = match from {
@@ -530,6 +541,8 @@ pub fn run(
                     "dry_run": report.dry_run,
                     "substitutions": substitutions_json(&report.substitutions),
                     "filled": filled_json(&report.filled),
+                    "id_map": id_map_json(&report.id_map),
+                    "tar_said": report.tar_said,
                 }));
             } else if report.dry_run {
                 println!(
@@ -552,6 +565,12 @@ pub fn run(
                 for line in repair_lines(&report.substitutions, &report.filled) {
                     println!("{line}");
                 }
+                for line in tar_lines(&report.tar_said) {
+                    eprintln!("{line}");
+                }
+                for line in id_map_lines(&report.id_map) {
+                    println!("{line}");
+                }
             }
         }
 
@@ -564,6 +583,7 @@ pub fn run(
             scratch,
             overwrite,
             no_space_check,
+            no_file_check,
             key,
         } => {
             // Item 107: refused by name before anything else, as `restore
@@ -589,8 +609,7 @@ pub fn run(
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
-                // `restore file` always spools the slices it reads.
-                spool: false,
+                no_file_check: *no_file_check,
                 keys,
             };
             // Issue #435: no `--from` restores from the loaded tape; the
@@ -601,7 +620,7 @@ pub fn run(
                     paths,
                     config,
                     unit,
-                    file,
+                    &file,
                     from,
                     to,
                     &device,
@@ -614,7 +633,7 @@ pub fn run(
                     paths,
                     config,
                     unit,
-                    file,
+                    &file,
                     to,
                     &device,
                     DEFAULT_BLOCK_SIZE,
@@ -632,10 +651,18 @@ pub fn run(
                     "destination": to,
                     "substitutions": substitutions_json(&report.substitutions),
                     "filled": filled_json(&report.filled),
+                    "id_map": id_map_json(&report.id_map),
+                    "tar_said": report.tar_said,
                 }));
             } else {
                 println!("restored \"{file}\" from \"{unit}\" on {from} to {to}");
                 for line in repair_lines(&report.substitutions, &report.filled) {
+                    println!("{line}");
+                }
+                for line in tar_lines(&report.tar_said) {
+                    eprintln!("{line}");
+                }
+                for line in id_map_lines(&report.id_map) {
                     println!("{line}");
                 }
             }
@@ -649,7 +676,7 @@ pub fn run(
             scratch,
             overwrite,
             no_space_check,
-            spool,
+            no_file_check,
             fail_fast,
             key,
             dry_run,
@@ -666,7 +693,7 @@ pub fn run(
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
-                spool: *spool,
+                no_file_check: *no_file_check,
                 keys,
             };
             let report = match label {
@@ -707,27 +734,14 @@ pub fn run(
                 }
             };
 
-            // #420 (`volume-format-v2.md` §4.2): with no unit named, the set
-            // is every unit the volume holds whole; a tape that ended early
-            // also names the units it cut, and where each is whole. A unit
-            // named that the tape cut was refused, by name, before the drive.
-            // #478 (§4.4, ADR-0012 item 89): the same for a unit of which the
-            // tape holds only a range, with where its restore starts.
-            let cut = if units.is_empty() {
-                volume::restore::cut_units_on_volume(conn, &report.volume_label)?
-            } else {
-                Vec::new()
-            };
+            // ADR-0012 items 266 and 288: with no unit named, the set is every
+            // unit the volume holds a written slice of, a unit of which the
+            // tape holds only a range included (it is read across
+            // cartridges); none is named and left out.
             if json_output {
-                let mut obj = units_report_json(&report);
-                obj["cut"] = cut_units_json(&cut);
-                obj["ranges"] = range_units_json(&cut);
-                crate::render::print_json(&obj);
+                crate::render::print_json(&units_report_json(&report));
             } else {
                 for line in units_report_lines(&report) {
-                    println!("{line}");
-                }
-                for line in cut_units_lines(&cut, &report.volume_label) {
                     println!("{line}");
                 }
             }
@@ -935,6 +949,52 @@ fn filled_json(filled: &[(String, String)]) -> serde_json::Value {
         .collect()
 }
 
+/// What tar said while it extracted (invariant 6: its exit status is never
+/// the verdict, and what it said is not dropped), as lines for the terminal.
+fn tar_lines(said: &[String]) -> Vec<String> {
+    said.iter().map(|l| format!("tar: {l}")).collect()
+}
+
+/// The staging's id map (item 278), as lines: what each user and group
+/// number in the restored unit was called by the host that wrote the tape.
+/// Shown, never acted on: a restore is by number and no owner is changed by
+/// name.
+fn id_map_lines(map: &[crate::idmap::IdRow]) -> Vec<String> {
+    if map.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "owners are restored by number, as the stream has them; the host that wrote them \
+         called them:"
+            .to_string(),
+    ];
+    for row in map {
+        let kind = match row.kind {
+            crate::idmap::IdKind::User => "user",
+            crate::idmap::IdKind::Group => "group",
+        };
+        lines.push(format!(
+            "  {kind} {} = {}",
+            row.id,
+            row.name.as_deref().unwrap_or("(no name)")
+        ));
+    }
+    lines
+}
+
+/// `--json`'s `id_map`: one object for each id.
+fn id_map_json(map: &[crate::idmap::IdRow]) -> serde_json::Value {
+    map.iter()
+        .map(|row| {
+            serde_json::json!({
+                "kind": row.kind.letter(),
+                "id": row.id,
+                "name": row.name,
+            })
+        })
+        .collect()
+}
+
 /// The refusal for `restore volume --dry-run` with no label (issue #435): a
 /// dry run opens no drive, and without a label the volume is whatever File 0
 /// on the loaded tape says. (`restore unit` asks the catalog for the unit's
@@ -966,6 +1026,7 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
             (None, false, false) => format!("not attempted {what} (--fail-fast)"),
         });
         lines.extend(repair_lines(&u.substitutions, &u.filled));
+        lines.extend(id_map_lines(&u.id_map));
     }
     let total = report.units.len();
     lines.push(if report.dry_run {
@@ -983,88 +1044,6 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
         )
     });
     lines
-}
-
-/// The units the early end of `label`'s tape cut (#420), and those of which
-/// it holds only a range of a version held across cartridges (#478), one
-/// line each, for `restore volume` with no unit named: not restored, and not
-/// a failure — the tape does not hold them whole by design
-/// (`volume-format-v2.md` §4.2 and §4.4, ADR-0012 item 89).
-pub(crate) fn cut_units_lines(cut: &[volume::restore::CutUnit], label: &str) -> Vec<String> {
-    let how = |c: &volume::restore::CutUnit| match c.restore_from() {
-        Some(from) => format!(
-            "; restore it with `tapectl restore unit --unit {} --from {from} --version {} --to \
-             <DIR>`",
-            c.unit_name, c.version
-        ),
-        None => String::new(),
-    };
-    let mut lines: Vec<String> = cut
-        .iter()
-        .map(|c| match c.range {
-            None => format!(
-                "not on this tape whole: {} — cut by the early end of \"{label}\"'s tape{}",
-                c.describe(),
-                how(c)
-            ),
-            Some(_) => format!(
-                "not on this tape whole: {} — a range of a version held across cartridges, read \
-                 with its other slices in slice order{}",
-                c.describe(),
-                how(c)
-            ),
-        })
-        .collect();
-    let cuts = cut.iter().filter(|c| c.range.is_none()).count();
-    let ranges = cut.len() - cuts;
-    if cuts > 0 {
-        lines.push(format!(
-            "{} left out: \"{label}\" ended early and does not hold them whole",
-            crate::render::plural(cuts as i64, "unit", "units")
-        ));
-    }
-    if ranges > 0 {
-        lines.push(format!(
-            "{} held across cartridges left out: \"{label}\" holds only a range of each, \
-             and `restore volume` restores the units a tape holds whole",
-            crate::render::plural(ranges as i64, "unit", "units")
-        ));
-    }
-    lines
-}
-
-/// `restore volume --json`'s `cut`: the units the end of the tape cut.
-fn cut_units_json(cut: &[volume::restore::CutUnit]) -> serde_json::Value {
-    cut.iter()
-        .filter(|c| c.range.is_none())
-        .map(|c| {
-            serde_json::json!({
-                "unit": c.unit_name,
-                "version": c.version,
-                "whole_on": c.whole_on,
-            })
-        })
-        .collect()
-}
-
-/// `restore volume --json`'s `ranges` (#478): the units of which the tape
-/// holds only a range, the slices it holds, and where the version is whole
-/// or its slice 1 is.
-fn range_units_json(cut: &[volume::restore::CutUnit]) -> serde_json::Value {
-    cut.iter()
-        .filter_map(|c| {
-            c.range.map(|(first, last)| {
-                serde_json::json!({
-                    "unit": c.unit_name,
-                    "version": c.version,
-                    "first_slice": first,
-                    "last_slice": last,
-                    "whole_on": c.whole_on,
-                    "starts_on": c.starts_on,
-                })
-            })
-        })
-        .collect()
 }
 
 /// `restore volume --json`: the units in tape order, each with its outcome.
@@ -1091,6 +1070,8 @@ fn units_report_json(report: &volume::restore::UnitsReport) -> serde_json::Value
                 "error": u.error,
                 "substitutions": substitutions_json(&u.substitutions),
                 "filled": filled_json(&u.filled),
+                "id_map": id_map_json(&u.id_map),
+                "tar_said": u.tar_said,
             })
         })
         .collect();
@@ -1134,8 +1115,50 @@ mod tests {
             &["--file", "a/b.txt", "--unit", "photos"],
         ] {
             let target = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
-            assert_eq!(target.resolve().unwrap(), ("photos", "a/b.txt"), "{args:?}");
+            assert_eq!(
+                target.resolve().unwrap(),
+                ("photos", "a/b.txt".to_string()),
+                "{args:?}"
+            );
             assert_eq!(target.name(), "photos", "{args:?}");
+        }
+    }
+
+    /// ADR-0012 item 297 (#569): the operator types a name's bytes, and the
+    /// file is looked up by its escaped form. clap takes the bytes whole (a
+    /// `String` argument refused a name that is not UTF-8).
+    #[test]
+    fn restore_file_takes_the_typed_path_as_bytes_and_escapes_it() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let typed: &[(&[u8], &str)] = &[
+            (b"caf\xe9.txt", "caf\\xe9.txt"),
+            (b"back\\slash.txt", "back\\\\slash.txt"),
+            (b"plain/\xff", "plain/\\xff"),
+            (b"tab\there", "tab\\there"),
+        ];
+        for (bytes, want) in typed {
+            let file = OsString::from_vec(bytes.to_vec());
+            for shape in 0..3 {
+                let argv: Vec<OsString> = ["tapectl", "restore", "file"]
+                    .iter()
+                    .map(OsString::from)
+                    .chain(match shape {
+                        0 => vec!["photos".into(), file.clone()],
+                        1 => vec!["--unit".into(), "photos".into(), file.clone()],
+                        _ => vec!["photos".into(), "--file".into(), file.clone()],
+                    })
+                    .chain(["--to".into(), "/d".into()])
+                    .collect();
+                let target = match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+                    crate::cli::Commands::Restore {
+                        command: RestoreCommands::File { unit, .. },
+                    } => unit,
+                    other => panic!("not restore file: {other:?}"),
+                };
+                let (unit, file) = target.resolve().unwrap();
+                assert_eq!((unit, file.as_str()), ("photos", *want), "shape {shape}");
+            }
         }
     }
 

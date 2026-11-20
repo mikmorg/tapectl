@@ -10,7 +10,7 @@ for and what it needs, and links there rather than copying the command lines.
 ```bash
 cargo check --all-targets       # fast compile verification
 cargo build                     # debug binary at target/debug/tapectl
-cargo test                      # about 4,600 tests; needs `dar` on PATH, no tape hardware
+cargo test                      # about 4,700 tests; needs GNU tar 1.35 on PATH, no tape hardware
 cargo clippy --all-targets      # must stay warning-clean
 cargo fmt --check
 scripts/check-docs.py           # `tapectl …` examples: subcommands and long flags must exist
@@ -19,10 +19,10 @@ scripts/check-docs.py           # `tapectl …` examples: subcommands and long f
 The crate is a library with a thin binary: all logic lives in `src/lib.rs`'s modules,
 and the integration tests import `tapectl::` directly.
 
-`cargo test` is not hermetic: the staging pipeline, the dar wrapper and several
-command tests run the real `dar`, found on `PATH`. Without it the run fails with
-panics that do not name dar; `cargo test --test test_dependencies` says what is
-missing.
+`cargo test` is not hermetic: the staging pipeline, the tar writer and several
+command tests run the real GNU tar, found on `PATH`, and it must meet the writer's
+floor (1.35, built with ACL support). Without it the run fails with panics that do not
+name tar; `cargo test --test test_dependencies` says what is missing.
 
 After a CLI change, regenerate the two command references:
 
@@ -37,16 +37,19 @@ runs `config check` on every whole `config.toml` example, and refuses a hard-cod
 `--device /dev/nstN`. `--self-test` is its positive control. Run it with clippy and
 fmt before committing a change to the docs or the CLI.
 
-CI runs fmt, clippy, `cargo test` (with dar installed), the `docs/man` drift check and
+CI runs fmt, clippy, `cargo test` (with a GNU tar at the floor installed), the `docs/man` drift check and
 a non-blocking `cargo audit`, on pushes and pull requests to `master` only. Its runner
 is GitHub's `ubuntu-latest`, Ubuntu 26.04 as of 1.8.0, whose coreutils are uutils, so
 a change to `RESTORE.sh` should pass
-`tests/heir_restore_sh.rs` in an `ubuntu:26.04` container as an ordinary user (root
+`tests/heir_restore.rs` in an `ubuntu:26.04` container as an ordinary user (root
 hides a pipe-size difference), or in a pull request's CI, before it reaches `master`.
 
-**Byte pins.** `tests/on_tape_golden.rs` pins the bytes of `MANIFEST.toml` and
-`RESTORE.sh` as tapectl writes them. If one fails, the on-tape format changed: that is
-a decision recorded in an ADR, never a pin refreshed to make a test pass.
+**Byte pins.** `tests/on_tape_golden.rs` is where the pins of the plaintext on-tape
+documents go (`RESTORE.sh`, `MANIFEST.toml`). Layout 2's pins were removed when the
+layout changed and Layout 3's are pinned once, with the release candidate, so none holds
+today. Once pinned, a failure means the on-tape format changed: that is a decision
+recorded in an ADR, never a pin refreshed to make a test pass. No pin holds the bytes of
+a data slice: two tar versions write different streams.
 
 **Budget suites** pin what a path costs (tape motions, catalog statements, sha256
 passes), not what it returns. A pin moves only on purpose, with the reason in the
@@ -81,10 +84,10 @@ aborts rather than writes to a real drive, but do not rely on that.
 | `tests/mhvtl_e2e.rs` | the round trip on tape and on-tape tenant isolation | `TAPECTL_GATE_TAPE` (an LTO-8 emulation), `TAPECTL_MHVTL=1` |
 | `tests/mhvtl_motions.rs` | the tape layer's command count against the kernel's | the same |
 | `tests/mhvtl_lbp.rs` | Logical Block Protection through the tape layer | `TAPECTL_GATE_TAPE_TD6` (an LTO-6 emulation: Reed-Solomon LBP), `TAPECTL_MHVTL=1` |
-| `scripts/mhvtl-verify-gate.sh` | the operator-level verification gate: the Rust legs above, and every heir leg with the real `age`, `dar`, `mt` and `tar` | `TAPECTL_GATE_TAPE` and `TAPECTL_GATE_TAPE_TD6` (two different drives), `TAPECTL_MHVTL=1` |
+| `scripts/mhvtl-verify-gate.sh` | the operator-level verification gate: the Rust legs above, and every heir leg with the real `age`, `mt` and `tar` | `TAPECTL_GATE_TAPE` and `TAPECTL_GATE_TAPE_TD6` (two different drives), `TAPECTL_MHVTL=1` |
 | `tests/performance.rs` | the performance baselines ([perf-baselines.md](perf-baselines.md)) | `TAPECTL_PERF_TESTS=1`, a release build |
 
-The gate is the heir path's only test with the real tools: `tests/heir_restore_sh.rs`
+The gate is the heir path's only test with the real tools: `tests/heir_restore.rs`
 runs `RESTORE.sh` with `mt`, `dd` and `age` faked. A release is not proven on the heir
 path until the gate has run.
 
@@ -134,8 +137,10 @@ one stays, marked as superseded in its notes.
   plurals, human sizes, verdict words, the `--json` error document).
 - `src/db/`: the SQLite catalog and its forward-only migrations; `ontape_catalog.rs`
   is the operator envelope's `catalog.db`.
-- `src/staging/`: `dar -c -` cut into slices, hashed and age-encrypted in memory.
-- `src/volume/`: the v2 layout, the write session (`session.rs`), the format parsers,
+- `src/tar/`: the writer's floor and probe, the pax stream's reader and its checks.
+- `src/staging/`: tar's stream, read as it passes, cut at member starts into slices,
+  compressed and age-encrypted in memory.
+- `src/volume/`: the Layout 3 layout, the write session (`session.rs`), the format parsers,
   `MANIFEST.toml` and `RESTORE.sh`, verify, restore, and catalog rebuild.
 - `src/tape/`: the st driver's ioctls, the cartridge's chip, Logical Block Protection.
 - `src/policy/`: copies, locations and escrow coverage, and the audit.
@@ -144,5 +149,6 @@ one stays, marked as superseded in its notes.
   in-memory store.
 
 Design records: [docs/adr/](adr/), [docs/design/](design/) (the on-tape format is
-[volume-format-v2.md](design/volume-format-v2.md)), and [CONTEXT.md](../CONTEXT.md),
+[volume-format-v3.md](design/volume-format-v3.md); Layout 2's is
+[volume-format-v2.md](design/volume-format-v2.md), history), and [CONTEXT.md](../CONTEXT.md),
 the vocabulary.

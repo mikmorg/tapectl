@@ -176,8 +176,13 @@ starts (dar, `bash -n` over RESTORE.sh, `systemctl`, and the six above, and
 `sh -c` over the operator's own `snapshot_command` / `release_command` of a
 `[[collections]]` table (ADR-0012 2026-10-16 item 75): the operator's command
 line, run as the user tapectl runs as, given the collection's name and root and
-the snapshot's path and no device; and `<FILE> --version` over the static
-tapectl handed to `key escrow-kit --static-binary`, ADR-0012 item 234) — and the exact `sg_logs` argument list, the
+the snapshot's path and no device; `<FILE> --version` over the static
+tapectl handed to `key escrow-kit --static-binary`, ADR-0012 item 234; and, from the
+2.0.0 build, GNU tar, the Layout 3 writer (`src/tar/mod.rs`): the archive of a unit's
+listed files written to a pipe, `--version`, and the floor probe's one-file archive in a
+scratch directory, with standard input null and no device; and `tar --version` and
+`age --version` over `drill record` (#548, D18), whose first lines the drill's row keeps,
+with standard input null and no device) — and the exact `sg_logs` argument list, the
 two page argument lists and the READ POSITION argument list: a new SG tool, a new program, a
 counter-resetting flag on `sg_logs`, a saving or other-page flag on the page
 tools, or any other CDB or flag on `sg_raw` fails it.

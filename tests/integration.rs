@@ -27,8 +27,8 @@ fn setup() -> (TempDir, Connection, PathBuf) {
         &config_path,
         format!(
             r#"
-[dar]
-binary = "/usr/bin/dar"
+[tar]
+binary = "tar"
 
 [staging]
 directory = "{staging}"
@@ -40,7 +40,6 @@ checksum_mode = "mtime_size"
 encrypt = true
 preserve_xattrs = true
 preserve_acls = true
-preserve_fsa = true
 min_copies = 2
 min_locations = 2
 "#,
@@ -1902,7 +1901,7 @@ fn test_export_selects_single_stage_set() {
         .unwrap();
         let ss = conn.last_insert_rowid();
         for num in 1..=2i64 {
-            let fname = format!("{tag}_v{version}.{num}.dar.age");
+            let fname = format!("{tag}_v{version}.{num}.tar.age");
             let path = staging.join(&fname);
             let bytes = format!("{tag}-slice-{num}").into_bytes();
             std::fs::write(&path, &bytes).unwrap();
@@ -1954,7 +1953,7 @@ fn test_export_selects_single_stage_set() {
     let copied: Vec<String> = std::fs::read_dir(&dest)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .filter(|n| n.ends_with(".dar.age"))
+        .filter(|n| n.ends_with(".tar.age"))
         .collect();
     assert_eq!(copied.len(), 2);
     assert!(
@@ -1980,6 +1979,10 @@ fn test_export_selects_single_stage_set() {
     let recovery = std::fs::read_to_string(dest.join("RECOVERY.md")).unwrap();
     assert!(recovery.contains("sha256sum -c SHA256SUMS"));
     assert!(
+        recovery.contains("tar -x") && !recovery.to_lowercase().contains("dar"),
+        "RECOVERY.md names tar, never dar: {recovery}"
+    );
+    assert!(
         !recovery.contains("ARCHIVE_BASE"),
         "placeholder leaked into RECOVERY.md"
     );
@@ -1990,6 +1993,31 @@ fn test_export_selects_single_stage_set() {
 /// `volume_write` must refuse before writing when the staged data won't fit the
 /// tape — the #8 dry-run showed the old path wrote past end-of-tape, reported
 /// success, and left dead slices with the snapshot marked current.
+/// Give stage set `ss` a one-member file table, as the write now requires
+/// of every unit it carries (ADR-0012 item 265): these fixtures make their
+/// stage sets by hand, with no tar stream, and test what comes after that
+/// check (a capacity, a missing key).
+fn give_file_table(conn: &Connection, ss: i64, slice_bytes: u64) {
+    use tapectl::volume::filetable::{Kind, Row};
+    let end = slice_bytes.div_ceil(512) * 512 + 512;
+    let row = Row {
+        kind: Kind::File,
+        slice: 1,
+        start: 0,
+        end,
+        size: end - 512,
+        sha256: Some([1; 32]),
+        path: "fixture.bin".to_string(),
+        link: None,
+    };
+    tapectl::db::stage_files::insert(conn, ss, std::iter::once(Ok(row))).unwrap();
+    conn.execute(
+        "UPDATE stage_sets SET stream_bytes = ?1 WHERE id = ?2",
+        rusqlite::params![end as i64, ss],
+    )
+    .unwrap();
+}
+
 #[test]
 fn test_volume_write_refuses_over_capacity() {
     use tapectl::config::{Config, LtoBackendConfig, TapectlPaths};
@@ -2046,7 +2074,7 @@ fn test_volume_write_refuses_over_capacity() {
     // A real slice file at its recorded size (sparse): `volume write`
     // refuses a staged set whose files are not on disk before anything
     // this test is about.
-    let slice = tmp.path().join("slice.dar.age");
+    let slice = tmp.path().join("slice.tar.age");
     std::fs::File::create(&slice)
         .unwrap()
         .set_len(5242880)
@@ -2058,6 +2086,7 @@ fn test_volume_write_refuses_over_capacity() {
         rusqlite::params![ss, slice.to_string_lossy()],
     )
     .unwrap();
+    give_file_table(&conn, ss, 5000000);
 
     // ADR-0010 decision 3: the ROW is what must gate this write, and config's
     // `capacity_override` must never be consulted after init. So the two
@@ -2120,31 +2149,17 @@ fn test_volume_write_refuses_over_capacity() {
     )
     .unwrap_err();
     let msg = format!("{err}");
+    // Item 289 (D20): a write is never refused for the staged sets not all
+    // fitting; with not one slice fitting under the volume's ceiling it has
+    // nothing to put on the tape, says so, and writes nothing.
     assert!(
-        msg.contains("capacity exceeded"),
-        "expected a capacity refusal, got: {msg}"
+        msg.contains("no staged slice fits within the fill ceiling")
+            && msg.contains("would put nothing on it"),
+        "expected the nothing-fits refusal, got: {msg}"
     );
-    // Pin the actual boundary: the refusal must name the ROW's figure
-    // (fill_ceiling is 1.0 here, so `available` equals
-    // capacity_bytes exactly), never config's "50M"/52,428,800 — that is
-    // the whole point of this test (issue #188 / ADR-0010 decision 3).
-    let expected_available = format!("over the {ROW_CAPACITY_BYTES} bytes this volume may be");
-    assert!(
-        msg.contains(&expected_available),
-        "expected the refusal to name the volume row's capacity ({expected_available}), got: {msg}"
-    );
-    // Issue #391: the refusal names the overage (9,961,472 on tape — the
-    // tenant envelope's backup is one block of it, volume-format-v2.md §1.3
-    // — + 0 reserve - 4,194,304) and the fill ceiling it was judged against.
-    assert!(
-        msg.contains("5767168 bytes (5.5 MiB) over"),
-        "the refusal must name by how much the layout is over, got: {msg}"
-    );
-    assert!(
-        msg.contains("the fill ceiling is 100% of this volume's 4.2 MB capacity")
-            && msg.contains("--fill-ceiling"),
-        "the refusal must name the ceiling, the capacity and the override, got: {msg}"
-    );
+    // The ROW's figure gated it: config's 50M would have taken the slice
+    // (this refusal is the "no refusal at all" failure mode's positive
+    // control, issue #188 / ADR-0010 decision 3).
     assert!(
         !msg.contains("52428800"),
         "refusal must never name config's capacity_override figure, got: {msg}"
@@ -2201,7 +2216,7 @@ fn test_volume_write_refuses_above_the_fill_ceiling_and_the_override_lifts_it() 
     )
     .unwrap();
     let ss = conn.last_insert_rowid();
-    let slice = tmp.path().join("slice.dar.age");
+    let slice = tmp.path().join("slice.tar.age");
     std::fs::File::create(&slice)
         .unwrap()
         .set_len(5242880)
@@ -2213,6 +2228,7 @@ fn test_volume_write_refuses_above_the_fill_ceiling_and_the_override_lifts_it() 
         rusqlite::params![ss, slice.to_string_lossy()],
     )
     .unwrap();
+    give_file_table(&conn, ss, 5000000);
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
          VALUES ('L6-CEIL', 'lto', 'p', 'LTO-6', 10200000, 'initialized')",
@@ -2253,20 +2269,16 @@ fn test_volume_write_refuses_above_the_fill_ceiling_and_the_override_lifts_it() 
 
     let refused = write(&config);
     assert!(
-        refused.contains("capacity exceeded") && refused.contains("over the 9894000 bytes"),
-        "the default 97% ceiling must refuse a layout that fits only at 100%: {refused}"
-    );
-    assert!(
-        refused.contains("the fill ceiling is 97% of this volume's 10.2 MB capacity"),
-        "{refused}"
+        refused.contains("no staged slice fits within the fill ceiling"),
+        "the default 97% ceiling leaves no slice a place that fits only at 100%: {refused}"
     );
 
     // Positive control: the override lifts the ceiling for this write, and
     // the same write gets past the capacity gate.
     let past = write(&config.with_fill_ceiling(Some(1.0)));
     assert!(
-        !past.contains("capacity exceeded"),
-        "at a 100% ceiling the layout fits; no capacity refusal may remain: {past}"
+        !past.contains("no staged slice fits"),
+        "at a 100% ceiling the slice fits; no nothing-fits refusal may remain: {past}"
     );
 }
 
@@ -2420,7 +2432,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
     // A real slice file at its recorded size (sparse): `volume write`
     // refuses a staged set whose files are not on disk before anything
     // this test is about.
-    let slice = tmp.path().join("slice.dar.age");
+    let slice = tmp.path().join("slice.tar.age");
     std::fs::File::create(&slice).unwrap().set_len(110).unwrap();
     conn.execute(
         "INSERT INTO stage_slices
@@ -2429,6 +2441,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
         rusqlite::params![ss, slice.to_string_lossy()],
     )
     .unwrap();
+    give_file_table(&conn, ss, 100);
 
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
@@ -2497,7 +2510,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
 /// Trigger: `unit discover` against a `discovery.watch_roots` entry that
 /// does not exist on disk hits the pre-existing warn! in
 /// `src/unit/discovery.rs` ("watch root does not exist, skipping") with no
-/// dar/tape/staging setup required. Run with `--json`: the JSON branch of
+/// tar/tape/staging setup required. Run with `--json`: the JSON branch of
 /// `unit discover` (src/cli/unit.rs) deliberately omits `skipped_roots`, so
 /// stdout is clean of the warning text *by construction* — this test would
 /// catch a subscriber regression (e.g. dropping `.with_writer(stderr)`, or
@@ -2534,8 +2547,8 @@ fn test_tracing_warning_goes_to_stderr_not_stdout() {
         &config_path,
         format!(
             r#"
-[dar]
-binary = "/usr/bin/dar"
+[tar]
+binary = "tar"
 
 [staging]
 directory = "{staging_str}"
@@ -2547,7 +2560,6 @@ checksum_mode = "mtime_size"
 encrypt = true
 preserve_xattrs = true
 preserve_acls = true
-preserve_fsa = true
 min_copies = 2
 min_locations = 2
 

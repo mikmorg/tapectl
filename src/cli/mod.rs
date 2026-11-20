@@ -7,12 +7,12 @@ pub mod collection;
 pub mod config;
 pub mod consent;
 pub mod db;
+pub mod drill;
 pub mod drive;
 pub mod host;
 pub mod key;
 pub mod location;
 pub mod operations;
-pub mod renamed;
 pub mod report;
 pub mod restore;
 pub mod setup;
@@ -142,7 +142,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Sources", &["collection", "unit", "snapshot"]),
     ("Stage and write", &["stage", "volume", "quick-archive"]),
     ("Check", &["status", "audit", "report"]),
-    ("Restore", &["restore"]),
+    ("Restore", &["restore", "drill"]),
     ("Drive and cartridges", &["drive", "cartridge"]),
     (
         "Catalog and maintenance",
@@ -236,48 +236,6 @@ fn grouped_help_template(cmd: &clap::Command) -> String {
         "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{groups}\
          {header}{GLOBAL_OPTIONS}:{header:#}\n{{options}}{{after-help}}"
     )
-}
-
-/// The command tree shell completions are generated from: [`command`]
-/// without the hidden stubs of the spellings 1.9.0 removed (`backend`,
-/// `staging`, `export`, `import`, `report pending`, …), which completion would
-/// otherwise offer (clap_complete lists hidden commands too). Rebuilt from
-/// the visible commands, keeping what completion reads: names, abouts, the
-/// arguments and their groups.
-pub fn completion_command() -> clap::Command {
-    use clap::CommandFactory;
-    // clap takes a name as `&'static str` (without its `string` feature):
-    // leaked, once per name, by a command that prints a script and exits.
-    fn leak(s: &str) -> &'static str {
-        Box::leak(s.to_owned().into_boxed_str())
-    }
-    fn visible(cmd: &clap::Command) -> clap::Command {
-        let mut out = clap::Command::new(leak(cmd.get_name()))
-            .args(cmd.get_arguments().cloned())
-            .groups(cmd.get_groups().cloned())
-            .subcommands(
-                cmd.get_subcommands()
-                    .filter(|sub| !sub.is_hide_set())
-                    .map(visible),
-            );
-        if let Some(about) = cmd.get_about() {
-            out = out.about(about.clone());
-        }
-        if let Some(about) = cmd.get_long_about() {
-            out = out.long_about(about.clone());
-        }
-        if let Some(version) = cmd.get_version() {
-            out = out.version(leak(version));
-        }
-        if cmd.is_disable_help_subcommand_set() {
-            out = out.disable_help_subcommand(true);
-        }
-        if cmd.is_disable_help_flag_set() {
-            out = out.disable_help_flag(true);
-        }
-        out
-    }
-    visible(&Cli::command())
 }
 
 #[derive(Subcommand, Debug)]
@@ -392,13 +350,6 @@ pub enum Commands {
         command: stage::StageCommands,
     },
 
-    /// Removed in 1.9.0: `stage clean` and `stage list` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true, disable_help_subcommand = true)]
-    Staging {
-        #[command(subcommand)]
-        command: StagingStub,
-    },
-
     /// Manage volumes and tape operations
     Volume {
         #[command(subcommand)]
@@ -444,6 +395,12 @@ pub enum Commands {
         command: location::LocationCommands,
     },
 
+    /// Record heir drills (RESTORE.sh run with the stock tools)
+    Drill {
+        #[command(subcommand)]
+        command: drill::DrillCommands,
+    },
+
     /// Generate reports
     Report {
         #[command(subcommand)]
@@ -455,14 +412,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: restore::RestoreCommands,
     },
-
-    /// Removed in 1.9.0: `unit export` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true)]
-    Export(renamed::Removed),
-
-    /// Removed in 1.9.0: `volume import` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true)]
-    Import(renamed::Removed),
 
     /// Quick archive: create + stage + write in one flow
     ///
@@ -502,13 +451,6 @@ pub enum Commands {
         /// See `volume write --full-confirm`.
         #[arg(long)]
         full_confirm: bool,
-    },
-
-    /// Removed in 1.9.0: `drive add` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true, disable_help_subcommand = true)]
-    Backend {
-        #[command(subcommand)]
-        command: BackendStub,
     },
 
     /// The tape drive: add it, see what is loaded, eject, health, cleanings
@@ -584,25 +526,6 @@ Examples:
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
-}
-
-/// The `backend` group 1.9.0 removed: its one command is `drive add`.
-#[derive(Subcommand, Debug)]
-pub enum BackendStub {
-    /// Removed in 1.9.0: `drive add`
-    #[command(hide = true, disable_help_flag = true)]
-    Add(renamed::Removed),
-}
-
-/// The `staging` group 1.9.0 removed: `stage clean` and `stage list`.
-#[derive(Subcommand, Debug)]
-pub enum StagingStub {
-    /// Removed in 1.9.0: `stage clean`
-    #[command(hide = true, disable_help_flag = true)]
-    Clean(renamed::Removed),
-    /// Removed in 1.9.0: `stage list`
-    #[command(hide = true, disable_help_flag = true)]
-    Status(renamed::Removed),
 }
 
 /// Database operations.
@@ -999,7 +922,10 @@ mod tests {
     /// `tapectl completions SHELL`'s script, as `main` generates it.
     fn completion_script(shell: clap_complete::Shell) -> String {
         let mut script = Vec::new();
-        clap_complete::generate(shell, &mut completion_command(), "tapectl", &mut script);
+        {
+            use clap::CommandFactory;
+            clap_complete::generate(shell, &mut Cli::command(), "tapectl", &mut script);
+        }
         String::from_utf8(script).unwrap()
     }
 
@@ -1064,20 +990,12 @@ mod tests {
         }
     }
 
-    /// ADR-0012 item 203's residual: completion offers no hidden stub of a
-    /// spelling 1.9.0 removed, in any shell, while it still offers the live
-    /// commands, some of the same names among them (the positive control:
-    /// the same search finds a command that must be there).
+    /// No command of the tree is hidden (1.x's stubs of removed spellings
+    /// are gone, ADR-0012 item 258(d)), and completion offers the live
+    /// commands in every shell.
     #[test]
-    fn completions_offer_no_hidden_stub() {
-        let hidden = hidden_paths();
-        for stub in [&["backend"][..], &["staging"], &["export"], &["import"]] {
-            assert!(
-                hidden.iter().any(|h| h == stub),
-                "{stub:?} is no longer a hidden stub: update this test"
-            );
-        }
-        assert!(hidden.iter().any(|h| h == &["report", "pending"]));
+    fn completions_offer_the_live_commands_and_nothing_is_hidden() {
+        assert_eq!(hidden_paths(), Vec::<Vec<String>>::new());
         let live: &[&[&str]] = &[
             &["drive"],
             &["status"],
@@ -1094,33 +1012,8 @@ mod tests {
             clap_complete::Shell::Fish,
         ] {
             let script = completion_script(shell);
-            // The negative's positive control: the same search finds the
-            // stubs in a script generated from the whole tree.
-            let mut whole = Vec::new();
-            {
-                use clap::CommandFactory;
-                clap_complete::generate(shell, &mut Cli::command(), "tapectl", &mut whole);
-            }
-            let whole = String::from_utf8(whole).unwrap();
-            for stub in [
-                &["backend"][..],
-                &["report", "pending"],
-                &["staging", "clean"],
-            ] {
-                assert!(
-                    offers(shell, &whole, stub),
-                    "{shell}: the search misses {stub:?}"
-                );
-            }
             for path in live {
                 assert!(offers(shell, &script, path), "{shell} lacks {path:?}");
-            }
-            for path in &hidden {
-                let path: Vec<&str> = path.iter().map(String::as_str).collect();
-                assert!(
-                    !offers(shell, &script, &path),
-                    "{shell} offers the hidden {path:?}"
-                );
             }
         }
     }

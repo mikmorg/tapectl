@@ -13,7 +13,7 @@
 //!
 //! **Home is `src/unit/`, not `src/collection/` or `src/staging/`,**
 //! because of the dependency direction: `collection` already legitimately
-//! depends on `staging` (dar/encryption plumbing) and on `unit`; `staging`
+//! depends on `staging` (tar/encryption plumbing) and on `unit`; `staging`
 //! already depends on `unit` (nesting checks). Putting the shared
 //! comparison in `collection` would force `staging::snapshot_create` to
 //! reach upward into it — a cycle. `unit` depends on neither, so both can
@@ -272,7 +272,9 @@ pub(crate) fn matches_snapshot(
         let Some(expected) = sha256 else {
             continue; // never staged — no baseline to compare against.
         };
-        let full_path = unit_path.join(&stamp.path);
+        // A stamp's path is in the escaped form (§1.5; ADR-0012 item 297), the
+        // catalog's: the name on disk is its bytes.
+        let full_path = unit_path.join(crate::volume::index::on_disk(&stamp.path));
         let actual = match hash_source_file(&full_path, &stamp.path) {
             Ok((hex, _)) => hex,
             Err(e) => {

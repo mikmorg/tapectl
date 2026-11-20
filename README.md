@@ -3,7 +3,7 @@
 **Long-term, encrypted, multi-tenant archiving to LTO tape — built so the tapes can be
 read back decades later, by someone else, without tapectl.**
 
-tapectl turns directories into encrypted archives (`dar` + `age`), plans each tape
+tapectl turns directories into encrypted archives (a `tar` stream, cut into slices, + `age`), plans each tape
 before writing it, writes it in one verified session, and keeps a catalog of what is
 where: which files, which version, which cartridge, on which shelf, in how many
 copies. Every tape carries its own recovery instructions, so the data outlives the
@@ -12,7 +12,7 @@ software, the database and the machine that wrote it.
 ```mermaid
 flowchart LR
     D["/media/family/photos/2019-italy<br/>(a unit)"] -->|snapshot create| S[Snapshot<br/>what exists, fast]
-    S -->|stage create| G["Staging<br/>dar + sha256 → age encrypt, in one pass"]
+    S -->|stage create| G["Staging<br/>tar + sha256 → cut, compress, age encrypt, in one pass"]
     G -->|volume write| T1[("Tape L6-0001<br/>home shelf")]
     G -->|volume write| T2[("Tape L6-0002<br/>offsite")]
     T1 & T2 -->|audit| A{{copies, places,<br/>verification age}}
@@ -24,7 +24,7 @@ You do not need this repository to get the data back.
 
 - **Start with the tape.** File 0 says how to read File 1, a complete recovery guide
   written for a person or an AI assistant. File 2 is `RESTORE.sh`, which restores with
-  `mt`, `dd`, `age`, `dar` and a few standard tools. Neither needs tapectl.
+  `mt`, `dd`, `age`, `tar` and a few standard tools. Neither needs tapectl.
 - **If you have the Heir Kit**, its `tapectl-X.Y.Z` file is a ready-built copy of the
   program, for Linux on the machine type the cover sheet names. Check it against the
   sha256 on the sheet. It saves you a build.
@@ -59,8 +59,8 @@ is a decision recorded in the [ADRs](docs/adr/). The last full test run passed a
 
 - **Self-describing tapes.** Each tape begins with a plaintext guide, a `RESTORE.sh`
   and a map of every file on it. With the right key, the data comes back with `mt`,
-  `dd`, `age`, `dar`, `sha256sum`, `head`, `truncate`, `tar`, `mkfifo` and `tee` alone
-  — no database, no tapectl.
+  `dd`, `age`, `tar`, `sha256sum`, `head` and `tail` alone (and `gzip`, `xz` or `zstd` for
+  a unit stored compressed) — no database, no tapectl.
 - **Tenants that cannot read each other.** Family, business, a friend's backups: each
   tenant has its own keys, and nothing about a tenant's content — not even file
   names — is written to tape in plaintext.
@@ -98,7 +98,7 @@ tapectl tenant add family -d "family photos and letters"
 tapectl unit init-bulk /media/family/photos --tenant family
 
 tapectl snapshot create family/photos/2019-italy         # fast: what is there
-tapectl stage create family/photos/2019-italy            # dar + sha256 + age, into staging
+tapectl stage create family/photos/2019-italy            # tar + sha256 + age, into staging
 tapectl volume write L6-0001 --init --full-confirm --move-to home-rack   # init, plan, write, seal, read it all back, shelve
 
 tapectl status                                           # where things stand, and the next command
@@ -117,7 +117,10 @@ output of every command.
   read from the cartridge). A virtual library
   ([mhvtl](docs/operator-guide.md#testing-with-a-virtual-tape-library)) works for
   trying things out.
-- **`dar` ≥ 2.6** (2.7.20+ recommended), `mt-st`, `sg3-utils`, `acl`, `python3`,
+- **GNU tar 1.35 or later, built with ACL support** (the writer's floor: `stage create`
+  refuses a tar below it and names it; Debian 13 and Ubuntu 24.04 and later ship one,
+  and [docs/install.md](docs/install.md) says how to build one on an older host),
+  `mt-st`, `sg3-utils`, `acl`, `python3`,
   `lsscsi`. From `sg3-utils`, tapectl reads the cartridge's chip and the drive's health
   pages, and uses `sg_modes` and `sg_wr_mode` for Logical Block Protection (without
   them it writes without LBP and says so).
@@ -128,7 +131,7 @@ output of every command.
 - Staging space for one tape's worth of data (up to 2.5 TB for a full LTO-6).
 - Rust 1.94.1 to build (pinned in `rust-toolchain.toml`).
 - The guided installer expects a **Debian/Ubuntu host with `sudo`**. It checks for
-  `dar`, `mt-st`, `sg3-utils`, `acl`, `python3` and `lsscsi` and offers to install
+  a tar at the floor, `mt-st`, `sg3-utils`, `acl`, `python3` and `lsscsi` and offers to install
   them with `apt`, and offers `age` from its upstream release.
 
 ## Install
@@ -194,8 +197,10 @@ The full index, including design records and test procedures, is
 
 ## What is on a tape
 
-Every tape uses **Layout Version 2**
-([specification](docs/design/volume-format-v2.md)):
+Every tape uses **Layout Version 3**
+([specification](docs/design/volume-format-v3.md)). A tape of Layout 2, written by
+tapectl 1.x, is read by tapectl 1.9.2 or by its own `RESTORE.sh`; this version reads and
+writes Layout 3 only:
 
 | File | Contents | Encrypted? |
 |---|---|---|
@@ -203,20 +208,19 @@ Every tape uses **Layout Version 2**
 | 1 | Recovery guide (Markdown, written for a human or an AI assistant) | No |
 | 2 | `RESTORE.sh` — scripted recovery | No |
 | 3 | Front index: every file's position, type, size and ciphertext sha256 | No |
-| 4 … | Envelopes: one per tenant (its file lists and restore recipe), then the operator's (the catalog) and its backup copy, then a backup copy of each tenant's. Each carries an index of the archive: for a tenant, which tapes hold each version of its units, and every path; for the operator, the same map for every tenant's units, without paths | Yes |
-| … | Data slices (`dar` archives) | Yes |
+| 4 … | Envelopes: one per tenant (its file tables, id map and restore recipe), then the operator's (the catalog) and its backup copy, then a backup copy of each tenant's. Each carries an index of the archive: for a tenant, which tapes hold each version of its units, and every path; for the operator, the same map for every tenant's units, without paths | Yes |
+| … | Data slices (each a cut of the unit's tar stream, at member boundaries, compressed if the unit is) | Yes |
 | last | Seal marker: binds the front index. A write that reached the drive's early warning ends with a short seal, which says where the tape ended | No |
 
 Nothing in the plaintext files says what the data *is* — no names, no paths, no
 tenants. A tape without its seal marker was never finished and says so. The tenant
-envelopes' backup copies are on tapes from 1.1.0, the envelopes' index from 1.3.0, and
-the short seal from 1.6.0.
+envelopes' backup copies, the envelopes' index and the short seal are part of the layout.
 
 ## Contributing
 
 ```bash
 cargo check --all-targets
-cargo test                      # about 4,600 tests; needs `dar` on PATH, no tape hardware
+cargo test                      # about 4,600 tests; needs GNU tar 1.35 on PATH, no tape hardware
 cargo clippy --all-targets      # must stay warning-clean
 cargo fmt --check
 scripts/check-docs.py           # `tapectl …` examples: subcommands and long flags must exist

@@ -41,6 +41,12 @@
 #          of one, a checkout whose HEAD is not a release tag, an upgrade step out
 #          of range.
 #
+# NO 2.x PREDECESSOR YET (ADR-0012 item 258(c): there is no upgrade from 1.x).
+# The harness installs the previous release tag and upgrades it, so it needs a
+# v2.x tag to start from. While the newest tag before HEAD is below v2.0.0 it
+# exits 2 at once with a message saying so, before it touches a drive. Its first
+# real run is the release after 2.0.0.
+#
 # Not covered, on purpose: tidy's removal (it needs a typed word, never given
 # under --auto), step 11's start of a real tapectl-backup.service, and a real
 # release build (the build rule: debug only). With no migration between the two
@@ -59,7 +65,7 @@
 #            --keep              (keep the run directory even when green)
 #
 # Needs: mhvtl loaded with at least two cartridges of the drive's generation,
-# sudo without a password, the `tapectl` service user, dar, age, age-keygen,
+# sudo without a password, the `tapectl` service user, GNU tar 1.35 or later, age, age-keygen,
 # lsscsi, mtx, mt, python3, cargo, git, systemd.
 # Exit: 0 green, 1 a check failed (the run directory is kept), 2 a
 # precondition failed (nothing was written).
@@ -90,6 +96,29 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# ---------- the previous release must be a 2.x tag (ADR-0012 item 258(c)) ----------
+# There is no upgrade from 1.x, so a harness that installs the previous release
+# and upgrades it has nothing to start from until a v2.x tag exists. This runs
+# before anything else, so it needs no drive and writes nothing.
+if [ -z "$FROM_TAG" ]; then
+    if git -C "$REPO" describe --exact-match HEAD >/dev/null 2>&1; then
+        FROM_TAG="$(git -C "$REPO" describe --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null)"
+    else
+        FROM_TAG="$(git -C "$REPO" describe --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null)"
+    fi
+fi
+[ "$(git -C "$REPO" cat-file -t "$FROM_TAG" 2>/dev/null)" = tag ] || die "the previous release '$FROM_TAG' is not an annotated tag here (--from-tag)"
+if [ -z "$FROM_TAG" ] || ! git -C "$REPO" rev-parse --verify --quiet "refs/tags/$FROM_TAG" >/dev/null; then
+    die "no release tag to upgrade from (--from-tag names none, and no v* tag precedes HEAD)"
+fi
+case "${FROM_TAG#v}" in
+    [0-9]*) _major="${FROM_TAG#v}"; _major="${_major%%.*}" ;;
+    *) die "the previous release '$FROM_TAG' is not a vX.Y.Z tag" ;;
+esac
+if [ "$_major" -lt 2 ]; then
+    die "the newest release tag before HEAD is $FROM_TAG, below v2.0.0, and there is no upgrade from 1.x (ADR-0012 item 258(c)): this harness has no predecessor to install yet. Its first real run is the release after 2.0.0 (the first tag v2.x before HEAD); until then --from-tag can name only a v2.x tag"
+fi
+
 # ---------- preconditions: fail closed before anything opens a device ----------
 [ "${TAPECTL_MHVTL:-}" = 1 ] || die "TAPECTL_MHVTL=1 not set — this scenario writes tapes and runs only against mhvtl"
 [ -n "$DEVICE" ] || die "--device not given — name the mhvtl drive (e.g. /dev/tape/by-id/scsi-XYZZY_A1-nst); there is no default"
@@ -102,7 +131,7 @@ for f in /dev/tape/by-id/*XYZZY*-nst; do
 done
 [ "$IS_MHVTL" = 1 ] || die "$DEVICE ($DEV_REAL) is not an mhvtl drive (no /dev/tape/by-id/*XYZZY*-nst names it) — refusing"
 grep -q '^mhvtl ' /proc/modules || die "mhvtl module not loaded — systemctl start mhvtl.target"
-for bin in lsscsi mtx mt dar age age-keygen sha256sum python3 cargo git flock sudo systemctl; do
+for bin in lsscsi mtx mt tar age age-keygen sha256sum python3 cargo git flock sudo systemctl; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
 id "$SVC_USER" >/dev/null 2>&1 || die "no '$SVC_USER' service user — run scripts/first-run.sh --from 5 --to 5 once, or create it"
@@ -114,14 +143,6 @@ done
 ( flock -n 9 || exit 1 ) 9>/tmp/tapectl-tape.lock || die "another process holds /tmp/tapectl-tape.lock — a gate, a rehearsal or a fill is using a drive; wait for it"
 
 CAND_SHA="$(git -C "$REPO" rev-parse HEAD)"
-if [ -z "$FROM_TAG" ]; then
-    if git -C "$REPO" describe --exact-match HEAD >/dev/null 2>&1; then
-        FROM_TAG="$(git -C "$REPO" describe --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null)"
-    else
-        FROM_TAG="$(git -C "$REPO" describe --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null)"
-    fi
-fi
-[ "$(git -C "$REPO" cat-file -t "$FROM_TAG" 2>/dev/null)" = tag ] || die "the previous release '$FROM_TAG' is not an annotated tag here (--from-tag)"
 PREV_VER="${FROM_TAG#v}"
 
 DISCOVERY="$("$REPO/scripts/mhvtl-device.sh" --tape "$DEVICE" --ensure-media)" || die "device discovery failed (above)"
@@ -146,9 +167,8 @@ git clone --quiet --no-checkout "$REPO" "$CAND" && git -C "$CAND" checkout --qui
 gitc() { git -C "$CAND" -c user.name=upgrade-mhvtl -c user.email=upgrade-mhvtl@localhost "$@"; }
 CAND_VER="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$CAND/Cargo.toml" | head -n 1)"
 newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; }
-# Upgrade step 2 backs the catalog up with the OLD binary, in its own spelling
-# (ADR-0012 OQ1): `db backup --to FILE` before 1.9.0, `db backup FILE` from it.
-if newer 1.9.0 "$PREV_VER"; then BACKUP_CMD="tc db backup --to"; else BACKUP_CMD="tc db backup"; fi
+# Upgrade step 2 backs the catalog up with the OLD binary: `db backup FILE`.
+BACKUP_CMD="tc db backup"
 NEW_VER="$CAND_VER"
 STAMPED=0
 if ! newer "$CAND_VER" "$PREV_VER"; then
@@ -278,7 +298,6 @@ OPERATOR="$USER"
 ESCROW_PUBLIC_KEY="$ESCROW_PUB"
 WORK_DIR="$RUN/work"
 STAGING_DIR="$RUN/staging"
-DAR_BIN="$(command -v dar)"
 BACKUP_DIR="$RUN/backups"
 KIT_OUT="$RUN/kit"
 LABEL="$LABEL"

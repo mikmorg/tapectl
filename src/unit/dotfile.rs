@@ -16,6 +16,10 @@ pub struct UnitDotfile {
     pub archive_set: Option<String>,
     pub checksum_mode: Option<String>,
     pub compression: Option<String>,
+    /// Item 287: `[policy] compression_level`. Modeled here so a round trip
+    /// (`unit tag`, `unit rename`) keeps it, as issue #212 had to for
+    /// `slice_size`. `None`: the dotfile is silent.
+    pub compression_level: Option<i64>,
     /// Issue #212: `[policy] slice_size` was read and honoured (by
     /// `policy::resolve` and `staging::resolve_slice_size_string`) since
     /// issue #47, but was never modeled here -- so `read_dotfile` dropped it
@@ -33,12 +37,6 @@ pub struct UnitDotfile {
     /// indistinguishable from a deliberate operator choice and would
     /// silently outrank the archive-set layer it is supposed to defer to.
     pub warehouse_copies: Option<i64>,
-    /// #478 (ADR-0012 item 82): whether this unit may span tapes by its
-    /// slices. `None` means the dotfile is silent and the archive set, then
-    /// `[defaults]` (off), decides; `Some(false)` is a deliberate choice that
-    /// keeps the unit whole even under an archive set that allows spanning.
-    /// No serde `default`, for `warehouse_copies`'s reason (issue #92).
-    pub allow_spanning: Option<bool>,
     /// #493 (ADR-0012 items 148, 149, 155): how many copies this unit should
     /// hold at each named location, `[policy.copies_at]`. `None` means the
     /// dotfile is silent and the archive set, then `[defaults]`, decides;
@@ -66,7 +64,6 @@ pub struct UnitDotfile {
 // compression = "none"
 // slice_size = "1G"
 // warehouse_copies = 0
-// allow_spanning = false
 //
 // [policy.copies_at]
 // home = 1
@@ -128,16 +125,16 @@ pub(crate) struct PolicySection {
     pub(crate) checksum_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) compression: Option<String>,
+    /// Item 287: the level `compression` packs at. Skipped when unset, so a
+    /// dotfile that never named it is rewritten byte for byte as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) compression_level: Option<i64>,
     /// Issue #212. No `#[serde(default)]` -- see `warehouse_copies` below.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) slice_size: Option<String>,
     /// No `#[serde(default)]` -- see `UnitDotfile::warehouse_copies`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) warehouse_copies: Option<i64>,
-    /// #478 (ADR-0012 item 82). Skipped when unset, so a dotfile that never
-    /// named it is rewritten byte for byte as before.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) allow_spanning: Option<bool>,
     /// #493 (ADR-0012 item 155): `[policy.copies_at]`, one `location =
     /// count` line each; TOML's inline `copies_at = { home = 1 }` is the same
     /// table. Last, so it serializes as a `[policy.copies_at]` sub-table after
@@ -199,9 +196,9 @@ pub fn is_unit_dotfile(rel_path: &str) -> bool {
 pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
     let policy = if data.checksum_mode.is_none()
         && data.compression.is_none()
+        && data.compression_level.is_none()
         && data.slice_size.is_none()
         && data.warehouse_copies.is_none()
-        && data.allow_spanning.is_none()
         && data.copies_at.is_none()
     {
         None
@@ -209,9 +206,9 @@ pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
         Some(PolicySection {
             checksum_mode: data.checksum_mode.clone(),
             compression: data.compression.clone(),
+            compression_level: data.compression_level,
             slice_size: data.slice_size.clone(),
             warehouse_copies: data.warehouse_copies,
-            allow_spanning: data.allow_spanning,
             copies_at: data.copies_at.clone(),
         })
     };
@@ -265,9 +262,9 @@ pub fn read_dotfile(path: &Path) -> Result<UnitDotfile> {
             .as_ref()
             .and_then(|p| p.checksum_mode.clone()),
         compression: wrapper.policy.as_ref().and_then(|p| p.compression.clone()),
+        compression_level: wrapper.policy.as_ref().and_then(|p| p.compression_level),
         slice_size: wrapper.policy.as_ref().and_then(|p| p.slice_size.clone()),
         warehouse_copies: wrapper.policy.as_ref().and_then(|p| p.warehouse_copies),
-        allow_spanning: wrapper.policy.as_ref().and_then(|p| p.allow_spanning),
         copies_at: wrapper.policy.as_ref().and_then(|p| p.copies_at.clone()),
         exclude_patterns: wrapper.excludes.patterns,
     })
@@ -295,9 +292,9 @@ mod tests {
             archive_set: Some("cold".into()),
             checksum_mode: Some("sha256".into()),
             compression: Some("lzma".into()),
+            compression_level: None,
             slice_size: None,
             warehouse_copies: None,
-            allow_spanning: None,
             copies_at: None,
             exclude_patterns: vec!["*.tmp".into(), ".cache/".into()],
         }
@@ -430,17 +427,14 @@ compression = "gzip"
         assert!(!raw.contains("[policy]"), "got: {raw}");
     }
 
-    /// #478 (ADR-0012 item 82): a dotfile that does not set
-    /// `allow_spanning` is rewritten byte for byte as 1.6.0 wrote it. `unit
-    /// tag`, `unit rename` and `tenant reassign` all rewrite the file
-    /// through `read_dotfile` and `write_dotfile`, so a key the operator
-    /// never wrote must not appear, or every such rewrite would change an
-    /// existing unit's dotfile (its size, and so its walk stamp in
-    /// `collection::fingerprint`). The text is what 1.6.0's `write_dotfile`
-    /// produced for this unit.
+    /// A dotfile is rewritten byte for byte. `unit tag`, `unit rename` and
+    /// `tenant reassign` all rewrite the file through `read_dotfile` and
+    /// `write_dotfile`, so a key the operator never wrote must not appear, or
+    /// every such rewrite would change an existing unit's dotfile (its size,
+    /// and so its walk stamp in `collection::fingerprint`).
     #[test]
-    fn a_dotfile_without_allow_spanning_is_rewritten_byte_for_byte() {
-        const WRITTEN_BY_1_6_0: &str = "\
+    fn a_dotfile_is_rewritten_byte_for_byte() {
+        const WRITTEN_BY_AN_EARLIER_BUILD: &str = "\
 [unit]
 uuid = \"d580a814-ce23-40e7-9c00-93a8fbab9459\"
 name = \"family/letters\"
@@ -458,48 +452,22 @@ patterns = [\"*.iso\"]
 ";
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(".tapectl-unit.toml");
-        std::fs::write(&path, WRITTEN_BY_1_6_0).unwrap();
+        std::fs::write(&path, WRITTEN_BY_AN_EARLIER_BUILD).unwrap();
         let df = read_dotfile(&path).unwrap();
         write_dotfile(&path, &df).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), WRITTEN_BY_1_6_0);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            WRITTEN_BY_AN_EARLIER_BUILD
+        );
     }
 
-    /// #478 (ADR-0012 item 82): `allow_spanning` is a `[policy]` key. Set
-    /// alone, it still writes the `[policy]` table (the guard in
-    /// `write_dotfile` must count it, or the key would vanish on the next
-    /// rewrite), and both values round-trip: `false` is an operator's choice
-    /// to keep the unit whole, not the same as silence. Unset, it is not
-    /// written.
+    /// An unknown `[policy]` key is refused by name, with the file's path,
+    /// never read as "not set" (issue #211's rule).
     #[test]
-    fn allow_spanning_round_trips_alone_and_is_not_written_when_unset() {
+    fn an_unknown_policy_key_is_refused_by_name() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(".tapectl-unit.toml");
-        let mut d = sample();
-        d.checksum_mode = None;
-        d.compression = None;
-        for value in [true, false] {
-            d.allow_spanning = Some(value);
-            write_dotfile(&path, &d).unwrap();
-            let raw = std::fs::read_to_string(&path).unwrap();
-            assert!(raw.contains("[policy]"), "{raw}");
-            assert!(raw.contains(&format!("allow_spanning = {value}")), "{raw}");
-            assert_eq!(read_dotfile(&path).unwrap().allow_spanning, Some(value));
-        }
-        d.allow_spanning = None;
-        write_dotfile(&path, &d).unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("allow_spanning"), "{raw}");
-        assert!(!raw.contains("[policy]"), "{raw}");
-        assert!(read_dotfile(&path).unwrap().allow_spanning.is_none());
-    }
-
-    /// #478: a misspelled spanning key is refused by name, with the file's
-    /// path, never read as "not set" (issue #211's rule).
-    #[test]
-    fn a_misspelled_allow_spanning_is_refused_by_name() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(".tapectl-unit.toml");
-        for bad in ["allow_span", "allowSpanning"] {
+        for bad in ["slice_sze", "sliceSize"] {
             std::fs::write(
                 &path,
                 format!(

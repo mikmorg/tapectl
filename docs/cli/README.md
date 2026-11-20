@@ -89,7 +89,7 @@ definitions it parses. For what to *do* with them, start at the
 | &nbsp;&nbsp;[`stage for-location`](stage.md#tapectl-stage-for-location) | Stage what a location needs, packed into one volume bound there |
 | &nbsp;&nbsp;[`stage list`](stage.md#tapectl-stage-list) | List the stage sets held in staging, with each version's copies |
 | &nbsp;&nbsp;[`stage clean`](stage.md#tapectl-stage-clean) | Release staged slices from disk |
-| &nbsp;&nbsp;[`stage info`](stage.md#tapectl-stage-info) | Show a version's newest stage set: its dar, sizes and slices |
+| &nbsp;&nbsp;[`stage info`](stage.md#tapectl-stage-info) | Show a version's newest stage set: its tar, sizes and slices |
 | [`volume`](volume.md) | Manage volumes and tape operations |
 | &nbsp;&nbsp;[`volume init`](volume.md#tapectl-volume-init) | Initialize a new volume (write ID thunk to tape) |
 | &nbsp;&nbsp;[`volume write`](volume.md#tapectl-volume-write) | Write staged data to volume |
@@ -143,6 +143,8 @@ definitions it parses. For what to *do* with them, start at the
 | &nbsp;&nbsp;[`restore volume`](restore.md#tapectl-restore-volume) | Restore several units from one volume in one pass over the tape |
 | &nbsp;&nbsp;[`restore file`](restore.md#tapectl-restore-file) | Restore a single file from a unit |
 | &nbsp;&nbsp;[`restore raw-volume`](restore.md#tapectl-restore-raw-volume) | Dump every file off a tape verbatim, using only the tape itself (no catalog) |
+| [`drill`](drill.md) | Record heir drills (RESTORE.sh run with the stock tools) |
+| &nbsp;&nbsp;[`drill record`](drill.md#tapectl-drill-record) | Record that an heir drill was done on a volume |
 
 ### Drive and cartridges
 

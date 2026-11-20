@@ -24,10 +24,9 @@
 //! the delete list below. The audit's count of six also included
 //! `logging.level`/`logging.format` — issue #172 WIRES those two instead of
 //! deleting them. Issue #347 found four more parsed-but-inert keys and ran
-//! the same delete-or-wire decision on each: `preserve_xattrs` and
-//! `preserve_fsa` were WIRED (`dar::create`: `false` now drops extended
-//! attributes / filesystem attributes), `preserve_acls` stays the ratified
-//! visible no-op (`policy::subsumed`), and `dirty_on_metadata_change` — whose
+//! the same delete-or-wire decision on each: `preserve_xattrs` was
+//! WIRED (it gives tar `--xattrs`, and `preserve_acls` gives it `--acls`:
+//! independent knobs since 2.0.0, D11), and `dirty_on_metadata_change` — whose
 //! wiring belongs to dirty detection, not config — is the one reported here
 //! until it is wired or deleted.
 //!
@@ -42,8 +41,8 @@
 //!
 //! - `backends.lto[].block_size` — the write path's block size is a FORMAT
 //!   CONSTANT (512 KiB: `collection::plan::BLOCK_SIZE`,
-//!   `cli::volume::DEFAULT_BLOCK_SIZE`, `docs/design/volume-format-v2.md`
-//!   §1/D7). `src/volume/layout.rs` bakes it into the on-tape recovery text
+//!   `cli::volume::DEFAULT_BLOCK_SIZE`, `docs/design/volume-format-v3.md`
+//!   §8/D7). `src/volume/layout.rs` bakes it into the on-tape recovery text
 //!   an heir reads, so a per-drive value could only ever disagree with the
 //!   tape it was written to.
 //! - `backends.lto[].hardware_compression` — `TapeStore::open`
@@ -64,10 +63,10 @@
 //!   sha256, hardcoded; `checksum_mode` is the real knob, and it governs
 //!   WHEN a checksum runs, never which algorithm.
 //!
-//! A config file still carrying any of these is now REJECTED by name, with
-//! the reason, by `config::stale_lto_fields_message` — a sharper answer
-//! than an advisory note, and the reason deleting them is not a loss of
-//! operator-facing surface.
+//! A config file still carrying any of these is REJECTED as an unknown key
+//! (`deny_unknown_fields`; since 2.0 with no remediation text of its own,
+//! ADR-0012 item 258(d)) — a sharper answer than an advisory note, and the
+//! reason deleting them is not a loss of operator-facing surface.
 
 use rusqlite::Connection;
 
@@ -190,14 +189,13 @@ mod tests {
             required_locations: None,
             encrypt: None,
             compression: None,
+            compression_level: None,
             checksum_mode: None,
             verify_interval_days: None,
             slice_size: None,
             preserve_xattrs: None,
             preserve_acls: None,
-            preserve_fsa: None,
             dirty_on_metadata_change: Some(true),
-            allow_spanning: None,
             copies_at: None,
         });
         let conn = crate::db::open_memory().unwrap();

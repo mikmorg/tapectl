@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-file \- Restore a single file from a unit
 .SH SYNOPSIS
-\fBtapectl restore file\fR [\fB\-\-json\fR] [\fB\-\-unit\fR] [\fB\-\-file\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-from\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] <\fB\-\-to\fR> [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-version\fR] [\fB\-\-home\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-key\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIUNIT\fR] [\fIPATH\fR] 
+\fBtapectl restore file\fR [\fB\-\-json\fR] [\fB\-\-unit\fR] [\fB\-\-file\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-from\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] <\fB\-\-to\fR> [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-version\fR] [\fB\-\-home\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-no\-file\-check\fR] [\fB\-\-key\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIUNIT\fR] [\fIPATH\fR] 
 .SH DESCRIPTION
 Restore a single file from a unit
 .PP
@@ -36,9 +36,9 @@ Snapshot version to restore.
 Defaults to the newest version of the unit on this volume (the same rule RESTORE.sh applies); a version the volume does not carry is refused, naming the ones it does
 .TP
 \fB\-\-scratch\fR \fI<DIR>\fR
-Where the decrypted slices wait for dar (default: inside \-\-to).
+Where the file is extracted before it is placed (default: inside \-\-to).
 
-Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside \-\-to, never the system temp directory. With the unit\*(Aqs isolated catalogue from `stage create` on disk only the slices holding the file (and the last) are read; otherwise every slice
+Where the file is extracted before it is placed: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside \-\-to, never the system temp directory. Only the slices that hold the file (and a hard link\*(Aqs target) are read
 .TP
 \fB\-\-overwrite\fR
 Replace a file of the same name already in \-\-to.
@@ -48,7 +48,12 @@ Without it one is refused before the tape is touched
 \fB\-\-no\-space\-check\fR
 Skip the free\-space check, for a filesystem that holds more than it reports.
 
-Skip the free\-space check (the decrypted slices read, plus the file, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
+Skip the free\-space check (the file\*(Aqs size), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
+.TP
+\fB\-\-no\-file\-check\fR
+Do not hash the restored file on disk once tar has ended.
+
+The member is still hashed against the file table as it is handed to tar. The check on disk is a second read of what was restored
 .TP
 \fB\-\-key\fR \fI<FILE>\fR
 An age identity file (a secret key) to decrypt with, in this command only.
@@ -63,6 +68,8 @@ Unit name. After \-\-unit, the file\*(Aqs PATH instead
 .TP
 [\fIPATH\fR]
 File path within the unit, relative to its root, as `catalog list` prints it.
+
+Typed as the shell has it: the name\*(Aqs own bytes, so a name that is not UTF\-8 and one with a backslash are typed as they are. `catalog list` prints them escaped (`\\\\` for a backslash, `\\xHH` for a byte outside UTF\-8).
 
 Checked against the catalog\*(Aqs file list for the version before the tape is touched; a directory is refused
 .SH "GLOBAL OPTIONS"

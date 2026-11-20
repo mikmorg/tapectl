@@ -8,7 +8,7 @@ tapectl\-volume\-plan \- Show bin\-packing plan for pending staged data
 .SH DESCRIPTION
 Show bin\-packing plan for pending staged data
 .PP
-When a staged unit may span (`allow_spanning`), it also shows the order one write of everything staged takes (owed runs of a span in progress, whole units, units that may span), the slices each plans, where each sits against the fill ceiling, and the units that would wait for the next tape. An estimate: the volume\*(Aqs own files are not counted.
+It also shows the order one write of everything staged takes (owed runs of a span in progress, then the queue), the slices each plans, where each sits against the fill ceiling, and the units that would wait for the next tape. An estimate: the volume\*(Aqs own files are not counted.
 .PP
 A plan needs no drive: the tapes are estimated for `\-\-generation`, or the configured drive\*(Aqs own generation, and the drive is never opened or probed, so it need not be attached. With neither, the plan is shown without the estimate. `volume init` decides each cartridge\*(Aqs real capacity.
 .PP

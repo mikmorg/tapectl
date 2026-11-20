@@ -39,14 +39,9 @@ pub const UNIT_FILES: [&str; 4] = [
 ];
 
 /// The tools tapectl and the tapes' RESTORE.sh run, each with its
-/// Debian/Ubuntu package.
-const TOOLS: &[(&str, &str)] = &[
-    ("dar", "dar"),
-    ("sg_logs", "sg3-utils"),
-    ("age", "age"),
-    ("mt", "mt-st"),
-    ("tar", "tar"),
-];
+/// Debian/Ubuntu package. `tar` is not here: the writer's floor ([`tar_floor`])
+/// checks it, before anything is made.
+const TOOLS: &[(&str, &str)] = &[("sg_logs", "sg3-utils"), ("age", "age"), ("mt", "mt-st")];
 
 /// Where the Quick start page is read.
 pub const QUICK_START_URL: &str =
@@ -308,6 +303,10 @@ pub fn run(
             .to_string(),
         ));
     }
+    // The writer's floor comes before anything is made (ADR-0012 items 229,
+    // 274): a host whose tar is below it learns that now, not after a home,
+    // a key and a config exist.
+    tar_floor(&startup.paths)?;
     let mut setup = Setup {
         startup,
         paths: &startup.paths,
@@ -353,6 +352,43 @@ pub fn run(
         ));
     }
     Ok(())
+}
+
+/// The anchor on the Quick start page that says how to get a tar at the floor.
+const TAR_SECTION: &str = "#get-a-tar-that-meets-the-floor";
+
+/// Check the tar setup would stage with against the writer's floor (GNU tar
+/// 1.35 built with ACL support, ADR-0012 item 274), through the probe
+/// `config check` and `stage create` use: the config's `[tar] binary` where
+/// the home has a config, else `tar` on `PATH`. Below it, or missing, it
+/// is an error that names the floor and what was found and where the way
+/// to a tar is written; it runs nothing that needs root and has made
+/// nothing yet.
+fn tar_floor(paths: &TapectlPaths) -> Result<()> {
+    use crate::policy::depth_check::{check_tar, TarToolCheck};
+    let binary = existing_config(paths)?
+        .map(|c| c.tar.binary)
+        .unwrap_or_else(|| "tar".to_string());
+    let (major, minor) = crate::tar::FLOOR;
+    let found = match check_tar(&binary, &std::env::temp_dir()) {
+        TarToolCheck::Ok { .. } => return Ok(()),
+        TarToolCheck::Refused { refusal, .. } => refusal,
+        TarToolCheck::Missing { path } => format!(
+            "no tar was found at '{path}'; the writer's floor is GNU tar {major}.{minor} or \
+             later, built with ACL support"
+        ),
+        TarToolCheck::Unreadable { path, detail } => format!(
+            "the tar at '{path}' could not be probed ({detail}); the writer's floor is GNU \
+             tar {major}.{minor} or later, built with ACL support"
+        ),
+    };
+    Err(TapectlError::Other(format!(
+        "setup stopped before it made anything: {found}. tapectl writes with GNU tar \
+         {major}.{minor} or later built with ACL support (Debian 12 and Ubuntu 22.04 ship \
+         1.34). Build one into /usr/local and name it in `[tar] binary`, or put it first on \
+         PATH, as {QUICK_START_URL}{TAR_SECTION} says (setup never runs commands that need \
+         root); then run `tapectl setup` again"
+    )))
 }
 
 /// The questions, answered from stdin, by default, or (dry run) not at all.
@@ -1653,7 +1689,7 @@ mod tests {
             commands,
             [
                 "sudo usermod -aG tape alice",
-                "sudo apt install dar sg3-utils age mt-st tar",
+                "sudo apt install sg3-utils age mt-st",
                 "sudo loginctl enable-linger alice",
             ]
         );

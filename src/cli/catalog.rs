@@ -24,10 +24,6 @@ pub enum CatalogCommands {
         version: Option<i64>,
     },
 
-    /// Removed in 1.9.0: `catalog list` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true)]
-    Ls(crate::cli::renamed::Removed),
-
     /// Search for files by pattern, in each unit's newest version
     ///
     /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
@@ -38,7 +34,12 @@ pub enum CatalogCommands {
         /// must match (AND). So "foo bar" finds paths containing a word
         /// starting with foo AND one starting with bar -- it is not a substring
         /// match, and "ar" will not find "bar".
-        pattern: String,
+        ///
+        /// Typed as the shell has it: a name's own bytes, so a name that is not
+        /// UTF-8 or has a backslash is searched as it is. The catalog holds a
+        /// path escaped (`\\` for a backslash, `\xHH` for a byte outside UTF-8),
+        /// and so does this command print it
+        pattern: std::ffi::OsString,
         /// Limit results
         #[arg(long, default_value = "50")]
         limit: i64,
@@ -350,8 +351,8 @@ fn display_warehouse(v: &[String]) -> String {
 /// serve a restore (issue #57). From 1.7.0 (#478, ADR-0012 items 121 and
 /// 127) a `range` write is listed too, with the run it holds (`Holds`): a
 /// spanning version's holders are its whole copies and its ranges, and a
-/// restore of it reads the ranges in slice order (`volume-format-v2.md`
-/// §4.4).
+/// restore of it reads the ranges in slice order (`volume-format-v3.md`
+/// §5.3).
 ///
 /// Extracted from the `Locate` arm so it is directly testable, mirroring the
 /// `copies_rows`/`dirty_rows` split in `src/cli/report.rs` rather than
@@ -498,25 +499,23 @@ fn rebuild_scratch(paths: &crate::config::TapectlPaths) -> Result<tempfile::Temp
     Ok(work)
 }
 
-/// What a rebuild did about the dar catalogues (issue #473): the sets that
-/// got theirs back from the operator envelope, and the ones left without.
-/// Empty when there is nothing to say.
-fn catalogue_lines(report: &crate::volume::rebuild::RebuildReport) -> Vec<String> {
+/// What a rebuild did about the file tables (ADR-0012 item 265, #557): the
+/// stage sets that got theirs back from the operator envelope's `catalog.db`,
+/// and the ones left without. Empty when there is nothing to say.
+fn table_lines(report: &crate::volume::rebuild::RebuildReport) -> Vec<String> {
     let mut lines = Vec::new();
-    if report.catalogues_restored > 0 {
+    if report.tables_restored > 0 {
         lines.push(format!(
-            "  dar catalogues: {} got theirs back from the operator envelope, so a copy \
-             written from them carries it again",
-            crate::render::plural(report.catalogues_restored as i64, "stage set", "stage sets")
+            "  file tables: {} got theirs (and the id map) back from the operator envelope, so \
+             a copy written from them carries them again",
+            crate::render::plural(report.tables_restored as i64, "stage set", "stage sets")
         ));
     }
-    if !report.sets_without_catalogue.is_empty() {
+    if !report.sets_without_table.is_empty() {
         lines.push(format!(
-            "  note: no dar catalogue for {} — the tape carried none for them, or it could not \
-             be put back. A copy written from them has none in its envelopes: RESTORE.sh \
-             `--list` shows no files and `--path` cannot pick any; whole-unit restore is \
-             unaffected, and `tapectl volume write` names them again",
-            report.sets_without_catalogue.join(", ")
+            "  note: no file table for {} — this tape's catalog.db carried none for them. A \
+             write of them is refused by name until each is staged again",
+            report.sets_without_table.join(", ")
         ));
     }
     lines
@@ -557,8 +556,6 @@ fn dispatch(
     dry_run: bool,
 ) -> Result<()> {
     match command {
-        CatalogCommands::Ls(_) => return Err(crate::cli::renamed::refused(&["catalog", "ls"])),
-
         CatalogCommands::List { unit, version } => {
             let unit_row = crate::db::queries::get_unit_by_name(conn, unit)?
                 .ok_or_else(|| TapectlError::UnitNotFound(unit.clone()))?;
@@ -619,7 +616,10 @@ fn dispatch(
             limit,
             all_versions,
         } => {
-            let rows = search_rows(conn, pattern, *limit, *all_versions)?;
+            // The query is a name's bytes as typed; the catalog keeps a path
+            // escaped (§1.5; ADR-0012 item 297), so it is searched so.
+            let rows = search_typed(conn, pattern, *limit, *all_versions)?;
+            let pattern = crate::volume::index::escape_os(pattern);
 
             if json_output {
                 let json: Vec<serde_json::Value> = rows
@@ -855,11 +855,14 @@ fn dispatch(
                     serde_json::json!(report.volume_inserted && report.unsealed_reason.is_some());
                 obj["found_volume_status"] = serde_json::json!(report.found_volume_status);
                 // #420: additive. Where a short tape ended, the units it
-                // cut, and what was recorded of the ending on a found row.
+                // took none of (planned and not written: no row), and what
+                // was recorded of the ending on a found row.
                 obj["ended_after"] = serde_json::json!(report.ended_after);
-                obj["cut_units"] = serde_json::json!(report.cut_units);
-                // #478: additive. The cut units above that may span.
-                obj["cut_spanning_units"] = serde_json::json!(report.cut_spanning_units);
+                obj["unwritten_units"] = serde_json::json!(report.unwritten_units);
+                // #478: additive. The units above whose other slices are
+                // planned on other tapes.
+                obj["unwritten_spanning_units"] =
+                    serde_json::json!(report.unwritten_spanning_units);
                 obj["ended_after_recorded"] = serde_json::json!(report.ended_after_recorded);
                 obj["volume_ended_after_mismatch"] =
                     serde_json::json!(report.volume_ended_after_mismatch);
@@ -873,10 +876,11 @@ fn dispatch(
                 // could be read, which the rebuild went on without.
                 obj["unreadable_tenant_envelopes"] =
                     serde_json::json!(report.unreadable_tenant_envelopes);
-                // Issue #473: additive. The dar catalogues put back from the
-                // operator envelope, and the stage sets still without one.
-                obj["catalogues_restored"] = serde_json::json!(report.catalogues_restored);
-                obj["sets_without_catalogue"] = serde_json::json!(report.sets_without_catalogue);
+                // ADR-0012 item 265 (#557): the file tables put back from the
+                // operator envelope's `catalog.db`, and the stage sets still
+                // without one. They replace #473's catalogue pair.
+                obj["tables_restored"] = serde_json::json!(report.tables_restored);
+                obj["sets_without_table"] = serde_json::json!(report.sets_without_table);
                 // #418 R4: additive. The tapes this tape's cross-volume index
                 // names that the catalog lacks: a to-do list, nothing added.
                 obj["cross_volume_index"] = index_json(&report);
@@ -1060,17 +1064,10 @@ fn dispatch(
                         report.sealed_at.as_deref().unwrap_or("?"),
                     );
                 }
-                if !report.had_catalog_db {
-                    println!(
-                        "  note: this tape carries no catalog.db (it was written by an older tapectl) — \
-                         the restore path is complete, but there is no per-file index and \
-                         each snapshot's original source path is unknown"
-                    );
-                }
                 for line in unreadable_envelope_lines(&report) {
                     println!("{line}");
                 }
-                for line in catalogue_lines(&report) {
+                for line in table_lines(&report) {
                     println!("{line}");
                 }
                 for line in index_lines(&report) {
@@ -1174,6 +1171,23 @@ fn match_expression(pattern: &str) -> Option<String> {
         .map(|t| format!("{}*", t.to_lowercase()))
         .collect();
     (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
+/// [`search_rows`] for a query as typed on the command line: a name's own
+/// bytes, escaped as the catalog keeps a path (§1.5; ADR-0012 item 297), so a
+/// name that is not UTF-8 or has a backslash is found as it is typed.
+fn search_typed(
+    conn: &Connection,
+    typed: &std::ffi::OsStr,
+    limit: i64,
+    all_versions: bool,
+) -> Result<Vec<SearchHit>> {
+    search_rows(
+        conn,
+        &crate::volume::index::escape_os(typed),
+        limit,
+        all_versions,
+    )
 }
 
 /// `catalog search` (issue #380). By default only each unit's NEWEST version
@@ -1371,7 +1385,7 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
 }
 
 /// What `catalog rebuild` prints for a tape that sealed short (#420,
-/// `volume-format-v2.md` §4.2): where it ended, the units it cut, and an
+/// `volume-format-v3.md` §5.1): where it ended, the units it cut, and an
 /// ending this catalog recorded differently. Empty for a full seal that
 /// agrees with the catalog.
 fn short_tape_lines(report: &RebuildReport) -> Vec<String> {
@@ -1381,34 +1395,35 @@ fn short_tape_lines(report: &RebuildReport) -> Vec<String> {
         lines.push(format!(
             "  note: volume \"{label}\" is SEALED SHORT: the drive's early warning ended it \
              after tape file {k}, and every file its plan lists after that is not on it \
-             (volume-format-v2.md §4.2)"
+             (volume-format-v3.md §5.1)"
         ));
-        // #478: a cut spannable unit is said apart from a cut whole unit.
-        // Its version restores from tapes whose ranges together hold every
-        // slice, in slice order, as well as from a whole copy (ADR-0012 items
-        // 101 and 131; volume-format-v2.md §4.4).
+        // #478: a unit whose other slices are planned on other tapes is said
+        // apart from one this tape was to hold whole. Its version restores
+        // from tapes whose ranges together hold every slice, in slice order,
+        // as well as from a whole copy (ADR-0012 items 101 and 131).
         let whole: Vec<&str> = report
-            .cut_units
+            .unwritten_units
             .iter()
-            .filter(|u| !report.cut_spanning_units.contains(u))
+            .filter(|u| !report.unwritten_spanning_units.contains(u))
             .map(String::as_str)
             .collect();
         if !whole.is_empty() {
             lines.push(format!(
-                "    cut by the early end, recorded \"cut\" and NOT a copy on this tape: {}. \
-                 Each is restorable only from another tape that holds it whole; `tapectl \
-                 catalog locate <UNIT>` names the ones this catalog knows",
+                "    planned and not written (the early end took none of it), recorded with no \
+                 write and NOT a copy on this tape: {}. Each is restorable only from another \
+                 tape that holds it whole; `tapectl catalog locate <UNIT>` names the ones this \
+                 catalog knows",
                 whole.join(", ")
             ));
         }
-        if !report.cut_spanning_units.is_empty() {
+        if !report.unwritten_spanning_units.is_empty() {
             lines.push(format!(
-                "    spanning units cut by the early end, none of their slices on this tape, \
-                 recorded \"cut\" and NOT a copy on this tape: {}. Each is restorable from \
-                 another tape that holds it whole, or from tapes whose ranges together hold \
-                 every slice, read in slice order (volume-format-v2.md §4.4); `tapectl catalog \
-                 locate <UNIT>` names the holders this catalog knows",
-                report.cut_spanning_units.join(", ")
+                "    units whose other slices are planned on other tapes, none of their slices \
+                 on this tape, recorded with no write and NOT a copy on this tape: {}. Each is \
+                 restorable from another tape that holds it whole, or from tapes whose ranges \
+                 together hold every slice, read in slice order; `tapectl catalog locate <UNIT>` \
+                 names the holders this catalog knows",
+                report.unwritten_spanning_units.join(", ")
             ));
         }
         if report.ended_after_recorded {
@@ -1503,9 +1518,6 @@ fn index_lines(report: &RebuildReport) -> Vec<String> {
             "  note: this tape's cross-volume index could not be used ({why}); the rebuild \
              above is complete without it"
         )];
-    }
-    if !report.had_index {
-        return Vec::new();
     }
     if report.index_volumes_missing.is_empty() {
         return vec![
@@ -1610,7 +1622,7 @@ fn refused_error(report: &RebuildReport) -> Option<TapectlError> {
 }
 
 /// What `catalog rebuild` says of the spannable sets on the tape (#478,
-/// ADR-0012 items 121 and 128; `volume-format-v2.md` §4.4): each one the tape
+/// ADR-0012 items 121 and 128; `volume-format-v3.md` §5.3): each one the tape
 /// holds as a range, with its run, and each version the run made current.
 /// Not under the short-seal lines: a range can end a tape that sealed full
 /// (the tail of a span). Empty for a tape with no spannable set.
@@ -1622,7 +1634,7 @@ fn range_lines(report: &RebuildReport) -> Vec<String> {
             "  note: volume \"{}\" holds a RANGE of each of these spanning units, not the \
              whole of it: {}. Recorded \"range\": a range is not a copy on its own, its slices \
              count one by one, and a restore needs the unit's other slices from the tapes \
-             that hold them (volume-format-v2.md §4.4)",
+             that hold them (volume-format-v3.md §5.3)",
             report.label,
             ranges.join(", ")
         ));
@@ -1637,7 +1649,7 @@ fn range_lines(report: &RebuildReport) -> Vec<String> {
     lines
 }
 
-/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v2.md`
+/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v3.md`
 /// §1.5): each spanning version some slices of which are on no tape this
 /// catalog records, the slices, and the tapes this tape's index names for
 /// them. Like [`index_lines`], it lists and never adds. Empty when every
@@ -1990,15 +2002,6 @@ mod tests {
     #[test]
     fn the_rebuild_reports_the_volumes_the_index_names_as_a_to_do_list() {
         use crate::volume::rebuild::{IndexedUnit, IndexedVolume, RebuildReport};
-        let none = RebuildReport::default();
-        assert!(
-            super::index_lines(&none).is_empty(),
-            "no index: nothing to say"
-        );
-        let json = super::index_json(&none);
-        assert_eq!(json["present"], false);
-        assert_eq!(json["volumes_missing"], serde_json::json!([]));
-
         let known = RebuildReport {
             had_index: true,
             ..Default::default()
@@ -2071,10 +2074,10 @@ mod tests {
     }
 
     /// #420: a tape that sealed short says where it ended and names the units
-    /// it cut as not copies; a full seal that agrees says nothing; a row
-    /// whose recorded ending disagrees is warned about either way.
+    /// it took none of as not copies; a full seal that agrees says nothing; a
+    /// row whose recorded ending disagrees is warned about either way.
     #[test]
-    fn a_short_tape_is_named_with_its_cut_units() {
+    fn a_short_tape_is_named_with_its_unwritten_units() {
         use crate::volume::rebuild::RebuildReport;
         let full = RebuildReport {
             label: "L6-0042".to_string(),
@@ -2085,7 +2088,7 @@ mod tests {
         let short = RebuildReport {
             label: "L6-0042".to_string(),
             ended_after: Some(17),
-            cut_units: vec!["bravo v1".to_string(), "charlie v1".to_string()],
+            unwritten_units: vec!["bravo v1".to_string(), "charlie v1".to_string()],
             ended_after_recorded: true,
             ..Default::default()
         };
@@ -2098,13 +2101,13 @@ mod tests {
         assert!(text.contains("tapectl catalog locate <UNIT>"), "{text}");
         assert!(!text.contains("warning:"), "{text}");
 
-        // #478: a cut spannable unit is not said to need a whole copy; a
-        // whole unit cut on the same tape still is.
+        // #478: a unit whose other slices are on other tapes is not said to
+        // need a whole copy; one the tape was to hold whole still is.
         let spanning = RebuildReport {
             label: "L6-0042".to_string(),
             ended_after: Some(17),
-            cut_units: vec!["bravo v1".to_string(), "video v2".to_string()],
-            cut_spanning_units: vec!["video v2".to_string()],
+            unwritten_units: vec!["bravo v1".to_string(), "video v2".to_string()],
+            unwritten_spanning_units: vec!["video v2".to_string()],
             ..Default::default()
         };
         let lines = super::short_tape_lines(&spanning);
@@ -2118,7 +2121,7 @@ mod tests {
         );
         let span = lines
             .iter()
-            .find(|l| l.contains("spanning units cut by the early end"))
+            .find(|l| l.contains("units whose other slices are planned on other tapes"))
             .expect("the spanning unit's line");
         assert!(
             span.contains("video v2") && !span.contains("bravo v1"),
@@ -2130,8 +2133,8 @@ mod tests {
         let only_spanning = RebuildReport {
             label: "L6-0042".to_string(),
             ended_after: Some(17),
-            cut_units: vec!["video v2".to_string()],
-            cut_spanning_units: vec!["video v2".to_string()],
+            unwritten_units: vec!["video v2".to_string()],
+            unwritten_spanning_units: vec!["video v2".to_string()],
             ..Default::default()
         };
         let text = super::short_tape_lines(&only_spanning).join("\n");
@@ -2687,7 +2690,7 @@ mod tests {
             )
             .unwrap();
         }
-        for (label, status) in [("L6-RANGE", "range"), ("L6-CUT", "cut")] {
+        for (label, status) in [("L6-RANGE", "range")] {
             conn.execute(
                 "INSERT INTO volumes (label, backend_type, backend_name, media_type,
                                       capacity_bytes, status)
@@ -2697,9 +2700,9 @@ mod tests {
             .unwrap();
             let volume = conn.last_insert_rowid();
             conn.execute(
-                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span,
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status,
                                      completed_at)
-                 VALUES (?1, ?2, ?3, ?4, 1, '2026-10-21T00:00:00Z')",
+                 VALUES (?1, ?2, ?3, ?4, '2026-10-21T00:00:00Z')",
                 params![set, snap, volume, status],
             )
             .unwrap();
@@ -3142,6 +3145,44 @@ mod tests {
     ];
     const REPORT_V2: &[SeedFile<'static>] =
         &[("docs", 0, "dir"), ("docs/report.txt", 10, "regular")];
+
+    /// ADR-0012 item 297 (#569): a query typed as bytes finds a name that is
+    /// not UTF-8, and one with a backslash, which the catalog keeps escaped;
+    /// the hit shows the escaped form.
+    #[test]
+    fn search_takes_the_typed_query_as_bytes_and_escapes_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let conn = db::open_memory().unwrap();
+        seed_versions(
+            &conn,
+            "u",
+            &[(
+                1,
+                "current",
+                3,
+                30,
+                &[
+                    ("docs", 0, "dir"),
+                    ("docs/caf\\xe9 menu.txt", 10, "regular"),
+                    ("docs/back\\\\slash notes.txt", 10, "regular"),
+                    ("docs/plain.txt", 10, "regular"),
+                ],
+            )],
+        );
+        let found = |typed: &[u8]| -> Vec<String> {
+            search_typed(&conn, std::ffi::OsStr::from_bytes(typed), 50, false)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.path)
+                .collect()
+        };
+        assert_eq!(found(b"caf\xe9 menu"), ["docs/caf\\xe9 menu.txt"]);
+        assert_eq!(
+            found(b"back\\slash notes"),
+            ["docs/back\\\\slash notes.txt"]
+        );
+        assert_eq!(found(b"plain"), ["docs/plain.txt"]);
+    }
 
     /// The acceptance test of #380: a file unchanged across two versions is
     /// ONE hit by default, from the newest version. It used to be one hit per

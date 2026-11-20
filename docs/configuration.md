@@ -21,7 +21,7 @@ code does.
 - [Rules for the whole file](#rules-for-the-whole-file)
 - [Editing from the command line: `config get`, `set`, `add`, `remove`](#editing-from-the-command-line-config-get-set-add-remove)
 - [`config.toml` reference](#configtoml-reference)
-  - [`[dar]`](#dar) · [`[staging]`](#staging) · [`[defaults]`](#defaults) ·
+  - [`[tar]`](#tar) · [`[staging]`](#staging) · [`[defaults]`](#defaults) ·
     [`[[backends.lto]]`](#backendslto) · [`[[archive_sets]]`](#archive_sets) ·
     [`[[collections]]`](#collections) · [`[discovery]`](#discovery) ·
     [`[compaction]`](#compaction) · [`[logging]`](#logging) ·
@@ -38,7 +38,7 @@ code does.
 ## Where the configuration lives
 
 Everything tapectl keeps lives in one directory, the **home**: the database
-(`tapectl.db`), the keys, dar catalogs, stage reports (`stage-reports/`), logs, and
+(`tapectl.db`), the keys, stage reports (`stage-reports/`), logs, and
 `config.toml`. The config file is always `<home>/config.toml`. tapectl picks the home
 in this order. The first rule that applies wins:
 
@@ -66,10 +66,6 @@ default. It also appends two commented-out examples: a `[[backends.lto]]` block 
 stands. Every other command needs an initialised home. The two exceptions are
 `completions` and `host check`, which run without one. See [`init`](cli/init.md).
 
-A home made by an older version may still have a `receipts/` directory. The first
-command you run moves it to `stage-reports/`. If both directories exist, both are
-kept, and new stage reports go to `stage-reports/`.
-
 ## Rules for the whole file
 
 **Unknown keys are errors.** Every table rejects keys it does not declare. A typo
@@ -79,8 +75,8 @@ every command with an error that names the file and the key. The one exception i
 (`compression`, `checksum_mode`, `logging.level`, `logging.format`, a drive
 `generation`), sizes and ranges are all checked when the file loads, not hours later
 when a stage or a write reaches them. One thing loading cannot tell you is whether
-your dar build supports a `compression` value. Only archive sets get that check, and
-only at `archive-set create/edit/sync` (see [`[defaults] compression`](#defaults)).
+the host's tar meets the writer's floor: `config check` probes it and says so, and
+`stage create` refuses a tar below it (see [`[tar]`](#tar)).
 
 ```text
 $ tapectl config check
@@ -89,62 +85,16 @@ config: INVALID
   |
 7 | slize_size = "5G"
   | ^^^^^^^^^^
-unknown field `slize_size`, expected one of `slice_size`, `compression`, `checksum_mode`, `encrypt`, `preserve_xattrs`, `preserve_acls`, `preserve_fsa`, `dirty_on_metadata_change`, `global_excludes`, `large_file_warn_threshold`, `min_copies`, `min_locations`, `warehouse_copies`, `verify_interval_days`, `allow_spanning`, `copies_at`
+unknown field `slize_size`, expected one of `slice_size`, `compression`, `compression_level`, `checksum_mode`, `encrypt`, `preserve_xattrs`, `preserve_acls`, `dirty_on_metadata_change`, `global_excludes`, `large_file_warn_threshold`, `min_copies`, `min_locations`, `warehouse_copies`, `verify_interval_days`, `copies_at`
 
   - unknown key: defaults.slize_size
-  - ~/.tapectl/config.toml: defaults.compression: invalid compression "zip": accepted values are none, gzip, bzip2, lzo, xz, lzma, zstd, lz4
+  - ~/.tapectl/config.toml: defaults.compression: invalid compression "zip": accepted values are none, gzip, xz, zstd
 home: ~/.tapectl (this account's ~/.tapectl)
-dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
+tar: tar (GNU tar) 1.35 at '/usr/bin/tar' (meets the writer's floor, GNU tar 1.35 with ACL support)
 staging: '~/.tapectl/staging' exists and is writable
 [defaults].slize_size is not a recognised setting — the config will not load while it is present; check the spelling, or remove it.
 ...
 ```
-
-**Keys that older versions wrote and this one refuses.** When one of these is
-present, the load fails with a message that says where the setting went. Delete the
-line, or rename the key as the table shows.
-
-| Key | What happened | What to do |
-|---|---|---|
-| `backends.lto[].media_type` | Renamed. A drive declares only its own `generation`. The generation of the *cartridge* is detected at `volume init` ([ADR-0010](adr/0010-media-generation-is-a-cartridge-property.md)). | Replace it with `generation = "LTO-6"` (the drive's generation). |
-| `backends.lto[].nominal_capacity` | Renamed. Capacity follows the loaded cartridge's generation. | Delete it. Use `capacity_override` only for a virtual drive. For one unusual cartridge, use `cartridge register --capacity`. |
-| `backends.lto[].block_size` | Removed. The block size (512 KiB) is a constant of the tape format and is written into the recovery text on every tape. | Delete the line. |
-| `backends.lto[].hardware_compression` | Removed. The write path always turns drive compression off. | Delete the line. |
-| `[packing]` (`strategy`, `fill_threshold`, `min_free_for_append`) | Whole table removed. Batches are chosen alphabetically, next-fit in name order (`collection plan --policy-aware` packs first the units the audit finds short of copies or locations), and tapes are never appended to. | Delete the table. |
-| `[labels]` (`format`) | Whole table removed. Volume labels always come from `--label`. | Delete the table. |
-| `defaults.hash` | Removed. Every checksum tapectl takes is sha256. | Delete the line. `checksum_mode` is the real setting. |
-| `defaults.min_copies_for_tape_only` | Renamed `min_copies`. The meaning and the default (2) are unchanged: it is the copy requirement every unit starts from. | Rename the key and keep the value. |
-| `defaults.min_locations_for_tape_only` | Renamed `min_locations`. The meaning and the default (2) are unchanged. | Rename the key and keep the value. |
-
-The removed keys fail with a message that names them:
-
-```text
-config: INVALID
-  - configuration error: ~/.tapectl/config.toml: backends.lto["lto6"]: "media_type" and "nominal_capacity" moved — declare the DRIVE's generation as generation = "LTO-6"; capacity now follows the cartridge's generation (ADR-0010); capacity_override is for virtual drives only
-  - unknown key: backends.lto[0].media_type
-```
-
-Every `config.toml` written by `init` before the rename carries both old
-`[defaults]` names, so a home that predates it stops loading until you rename them.
-`config check` says what to do:
-
-```text
-config: INVALID
-  - configuration error: ~/.tapectl/config.toml: defaults.min_copies_for_tape_only and defaults.min_locations_for_tape_only were renamed: the keys are now defaults.min_copies and defaults.min_locations, with the same meaning — the copy requirement every unit starts from (an [[archive_sets]] entry's min_copies overrides it) and the number of distinct locations a tape-only unit's copies must span. Rename the lines; the values carry over unchanged.
-  - unknown key: defaults.min_copies_for_tape_only
-  - unknown key: defaults.min_locations_for_tape_only
-home: ~/.tapectl (this account's ~/.tapectl)
-dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
-staging: '~/.tapectl/staging' exists and is writable
-[defaults].min_copies_for_tape_only was renamed to [defaults].min_copies — the config will not load while the old name is present. Rename the key; its meaning and value are unchanged.
-[defaults].min_locations_for_tape_only was renamed to [defaults].min_locations — the config will not load while the old name is present. Rename the key; its meaning and value are unchanged.
-...
-```
-
-Every other command refuses with the first problem only, the `configuration error:`
-line, and exits 2. For the service-user install, `scripts/first-run.sh` checks for the
-old names at step 0 and offers to rename them in place. It keeps a copy of the old
-file beside it.
 
 **Size units.** Two parsers are used, and they differ on purpose:
 
@@ -166,8 +116,8 @@ file beside it.
   error: configuration error: config set defaults.slice_size refused (~/.tapectl/config.toml is unchanged): defaults.slice_size = configuration error: "2X" is not a valid size: a number with an optional unit, such as 2500G, 500M, 512MiB or a bare byte count (K, M, G and T are binary here)
   ```
 
-  `slice_size` takes every one of these forms: tapectl hands dar the byte count,
-  so `1.5G` and `512MiB` cut slices of exactly that size.
+  `slice_size` takes every one of these forms: a size must be a multiple of 512
+  bytes (whole tar blocks), so `1.5G` and `512MiB` cut slices of that size.
 
 **Adding array tables by hand.** Append `[[archive_sets]]`, `[[collections]]` and
 `[[backends.lto]]` tables to the end of the file. A `config.toml` written by this
@@ -284,32 +234,34 @@ Every table is optional. A missing table, or a missing key inside one, takes the
 default shown. The one exception is `[defaults] global_excludes`: see its row. "Read
 by" names the commands whose behaviour the key changes.
 
-### `[dar]`
+### `[tar]`
 
 | Key | Type | Default | What it does | Read by |
 |---|---|---|---|---|
-| `binary` | string | `"dar"` | The dar program. A bare name is looked up on `PATH`. A path containing `/` is used as given. dar 2.6 or newer is required. | [`stage create`](cli/stage.md#tapectl-stage-create), [`restore`](cli/restore.md), [`archive-set create/edit/sync`](cli/archive-set.md) (to check that dar supports a compression), `init` and `config check` (to report the version found; `config check` also checks each stored archive set's compression against it) |
+| `binary` | string | `"tar"` | The GNU tar that writes each unit's stream. A bare name is looked up on `PATH`. A path containing `/` is used as given. It must be **GNU tar 1.35 or later, built with ACL support** (the writer's floor): below 1.35 `--numeric-owner` does not reach an ACL entry, and a 1.35 built without libacl writes no ACL at all. The version is the early refusal; the proof is tapectl's own check of every stream. | [`stage create`](cli/stage.md#tapectl-stage-create), `init`, `setup` and `config check` (they probe it and print the version found) |
+
+A host whose system tar is older builds the release into `/usr/local` and names it
+here; see [install.md](install.md#the-writers-tar). Only the host that *writes* is held
+to the floor: any tar reads a tape. An old `[dar]` table is refused as any unknown key is.
 
 ### `[staging]`
 
 | Key | Type | Default | What it does | Read by |
 |---|---|---|---|---|
 | `directory` | string (path) | `<home>/staging` as written by `init` | Where `stage create` puts the encrypted slices waiting for tape, and where write sessions keep their working files. It must be writable and, ideally, big enough for a full cartridge. `config check` warns when it is not. | [`stage create`](cli/stage.md#tapectl-stage-create), [`volume write`](cli/volume.md#tapectl-volume-write), [`volume read-slices`](cli/volume.md#tapectl-volume-read-slices), [`volume compact-read`](cli/volume.md#tapectl-volume-compact-read), [`stage list/clean`](cli/stage.md), [`collection run`](cli/collection.md#tapectl-collection-run) |
-| `hash_threads` | integer, 1 to 64 | `1` | How many source files one `stage create` reads and hashes at once, beside dar. Files are handed out in dar's read order and their hashes recorded in that order, so the result is the same at any setting; only the speed changes. It never runs more threads than the host has cores. Every file is still read within 128 MiB of where dar reads (the source leaves its disk once), so threads run at once only over files that fit in that window: a unit of many small files gains, one of a few large files is hashed about a file at a time. Each thread reads its own file, so on a single spinning disk more threads can mean more seeking. The default, `1`, is the one-file-at-a-time pass; it stays the default until a many-file unit has been measured on the production host at 1, 2, 4 and 8 threads (ADR-0012, 2026-10-07). If you raise it and a stage reads the source slower than before, lower it again. | [`stage create`](cli/stage.md#tapectl-stage-create), [`collection run`](cli/collection.md#tapectl-collection-run), [`quick-archive`](cli/quick-archive.md) |
-| `jobs` | integer, 1 to 16 | `1` | How many units are staged at once when several are staged together: `stage create` with several unit names, `collection run`, and first-run's staging step. `--jobs` on `stage create` and `collection run` overrides it for one run. The largest units start first, each prints a line as it starts and ends, and after a failure no further unit is started (the ones running finish). Each stage in flight keeps up to 128 MiB of its source in the page cache, so fewer run when the host's available memory cannot hold that many, and it says so. The stages share the cores: each hashes with its share of `hash_threads`. | [`stage create`](cli/stage.md#tapectl-stage-create), [`collection run`](cli/collection.md#tapectl-collection-run) |
+| `jobs` | integer, 1 to 16 | `1` | How many units are staged at once when several are staged together: `stage create` with several unit names, `collection run`, and first-run's staging step. `--jobs` on `stage create` and `collection run` overrides it for one run. The largest units start first, each prints a line as it starts and ends, and after a failure no further unit is started (the ones running finish). Each stage in flight keeps up to 128 MiB of its source in the page cache, so fewer run when the host's available memory cannot hold that many, and it says so. | [`stage create`](cli/stage.md#tapectl-stage-create), [`collection run`](cli/collection.md#tapectl-collection-run) |
 
 `init` always writes the real path. If you delete the key while using a
 non-default home, the fallback is `$HOME/.tapectl/staging`, not `<home>/staging`,
 so keep the key.
 
 `stage create` (and `collection run` and `quick-archive`, which call it) checks this
-directory before it runs dar. A directory it cannot create or write to is refused by
+directory before it runs tar. A directory it cannot create or write to is refused by
 path. Staging one unit needs room for its encrypted slices, and only those: no
-plaintext is written there. That comes to about the unit's size, plus dar's own records
-for each file, for which the check allows up to 1 KiB a file. When the free space is
-below that, the stage only *may* not fit (with compression on, how far dar shrinks the
-data cannot be known in advance, and dar stores runs of zeros and hard-linked files in
-less space), so you are asked on a terminal. `--yes` proceeds, and a non-interactive run
+plaintext is written there. That comes to about the unit's stream: its files plus tar's
+headers, and about 1/4096 more for age's tags. When the free space is below that, the
+stage only *may* not fit (with compression on, how far each slice shrinks cannot be
+known in advance, and tar stores a hard-linked file once), so you are asked on a terminal. `--yes` proceeds, and a non-interactive run
 without `--yes` refuses. Other stages running at the same time, in this command
 or another, count against the free space: what each may still write is set
 aside before this unit is checked.
@@ -321,22 +273,22 @@ These are the system-wide defaults. They form the bottom layer of
 
 | Key | Type | Default | What it does | Read by |
 |---|---|---|---|---|
-| `slice_size` | size (binary) | `"1G"` | Maximum size of one dar slice. A slice is the unit that is encrypted, written, retried and restored. Can be overridden by an archive set or a dotfile. | `stage create`, `collection run` |
-| `compression` | `none` \| `gzip` \| `bzip2` \| `lzo` \| `xz` \| `lzma` \| `zstd` \| `lz4` | `"none"` | dar compression. Must also be supported by your dar build, and for this key (and a dotfile's `compression`) nothing checks that in advance. Loading checks only the spelling, and `config check` says `config: valid`. A codec your dar lacks is found only when `stage create` runs dar. An archive set's value is checked against the real binary: `archive-set create/edit/sync` refuse a codec it cannot perform, and `config check` warns about a stored set that has one. | `stage create` |
+| `slice_size` | size (binary) | `"1G"` | Maximum size of one slice of the unit's tar stream, a multiple of 512 bytes. A slice begins at a member's start, so it holds whole files, and a file larger than `slice_size` gets a run of slices to itself. A slice is the unit that is compressed, encrypted, written, retried and restored. tapectl's own restore holds one whole slice in memory at a time, so its peak heap follows `slice_size`, not the largest file, and every buffer is made at the size the catalog gives, never grown by doubling: about 1× the slice uncompressed; for a compressed staging the frame and the decoded slice are alive together, about 2× the slice at worst (on data that does not compress the frame is a little larger than the cut; on data that compresses it is smaller), plus a fixed 0.2 MiB or so (measured at 2M, 3M and 8M slices by `tests/restore_memory.rs`). The frame is freed before tar is fed. `config check` warns when that figure for the largest `slice_size` among `[defaults]` and the archive sets (doubled where that level sets a `compression`) is more than the host's `MemAvailable`, and `--json` carries the line under `restore_memory`; a restore warns once, before it reads, from the largest slice it is about to read, on the same test. Both warnings are advisory: they change no exit code and refuse nothing. Can be overridden by an archive set or a dotfile. | `stage create`, `collection run` |
+| `compression` | `none` \| `gzip` \| `xz` \| `zstd` | `"none"` | How each slice is compressed, alone, after the cut and before it is encrypted. tapectl compresses in-process: nothing on the host has to support an algorithm, and any other value is refused when the file loads. A unit stored compressed names its algorithm in the tape's `MANIFEST.toml`, and the heir needs that algorithm's tool (`gzip`, `xz` or `zstd`) only for such a unit. Off by default: whether it pays depends on the content (photos, video and archives rarely shrink). Overridden by an archive set and a unit's dotfile. | `stage create` |
+| `compression_level` | integer | the algorithm's own | The level `compression` packs each slice at: gzip 1 to 9 (default 6), xz 0 to 9 (default 6), zstd 1 to 19 (default 3). A value outside the algorithm's range is refused, naming the key, when config.toml is loaded and when `stage create` resolves the unit's policy. Resolved like `compression`: a unit's dotfile, then its archive set, then here. The level is recorded with the staging; no reader needs it. | `stage create` |
 | `checksum_mode` | `mtime_size` \| `sha256` \| `sha256_on_archive` | `"mtime_size"` | How a unit's files are compared with its last snapshot to decide whether it is dirty. `mtime_size` compares each file's path, size and modification time. `sha256` also compares a content hash when those match. `sha256_on_archive` detects changes as `mtime_size` does. A new unit takes the resolved mode (dotfile, then archive set, then `[defaults]`) **when it is registered**, and keeps it. A later change here does not reach units already registered. See [below](#keys-that-are-accepted-but-do-less-than-their-name-says). | `unit init`, `unit init-bulk`, `collection sync`, `unit discover`, `quick-archive` (at registration) |
 | `encrypt` | bool | `true` | Encryption **cannot** be turned off: the escrow recipient takes part in every write. When a unit's *resolved* `encrypt` is `false`, `stage create` prints a warning for it that `[logging] level` cannot silence, and encrypts anyway. `false` here is overridden by an archive set that sets `encrypt = true`, so that set's units stage with no warning. `audit` checks that a unit's stage sets on tape are encrypted, but only while the unit's resolved `encrypt` is `true`: `false` turns that check off for the unit. | `stage create`, `audit` |
-| `preserve_xattrs` | bool | `true` | `true` archives every extended attribute, and with them the POSIX ACLs that Linux stores as extended attributes. `false` passes dar `-u "*"`, which drops them all, ACLs included. | `stage create` |
-| `preserve_acls` | bool | `true` | No effect of its own. dar has no separate ACL switch, so ACLs follow `preserve_xattrs`. `config check` prints a note wherever this disagrees with `preserve_xattrs`, in either direction. | `config check` (advisory) |
-| `preserve_fsa` | bool | `true` | Filesystem-specific attributes, such as Linux `chattr` flags. `true` passes dar `--fsa-scope extX`, and `false` passes `--fsa-scope none`, which drops them. | `stage create` |
+| `preserve_xattrs` | bool | `true` | `true` gives tar `--xattrs`, so each file's extended attributes are archived; the raw POSIX ACL attribute is left out of that record (an ACL is stored once, by `preserve_acls`). `false` stores no extended attribute. | `stage create` |
+| `preserve_acls` | bool | `true` | `true` gives tar `--acls`, so each file's POSIX ACL is stored once, as a text record with every user and group by number. tapectl checks that a file that had an ACL carries it, and refuses the stream otherwise. `false` stores no ACL. | `stage create` |
 | `dirty_on_metadata_change` | bool | `false` | Resolved, but not read by any command in this version: dirty detection compares path, size and modification time only. `config check` prints a note when it is `true`. | `config check` (advisory) |
-| `global_excludes` | list of globs | `["*.nfo", "Thumbs.db", ".DS_Store", "*.tmp"]` (written by `init`) | What is never archived from any unit, added to each unit's own `[excludes]` patterns. **The default list applies only when the whole `[defaults]` table is missing.** A `[defaults]` table without this key means `[]`, so nothing is excluded: if you trim `[defaults]` by hand, keep this line. `config check` does not warn about it. Case never matters. A plain pattern (`*.tmp`) matches a file's **name only** and never a directory. A pattern ending in `/` (`.cache/`) excludes the directory of that name, at any depth in the unit, with everything inside it, and a file of that name too. That subtree stays out of the dar archive as well; the directory itself is archived empty. See [`[excludes]`](#excludes-yours-to-edit). | `snapshot create`, `stage create`, `unit info --dirty`, `report dirty`, `audit` (its dirty check), `collection sync/status/plan`, `unit mark-tape-only` |
+| `global_excludes` | list of globs | `[]` (written by `init`: nothing is left out by default, ADR-0012 item 252) | What is never archived from any unit, added to each unit's own `[excludes]` patterns. A pattern the matcher cannot read is refused at load, naming it (#542). Every snapshot records and reports what each pattern left out (`snapshot create`'s `left out:` lines and its `--json` key `left_out`), and a socket is always left out and reported the same way (item 270). Case never matters. A plain pattern (`*.tmp`) matches a file's **name only** and never a directory. A pattern ending in `/` (`.cache/`) excludes the directory of that name, at any depth in the unit, with everything inside it, and a file of that name too. That subtree stays out of the archive as well; the directory itself is archived empty. See [`[excludes]`](#excludes-yours-to-edit). | `snapshot create`, `stage create`, `unit info --dirty`, `report dirty`, `audit` (its dirty check), `collection sync/status/plan`, `unit mark-tape-only` |
 | `large_file_warn_threshold` | size (binary) | `"100G"` | `snapshot create` warns about any file bigger than this. It only warns and never refuses. | [`snapshot create`](cli/snapshot.md#tapectl-snapshot-create) |
 | `min_copies` | integer | `2` | The number of Copies each Version of a unit needs, unless the unit's archive set sets its own `min_copies` (a dotfile cannot set this key). It is the bottom layer of every unit's copy requirement. From 1.7.1 the unit's **copy floor** is the larger of its resolved `min_copies` and the sum of its resolved [`copies_at`](#defaults) targets, so a map asking for more copies in all raises it; with no map the floor is `min_copies`. A tape-only unit needs the floor times [`tape_only_safety_multiplier`](#compaction) everywhere it is judged. At least 1: 0 or below is refused by name at load, `config check` and `config set` (#453). | `audit`, `status`, `report fire-risk`, `report reclaimable`, `stage list --owing`, `volume plan` (its default `--copies`), `collection status/run`, `stage clean`, `unit mark-tape-only`, `snapshot mark-reclaimable`, and the retire gate of `volume retire`, `cartridge retire` and `volume compact-finish` (see below the table) |
-| `min_locations` | integer | `2` | How many distinct locations a tape-only unit's copies must span, as set. [`tape_only_safety_multiplier`](#compaction) never raises it (a tape-only unit needs more copies, not more places), and a unit that is not tape-only has no such floor. [`unit mark-tape-only`](cli/unit.md#tapectl-unit-mark-tape-only) asks it before accepting a unit without consent. After that, `audit` holds the unit to it (`location_count`, a violation) and `snapshot mark-reclaimable` / `report reclaimable` ask it of the version that supersedes the one released. It exists only here: an archive set names places with `required_locations` instead. 0 or more: a negative value is refused by name (#453). | `unit mark-tape-only`, `audit`, `snapshot mark-reclaimable`, `report reclaimable` |
-| `copies_at` | table: location name = count | none | How many copies each unit should hold at each named location, its **copy targets** (from 1.7.1; [ADR-0012](adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md) items 148-160). A copy *at* a location is an eligible tape whose recorded location is that one, or a recorded warehouse deposit there; it is counted per Version, at the Version's least-covered slice, as every copy count is. Write it inline, `copies_at = { home-rack = 1, offsite = 1 }`, or as a `[defaults.copies_at]` table with one `name = count` line each. **The most specific layer that sets `copies_at` wins whole**: a unit's dotfile [`[policy.copies_at]`](#policy-yours-to-edit), else its archive set's `copies_at` (where `required_locations` counts as one copy at each name), else this one. Maps never merge, and an empty map is a setting that hides the layers below. The copy floor becomes the larger of `min_copies` and the map's sum, and a tape-only unit's target at each location is multiplied by [`tape_only_safety_multiplier`](#compaction), as its floor is. Each count is 0 or more (0 asks for none there), refused by name at load and by `config check`. Each name must be a registered location, but that is checked when a unit's policy is resolved, not at load: a name with no [`location add`](cli/location.md#tapectl-location-add) behind it makes every unit that takes this map unresolvable, so add the locations first. [`location rename`](cli/location.md#tapectl-location-rename) rewrites the names stored in the catalog and in unit dotfiles, but not this key: change it here too. Absent, no unit has a target unless its archive set or dotfile gives one. | `audit` (`copy_count`, `location_presence`), [`report needs`](cli/report.md#tapectl-report-needs), [`stage for-location`](cli/stage.md#tapectl-stage-for-location), `volume write --for-location`, `volume plan --policy-aware`, and every reader of the copy floor (the `min_copies` row) |
+| `min_locations` | integer | `2` | How many distinct locations a tape-only unit's copies must span, as set. [`tape_only_safety_multiplier`](#compaction) never raises it (a tape-only unit needs more copies, not more places), and a unit that is not tape-only has no such floor: an active unit with every copy on one shelf is clean under `min_locations` alone. To hold every unit to two places, set [`copies_at`](#defaults) instead (`copies_at = { home-rack = 1, offsite = 1 }`); `audit` then reports a unit short at either place as a `location_presence` violation. [`unit mark-tape-only`](cli/unit.md#tapectl-unit-mark-tape-only) asks it before accepting a unit without consent. After that, `audit` holds the unit to it (`location_count`, a violation) and `snapshot mark-reclaimable` / `report reclaimable` ask it of the version that supersedes the one released. It exists only here: an archive set names places with `required_locations` instead. 0 or more: a negative value is refused by name (#453). | `unit mark-tape-only`, `audit`, `snapshot mark-reclaimable`, `report reclaimable` |
+| `copies_at` | table: location name = count | none | How many copies each unit should hold at each named location, its **copy targets** (from 1.7.1; [ADR-0012](adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md) items 148-160). A copy *at* a location is an eligible tape whose recorded location is that one, or a recorded warehouse deposit there; it is counted per Version, at the Version's least-covered slice, as every copy count is. Write it inline, `copies_at = { home-rack = 1, offsite = 1 }`, or as a `[defaults.copies_at]` table with one `name = count` line each. **The most specific layer that sets `copies_at` wins whole**: a unit's dotfile [`[policy.copies_at]`](#policy-yours-to-edit), else its archive set's `copies_at` (where `required_locations` counts as one copy at each name), else this one. Maps never merge, and an empty map is a setting that hides the layers below. The copy floor becomes the larger of `min_copies` and the map's sum, and a tape-only unit's target at each location is multiplied by [`tape_only_safety_multiplier`](#compaction), as its floor is. Each count is 0 or more (0 asks for none there), refused by name at load and by `config check`. Each name must be a registered location, but that is checked when a unit's policy is resolved, not at load: a name with no [`location add`](cli/location.md#tapectl-location-add) behind it makes every unit that takes this map unresolvable, so add the locations first. [`location rename`](cli/location.md#tapectl-location-rename) rewrites the names stored in the catalog and in unit dotfiles, but not this key: change it here too. Absent, no unit has a target unless its archive set or dotfile gives one. This is how a host holds **every** unit, active ones included, to two places: [`min_locations`](#defaults) binds tape-only units only, so a `copies_at` naming two locations is what makes `audit` report an active unit whose copies all sit at one of them. | `audit` (`copy_count`, `location_presence`), [`report needs`](cli/report.md#tapectl-report-needs), [`stage for-location`](cli/stage.md#tapectl-stage-for-location), `volume write --for-location`, `volume plan --policy-aware`, and every reader of the copy floor (the `min_copies` row) |
 | `verify_interval_days` | integer | `365` | The full-readback clock for every unit whose archive set gives none (#453): `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit's copies, or a volume, have had no passing full readback within this many days. At least 1, refused by name otherwise. An archive set's own `verify_interval_days` overrides it; a dotfile cannot set it. Absent from the file means 365 (1.2.0); `init` writes it. There is no way to switch the clock off; a very large number is the nearest thing. `config check` prints the value in force. | [`audit`](cli/audit.md#tapectl-audit) |
+| `drill_interval_days` | integer | `365` | How many days may pass after the newest [`drill record`](cli/drill.md#tapectl-drill-record) before `audit` warns (`drill_age`) that a heir drill is due; `audit` also warns when none is recorded at all. At least 1, refused by name otherwise at load and by `config check`. Absent from the file means 365, and `init` does not write it. | [`audit`](cli/audit.md#tapectl-audit) |
 | `warehouse_copies` | integer | `0` | How many warehouse deposits each unit should have in addition to its tape copies ([ADR-0006](adr/0006-storage-interface-first-class-stores.md)). `0` means none are expected, and `audit` says nothing about warehouses. | `audit` |
-| `allow_spanning` | bool | `false` | Whether a unit may span tapes (from tapectl 1.7.0; [ADR-0012](adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md) items 82-84): a unit that allows it may have its slices run across more than one tape. It is packed after the units that may not span (one larger than a tape starts right after the slices a span in progress still owes, and the whole units it displaces go after its tail on its last tape: 1.7.1, ADR-0012 item 147), and it is cut where the drive reports early warning, not where the plan ends, its remaining slices continuing on the next cartridge; its tapes then belong together, in order, to restore it. A drive needs its measured [`post_warning_bytes`](#backendslto) for this: without it, a spannable unit that would pass the fill ceiling is refused. A unit larger than one cartridge is refused unless it allows spanning, and the refusal names this key; one that allows it is still refused if the staging area cannot hold it whole. Off by default: every unit is written whole on one tape. An archive set's `allow_spanning`, then a dotfile's, overrides it, either way. `init` writes it. | `volume write`, `collection run`, `stage create` (from 1.7.0) |
 
 `unit mark-tape-only` checks the unit against the floors of a tape-only unit, which
 it is about to be: its copy floor (the larger of its resolved `min_copies` and its
@@ -392,7 +344,7 @@ tapectl config check
 | `device_sg` | path | derived from `device_tape` | The SCSI generic node of the **same** drive. It is used to read the cartridge memory chip (serial, generation) and the drive's health log pages. When the line is absent, tapectl derives it from `device_tape` (the node the kernel binds to that tape node, read from sysfs) every time the config loads, so a `/dev/sgN` renumbering never matters (issue #431). Set it only to override; a write refuses a configured node that is provably a different drive from `device_tape`. Absent and not derivable (the drive is not attached, or `device_tape` is not a tape node) is refused by name where a drive is needed, and `config check` warns. `device_sg = ""` is refused. To go back to deriving: `tapectl config remove 'backends.lto[NAME].device_sg'`. |
 | `generation` | string | *required* | The generation the drive natively writes, such as `"LTO-6"` or `"LTO-8"`. `LTO-5`, `L5` and `lto5` are all accepted. `"LTO-7-M8"` is refused here: it is a cartridge format, and the drive that writes it declares `LTO-8`. |
 | `capacity_override` | size (**decimal**; `KiB`…`TiB` binary) | unset | **Virtual drives only** (mhvtl, test harnesses). It overrides the capacity for every cartridge this drive touches. A real drive gets its capacity from the loaded cartridge's detected generation, so leave this unset. `config check` warns whenever it is set. |
-| `fill_ceiling` | float | `0.97` | The **fill ceiling**: the fraction of a cartridge's capacity a write may fill, above 0 and at most 1. The pre-write capacity check of every write refuses a layout above it and says by how much; planning sizes tapes with it. `--fill-ceiling` on `volume write`, `volume plan`, `collection plan` and `collection run` overrides it for one command (`0.99` or `99%`). It was called `usable_capacity_factor` (default `0.92`) until issue #391; a config that still uses that name is refused, naming the new key. Each completed write records the capacity it used (a `write_capacity_used` event in `report events`), so the ceiling can be tuned from what writes really take. |
+| `fill_ceiling` | float | `0.97` | The **fill ceiling**: the fraction of a cartridge's capacity a write may fill, above 0 and at most 1. The pre-write capacity check of every write refuses a layout above it and says by how much; planning sizes tapes with it. `--fill-ceiling` on `volume write`, `volume plan`, `collection plan` and `collection run` overrides it for one command (`0.99` or `99%`). Each completed write records the capacity it used (a `write_capacity_used` event in `report events`), so the ceiling can be tuned from what writes really take. |
 | `post_warning_bytes` | size (**decimal**; `KiB`…`TiB` binary) | unset | The room, measured by `scripts/lto-profile.sh`, from this drive's early warning to the hard end of the medium: the lower of the walk it makes to the hard end and the drive's own page 0x0c figure ("minimum native capacity from EW to EOP"). With it set on any drive, a slice plus the seal must fit in **half of the smallest such room** (ADR-0012 item 100): `config check` reports a `[defaults]` or archive-set `slice_size` that does not as an `error:` line and exits non-zero, `config set` refuses an edit that breaks it, and `stage create` refuses the slice size in force for the unit, naming the key, the drive and the numbers. Every other command still loads the file. Above zero. Absent means nothing is checked. See [`docs/lto-profiling.md`](lto-profiling.md). |
 | `enospc_buffer` | size (binary) | `"50M"` | Headroom kept free before end of tape. The pre-write capacity check reserves it, and `collection plan` and `collection run` subtract it from each tape's budget. |
 
@@ -471,12 +423,12 @@ written to the database, and each has a matching `archive-set create`/`edit` fla
 | `copies_at` | table: location name = count | This set's copy targets per location (from 1.7.1; see [`[defaults] copies_at`](#defaults)), laid over `required_locations` name by name: `required_locations = ["home-rack", "offsite"]` with `copies_at = { home-rack = 2 }` is `{ home-rack = 2, offsite = 1 }`. Either key makes this set's layer set the map, which then hides `[defaults] copies_at`; a unit's dotfile `[policy.copies_at]` replaces it in turn. Each name must be a registered location and each count 0 or more: `create`, `edit` and `sync` refuse otherwise, by name. `--copies-at` replaces the set's whole map; it takes `NAME=N` and is repeated for each location. | `--copies-at NAME=N` (repeatable) |
 | `encrypt` | bool | See `[defaults] encrypt`: `false` is warned about and the data is encrypted anyway, but `audit` stops checking this set's units for unencrypted stage sets. | `--encrypt true\|false` |
 | `compression` | closed set, as in `[defaults]` | Overrides `[defaults] compression`. | `--compression` |
+| `compression_level` | integer | Overrides `[defaults] compression_level`, in the range of the algorithm in force. | `--compression-level` |
 | `checksum_mode` | closed set, as in `[defaults]` | Overrides `[defaults] checksum_mode` for units registered into this set. Units already registered keep their mode. | `--checksum-mode` |
 | `slice_size` | size (binary) | Overrides `[defaults] slice_size`. | `--slice-size` |
 | `verify_interval_days` | integer | `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit with copies has had no passing full `volume verify` within this many days. Overrides `[defaults] verify_interval_days` (365 days when that is absent). It also bounds how old an interrupted full readback may be and still be continued: a full verify or `--full-confirm` does not continue one whose oldest read is older than the shortest interval among the units on that volume, and reads everything again (ADR-0012, 2026-10-07). It must be at least 1: `archive-set create`, `edit` and `sync` refuse a smaller value by name, and so do loading config.toml and `config check` (#422). A catalog row written with one before then keeps working; at 0 or below, no interrupted readback is continued. | `--verify-interval-days` |
-| `preserve_xattrs`, `preserve_acls`, `preserve_fsa` | bool | Override their `[defaults]` namesakes for this set's units, with the same effect. `preserve_acls` still has no effect of its own. | `--preserve-xattrs`, `--preserve-acls`, `--preserve-fsa` (each `true\|false`) |
+| `preserve_xattrs`, `preserve_acls` | bool | Override their `[defaults]` namesakes for this set's units, with the same effect. | `--preserve-xattrs`, `--preserve-acls` (each `true\|false`) |
 | `dirty_on_metadata_change` | bool | Stored and resolved, but read by nothing, as in `[defaults]`. `config check` names it when `true`. | `--dirty-on-metadata-change true\|false` |
-| `allow_spanning` | bool | Whether this set's units may span tapes, from tapectl 1.7.0 (see [`[defaults] allow_spanning`](#defaults)). Overrides `[defaults] allow_spanning`, and a unit's dotfile overrides it in turn. Left out, the set defers to `[defaults]`, which is off. | `--allow-spanning true\|false` |
 
 An `[[archive_sets]]` table does not accept `warehouse_copies`: the key is refused as
 unknown, and the config will not load. A set's `warehouse_copies` can be set only with
@@ -493,7 +445,7 @@ and in a dotfile's `[policy]`.
 > `archive-set edit` can only set it to something else. Sets that are not named in the
 > file are left alone, and `sync` never deletes a set.
 
-`sync` validates every entry before it writes any row: compression against your dar,
+`sync` validates every entry before it writes any row: compression,
 checksum mode, slice size, and each `required_locations` and `copies_at` name against
 the registered locations. A bad entry changes nothing:
 
@@ -655,7 +607,7 @@ group = "tapectl-ops"
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `group` | group name | *(no table: the home stays private)* | Every command run as the service user keeps the home at 0710 and `logs/` at 2750 (setgid), both owned by this group, and writes each session log 0640. Every other entry of the home — `config.toml`, the catalog, the keys, `catalogs/`, `stage-reports/`, `locks/`, `tmp/`, a `staging/` inside it, whatever else is there — has its group and other bits removed on every command, so a member can open none of them even by name. |
+| `group` | group name | *(no table: the home stays private)* | Every command run as the service user keeps the home at 0710 and `logs/` at 2750 (setgid), both owned by this group, and writes each session log 0640. Every other entry of the home — `config.toml`, the catalog, the keys, `stage-reports/`, `locks/`, `tmp/`, a `staging/` inside it, whatever else is there — has its group and other bits removed on every command, so a member can open none of them even by name. |
 
 The service user must be a member of the group itself: giving a directory a
 group (`chgrp`) is limited to one's own groups, and until it can, the home and
@@ -683,7 +635,6 @@ they say. This is the honest list for this version:
 | Key | What actually happens |
 |---|---|
 | `encrypt = false` (any layer) | A warning at `stage create` for each unit whose *resolved* `encrypt` is `false`. `[defaults] encrypt = false` under an archive set with `encrypt = true` resolves to `true`, so it brings no warning. The data is encrypted anyway. `audit` also stops running its `encryption` check for the units whose resolved value is `false`. |
-| `preserve_acls` (any layer) | No effect of its own, because ACLs are extended attributes and follow `preserve_xattrs`. `preserve_acls = false` beside `preserve_xattrs = true` keeps them anyway, and `preserve_acls = true` beside `preserve_xattrs = false` drops them anyway. `config check` prints a note for either mismatch, in `[defaults]`, in an archive set, or in an `[[archive_sets]]` table not yet synced. Because `init` writes `preserve_acls = true`, setting only `preserve_xattrs = false` brings the second note. |
 | `dirty_on_metadata_change = true` (any layer) | Resolved through the policy chain, but no command reads it. `config check` prints a note naming the key. |
 | `checksum_mode` in `[defaults]` or an archive set | Read once, **when a unit is registered**. Dirty detection and version minting then use the mode recorded on the unit. Changing the key later does not change the mode of units already registered. `unit info` shows the recorded mode. |
 | `capacity_override` on a real drive | It works, and that is the problem: it overrides capacity for every cartridge. `config check` warns. |
@@ -698,8 +649,8 @@ the sg node with the one `lsscsi -g` shows for the same drive.
 ```toml
 # ~/.tapectl/config.toml — one drive, defaults everywhere else.
 
-[dar]
-binary = "dar"                      # found on PATH
+[tar]
+binary = "tar"                      # found on PATH; GNU tar 1.35 or later with ACL support
 
 [staging]
 directory = "/srv/tapectl-staging"  # needs room for a cartridge's worth of slices
@@ -711,14 +662,12 @@ checksum_mode = "mtime_size"
 encrypt = true
 preserve_xattrs = true
 preserve_acls = true
-preserve_fsa = true
 dirty_on_metadata_change = false
-global_excludes = ["*.nfo", "Thumbs.db", ".DS_Store", "*.tmp"]
+global_excludes = []
 large_file_warn_threshold = "100G"
 min_copies = 2                      # every unit wants two copies...
 min_locations = 2                   # ...in two places (tape-only: copies x tape_only_safety_multiplier, places as set)
 warehouse_copies = 0
-allow_spanning = false              # every unit whole on one tape (spanning is 1.7.0's)
 
 [discovery]
 watch_roots = ["/media"]            # `unit discover` finds moved units here
@@ -752,8 +701,8 @@ overlap a tape write. Keys left out of `[defaults]` take their defaults, except
 `".cache/"` exclude keeps every `.cache` directory's contents out of every unit.
 
 ```toml
-[dar]
-binary = "dar"
+[tar]
+binary = "tar"
 
 [staging]
 directory = "/scratch/tapectl-staging"
@@ -909,15 +858,15 @@ are not kept.
 `unit init` never writes this table. Add it by hand to give one unit its own
 policy. It is read from disk every time the unit's policy is resolved, which happens
 at `stage create`, `audit`, `collection status/plan/run` and elsewhere. So a change
-takes effect straight away. It accepts exactly six keys:
+takes effect straight away. It accepts exactly seven keys:
 
 | Key | Type | Overrides |
 |---|---|---|
 | `slice_size` | size (binary) | the archive set, then `[defaults]` |
 | `compression` | closed set, as in `[defaults]` | the archive set, then `[defaults]` |
+| `compression_level` | integer | the archive set, then `[defaults]` |
 | `checksum_mode` | closed set, as in `[defaults]` | Read when a unit is registered from this dotfile (`unit discover`, `collection sync`), where it wins over the archive set and `[defaults]`. Changing it later does not change the registered unit's mode (see [above](#keys-that-are-accepted-but-do-less-than-their-name-says)). It is still validated every time the policy is resolved, so a bad value makes every command that resolves the unit's policy refuse it. |
 | `warehouse_copies` | integer | the archive set, then `[defaults]` |
-| `allow_spanning` | bool | the archive set, then `[defaults]`. From tapectl 1.7.0, `true` lets this unit span tapes (see [`[defaults] allow_spanning`](#defaults)), and `false` keeps it whole on one tape even when its archive set allows spanning. |
 | `copies_at` | table: location name = count | the archive set's map (its `required_locations` included), then `[defaults]`, **whole**. From tapectl 1.7.1, the unit's own copy targets per location (see [`[defaults] copies_at`](#defaults)): written as a `[policy.copies_at]` table with one `location = count` line each, or inline as `copies_at = { offsite = 2 }` under `[policy]`. A map that names only `offsite` drops a `home-rack` its archive set named, and an empty table means "no targets". Every name must be a registered location, or the unit's policy is unresolvable, naming the name. |
 
 `min_copies`, `required_locations` and `verify_interval_days` are **not** dotfile
@@ -934,7 +883,7 @@ warning: unit 'family/letters' dotfile cannot be read, so every command that res
    |
 12 | min_copies = 3
    | ^^^^^^^^^^
-unknown field `min_copies`, expected one of `checksum_mode`, `compression`, `slice_size`, `warehouse_copies`, `allow_spanning`, `copies_at`
+unknown field `min_copies`, expected one of `checksum_mode`, `compression`, `compression_level`, `slice_size`, `warehouse_copies`, `copies_at`
  (…/letters/.tapectl-unit.toml)
   hint: an unrecognised key under [policy] is refused by name; an ABSENT key is always fine and defers to the archive set or defaults
 ```
@@ -978,8 +927,8 @@ patterns = []
 | `patterns` | list of globs | What in this unit is never archived, added to `[defaults] global_excludes`. Case never matters. A plain pattern matches a file's **name** only (never its path) and never a directory: `"*.iso"` excludes every ISO file anywhere in the unit, but `"cache"` does not exclude a directory called `cache`. A pattern ending in `/` does: `"cache/"` excludes every directory named `cache` at any depth in the unit, with everything inside it, and a file named `cache` too. Only paths inside the unit are matched, never the directories above it. |
 
 The exclusions reach every part of tapectl alike: the snapshot's file list, dirty
-detection, and the dar archive itself (tapectl passes plain patterns to dar as `-X`
-and directory patterns as `-P` prune masks), so nothing excluded is written to tape.
+detection, and the archive itself (tar is given the exact list of what is left, so
+nothing excluded is written to tape).
 An excluded directory is archived as an empty directory. A pattern that is not a
 valid glob, a plain pattern containing `/`, and a directory pattern with a `/` inside
 its name (`a/b/`) match nothing.
@@ -1026,11 +975,11 @@ shows which layer can carry which field:
 | verify interval | — | `verify_interval_days` | `verify_interval_days` (365 when absent) |
 | slice size | `slice_size` | `slice_size` | `slice_size` |
 | compression | `compression` | `compression` | `compression` |
+| compression level | `compression_level` | `compression_level` | `compression_level` |
 | checksum mode (at registration) | `checksum_mode` | `checksum_mode` | `checksum_mode` |
 | warehouse deposits | `warehouse_copies` | `warehouse_copies` (CLI only) | `warehouse_copies` |
-| spanning tapes (from 1.7.0) | `allow_spanning` | `allow_spanning` | `allow_spanning` (off) |
 | encryption | — | `encrypt` (always on) | `encrypt` (always on) |
-| xattrs, ACLs, FSA | — | `preserve_xattrs`, `preserve_acls`, `preserve_fsa` | `preserve_xattrs`, `preserve_acls`, `preserve_fsa` |
+| xattrs, ACLs | — | `preserve_xattrs`, `preserve_acls` | `preserve_xattrs`, `preserve_acls` |
 
 `copies_at` resolves as one value, not name by name: the most specific layer that sets
 it wins whole, and the layers below it are not read for any name. An archive set sets
@@ -1124,9 +1073,7 @@ Archive set: critical
   Warehouse copies: 1
   Preserve xattrs:  -
   Preserve ACLs:    -
-  Preserve FSA:     -
   Dirty on metadata change: -
-  Allow spanning:   -
   Copies at:        -
   Units using:      1
   Created:          2026-09-29 08:33:13
@@ -1139,7 +1086,7 @@ not name alone (see [`[[archive_sets]]`](#archive_sets)).
 
 | Command | Flags that set policy |
 |---|---|
-| [`archive-set create <NAME>`](cli/archive-set.md#tapectl-archive-set-create) | `--min-copies`, `--required-locations a,b` (registered locations only), `--copies-at NAME=N` (repeatable, registered locations only), `--encrypt true\|false`, `--compression`, `--checksum-mode`, `--slice-size`, `--verify-interval-days`, `--warehouse-copies`, `--preserve-xattrs true\|false`, `--preserve-acls true\|false`, `--preserve-fsa true\|false`, `--dirty-on-metadata-change true\|false`, `--allow-spanning true\|false`, `-d/--description`. A flag you leave out stays empty and defers to `[defaults]`. |
+| [`archive-set create <NAME>`](cli/archive-set.md#tapectl-archive-set-create) | `--min-copies`, `--required-locations a,b` (registered locations only), `--copies-at NAME=N` (repeatable, registered locations only), `--encrypt true\|false`, `--compression`, `--compression-level`, `--checksum-mode`, `--slice-size`, `--verify-interval-days`, `--warehouse-copies`, `--preserve-xattrs true\|false`, `--preserve-acls true\|false`, `--dirty-on-metadata-change true\|false`, `-d/--description`. A flag you leave out stays empty and defers to `[defaults]`. |
 | [`archive-set edit <NAME>`](cli/archive-set.md#tapectl-archive-set-edit) | the same flags. Only the ones you pass change, and each change is recorded in the event log. |
 | [`archive-set sync`](cli/archive-set.md#tapectl-archive-set-sync) | none. It reads `[[archive_sets]]` from `config.toml` and writes the keys each table names. `--dry-run` is refused. |
 | [`archive-set list`](cli/archive-set.md#tapectl-archive-set-list) / [`info <NAME>`](cli/archive-set.md#tapectl-archive-set-info) | none. These show what is stored. |
@@ -1157,7 +1104,7 @@ the unit is adopted.
 | `TAPECTL_HOME_POINTER` | every command | Names the home pointer file in place of `/etc/tapectl/home` ([where the configuration lives](#where-the-configuration-lives)). |
 | `USER` | `init` | The default operator name when `--operator` is not given. Falls back to `operator`. Under a system account (a uid below `UID_MIN` from `/etc/login.defs`, or below 1000 if the file does not set it; this includes root and a `tapectl` service user), `init` refuses without `--operator` rather than name the operator after the account. |
 | `NO_COLOR` | every command | When it is set to a non-empty value, tapectl never colours its log lines on stderr. They are plain anyway whenever stderr is not a terminal. |
-| `PATH` | `stage create`, `restore`, `init`, `config check`, … | Used to find a bare `[dar] binary` such as `dar`. `init` and `config check` print where it was found. |
+| `PATH` | `stage create`, `init`, `config check`, … | Used to find a bare `[tar] binary` such as `tar`. `init` and `config check` print where it was found. |
 | `TAPECTL_PIPELINE_TRACE` | every command that writes a tape (`volume write`, `volume resume`, `volume rewrite`) | When it is `1`, the write records a trace of its feed beside the session log, `<session>.pipeline.tsv`: one row every 250 ms with the queue, the threads' waits and CPU, the host's load and the staging disks' activity ([operator guide](operator-guide.md)). It changes nothing the write does. |
 
 That is the complete list an operator can use. The source also reads
@@ -1185,7 +1132,7 @@ home with no drive configured yet:
 $ tapectl config check
 config: valid
 home: /srv/tapectl (named by TAPECTL_HOME)
-dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
+tar: tar (GNU tar) 1.35 at '/usr/bin/tar' (meets the writer's floor, GNU tar 1.35 with ACL support)
 staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
 note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst`
@@ -1199,17 +1146,14 @@ How to read it:
 | `config: valid` / `config: INVALID` followed by `- …` lines | Whether every other command can load the file. With the slice cap's `error:` line below, it is what sets the exit code: **0** when valid, **2** when invalid. |
 | `error: … defaults.slice_size = … is too large for backends.lto["…"].post_warning_bytes = …` (after `config: valid`) | The file loads and every command runs, but a `slice_size` cannot be sealed after the drive's early warning (ADR-0012 item 100); `config check` exits non-zero. The line names the largest `slice_size` that fits; lower it (`config set defaults.slice_size 512M`) or correct a mis-measured `post_warning_bytes`. `stage create` and `config set` refuse the same value. |
 | `home: … (…)` | The home this checked, and the rule that chose it ([where the configuration lives](#where-the-configuration-lives)). |
-| `dar: …` | The dar binary was found, and its version meets the minimum. Otherwise you get a warning saying why not. |
+| `tar: …` | The tar `stage create` would run was found and meets the writer's floor (GNU tar 1.35 with ACL support). Otherwise `warning: stage create would refuse this tar: …` names what was found and the floor. |
 | `staging: …` | The staging directory exists and is writable. |
-| `warning: staging … has N GB free; one LTO-6 cartridge is up to 2.5 TB — a tape filled in one session will not fit …` | Staging is smaller than one cartridge of the configured drive's generation, so you cannot stage a full tape's worth before a write. `stage create` checks each unit before it runs dar: it refuses when the space is certainly too small, and asks when it may be (see [`[staging]`](#staging)). A stage can run out of space partway only if you answer yes, or pass `--yes`, at that question. |
+| `warning: staging … has N GB free; one LTO-6 cartridge is up to 2.5 TB — a tape filled in one session will not fit …` | Staging is smaller than one cartridge of the configured drive's generation, so you cannot stage a full tape's worth before a write. `stage create` checks each unit before it runs tar: it refuses when the space is certainly too small, and asks when it may be (see [`[staging]`](#staging)). A stage can run out of space partway only if you answer yes, or pass `--yes`, at that question. |
 | `note: drive "…" device path(s) not present: …` | The drive's device nodes do not exist right now. This is normal if the drive is switched off or detached. With no `device_sg` line, the note says instead that `device_sg` cannot be derived from a `device_tape` that does not exist. |
 | `warning: drive "…" sets capacity_override …` | See [`[[backends.lto]]`](#backendslto). |
 | `warning: unit '…' dotfile sets [policy] …` | A dotfile overrides its archive set's `compression` or `checksum_mode`. |
 | `warning: unit '…' dotfile cannot be read …` | That unit's dotfile has a syntax error or an unknown key. `stage create` and `snapshot create` refuse the unit, and `audit` reports a `policy_unresolvable` violation (see [`[policy]`](#policy-yours-to-edit)). |
-| `warning: archive set "…" has compression "…", which the local dar binary cannot perform …` | A stored archive set names a codec your dar build lacks, so staging its units will fail. Change the set with `archive-set edit`, or install a dar that has the codec. `[defaults]` and dotfile values get no such check (see [`[defaults] compression`](#defaults)). |
-| `note: … preserve_acls = …, which cannot take effect …` | `preserve_acls` disagrees with `preserve_xattrs` in `[defaults]` or an archive set. See [above](#keys-that-are-accepted-but-do-less-than-their-name-says). |
 | `note: ….dirty_on_metadata_change = true is parsed but not consumed …` | That key does nothing in this version. See [above](#keys-that-are-accepted-but-do-less-than-their-name-says). |
-| `[defaults].… was renamed to [defaults].… — the config will not load …` | An old key name. Rename it, as the line says ([refused keys](#rules-for-the-whole-file)). |
 | `[defaults].… is not a recognised setting …` | A misspelled or unknown `[defaults]` key. |
 | `host check (…)` | The quiet-host limits in force, and whether they came from a `[host_check]` table or the defaults. |
 | `ops: …` / `warning: ops: …` | Only with an [`[ops]`](#ops) table: the group that may read the session logs, and anything about the group, its membership or the home's modes that is not yet as it needs to be. |
@@ -1222,17 +1166,17 @@ Everything after the first line is advice (the `note:` lines are new in 1.9.0). 
 never changes the exit code, and
 `config check` never edits your files or touches a tape. `--json` gives the same
 report as one object, with fields such as `valid`, `problems`, `home`,
-`home_source`, `notes`, `dar`, `staging`, `staging_space`, `tape_devices` (each
+`home_source`, `notes`, `tar`, `staging`, `staging_space`, `tape_devices` (each
 row names its drive as `drive`), `shadowing_dotfiles`, `unknown_keys`,
 `decorative_keys` (keys that do nothing, such as `dirty_on_metadata_change = true`),
-`subsumed_policy_fields` (the `preserve_acls` notes), `host_check` (with `warnings`
+`host_check` (with `warnings`
 for contender names longer than 15 characters), `ops`, `defaults` (its
 `verify_interval_days` is the value in force; the object is `null` only when the file did not load) and more.
 
 Other commands fail on an invalid config with the first problem only, and exit 2:
 
 ```text
-error: failed to load config: configuration error: ~/.tapectl/config.toml: defaults.compression: invalid compression "zip": accepted values are none, gzip, bzip2, lzo, xz, lzma, zstd, lz4
+error: failed to load config: configuration error: ~/.tapectl/config.toml: defaults.compression: invalid compression "zip": accepted values are none, gzip, xz, zstd
 ```
 
 ### `config show`

@@ -10,14 +10,16 @@ are in `docs/design/v3-implementation-plan.md`.
 
 ## Project Overview
 
-tapectl is a Rust CLI tool for managing long-term archival storage across LTO tape and exportable encrypted directories (Blu-ray, USB). It wraps `dar` for archive creation/extraction, uses the `age` crate (from the rage project) for age encryption, and SQLite for catalog/inventory/policy/audit.
+tapectl is a Rust CLI tool for managing long-term archival storage across LTO tape and exportable encrypted directories (Blu-ray, USB). It archives with GNU tar (a pax stream cut into slices of whole members, each compressed alone when asked and age-encrypted), uses the `age` crate (from the rage project) for age encryption, and SQLite for catalog/inventory/policy/audit.
 
-**The on-tape format is Layout Version 2** (ADR-0007). For anything touching tape
-bytes or the write path, the normative set is, in authority order:
-`docs/design/volume-format-v2.md` (the byte format) → `docs/design/layout-session.md`
-(session state machine) → `docs/design/v2-open-questions.md` (resolved decisions,
-§§1–11) → `docs/design/v2-implementation-plan.md` (the T0–T11 build playbook).
-`docs/adr/0001`–`0007` govern all of them.
+**The on-tape format is Layout Version 3** (tapectl 2.0.0; ADR-0014, which gathers ADR-0012
+items 239 onward). For anything touching tape bytes or the write path, the normative set is,
+in authority order: `docs/design/volume-format-v3.md` (the byte format) → the "Layout 3"
+section of `docs/design/layout-session.md` → ADR-0012 items 239 onward (a later item amends
+an earlier one) → `docs/design/v3-implementation-plan.md` (the build plan). Layout 2's texts
+(`volume-format-v2.md`, `v2-open-questions.md`, `v2-implementation-plan.md`) are history:
+2.0.0 neither reads nor writes Layout 2 (item 242). This file is rewritten for the release
+by T6.7; until then, where a line below disagrees with that set, the set wins.
 
 `tapectl-design-v4_0.md` remains the reference for everything those do NOT cover,
 read **together with `docs/design-errata.md`** (the complete list of
@@ -25,731 +27,38 @@ superseded/recast sections — note §2.6/§8.1–§8.8 are superseded wholesale
 and §2.9/Appendix C end-of-tape salvage is rejected outright). `CONTEXT.md` is the
 vocabulary.
 
-## Current State
+## Where the history is, and the rules it left
 
-Milestones 0 through 7 are complete (Milestone 7's last piece, real LTO-6 validation,
-was done on 2026-09-10 — see below).
+What each milestone, release and ruling did is recorded, not repeated here:
+- `docs/coordinator-handoff.md`: the 2.0.0 build (what is ruled, the order of work, who
+  settles what, which older texts no longer hold); the tasks are in
+  `docs/design/v3-implementation-plan.md`.
+- `docs/adr/0012-*.md`: every CTO ruling as a numbered item (a later item amends an earlier
+  one). `docs/releases/<version>.md`: what each release changed, for the operator.
+- `docs/runs/`: dated run records, never edited. `docs/audits/` and `docs/research/`: the
+  reviews and measurements. `docs/handoff.md`: the operator's steps on home2.
 
-**Milestone 7 (complete — its real-LTO-6 validation is below):** Phases 1–9 landed. Lib target (Phase 1), module unit tests (Phase 2), sg_logs health collection (Phase 3), full audit trail wiring (Phase 4), mhvtl-gated E2E round-trip (Phase 5), library failure-mode tests (Phase 6), multi-tenant isolation tests (Phase 7 — crypto cross-decrypt rejection, plaintext-leak scan on raw tape bytes, both-tenants self-restore, tape-device lock for parallel mhvtl tests), performance harness (Phase 8 — `tests/performance.rs` gated on `TAPECTL_PERF_TESTS=1`, baselines in `docs/perf-baselines.md`), docs + man pages (Phase 9 — README Testing/Documentation sections, `examples/gen_man.rs` + `docs/man/*.1` via clap_mangen, `docs/lto6-validation-checklist.md`, written as a procedure stub in Phase 9 but **no longer one** — it was fleshed out and dry-run annotated against mhvtl on 2026-07-20 (#8) and records the ENOSPC fidelity gap; read it as usable procedure).
-
-**2026-09-11 — disaster recovery and the architecture review (complete).** Three
-review rounds on `catalog rebuild --from-volume` (#136) and what building it
-exposed, then seven deepenings, all landed and real-drive-validated (four
-45/45 passes on the HP LTO-6 that day and the next). What to know:
-- **The catalog is reconstructible from tape** with the operator or escrow key
-  (`volume::rebuild`, `volume::envelope`); tapes written after 2026-09-11 carry
-  tenant ownership and each stage set's escrow receipt in the operator
-  envelope's `catalog.db` (`db::ontape_catalog`, shape-probed, no stamp).
-- **Escrow coverage has three answers** — covered / unknown / gap —
-  through one predicate and one query (`policy::escrow`); a rebuilt row is
-  `unknown` (`stage_sets.origin`), attestable by `catalog rebuild --key <escrow>`
-  decrypting one slice header. `audit` names an escrow-identity mismatch once.
-- **The DR recipe is one command:** `init --operator <name> --escrow-public-key <original>`
-  (#139). `--operator` is required under a system account such as the `tapectl`
-  service user (uid below `UID_MIN`), where `init` refuses without it (#357).
-  No command replaces a registered escrow identity (ADR-0005).
-- **`audit` scopes per check** (`cli::audit::CHECKS`); tape-only units were
-  invisible to every check from Milestone 6 until #138.
-- **Byte pins:** `tests/on_tape_golden.rs` pins MANIFEST.toml and RESTORE.sh.
-  If one fails, the on-tape format changed — a CTO decision, never an agent's re-pin.
-  `MANIFEST.toml` is one type both directions (`volume::manifest`); RESTORE.sh
-  is assembled from named awk fragments (`volume::restore_script`).
-- The full account: `docs/runs/2026-09-11-unattended.md`,
-  `docs/audits/2026-09-11-rebuild-findings-review.md`; the process rules that
-  outlived the run: `.claude/skills/unattended-run/SKILL.md`.
-
-**2026-09-13 — the media-generation redesign (complete).** The last redesign before
-first production use, triggered by "how do I write both LTO-5 and LTO-6 from this
-LTO-6 drive". The answer exposed that a property of the *cartridge* was being read
-from the *drive's* config, and an audit for that same shape found more. Two ADRs
-govern the result:
-- **ADR-0010 — generation is a cartridge property.** A drive declares only the one
-  generation it is (`[[backends.lto]].generation`); `media_type`/`nominal_capacity`
-  are gone from config and a stale key is refused by name. The medium's generation is
-  DETECTED at `volume init` (`src/media.rs` tables + `src/tape/media_detect.rs`: MAM
-  medium density code → MAM format code → the st driver's density register), and
-  capacity follows it, overridden by the cartridge row then by the drive's
-  `capacity_override` (virtual drives only). It is decided ONCE at init and stored in
-  `volumes.capacity_bytes`; **no path reads capacity from config after init**. A drive
-  that cannot write the detected medium refuses, and `--force` never overrides it.
-  `volume init` also BINDS the cartridge (`src/volume/binding.rs`) from the MAM medium
-  serial, auto-registering one when nothing matches — which is why
-  `cartridge_volumes`, written only by tests until now, is live.
-- **ADR-0011 — a cartridge's place is a location, not a status.** `offsite` left the
-  status CHECK (migration 012 rebuilds the table to four states); `cartridge move` and
-  `volume move` share one mover so the shelf and the catalog cannot drift.
-  `cartridge retire` writes `retired_permanent` under an ADR-0008 Tier-2 gate and
-  retires the volumes on it; `volume retire` frees the cartridge it was the last live
-  volume on.
-- **Binding records a displacement, it never gates one** — when the serial proves which
-  cartridge is in the drive. Re-initialising a cartridge closes the open mount, marks the
-  displaced volume `erased`, and warns naming any unit left without a copy. The File 0
-  check is the consent point (ADR-0003) and a second gate was deliberately rejected. The
-  mhvtl gate proves it: four volumes initialised on one cartridge in one run, no
-  `--force`, three left `erased`. The one carve-out (ADR-0012): with no readable serial,
-  a blank tape plus a `--cartridge` bound to a live volume is refused.
-- **2026-09-14 — ADR-0012, the pre-production rulings.** The review's questions were
-  grilled and ratified in full: a *Copy* is identical content, counted per Version (a
-  unit is as covered as its least-covered live version, and a version is minted only
-  when content changed); a cartridge's identity is its chip serial, the barcode a
-  relabelable sticker; the retire family's zero floor is absolute (ADR-0008 Tier 3, the
-  code had it inverted); cartridge capacities are decimal, data sizes binary; unknown
-  config keys are errors everywhere; `volume calibrate` is not built. The work queue is
-  the GitHub label `review-2026-09-13`; nothing ships to a production tape until it is
-  empty, including documentation.
-- `--device` no longer defaults to `/dev/nst0` anywhere. Write paths resolve it
-  strictly (`config::resolve_lto_backend`), read paths leniently
-  (`config::resolve_device`) so DR still works with keys and no `backend add`.
-- The audit that came with it is recorded in `docs/design-errata.md` (four design
-  promises no code keeps) and issues #142-#152.
-
-**Handoff:** `docs/handoff.md` divides the remaining work between what an agent
-finishes and what needs the operator's hands. It covers the 1.1.0 fresh start in order:
-- the real-drive proof on home2, on the CTO's go-ahead;
-- the `v1.1.0` tag;
-- the operator's fresh start;
-- `keepsake` on two cartridges, then the Heir Kit;
-- the backlog.
-
-The 1.0.0 real-drive rehearsal is done (2026-09-23,
-`docs/runs/2026-09-23-real-drive-rehearsal.md`).
-
-**Renovation (2026-07):** a full renovation stage, charted as a wayfinder map at
-[issue #1](https://github.com/mikmorg/tapectl/issues/1) with a phased backlog in
-issues #20–#73. The three audits under `docs/audits/` found the happy path solid but
-the heir/emergency and unhappy paths broken. The milestone claims above describe
-happy-path completeness only — treat them accordingly.
-
-**Format v2 regear (complete, 2026-07-28).** Holistic R&D
-(`docs/research/2026-07-21-ontape-format-and-write-design.md`) established that a
-plan-first, write-once medium should not imitate a streaming format. The whole
-write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
-
-- **On tape:** a plaintext **front index** (File 3) carrying every file's
-  position/type/size + ciphertext sha256; **envelopes before slices**; a trailing
-  plaintext **seal marker** binding the front index. End-of-tape salvage is gone —
-  a real EOT is a clean abort to an unsealed tape, and the pre-flight capacity gate
-  is the sole capacity defense.
-- **In code:** a typestate **write session** (`src/volume/session.rs`:
-  build → validate → plan → execute → seal → confirm), a **Store trait** with a
-  shared chain walk (`src/store.rs`), Layout build/materialize (`src/volume/build.rs`),
-  format parsers (`src/volume/format.rs`), and a **Collection** layer
-  (`src/collection/`, `collection sync|status|plan|run`) for folder-per-unit
-  archiving (CONTEXT.md: "Collection" is the source-root concept; "library" is
-  reserved for the tape library / changer).
-- **Verified:** 270 ungated tests; `tests/format_v2.rs` is a keyless synthetic-heir
-  acceptance suite (proves the byte layout from recorded bytes alone); mhvtl e2e 9/9
-  on real tape including Rust-vs-bash chain-walk parity on both a good and a
-  corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **against an empty
-  EXPECTED_FAIL manifest** (26/26 on 2026-09-10 — H7 #33 / H8 #34 are fixed and
-  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29; 46 since #480 added `heir_where`, `heir_find` and `heir_slice_from_copy`, the last of which writes a second cartridge and retires its `MHVTLC2` volume; 52 since #420 added the five `heir_short_*` checks, GREEN 52/52 on 2026-10-20; 61 since #478 added the nine `span_*` checks of item 136, GREEN 61/61 on 2026-10-23; 62 since #497 added `heir_big_catalogue`, GREEN 62/62 on 2026-10-26; 65 since #388 added `lbp_fallback_recorded`, `rust_lbp` and `lbp_page_clear_after_every_command`, GREEN 65/65 on 2026-10-27, and the gate also names a TD6 drive in `TAPECTL_GATE_TAPE_TD6` for `rust_lbp`; 67 since 1.8.0 added `heir_slice_boundary_read` (#498's trigger read from tape) and `heir_late_damage` (item 182 with the real age, on `heir_big_catalogue`'s tape), GREEN 67/67 on 2026-10-28 and on 2026-10-29 with items 185-186).
-
-Issues #22–#28 (closed) describe the *pre-v2* design; read them against the normative
-set above, never as instructions.
-
-**Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
-this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
-ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195). That upgrade ran on 2026-11-02 ((i) step 0, rehearsal 53/53; `docs/runs/2026-11-02-1.8.1-handoff-i.md`), and home2 runs 1.8.1. On 2026-11-03 the CTO moved the home out of the hidden `.tapectl`: from (i)'s fresh start it is `/srv/archive_meta/tapectl/home`, named by `home2.profile`'s `TAPECTL_HOME_DIR` (`first-run.sh --tapectl-home`; ADR-0012 item 197), and `tapectl-op` and the units carry it as `TAPECTL_HOME`. (i) paused after step 6 on 2026-11-03, with the new home made and no units yet: copy 1 waits for 1.9.0, the CLI review's release (ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`; below), and since 2026-11-09 for 1.9.2, which contains it, installed by `--upgrade` first.
-
-**2026-11-13: the existing tapes and catalog are tests, and a queue stands before production**
-(ADR-0012 items 235-238). The design and defect review of 2026-11-12
-(`docs/audits/2026-11-12-design-and-defect-review.md`) found that the dar catalogue in every
-envelope since 1.1.0 carries the wrong slice layout (H1, #518): `dar -l <catalogue> -T slice`
-means nothing, RESTORE.sh's `--restore --path` and `--fill-from` read the wrong slices, and
-`restore file` plans from the same numbers. The whole-unit restore, the per-file check and
-slice replacement are not affected. The CTO ruled L6-0001, L6-0002 and home2's catalog test
-articles, disposable (a status: nothing on home2 is erased or changed by it), and that every
-finding is addressed before production runs start. The paragraph above and the handoff still
-describe what home2 holds; read "production" there as "the test articles". **The queue is the
-label `review-2026-11-12` (#518 to #555), and its open questions are in #554.** The on-tape
-authorization came on 2026-11-14 (item 243, below); a pin still moves only in a commit of its
-own, and only once a go is given. When a test needs a dar catalogue, make it as staging does
-(`-@`, then `dar -C ... -A ...`), never with the test-only `extract_catalog`, which is how H1
-hid.
-
-**2026-11-14: the data zone changes before production** (ADR-0012 items 239-241; #555 holds
-the measurements). Format changes are made now. Tape-file slices stay, with every rule
-defined on them (the early warning W1-W9, the short seal, ranges and spanning, resume, the
-retry after a refusal, replacement by sha256). A slice's payload becomes a plain cut of a tar
-stream: dar's slice framing goes and dar leaves the data zone, so #518's fix shape is moot
-for new tapes. Later that day the CTO ruled the rest of the first round (items 242-249): **no reverse
-compatibility with the current version, simplify** (the new tapectl reads and writes the new
-layout only; a Layout 2 tape is read with 1.9.2 or its own RESTORE.sh); **the on-tape
-authorization** for the new layout (it ends when a drill passes on the production run, item
-268; item 243 first had it end at the install); a production run is
-a fresh start (new catalog, keys and unit identities, the escrow kept if the paper passes);
-the two cartridges can be rewritten whenever; **spanning is supported from the first day**;
-production is gated on total completion of all features and fixes. "Simplify" removes
-compatibility, not features. That evening the second round was answered too (items 250-263), so **the design of tapectl
-2.0.0, Layout Version 3, is ruled**: GNU tar on the host writes a pax stream from tapectl's
-exact file list and tapectl reads it as it passes (member check, per-file sha256, member
-starts); a file table per staging replaces the dar catalogue in the tenant envelope; the heir
-has one repair (the members a bad slice touches are left out and listed, and the listed paths
-are restored from another copy; item 264 replaced the zero-fill first recorded) and one prompt
-(the next cartridge of a span); hard links stay links; a range is a source for the files whose
-slices it holds (item 143 amended); one baseline schema, no upgrade from 1.x; no notification
-is built in (the command line is made sufficient for reporting tools); a new install leaves no
-file out by default; a second drive does not gate; the drill (#548) and the reads (#551) do;
-the first production run is the acceptance. The amendment names what this supersedes in the
-reader's half of spanning, and marks the coordinator's readings as readings. **No go has been
-given: build nothing until the CTO says so.** The plan is #554, by phase; Phase 0 is three
-measurements (GNU tar 1.30, bsdtar, real scale) that come before any code.
-
-**2026-11-16: the research before the build**
-(`docs/research/2026-11-16-layout-3-before-the-build.md`). GNU tar 1.30 and bsdtar pass, and a
-96 GiB member came back identical through 96 cut and encrypted pieces; nothing measured
-reopens item 253 (scale is shown only that far). Two things recorded on 2026-11-14 do NOT
-stand and are back with the CTO: **the default "every reader zero-fills a lost slice"**
-(measured: a zero-filled slice makes every tar stop and exit 0 with the later files missing,
-and `--ignore-zeros` extracts a tar file's contents as the unit's own; feeding tar whole
-members by byte range from the file table works on every tar tested, #556), and **the
-coordinator's reading of the acceptance run's order** (an untagged candidate cannot be
-repeated and its Heir Kit names a tag that does not exist, #559). An independent reader found
-the rest: the file table has no home between tapes (#557), a range tape alone and the
-scratch mode of a span restore (#558), a Layout 2 cartridge at contact (#560), owner names,
-sockets and the heir's work directory (#561). Questions 26 to 33 were in #554 and are answered
-(next paragraph); the rules for the Layout 3 format document that need no ruling are #562.
-Measured limits to design around: a zero-filled slice stops every tar at exit 0, so readers
-feed tar whole members by byte range; a hard-linked name depends on the slices of the name
-archived first; and busybox tar exits 0 with files missing, so a restore is judged by the
-per-file sha256 check.
-
-**2026-11-16 (later): questions 26 to 33 are ruled, and an id map is added** (ADR-0012 items
-264-272; the CTO: "Ratify all. We should also store a user, group id mapping in our catalog").
-Readers feed tar whole members by byte range from the file table, and none zero-fills or uses
-`--ignore-zeros` (264). The file table is kept in the catalog database, outlives its slices,
-and a write refuses a unit without one (265). A restore may start on any tape of a span, and
-the heir may answer "I do not have it" at the prompt (266); the heir's restore across
-cartridges streams (267). **The acceptance run's order: `v2.0.0` is tagged first, installed by
-the fresh start, writes both cartridges, and the drill decides; a pass ends the on-tape
-authorization, a failed drill means a new release and another fresh start** (268, which
-restates item 243's end). A Layout 2 cartridge is known by its label and never written over
-without `cartridge erase` and the typed label (269). The writer passes `--numeric-owner` and
-sockets are left out and reported (270). The heir's work directory is inside the destination
-(271). A user and group id map is stored in the catalog (272, #564). **"Ratify all" was not the
-go: build nothing until the CTO says so.** A measurement made after the answer (#563): home2's
-tar is GNU tar 1.30, where `--numeric-owner` does not reach an ACL, so its text record keeps
-the host's names (1.34 does the same; 1.35 is the first release that writes numbers, and only
-when built with ACL support; the raw `system.posix_acl_*` record is numbers on all three), and
-every file of home2's collection carries such an entry, the service account's read grant. Read
-back on another host the entry is dropped (name unknown) or moved to another account (name
-with another id), both at exit 0.
-
-**2026-11-16 (later still): the standard is not lowered to home2's current toolchain** (ADR-0012
-item 273, the CTO's words). Where the design needs what home2's tools do not do, home2 is
-brought up to the design; a recommendation that bends the format to an old tool there is
-designing down. So the format is not bent to tar 1.30, and item 270 stands as it reads. The
-readings recorded with it: it concerns the host that WRITES (the heir's readers stay as wide
-as they were); no name is in the stream, an ACL is stored once in the record a reader's
-ordinary flags restore (the readers' measurement picks it), and the proof is tapectl's own
-check of the stream, with the tar version as the early refusal.
-
-**2026-11-16 (evening): questions 34 to 37 are ruled, and the build is planned in stages**
-(ADR-0012 items 274-279; the CTO: "Ratify all, write up all plans in detail for worker LLM to
-implement in stages"). The writer's floor, GNU tar 1.35 built with ACL support, binds every
-host that writes: tapectl 2.0.0 refuses to stage below it, and its own check of the stream is
-the proof, both ways (a name in the stream; a file's ACL missing from it, which is what a
-1.35 built without ACL support produces) (274). home2 gets its tar built from the upstream
-release into `/usr/local`, as dar 2.7.21 was (275; not yet tried on Debian 10). Each tenant
-envelope carries the id map as text beside the file table (276); it holds, per staging, every
-user and group id the stream carries with the name the host gave or none (277); a restore
-shows it and never acts on it (278). **The plan is `docs/design/v3-implementation-plan.md`**
-(279): #554's phases as tasks `T<stage>.<n>`, each with its owner (worker, coordinator,
-operator, CTO), what it depends on, the texts it is read with, its fence, its traps and what
-proves it done; Appendix A maps every issue, item and #562 rule to a task. Read it before
-dispatching any worker, and build worker prompts from it and `.claude/commands/worktree-agent.md`.
-What it fixed: Stage 2 is FIFTEEN fixes (never sixteen) in seven tasks and three waves,
-because #554's a-to-f grouping put #544, #540, #536 and #529 beside files another group
-edits; Stage 2 lands on `master`, Stages 3 to 5 on the integration branch `layout-3`; the
-suite stays green through the payload's replacement by tests marked `L3-pending T4.<n>`.
-Stage 1 (the Layout 3 format document) is the coordinator's, never a worker's, and waits on
-T0.1 (which ACL record the readers restore). **That message was not the go either: build
-nothing.** Waiting on the CTO (the plan's Appendix B): the go; the eighteen byte, schema and
-command-line choices D1 to D18, to be seen before Stage 1 writes them; and T0.3, real scale
-on home2 or its move to Stage 6.
-
-**2026-11-16 (night): compression is carried, and the design is not sized to one corpus**
-(ADR-0012 items 280-281; #565). The plan's D15 had recommended removing the `compression`
-setting under tar; the CTO: "We need to ensure proper compression is made available
-optionally for select archives. My example data (keepsakes) are not the only content in
-perpetuity". So `compression` stays, off by default, chosen by `[defaults]`, an archive set
-or a unit's dotfile as today (280). **Never argue a design choice from what `keepsake`
-happens to hold** (281): it is an example, and what tapectl archives later is not known.
-Its shape is NOT settled. The amendment deduced "each slice must decompress alone" (shape A:
-cut, compress, encrypt); that was too narrow, and after the CTO's "Consider how best to
-integrate with current design" a second shape was measured and was first recommended (shape B): the
-tar stream is compressed in frames that begin at member boundaries, the frames joined are
-the STORED stream, and it is cut and encrypted exactly as an uncompressed stream is; the
-file table gains one column (where the member's frame begins in the stored stream). B leaves
-every slice rule of item 240 untouched (equal slices, one meaning of size and hash), costs a
-frame for a bad chunk, and shows nothing new without a key; its price is that a lost slice
-also costs its edge frames' other files (a widening of item 264's limit, the CTO's to rule)
-and that tapectl itself compresses. Measured with a reader given only the table's text and
-the slices: zstd, xz, gzip and bzip2 pass; `lzo` and `lzma` cannot be carried under B. The
-plan's D15 holds the comparison and the task deltas; Stage 4's tasks are still written for
-A. In both shapes every stream check precedes compression, and a decompressor's exit status
-is never the verdict (BusyBox `unxz` exits 0 after writing wrong bytes). Open with the CTO,
-in #565 and #554: question 41 (the shape; recommended A since the re-weighing in the next paragraph), question 38 (which algorithms; recommended gzip, xz, zstd on reader and build
-cost alone, since the first check's random words cannot rank them), 39 (who compresses;
-recommended tapectl itself, with a library for each algorithm, untried in the static musl
-build), 40 (a level; recommended an optional `compression_level`). The plan carries it: T0.5
-(all seven algorithms on real data, the older and smaller decompressors, real `age`),
-T0.6 (the libraries in the static build), T4.5, T4.6, T4.8, the heir's script, a gate leg
-for each algorithm, and T5.7. T0.3 gained a second leg of millions of small members. Under
-shape A only, a compressed unit's slice sizes on tape follow their content, and the front
-index states sizes in plaintext. Still no go.
-
-**2026-11-16 (late): slices and the compression shape, asked again** (#566; a comment on #565).
-The CTO asked whether slices should be dropped for another way of spanning. Recommended: they
-stay (question 42). A unit's ciphertext is made once at staging and the heir has the stock
-`age`, which begins only at a header, so a tape of a span either ends on a staged age file (a
-slice, whatever it is called) or ends mid-file; measured with age 1.1.1, one stream a unit
-gives nothing from the second tape of a span and loses the rest of a copy to one bad chunk.
-What made slices heavy in 1.x was dar's framing, which item 241 removed. Then the CTO: "I'm
-skeptical that b is better than a, re q41", and the re-weighing changed the recommendation to
-**A**. The row B rested on ("item 240's rules untouched") did not hold: no rule of item 240
-depends on equal slices. Measured through `age` and the stock decompressor, with no file table:
-under A a slice decodes alone to exactly its plain cut, so a compressed unit reads as an
-uncompressed one does, with any reader and any tar; under B a slice alone gives nothing (it
-begins inside a frame) and after a lost slice the decompressor stops at the gap, starting again
-only from the file table's `at`. What a tar then makes of a gap depends on the tar in both
-shapes (GNU tar skips on, BusyBox tar stops), so no figure from one tar is a rule. "A bad chunk costs a frame"
-is tapectl's reader only; the heir loses the slice in both. B's one advantage is that nothing
-new shows without a key; on-tape sizes are permitted in plaintext and the size channel was
-accepted on 2026-07-22 with compression off, so its weight is the CTO's. **Neither question is
-ruled, and neither message was the go.** When weighing a format choice, ask first what one
-slice gives the stock tools alone, with no file table, and state it by what does not depend
-on the tar.
-
-**2026-11-16 (last): the EOT and spanning logic may change, and two questions follow** (#567).
-The CTO: "I'm ok changing the EOT/spanning logic for optimal overall design". That lifted the
-constraint #566 had held (the early-warning and spanning rules as proven), and #567 withdraws
-two things #566 said: "keep the plain cut", and the acceptances of 1.6.0 to 1.8.0 as a reason
-against change. **Question 43** (measured): a slice ends at a member's start, holding whole
-members; a member larger than `slice_size` gets a run of slices to itself; the slices joined
-are the same stream. With no file table and each slice in its own tar run, a plain cut fails
-every run (GNU tar 2,396 of 2,428 files, BusyBox tar 168) and a cut at member starts fails
-none (2,428 with both); a lost slice costs exactly its files at exit 0. Its price: a slice's
-size on tape follows the files in it (a file alone in its slice, or in a run of its own, shows
-its size without a key, finer than the per-unit sizes accepted on 2026-07-22), and more
-slices (at worst three for each `slice_size` of stream). If it is ruled yes, question 41 is A
-by consequence, and question 42 is only "slices stay, each an age file and a tape file".
-**Question 44** (reasoned, not measured) is two. 44a: every unit continues on the next
-cartridge at the early warning, with no opt-in and no `cut` unit; W1 to W9 stay as measured;
-`allow_spanning` and the planner's two classes go; `volume rewrite` and compaction must carry a
-range; it reverses item 9 and item 82's opt-in. 44b: the queue is filled to the warning (item
-123's bound made the one bound), so one unit lies across the end of every full tape and one
-tape no longer holds only whole units; with 44a alone a unit crosses only where one is cut
-today. All three are recommended and **none is ruled; the permission is not the go.** Not yet run: bsdtar and
-GNU tar 1.30 on a slice with no end-of-archive blocks, needed before the format document.
-
-**2026-11-17: questions 38 to 44 are ruled** (ADR-0012 items 282-289; the CTO: "Ratify all
-recommendations."). The paragraphs above that call these open, or call shape B recommended,
-are history. Slices stay (282). **A slice ends at a member's start**: it holds whole members,
-a member larger than `slice_size` has a run of slices to itself, and the slices joined are
-the stream; that a slice's size on tape follows the files in it is accepted (283, amending
-item 241's "plain cut"). Each slice is compressed alone, after the cut and before it is
-encrypted (284); gzip, xz and zstd are carried (285; T0.5 confirms or reopens it); tapectl
-itself compresses, with a library for each (286; if T0.6 fails, the fallback of a host tool
-goes to the CTO first); an archive may set `compression_level` (287). **Every unit continues
-on the next cartridge at the early warning** (288): none is `cut`, none opts in, and W1 to
-W9 are unchanged; this reverses item 9 and item 82's opt-in. **The queue is filled to the
-warning** (289), so one unit lies across the end of every full tape. The amendment names what
-goes (the `cut` unit, `allow_spanning`, `may_span`, the plan's two classes, items 94 and 147,
-item 133's refusal of a range in rewrite and compaction) and what stands (W1 to W9, copies
-counted for each slice, items 85, 86 and 93). Item 283 is measured on GNU tar 1.35 and BusyBox
-only, and items 288 and 289 are reasoned, not measured. **The plan carries all of it**: rule
-13 (a slice begins at a member's start or continues one long member); T0.7, the readers
-still owed to item 283 (bsdtar, GNU tar 1.30), with a decision rule, and a failure reopens
-the item; T5.1 is now a build task (no `cut`, no opt-in, one class, one bound) and T5.3
-carries a range; and the decision list is **D1 to D22** (D1, D3, D4, D6, D9, D10, D11 and D15
-rewritten; D19 the batch, D20 the one plan bound, D21 a range in rewrite and compaction, D22
-how a tape marks a long member's run). **"Ratify all recommendations" was not the go, and it
-did not cover D1 to D22 or T0.3: build nothing.** Open with the CTO: the go, D1 to D22, T0.3.
-
-**2026-11-17 (later): D1 to D22 are ratified, the scale run is ruled, and the coordinator's
-role is handed on** (ADR-0012 items 290, 291; the CTO: "Ratify all & handoff for opus to take
-over; make sure complex decisions have been thoroughly determined"). The twenty-two choices
-of the format document are ratified as proposed, and item 290 holds each one's text. Real
-scale is taken in two places: a made tree of two million files before the code (the plan's
-T0.3), and the collection's largest real unit at the real-drive acceptance (T6.6); this
-amends item 253's "before any code" for that leg. The coordinator had said a "ratify all"
-would be read as those two only and that the go needs the word, so **this was not the go
-either: build nothing.** One measurement may run before the go: T0.3, the made tree, because
-the ratified recommendation said "now" (a reading in the amendment); it has not been started. For the handoff, every measurement task has its decision rule fixed
-in the plan, and two designs the rulings left owed are worked out there under headings that
-say "determined": the plan order once every unit continues (T5.1), and a range carried
-through `volume rewrite` and compaction (T5.3). **The entry for whoever coordinates next is
-`docs/coordinator-handoff.md`.** The only thing open with the CTO is the go.
-
-**2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
-issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
-- `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only` are now
-  `min_copies`/`min_locations`, same meaning; the old names are refused by name, and
-  `first-run.sh` offers the rename in place before step 1.
-- Migration 026 dropped the states nothing set (unit `retired`, snapshot
-  `superseded`/`failed`, volume `blank`/`missing`); a row still carrying one fails the
-  migration loudly, and `volumes.status` has no default.
-- `volume verify` exits 0 passed / 2 medium proven bad (quarantined) / 3 inconclusive.
-- Stage reports live in `<home>/stage-reports/` (an old `receipts/` is moved once);
-  *Receipt* means only the recipient list (`stage_sets.key_fingerprints`).
-- RESTORE.sh checks for `tar` up front; the golden pin moved under that ruling (#349).
-- **#360, built (`volume::adopt_lost`):** `volume resume` adopts a volume the catalog lost
-  mid-write (restored from a backup taken between `volume init` and `volume write`, then
-  `catalog rebuild --from-volume`) only on a matching File 0 uuid, a seal marker binding
-  the front index, a passing full verify recorded after the rebuild, and front-index slice
-  hashes equal to the catalog's own staged hashes (`stage_sets.origin = 'staged'`);
-  `catalog rebuild` still never changes a status (ADR-0012, 2026-09-29 later amendment),
-  with one exception from 1.7.0: it promotes a spanning snapshot it finds `staged` to
-  `current`, upward only, once every slice is on a volume the catalog records `sealed`
-  (ADR-0012 item 144); a volume's status it never changes.
-  Still back up the catalog at the end of every write session.
-
-**2026-09-30 — the structural review** (ADR-0012, "Amendment, 2026-09-30"): nothing in the
-schema or the format had to change before the first tape; the code and catalog findings are
-issues #373–#385, built after it. Before it, and pinned once (`tests/on_tape_golden.rs`, the
-third re-pin): RESTORE.sh decrypts a unit into scratch space inside `--to` (or
-`--scratch DIR`) after a space check, never into /tmp; names a full disk as one; streams
-`--verify`; refuses a layout_version other than 2. The package version is `1.0.0` (it was
-`0.1.0` on every commit before), tagged `v1.0.0`. Version rule (ruled 2026-09-30, amended
-2026-11-04 by ADR-0012 item 201): the minor moves when generated on-tape bytes change or a
-command or flag spelling is removed, the patch for any other build installed on a production
-host; a change to scripts alone is no release (its run record names the commit); each release
-is tagged `vX.Y.Z` on the commit it is built from. Units are never split by hand: if a large unit's
-re-archiving ever costs too much, the answer is #12's differential-only shape, underneath
-the unit. The interim rules that waited on #376/#377/#378 are lifted: a write session holds
-a per-volume flock and the catalog has a busy policy (#376, #377), and the unit's own
-`.tapectl-unit.toml` is not content (#378, ADR-0012 2026-10-07 item 24), so `unit tag`,
-`unit rename` or a dotfile edit mints no version.
-
-**2026-10-06 and 2026-10-07: what 1.1.0 is.** ADR-0012's amendments of those dates
-(items 1–24 and 1–35) are the rulings behind 1.1.0. `docs/releases/1.1.0.md` is the
-operator's account of them: on-tape changes, migrations 027–035, exit codes and config
-keys.
-
-**2026-10-12: home2 starts fresh on 1.1.0** (ADR-0012, amendment "2026-10-12", items
-36–48).
-- **The fresh start.** There is no upgrade from 1.0.0. A new catalog comes from
-  `first-run.sh` step 1, and the escrow identity is adopted, not minted (item 39). Every
-  tenant key is new (item 41). The 1.0.0 home and staging are deleted (item 38).
-  L6-0001, `keepsake`'s only tape copy, is erased and reused (item 37). `keepsake` has no
-  tape copy until two new ones seal, and that window is accepted.
-- **Pulled into 1.1.0 for it:**
-  - a backup copy of every tenant envelope on tape (item 44; `volume-format-v2.md` §1.3;
-    re-pin `57f061f`);
-  - the on-tape `catalog.db` generation 3 (item 48; §1.4);
-  - an adopt-keypair path (`init --operator-key`, `tenant add --adopt-key`, `ADOPT_KEYS_FROM`;
-    item 42).
-- **Policy rulings:**
-  - the tape-only multiplier raises copy floors only, never the distinct-place count
-    (item 46);
-  - a tape-only shortfall stays an ADR-0008 Tier-2 consent gate (item 47);
-  - #416's pass counters are test-only (item 45).
-- **Status.** 1.1.0 is tagged `v1.1.0` (2026-10-13) after the real-drive proof on home2
-  (step 12 50/50, db-loss 6/6, `cartridge erase` on the real drive, the #326/#366/#368
-  measurements and #426 traced to host contention;
-  `docs/runs/2026-10-12-1.1.0-real-drive-proof.md`). The operator's fresh start ran on
-  2026-10-14/15.
-
-  `docs/handoff.md` has the sequence. The 2026-10-07 on-tape authorization ended when
-  v1.1.0 was installed (item 40). Open after it: #420, #418 R4, #388, #409 and the #364
-  staging epic.
-
-**2026-10-15: 1.1.1, a patch for home2** (ADR-0012 amendment "2026-10-15", items 57–64;
-`docs/releases/1.1.1.md`). No on-tape change; migration 036 adds `cleaning_cartridges`. In
-it: `drive status`/`eject`/`cleaned`, `device_sg` derived from `device_tape`, proven-blank
-init without `--force`, `volume write` releasing staging (`--keep-staging`), the one-command
-copy `volume write --init --full-confirm --move-to`, optional labels for reads, raised
-priority for tape commands, the `/etc/tapectl/home` pointer, and a single source read
-(dar's `fadvise` neutralised by a seccomp filter on `dar -c`, #441). home2 upgrades in
-place (take `db backup` with 1.1.0 first).
-
-**2026-10-16: 1.1.2, the two reviews' fixes** (`docs/releases/1.1.2.md`; ADR-0012 amendment
-"2026-10-15 (later)", items 65–70). No on-tape change and no migration. The design review (`docs/audits/2026-10-15-design-review.md`)
-and the first adversarial review of the 1.1 code (`docs/audits/2026-10-15-1.1-diff-review.md`,
-one high: a rebuilt unsealed tape counted as a copy) filed #444–#475, worked in four waves.
-Things to know: an unreadable seal position is not an absent seal unless the drive reports
-END OF DATA (#460; the HP drive proves it at the next step-12 rehearsal); `stage create`
-compares dar's catalogue with what it hashed (#464); `audit` has a per-volume full-readback
-clock and `[defaults] verify_interval_days` (#453, #454; home2 sets 365); the gate's Rust
-legs are judged by test name and its erase leg runs `cartridge erase` then a no-force init.
-
-**2026-10-16: 1.2.0, the re-pin** (`docs/releases/1.2.0.md`; ADR-0012 amendment
-"2026-10-16", items 71–75). The minor moved because generated on-tape text changed:
-RESTORE.sh checks each mode's own tools from one table (`RESTORE_TOOLS` in `layout.rs`),
-exports `LC_ALL=C`, says "a key matched" only when one did, describes its work directory
-(the decrypted envelopes under `${TMPDIR:-/tmp}`) and warns before filling it, and after a
-lone-unit restore says what else the key opened; RECOVERY.md names a dar catalogue only when
-the envelope holds it; File 1 names the drives that read the tape, the SAS interface, one
-unit's disk space and the tool list. The golden RESTORE.sh pin moved once, in its own commit;
-MANIFEST.toml, File 0, the front index, the seal and the envelopes did not, `requires` stays
-empty and the "needs tapectl" text stays "tapectl 1.1.0" (item 73), so 1.1.x and 1.2.0 read
-each other's tapes. Also in it: `[defaults] verify_interval_days` is 365 when absent (#453),
-and `[[collections]]` `snapshot_command`/`release_command` let `collection run` read every
-unit from a read-only snapshot while every recorded path stays real (#455; `collection::hook`,
-`staging::view`). No migration. home2 goes from 1.1.0 straight to 1.2.0 by handoff (f); the
-2026-10-16 on-tape authorization ends when v1.2.0 is installed (item 72). Next: the spanning
-and #418 R4 design (1.3.0), put to the CTO in rounds.
-
-**2026-10-19: 1.3.0, the cross-volume index and restore repairs** (`docs/releases/1.3.0.md`;
-ADR-0012 items 76-103, ruled 2026-10-16 to 10-19). Each envelope now carries an index of the
-archive (`volume-format-v2.md` §1.5): a tenant's units and every path with its recorded sha256,
-and the operator's map of which volumes hold which version; RESTORE.sh reads it (`--where`,
-`--find`) and checks every restored file against it. Restore repairs (#480): a damaged slice is
-read from another copy (tapectl asks for the cartridge; RESTORE.sh takes `--slices-from` or
-`--swap-tapes`), damaged files are filled from another copy of the same version, and tapectl's
-restore reads around a bad 64 KiB age chunk (`crypto::chunks`, reviewed: a slice whose ciphertext
-hash mismatched is whole only if its plaintext proves it). Every Rust reader checks `requires`
-(#476). File 1 was rewritten (#477). No migration; `requires` stays empty. Spanning is designed
-and ruled (items 76-77, 82-100: opt-in per unit, packed last, cut at the drive's early warning
-then the short seal) and waits for #420 (#478); the profiling toolkit is #479.
-
-**2026-10-19: 1.4.0, File 1 again, in-place compaction, the escrow heir's restore**
-(`docs/releases/1.4.0.md`; ADR-0012 items 105-107). File 1 was rewritten after two more fresh
-reads (#481): RESTORE.sh's bytes did not move. `volume rewrite` compacts a tape on its own
-cartridge, even when it holds the only copy, behind a typed consent and a full readback, with a
-hold no release path can lift until the new volume reads back (#483; `src/volume/rewrite.rs`,
-migration 037). `restore unit|file|volume` and `catalog rebuild` take `--key FILE`, so an heir with
-only the escrow secret restores through tapectl (item 107). `scripts/lto-profile.sh` profiles a
-drive and emits its `[[backends.lto]]` block; `post_warning_bytes` caps the slice size (#479).
-
-**2026-10-19: 1.5.0, the fifth read's last findings and the kit's own tapectl**
-(`docs/releases/1.5.0.md`; ADR-0012 item 109, #485). File 1 and RECOVERY.md text only; no golden
-pin moved and there is no migration. `key escrow-kit` writes a fourth file, `tapectl-<version>`, a
-copy of the running binary named on the cover sheet with its sha256 (`escrow_kit::generate`;
-tests call `generate_with_program` with a small stand-in), and File 1's "tapectl itself" sends the
-heir there first.
-
-**2026-10-21: 1.6.0, the short seal** (`docs/releases/1.6.0.md`; ADR-0012 items 110-120, #420).
-A write that reaches the drive's early warning finishes the slice in flight, seals the tape short
-after it and exits 0: whole units count as copies, the units after the warning are `cut` (stay
-staged; the next `volume write` writes them whole elsewhere), and no unit is ever split. Every
-1.6.0 tape's File 0 states `requires = ["short-seal"]`, so a 1.5.0 reader refuses it by name
-(item 111). The seal is the last file at END OF DATA (`volume-format-v2.md` §1.2 rule 6, §4); the
-catalog records `volumes.ended_after` and `writes.status = 'cut'` (migration 038). Where things
-live: the retry past the warning in `tape::ioctl::write_block_retrying`; the session's short
-ending in `volume::session`; the chain walk's ending in `store::ConfirmPlan::with_ending`
-(`ended_after_disagrees` is inconclusive, never a quarantine); planning past the fill ceiling to
-100% of nominal only with `post_warning_bytes` (item 113, `CapacityBudget::split`); a warned write
-always reads back the slice at `ended_after` (item 114). The golden pins moved under item 116 and
-a third pins the short seal. The test hook `TAPECTL_TEST_EARLY_WARNING_AT` fakes st past a
-warning; the gate's `heir_short_*` legs run RESTORE.sh on a short tape. #488's first build rides
-it: ring's SHA-256 behind `pass_count::Sha256`, the HP page-0x34 repositions figure in
-`write_feed_ratio` events, `TAPECTL_PIPELINE_TRACE=1`, and the `research` cargo feature's knobs.
-The acceptance run on home2 (`scripts/short-seal-acceptance.sh`, item 117) passed all seven steps
-on 2026-10-22, reading back the slice past the warning and the short seal on the real drive
-(`docs/runs/2026-10-21-1.6.0-acceptance.md`); 1.6.0 is tagged `v1.6.0` on `c9c5877`. #488's
-drive phase ran on 2026-10-22 with the research build (`docs/runs/2026-10-22-488-drive-phase.md`):
-no load reproduced #426, ring is the one lever the figures support, and the excess that did
-appear came with the drive's own page 0x02 corrections while the feed was steady.
-
-**2026-10-23: 1.7.0, spanning** (`docs/releases/1.7.0.md`; ADR-0012 items 121-144 on the design of
-items 82-95, #478). A unit whose policy sets `allow_spanning` (dotfile > archive set >
-`[defaults]`, off when absent) may have its slices on several tapes: spannable units go last, the
-drive's early warning ends each tape's *range* (the run of one stage set's slices on one volume,
-`writes.status = 'range'`), and the next write lays the owed slices first. Whole units are still
-never split. A tape whose plan holds a slice of a spannable set states `requires = ["short-seal",
-"spanning"]` (a 1.6.0 reader refuses it); the MANIFEST block states `may_span = true` and lists
-every slice, with `tape_position` only for this tape's (`volume-format-v2.md` §1.2, §4.4;
-`layout-session.md` "Spanning"). Migration 039: `writes.may_span` (frozen at plan time; rebuild
-reads the block), `stage_slices.released_at`, `archive_sets.allow_spanning`. Where things live:
-the plan order in `CapacityBudget::place` (`Placement`; `split` is `place` of whole units), wired by
-`volume::write::build_span_layout` (a probe build, `place`, the build in plan order, read back);
-confirm's completed/range/cut split in `session::span_split`, shared with the adoption of a lost
-write; copies per slice (a version is as covered as its least-covered slice, item 127; item 138's
-credit) and item 128's promotion in `policy::coverage` (`slice_copies`,
-`every_slice_on_sealed_volume_sql`); the per-slice staging release in
-`staging::clean::release_covered_slices`; tapectl's restore across cartridges in
-`volume::restore::span` over `slice_holders::holders_of_set`; RESTORE.sh's in `restore_across_tapes`
-and the `span_*` functions (`span_accept` takes a cartridge only by hash under its seal, R8), with
-the one prompt in `swap_loop` (stdin, no timeout, no device held); the rebuild's split in
-`rebuild::tape_split` and item 144's promotion in `promote_spanning_version`. `volume rewrite` and
-compaction refuse a range volume (`write::refuse_range_holder`, item 133). `audit` adds
-`span_in_progress` and four range invariants under `short_seal`; `report failed-stages` is #409's
-report (item 91). RESTORE.sh was re-pinned six times (three under item 135, once for the fresh
-read of File 1, once under item 145 for its damage handling, once under item 176 for #497;
-`25505925…`), a pin covers the range block, and the 1.6.0 RESTORE.sh is a test fixture. The coordinator amended fork X12: a
-whole unit a queued spannable unit pushes past the fill ceiling waits for the next tape, never
-refused (for the CTO, in the release notes). The gate's span leg (item 136), the chain and a fresh
-read of File 1 are done. Item 145 fixed RESTORE.sh's damage handling, which GitHub's Ubuntu 26 runner
-exposed: a `sha256sum` that quotes names had hidden damaged files from the list. By item 146 the
-real-drive proof (item 137, `scripts/span-acceptance.sh`, with a scratch build on home2) comes
-before the `v1.7.0` tag, and handoff (h) after it. Its first run (2026-10-25/26) passed steps 1a-4b
-and failed step 5 on #497: given the isolated catalogue (`-A`), `dar --sequential-read` stops before
-the archive's own trailing catalogue and exits 0, and RESTORE.sh's `stream_unit` (and tapectl's
-`stream_into_dar`) called a whole restore of a unit of many files a failure once that unread tail
-outgrew a pipe. Items 176-178: the fix ships in 1.7.0 (every slice is read to its end, authenticated
-and hashed, its plaintext dropped once dar is done, and dar's exit status decides;
-`SequentialExtract::status`, RESTORE.sh's `dar_reap`/`DAR_RC`), the proof runs again in full on a
-debug build of the fixed commit, and the tapes already written are not rewritten: the troubleshooting
-guide and the Heir Kit's cover sheet give the way (keepsake's tapes carry 1.1.0's RESTORE.sh, which
-has no `--slices-from`; item 178's fact correction). The re-run passed every step on 2026-10-26/27
-(`docs/runs/2026-10-26-1.7.0-span-acceptance.md`), and 1.7.0 is tagged `v1.7.0` on `f66d0ff1`; home2
-went from 1.5.0 straight to 1.8.0 (item 183). Item 147 (#492) aligns item 94's start
-with its own text in a 1.7.x patch.
-
-**1.7.1: per-location copy targets and auto-stage** (`docs/releases/1.7.1.md`; ADR-0012 items
-147-160; #491, #492, #493). A patch: no byte on tape changes. A unit's *copy targets* are a map of
-location to count, `copies_at`: the dotfile's `[policy.copies_at]`, an archive set's `copies_at`
-(its `required_locations` folded in at one copy each) or `[defaults] copies_at`; the most specific
-layer wins whole (`ResolvedPolicy.copies_at`). The dotfile layer is frozen into
-`units.copies_at_frozen` at snapshot, stage and adoption (`policy::freeze_copies_at`) and read only
-while the dotfile is absent. **The copy floor is `ResolvedPolicy::copy_floor_base`** (the larger
-of `min_copies` and the map's sum) through `coverage::copy_floor`; each target is
-`coverage::location_target`, and every per-location check asks `coverage::short_of_copies_at`.
-Item 158's need at one location is `coverage::NeedAt` (`need_at`, `NeedAt::judge`); `report needs`
-is `cli::report::needs_rows`. Auto-stage lives in `src/for_location.rs` (`plan`, `stage`, and
-`staged_sets_for_location`, which `volume write --for-location` takes as
-`volume::write::StagedScope::ForLocation`); `--keep-staging-for-locations` is
-`staging::release::Hold::EveryLocation`. Item 159 as built binds an owed run to a location only
-when it starts after slice 1. Item 147 (#492) is `CapacityBudget::place`'s start;
-`CapacityBudget::span_last_run` and `collection::selector::after_the_tail` keep the whole units it
-displaces in the collection batch (`after_tail`). #491's fix is `volume::write::read_back_span_plan`. Migration 040.
-Item 26's shared-place warning judges where a moved tape goes (`--for-location X`, `--move-to Y`):
-`volume::write::WriteScope` carries the destination beside the `StagedScope`, and
-`coverage::copy_distinctness_at` takes it; `stage for-location`'s plan runs the same check.
-1.7.1 is tagged `v1.7.1` after the whole chain passed on the tree rebased onto `v1.7.0` (2026-10-27);
-home2 skipped it for 1.8.0 (item 183).
-
-**1.7.2: Logical Block Protection** (`docs/releases/1.7.2.md`; ADR-0012 items 161-166, 174, 175;
-#388). A patch: no byte on tape changes, and the CRC never reaches the medium. tapectl arms the
-drive's Control Data Protection page (0Ah/F0h, Reed-Solomon) for every `TapeStore` open and clears
-it in `TapeDevice`'s `Drop`, after any filemark st owes; an open clears a page a crash left armed.
-All of it is in the tape layer: `src/tape/lbp.rs` (the RS-CRC, slicing-by-16; the page through
-`sg_modes`/`sg_wr_mode` on the sg node sysfs binds to the st node, never config's `device_sg`;
-`arm`, `disarm`, `clear_leftover`) and `tape::ioctl::TapeDevice` (the 524,292-byte wire block, the
-probe read at open, the read check). Above the device every count stays in payload bytes. A
-drive or path that cannot take it is `Protection::Unavailable`, warned once per process per node
-on a write open (item 165) and recorded in `volumes.write_lbp`/`write_lbp_note` (migration 041,
-`session::record_run_protection`). A write `EIO` while armed is `TapectlError::LbpRefusal`: the
-session writes on once from the planned start of the file holding the drive's position
-(`Store::logical_position`, `session::retry_from_refusal`, item 174), and a second leaves it
-`interrupted`. From 1.8.0 (item 185) that position is READ POSITION's short form through `sg_raw` on
-the armed page's sg node (`lbp::PageControl::read_position`, `lbp::read_position_argv`), never st's
-`MTIOCPOS`, whose vendor-specific form the HP refuses; it is the one raw CDB tapectl sends
-(`tests/sg_boundary.rs`). A session that saw a refusal confirms in full (item 186; a
-`write_lbp_refusal` event on the volume). Item 175's switch is `tape::lbp::LBP_R_POLICY` (`AllReads`; `OnlyConfirmOfLbpWrite`
-arms LBP_R only for a confirm, `session::arm_read_check_for_confirm`), decided by R1 on home2.
-Output: `volume info`'s Write check line, `report verify-status`, `drive status`'s LBP page; the
-Heir Kit's sheet says a power cycle clears a page left armed. The test hook
-`TAPECTL_TEST_LBP_CORRUPT_BLOCK=n1[,n2…]` (F5, `lbp::CorruptBlocks`) corrupts each listed block
-write since the open, re-sent ones too, and refuses an unarmed open.
-mhvtl cannot carry 524,292 bytes in one command, so the gate's TD8 drive always falls back
-(`lbp_fallback_recorded`, `lbp_page_clear_after_every_command`) and `tests/mhvtl_lbp.rs`
-(`rust_lbp`) proves the path on a TD6 at a 262,144-byte payload, named by `TAPECTL_GATE_TAPE_TD6`.
-The real-drive proof is `scripts/lbp-acceptance.sh`, R1 first (`--r1-only`). 1.7.2 also carries
-tapectl's half of #498 (item 180): a streamed restore feeds dar one stream on its standard input,
-never a named pipe per slice. `dar::slice::stream_template` takes the stream's header from the
-installed dar, `Join` puts slice 1's labels in it and strips and checks each slice's header and
-trailer, and `dar::restore::SequentialExtract` owns dar's stdin. 1.7.2 is never tagged on its own
-(item 183): it ships in 1.8.0, whose real-drive LBP acceptance passed on 2026-10-29.
-
-**1.8.0: RESTORE.sh feeds dar one stream** (`docs/releases/1.8.0.md`; ADR-0012 items 181-183,
-#498). It contains 1.7.2, and the minor moves because RESTORE.sh changed: its golden pin moved
-under item 181, then twice under item 184 (fixes before the tag; `a5dc4063…` ships), and nothing else on tape did
-(`requires` and every other pin hold).
-RESTORE.sh's `stream_unit` joins a unit's slices back into the `dar -c -` stream and writes it into
-one FIFO that `dar -x -` reads; the script holds it open as fd 3 across slices and cartridge swaps,
-and only each slice's feed, a child, writes to it, so dar closing it ends a writer, never the
-restore. `stream_check` (once a run, before any slice) makes the stream's header with the heir's
-own dar and tests that `head` does not read ahead; `join_slice`/`join_rest` cut each slice with
-`head -c` at the manifest's `size_bytes` (`AWK_SELECT_VERSION`'s `plain_out`, `<list>.plain`) and
-check it (header equal to slice 1's, the slice size, `N`/`T`). No tool reads a FIFO for a slice's
-end: Ubuntu 26.04's uutils coreutils 0.10.0, CI's image, hangs on `tail -c 1 <fifo` under 64 KiB
-(item 184), so prove a RESTORE.sh change in the `tapectl-u26` container (`/scratch/tapectl-u26`)
-or a PR before master. The header is read by the awk fragment
-`AWK_DAR_HEADER` in `restore_script.rs`, the mirror of `dar::slice`'s parser. When `stream_check`
-fails, a unit on one tape spools (`spool_unit`) with a NOTE, and a unit across tapes is refused in
-`restore_across_tapes` before any slice. Item 182: damage found while dar's stream is open closes it
-there (no final `T`) and reaps dar, and `late=1` is dar's final status 0, never `dar_running` at an
-instant (item 184: uutils `cat`/`tee` enlarge their pipes to 1 MiB, so the join can pass the damage
-before dar closes anything; run the container's heir suite as `--user 1000:1000`, since root, over
-its pipe quota, keeps 8 KiB pipes and hides it); that is `late_damage`'s NOTE, repeated by `late_notes`,
-and the per-file check decides the restore. tapectl's own streamed restore names `--spool` when
-its dar's header is unknown. The span proofs' `CAP94` follows File 2's size (74 blocks; the
-control has about three blocks of margin). The LBP acceptance on home2
-(`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`): the first full run (2026-10-28) failed step 3
-because item 174 could not read the HP's position through st; items 185 and 186 are the fix, and the
-second full run, on `d3b7068d`, passed every step on 2026-10-29, the drive refusing and tapectl
-retrying on the HP. 1.8.0 is tagged `v1.8.0` on `d3b7068d`; home2 has run it since 2026-10-29,
-installed straight from 1.5.0 by handoff (h) (`docs/runs/2026-10-29-1.8.0-handoff-h.md`).
-
-**1.8.1: the in-place upgrade and the setup review** (`docs/releases/1.8.1.md`; ADR-0012 items
-187-192, 195, 196; #502, #503, #505, #506, #507). A patch: no byte on tape changes and there is no
-migration; the binary's only change is #503's retire hint. `scripts/first-run.sh --upgrade` is the
-repo's in-place upgrade (thirteen steps of its own, resumable; `docs/install.md` §10), and its
-acceptance is `scripts/upgrade-mhvtl.sh` (below, Testing). Its rollback imports the backup with
-the NEW binary before the old one goes back: every command opens (and migrates) the catalog
-first, so an older binary's `db import` is refused after a migrating upgrade. Step 12 refuses a
-test cartridge the catalog knows. The host remembers its profile (item 187); `--auto` mints no
-escrow without `--mint-escrow` (item 188); step 12 stops the drive-poll timer (item 190);
-`install-systemd.sh` never moves the backup directory silently (#502); `tapectl-op` raises
-`volume rewrite`, `init`, `identify`, `catalog rebuild` and `drive eject` too (item 196).
-home2 installed 1.8.1 by `--upgrade` on 2026-11-02, as handoff (i)'s step 0, before its fresh start (item 195; the rehearsal 53/53, `docs/runs/2026-11-02-1.8.1-handoff-i.md`).
-1.8.1 is tagged `v1.8.1` on `ac8bf8aa` (2026-11-01), after the whole chain passed on `5c17b52b`
-(chain57; the notes' Testing) and PR #510's CI.
-
-**1.9.0: the CLI review's release** (`docs/releases/1.9.0.md`; ADR-0012 items 198-221,
-`docs/audits/2026-11-04-cli-review.md`). No byte on tape changes and there is no migration (item
-221): every golden pin holds, and the minor moves because command and flag spellings were removed.
-A removed spelling is refused by name with exit 2, naming its replacement (`src/cli/renamed.rs`'s
-`RENAMED`; `tests/dry_run_contract.rs` holds every clap leaf to one verdict); the three File 1
-commands keep their spellings. Output goes through `src/render.rs` (borderless tables, real plurals,
-UTC times, colour only on verdict words); under `--json` every error is one JSON document on stdout
-(`TapectlError::with_json` merges a command's own payload) and the `error:` line still goes to
-stderr, so scripts that read stderr keep working. The first help paragraph of every command and
-flag is one line of at most 92 characters (`tests/help_text.rs`). What changed for the operator:
-`collection add|remove` edit `[[collections]]` with the access check and its `setfacl` lines
-(item 206); `config get`; `status` is the home screen (item 213; `volumes_past_verify_interval`
-in `policy::evidence` is the one "due a verify" rule it shares with `audit`); one copy loop,
-`volume write L --init --full-confirm --move-to X`, in every remedy, script and doc (item 218),
-and a `volume resume` keeps the write's `--full-confirm`/`--move-to` (item 215); staging is
-released per unit at its copy floor by default (item 217, read with item 154, the clarification
-under item 221); plans need no drive; a cartridge registered at `volume init` takes the label as
-its barcode (item 219); `unit check-integrity` tells CHANGED from BITROT (Q40's exit for CHANGED
-alone is `operations::changed_exit_code`, 0 as built, pending the CTO); `db backup DIR` writes a
-dated file and never overwrites. dar is handed `slice_size` as a byte count
-(`dar::slice::dar_slice_arg`), so the KiB-TiB spellings config accepts work there too. The scripts
-batch: `first-run.sh` step 7's staging diagnosis (item 199), `POST_WARNING_BYTES` (item 200), step
-11 through `collection add`, step 13 as the one copy loop with a same-label retry after an aborted
-write (#401), and `install-systemd.sh` installing bash completion and man pages. fr414's phase E
-runs copy 2 as home2 will (a second `--from 13` on a second cartridge that carries a foreign
-sealed volume). home2 installs 1.9.0 by `--upgrade` as handoff (i)'s next step, then copies 1
-and 2. 1.9.0 is tagged `v1.9.0` on `4421e212` (2026-11-05), after the whole chain passed on
-`e48546d2` (chain65; the notes' Testing) and PR #512's CI.
-
-**1.9.1: the friends' setup and 1.9.0's open questions** (`docs/releases/1.9.1.md`; ADR-0012 items
-222-234, ruled 2026-11-09). A patch: no byte on tape, no migration, no spelling removed. `tapectl
-setup` (`src/setup.rs` holds the ten steps, `src/cli/setup.rs` the flags; `setup::make_home` is shared
-with `init`) installs a one-drive host as the operator's own account (item 229): it prints what needs
-root and never runs it, writes weekly backup and audit timers as systemd USER units, and mints the
-escrow as `init` does (shown once, stored nowhere; ADR-0005). Its tests are `tests/setup.rs`, with
-the env hooks `TAPECTL_SETUP_UNIT_DIR`, `TAPECTL_TEST_SETUP_GROUPS`, `TAPECTL_TEST_SETUP_BY_ID_DIR`.
-`docs/quick-start.md` is its page; `first-run.sh` stays the service-user installer (item 228).
-`.github/workflows/release.yml` builds a static musl binary on each `v*` tag and attaches it with
-`SHA256SUMS` (item 230: CI's release build is the one standing exception to the build rule).
-`key escrow-kit --static-binary FILE` puts it in the Heir Kit (item 234, #486; `escrow_kit::elf_facts`,
-and the kit runs `FILE --version`, listed in `tests/sg_boundary.rs`). `unit check-integrity`: a size
-change with a moved mtime is CHANGED, exit 0 (items 223, 224). `catalog rebuild` registers a cartridge
-with its File 0 label as the barcode (item 226; `binding::give_first_barcode_because`). `snapshot create
---all-pending` (item 225), which `status` suggests. home2 skips 1.9.0 and goes from 1.8.1 straight to
-1.9.1 by `--upgrade`, then copies 1 and 2 (handoff (i)); the whole chain passed on `691bf9aa`
-(chain66), including `upgrade-mhvtl.sh` from both `v1.8.1` and `v1.9.0`.
-
-**1.9.2: SQLite 3.54.1** (`docs/releases/1.9.2.md`; #514). A patch for RUSTSEC-2026-0459: rusqlite 0.39
-to 0.41 (libsqlite3-sys 0.39.1). No released `rusqlite_migration` takes rusqlite 0.41, so its 2.5.0
-source is vendored in `vendor/rusqlite_migration` with only that requirement raised, through
-`[patch.crates-io]` (`VENDORED.md` says when to drop it). rusqlite 0.41's hooks (`trace_v2`,
-`authorizer`, `commit_hook`, `busy_handler`) take `&mut Connection`: the test helpers that count
-statements hand their closure the connection. home2 runs 1.9.2 since 2026-11-10 (1.8.1 → 1.9.1 → 1.9.2 by `--upgrade`, each rehearsal 53/53), and handoff (i)'s copies are done: `keepsake`'s 27 units on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), 1.20 TiB each, sealed with a full readback, `audit` clean (`docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`).
-
-**Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
-LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
-for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
-open hardware questions are answered there — block size 512 K vs 1 M is a wash, MAM
-over-report is +2 MiB. `scripts/lifecycle-suite.sh` (17 scenarios, `--list` names
-them, x a 12-method restore matrix) is the permutation suite built from it.
+Rules that outlived the history:
+- **Production is home2** (`contrib/hosts/home2.profile`); its drive is not on this VM. The
+  tapes L6-0001 and L6-0002 and home2's catalog are test articles (ADR-0012 items 235-238).
+- **A byte pin** (`tests/on_tape_golden.rs`) that fails means the on-tape format changed: a
+  CTO decision, never an agent's re-pin, and a pin moves only in a commit of its own.
+- **Never argue a design choice from what `keepsake` holds** (item 281), and never bend the
+  format to home2's older tools (item 273). Weigh a format choice by what one slice gives
+  the stock tools alone, with no file table.
+- **Prove a RESTORE.sh change** in the `tapectl-u26` container (`/scratch/tapectl-u26`) as
+  uid 1000, and in a PR's CI: Ubuntu 26.04's uutils hang on `tail -c 1 <fifo` and enlarge
+  pipes to 1 MiB where GNU coreutils do not (item 184), and root hides it.
+- **Version rule** (item 201): the minor moves when generated on-tape bytes change or a
+  command or flag spelling is removed, the patch for any other build installed on a
+  production host; a change to scripts alone is no release. Each release is tagged
+  `vX.Y.Z` on the commit it is built from.
+- **Units are never split by hand** (#12's differential shape is the answer). Back up the
+  catalog at the end of every write session.
+- **Capacity is decided once, at `volume init`,** from the detected medium, and no path
+  reads it from config after (ADR-0010). `--device` has no default.
+- Real LTO-6 validation is done (2026-09-10, `docs/lto6-session-journal-2026-09-10.md`);
+  `scripts/lifecycle-suite.sh` is the permutation suite built from it.
 
 ## Build Commands
 
@@ -764,7 +73,7 @@ cargo fmt --check
 ```
 
 CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, `cargo test`
-(with dar installed), a `docs/man` drift check and a non-blocking `cargo audit` — but only
+(with GNU tar and the decompressors), a `docs/man` drift check and a non-blocking `cargo audit` — but only
 on pushes and PRs to `master`. Run `clippy`, `fmt --check`, and `cargo test` locally
 before committing; nothing checks a push to any other branch.
 
@@ -789,20 +98,11 @@ control). Run it with clippy/fmt before committing a docs or CLI change.
 Default `cargo test` runs unit + integration + tenant-isolation + failure-mode tests;
 none need tape hardware or mhvtl.
 
-**`dar` must be on `PATH` (issue #43).** The ungated suite is *not* hermetic: 49
-tests need a working dar (counted 2026-09-29 by stubbing dar out) — the staging
-pipeline, `stage create`/`quick-archive`/collection batches, the dar wrapper,
-`config check`'s dar probe, the restore record, and three `cli_smoke` tests.
-Without dar, plain `cargo test` runs the whole lib test binary first — dozens of
-dar-dependent tests fail with cryptic panics — and then stops (cargo's fail-fast is
-per test binary), never reaching the named check in `tests/test_dependencies.rs`; run
-`cargo test --test test_dependencies` for its instructions. Its by-name list
-(`DAR_DEPENDENT_TESTS`) names only 13 of the 49, so do not read it as complete. dar is
-a hard *runtime* dependency anyway, so testing needs nothing extra. The ungated tests
-that run dar resolve it as plain `"dar"` via `PATH` — never hardcode `/usr/bin/dar`,
-which is wrong on any distro installing to `/usr/local/bin`. The two
-`binary = "/usr/bin/dar"` fixtures in `tests/integration.rs` are inert only because
-no test using them reaches dar; do not copy them.
+**GNU tar and `gzip`, `xz` and `zstd` must be on `PATH` (issue #43).** The ungated suite is
+*not* hermetic: staging runs the real GNU tar (the writer's floor is 1.35 built with ACL
+support, ADR-0012 item 274), and the tests that read a slice back run each carried
+decompressor. `tests/test_dependencies.rs` names each tool once, loudly; run
+`cargo test --test test_dependencies` when the suite fails in ways that look unrelated.
 
 ```bash
 cargo test                              # everything ungated
@@ -888,34 +188,32 @@ TAPECTL_MHVTL=1 bash scripts/upgrade-mhvtl.sh \
 **The heir path's only test with real tools is the mhvtl gate** (ADR-0012 item 70,
 #457). `tests/heir_restore_sh.rs` runs RESTORE.sh with `mt`, `dd` and `age` faked (CI
 has no age CLI); only the gate's RESTORE.sh legs (`heir_*`) and home2's real-drive
-proof run it with the real `age`, `dar`, `mt` and `tar`. A release is not proven on
+proof run it with the real `age`, `mt`, `tar` and decompressors. A release is not proven on
 the heir path until the gate has run; each run record names the age version it used
-(`age --version`). Since 1.3.0 the gate's heir legs also run RESTORE.sh's index modes
-(`heir_where`, `heir_find`), its slice replacement (`heir_slice_from_copy`) and its per-file
-sha256 check (`heir_file_check`) with the real tools, and since 1.8.0 its one stream into dar
-(`heir_slice_boundary_read`) and its note on damage dar never needed (`heir_late_damage`). The gate's Rust legs pass only when every test they name ran and
+(`age --version`). The gate has one heir leg per RESTORE.sh mode (`heir_*`), each
+compression included (`heir_gzip_*`, `heir_xz_*`, `heir_zstd_*`). The gate's Rust legs pass only when every test they name ran and
 said `ok`, and a gate run turns an on-media skip into a failure (#471).
 
 ## Architecture
 
-**Three-phase pipeline:** `snapshot create` (fast metadata) → `stage create` (dar + sha256 + encrypt) → `volume write` (tape I/O)
+**Three-phase pipeline:** `snapshot create` (fast metadata) → `stage create` (tar + sha256 + compress + encrypt) → `volume write` (tape I/O)
 
 **Key subsystems:**
 - **CLI layer** (`src/cli/`): clap derive-based subcommands (tenant, unit, snapshot, stage, volume, catalog, restore, audit, etc.)
 - **Database** (`src/db/`): SQLite with WAL mode, forward-only numbered migrations, full audit trail; `ontape_catalog.rs` is the operator envelope's `catalog.db` — schema, generation probe, read and write in one place
 - **Unit management** (`src/unit/`): archival entities tracked via `.tapectl-unit.toml` dotfiles in each directory
-- **dar integration** (`src/dar/`): subprocess wrapper for create, restore and the version check; minimum dar 2.6.x
-- **Staging** (`src/staging/`): sha256 validation beside dar's single read of the source, `dar -c -` cut into dar slices and age-encrypted in memory (no plaintext on the staging device, #370), ephemeral slices; `release.rs` is the policy gate in front of `clean_staging`, shared by `collection run`, `volume write` and `volume resume` (#440)
-- **Volume management** (`src/volume/`): Layout-v2 self-describing layout (`volume-format-v2.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal/ID-thunk parsers (`format.rs`), `MANIFEST.toml` in both directions (`manifest.rs`), envelope read-back (`envelope.rs`), RESTORE.sh from named awk fragments (`restore_script.rs`), catalog rebuild (`rebuild.rs`), raw dump (`raw.rs`), verify, read-slices
+- **tar** (`src/tar/`): the GNU tar writer (`writer.rs`), the pax stream reader and its checks (`pax.rs`, `stream.rs`), the version probe (`probe.rs`)
+- **Staging** (`src/staging/`): sha256 beside tar's single read of the source; the stream cut at member starts into slices (`cut.rs`), each compressed alone (`pack.rs`) and age-encrypted in memory (no plaintext on the staging device, #370); the file table and id map (`files.rs`); `release.rs` is the policy gate in front of `clean_staging`, shared by `collection run`, `volume write` and `volume resume` (#440)
+- **Volume management** (`src/volume/`): Layout 3's self-describing layout (`volume-format-v3.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal/ID-thunk parsers (`format.rs`), `MANIFEST.toml` in both directions (`manifest.rs`), envelope read-back (`envelope.rs`), the heir's RESTORE.sh (`src/volume/heir/`), tapectl's one restore reader (`restore/`), catalog rebuild (`rebuild.rs`), raw dump (`raw.rs`), verify, read-slices
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
 - **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit; `coverage.rs` owns the copy/location SQL and every `volumes.status` predicate, `escrow.rs` owns escrow coverage (verdict AND query) — never inline either again. A copy floor is always `copy_floor(config, resolved.copy_floor_base(), status)`, never `min_copies` read directly (1.7.1)
 - **Store trait** (`src/store.rs`): built (ADR-0006) — `capacity`/`execute`/`confirm`/`read_file`, streaming so RAM tracks block size not slice size. `TapeStore` and `MemStore` share one chain-walk implementation, so MemStore-based tests exercise the real confirm path. `WarehouseStore`/`ExportStore` stay ADR-0006 peers but are unbuilt and untracked: #72 (closed) rescoped warehouse copies to a documented rclone/aws-cli procedure over sealed volumes (`docs/design-errata.md`), #73 (closed) is the warehouse-location model, and no issue tracks an `ExportStore` — `export` does not go through the trait
-- **Cross-volume index** (`src/volume/index.rs`, `policy::coverage::index_versions`): `index/units.tsv` and `index/paths.tsv` built in the home work dir, streamed into each envelope by `build()` after `catalogs/`; RESTORE.sh's `--where`/`--find` read it; `catalog rebuild` reads the operator map as a to-do list and never imports it (`volume-format-v2.md` §1.5)
+- **Cross-volume index** (`src/volume/index.rs`, `policy::coverage::index_versions`): `index/units.tsv` and `index/paths.tsv` built in the home work dir, streamed into each envelope by `build()` after `catalogs/`; RESTORE.sh's `--where`/`--find` read it; `catalog rebuild` reads the operator map as a to-do list and never imports it (`volume-format-v3.md` §1.5)
 - **Collection** (`src/collection/`): `[[collections]]` config → `collection sync|status|plan|run`; folder-per-unit registration, alphabetical next-fit batch selector, stage-once/write-N-copies/release
 
 **Design principles:**
-- Volumes are self-describing — full data restore without the database or tapectl, and catalog rebuild with the operator/escrow key; what that does and does not promise is defined in `docs/design/volume-format-v2.md` ("Self-describing — what that promises")
+- Volumes are self-describing — full data restore without the database or tapectl, and catalog rebuild with the operator/escrow key; what that does and does not promise is defined in `docs/design/volume-format-v3.md` §2 ("Self-describing: what that promises")
 - Strict tenant isolation — zero content metadata in plaintext on tape; tenant envelopes use age trial-decryption
 - Multi-tenant bin-packing on shared volumes
 - Physical cartridges tracked separately from logical volumes (cartridges can be erased/reused)
@@ -923,14 +221,14 @@ said `ok`, and a gate run turns an on-media skip into a failure (#471).
 
 ## External Dependencies
 
-- `dar` ≥2.6 (recommended 2.7.20+) — archive creation/extraction
+- GNU `tar` ≥ 1.35 built with ACL support on every host that writes (ADR-0012 item 274); `gzip`, `xz`, `zstd` for the heir and the tests (tapectl compresses in-process)
 - `sg3-utils` — drive health pages (`sg_logs`), the cartridge's MAM (`sg_read_attr`), drive identity (`sg_inq`), and since 1.7.2 the Control Data Protection mode page that arms and clears Logical Block Protection (`sg_modes` reads it, `sg_wr_mode` writes it; `src/tape/lbp.rs`, #388)
 - `mhvtl` — virtual tape library for development/testing
 - `lsscsi`, `mt-st` — the binary never calls them (device discovery and debugging), but
   `scripts/first-run.sh` step 2 requires both, along with `acl` (`setfacl`) and `python3`
-- the `age` and `tar` CLIs — not used by the binary (it uses the `age` and `tar`
-  crates), but the on-tape RESTORE.sh (the heir path) refuses to run without them or `mt`,
-  and names `gpg` up front when the dar it finds needs it (ADR-0012 2026-10-06 item 21)
+- the `age` CLI — not used by the binary (it uses the `age` crate), but the on-tape
+  RESTORE.sh (the heir path) refuses to run without it, `tar` or `mt`, and needs the
+  decompressor of a compressed staging
 
 ## Key Rust Dependencies
 
@@ -938,7 +236,7 @@ said `ok`, and a gate run turns an on-media skip into a failure (#471).
 
 ## Configuration
 
-- System config: `~/.tapectl/config.toml` (dar path, backends, defaults incl. exclusions and copy policy, archive sets, staging, collections, host check); locations are catalog rows from `location add`, not config — a `[locations]` table is refused
+- System config: `~/.tapectl/config.toml` (`[tar] binary`, backends, defaults incl. exclusions and copy policy, archive sets, staging, collections, host check); locations are catalog rows from `location add`, not config — a `[locations]` table is refused
 - Database: `~/.tapectl/tapectl.db`
 - Session logs: `~/.tapectl/logs/<UTC>-<command>-<pid>.log`, one per long operation
   (issue #386, `src/progress.rs`): phases, waits over 5 s, stalls, and the INFO tracing

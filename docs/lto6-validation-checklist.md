@@ -56,11 +56,13 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
       `docs/lto6-session-journal-2026-09-10.md`.)
 - [ ] Compression as found: `sg_logs`/mode page 0x0f `DCE`. tapectl disables it per
       write; the record shows `DCE 1→0` verified.
-- [ ] `dar --version` ≥ 2.6; `age` present (RESTORE.sh and the rehearsal need it).
-- [ ] The mhvtl gate is GREEN on this checkout (`TAPECTL_GATE_TAPE=/dev/nst3
-      TAPECTL_GATE_TAPE_TD6=/dev/nst4 TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`,
-      67 checks since 1.8.0 (65 since #388); `TAPECTL_GATE_TAPE_TD6` names a TD6 emulation for the
-      `rust_lbp` leg, from `readlink -f /dev/tape/by-id/scsi-XYZZY_A3-nst`). The gate
+- [ ] GNU `tar` and `age` present (RESTORE.sh and the rehearsals need them; dar is no longer used).
+- [ ] The mhvtl gate is GREEN on this checkout (`TAPECTL_GATE_TAPE="$(readlink -f
+      /dev/tape/by-id/scsi-XYZZY_A2-nst)" TAPECTL_GATE_TAPE_TD6="$(readlink -f
+      /dev/tape/by-id/scsi-XYZZY_A3-nst)" TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`;
+      it judges each expected check by name and prints the count, 78 on 2026-11-20;
+      `TAPECTL_GATE_TAPE_TD6` names a TD6 emulation for the `rust_lbp` leg, and the device
+      numbers move, so resolve both by id at every run). The gate
       always runs `cargo build` and tests the checkout's own debug binary; it has no
       `TAPECTL_BIN`, so a green gate says
       nothing about an installed release binary. The rehearsal's `TAPECTL_BIN=` run
@@ -197,11 +199,11 @@ the test cartridge EW7VWMVKF6 in a throwaway home, and the CTO authorizes each r
 **How the tape is filled** (item 115). Three small real units and, sorting between them, one
 filler unit (`volume write` orders the batch by name: `ssa-a-docs`, `ssa-b-photos`,
 `ssa-m-filler`, `ssa-z-tail`). The filler is staged normally from a source a little larger than
-one slice, so its stage set is real (recipients, escrow receipt, dar catalogue) and its slice 1 is
+one slice, so its stage set is real (recipients, escrow receipt) and its slice 1 is
 a full 1 GiB slice. `examples/short_seal_filler.rs` (`fill`) then gives it about 2,370 slice rows,
 all naming that one staged file. The write's checks read row counts and file sizes, and its
-hashing streams the file each time, so no 2.6 TB staging area is needed. The filler is cut and
-never restored. Its one file is moved to `/dev/shm` when there is room, because the write evicts
+hashing streams the file each time, so no 2.6 TB staging area is needed. The filler ends as a range whose owed
+slices are never written, and is never restored. Its one file is moved to `/dev/shm` when there is room, because the write evicts
 each slice from the page cache behind it.
 
 **The capacity.** The run registers the cartridge at 2.55 TB (`cartridge register --capacity`,
@@ -212,7 +214,7 @@ in the throwaway catalog only), not the generation table's 2.5 TB:
 - so a plan bounded at 2.5 TB ends about 2 GB before the warning, seals full and proves nothing.
 
 At 2.55 TB the fill ceiling (97%, 2.47 TB) is below the warning and the plan bound is above it.
-The filler is planned past the ceiling (item 113) and the warning lands inside it. The drive's
+The filler is the set that carries the plan past the plan bound, so it is planned to its end (items 288 and 289), and the warning lands inside it. The drive's
 `capacity_override` is not used: it is for virtual drives. Production keeps the table figure.
 
 **Before the run.**
@@ -248,11 +250,11 @@ It refuses (exit 2, nothing touched) when any of these fails:
 |---|---|---|
 | 1 setup | no tape. The home, the config (`post_warning_bytes = "99008M"`, item 118's figure; `min_copies = 1`), four units staged, the filler's rows | ~10 min |
 | 2 erase, `volume init SSA-0001` | whatever the cartridge held is erased by this home's `cartridge erase` (File 0's label confirmed), so init needs no `--force`; the medium line's capacity is the registered 2.55 TB | ~5 min |
-| 3 `volume write` | exit 0, `"ending": "short"`, `ended_after` K, cut `ssa-m-filler` and `ssa-z-tail`; the volume `sealed` with `ended_after` K; `completed` and `cut` rows; the `write_early_warning` event; the confirm phase's bytes (`phase_timings`) cover the slice at file K and the seal, item 114's readback; the whole units' staging released (`min_copies = 1`) and the cut units' kept | ~4.5-5 h |
-| 4 verify | `volume verify --full` exit 0; RESTORE.sh `--info` "Verdict: SEALED" and "ended early, after file K"; `--verify` "VERIFY: PASS" with the planned files after K marked NOT ON TAPE | ~9-10 h |
-| 5 restore | `ssa-b-photos` (two slices) by `restore unit` and by RESTORE.sh, each identical to its source; the cut unit refused by both | ~15 min |
+| 3 `volume write` | exit 0, `"ending": "short"`, `ended_after` K; `range_units` names `ssa-m-filler` and `deferred_units` names `ssa-z-tail` (planned and not written), and there is no `cut_units` key; the volume `sealed` with `ended_after` K; rows `completed` (`ssa-a-docs`, `ssa-b-photos`) and `range` (`ssa-m-filler`), and no row at all for `ssa-z-tail`; the write's stderr says "Held here as a range, the rest of each still staged: ssa-m-filler" and "Planned and not written (still staged): ssa-z-tail."; the `write_early_warning` event; the confirm phase's bytes (`phase_timings`) cover the slice at file K and the seal, item 114's readback; the whole units' staging released (`min_copies = 1`), the filler's owed slices and all of `ssa-z-tail` kept | ~4.5-5 h |
+| 4 verify | `volume verify --full` exit 0; RESTORE.sh `--info` says the tape "ended EARLY, after file K" and names the planned files after K as `NOT ON TAPE`; `--verify` says "VERIFY PASSED" with one `NOT ON TAPE` line | ~9-10 h |
+| 5 restore | `ssa-b-photos` (two slices) by `restore unit` and by RESTORE.sh, each identical to its source; `ssa-z-tail`, which the tape holds none of: RESTORE.sh names its slices "NOT ON THIS CARTRIDGE", ends "RESTORE INCOMPLETE" and leaves `.tapectl-damaged-files.txt`; `restore unit` exits non-zero | ~15 min |
 | 6 rebuild | `catalog rebuild --from-volume` into a second bare home; `short_seal_filler compare` agrees on the volume, its units, every write's status and every slice on the tape | ~15 min |
-| 7 rewrite | the filler released by `stage clean --force`; `SSA-0001` retired; `cartridge erase`; `SSA-0002` initialised without `--force`; the cut unit written whole (full seal), verified and restored | ~20 min |
+| 7 rewrite | the filler released by `stage clean --unit ssa-m-filler --force`; `ssa-a-docs`, `ssa-b-photos` and `ssa-m-filler` marked reclaimable (`snapshot mark-reclaimable --version 1 --force`); `SSA-0001` retired; `cartridge erase`; `SSA-0002` initialised without `--force`; `ssa-z-tail` written whole (full seal, `completed`), verified and restored | ~20 min |
 
 About 14-16 hours of drive time in all. Step 4's two whole-tape reads are most of it.
 
@@ -266,7 +268,7 @@ About 14-16 hours of drive time in all. Step 4's two whole-tape reads are most o
       (`RESULT.txt`, the step's `.err` and `.out` files, `drive-at-fail/`), and keep the cartridge
       unwritten until it is understood (#420's lost readback). On a FAIL in step 3 or 4,
       `catalog-at-fail.db` and the tape are the evidence.
-- [ ] Afterwards the cartridge holds `SSA-0002`, owned by the throwaway home. Retire it and run
+- [ ] Afterwards the cartridge holds `SSA-0002` (`ssa-z-tail` only), owned by the throwaway home. Retire it (after `snapshot mark-reclaimable ssa-z-tail --version 1 --force`: it holds that unit's only copy) and run
       `cartridge erase` there before the cartridge is a test cartridge again. Then start the
       drive-poll timer.
 
@@ -277,11 +279,12 @@ pages 0x02 0x03 0x0c 0x17 from before and after (one LOG SENSE each; never 0x2E)
 
 ## Spanning on the real drive (1.7.0 acceptance)
 
-ADR-0012 item 137, as item 139 amends it (#478). Spanning stays off on home2 until this passes
-(`docs/handoff.md` (h)). It uses the one test cartridge, EW7VWMVKF6, as two volumes in turn:
-- **Tape 1** holds a unit that allows spanning, ended by the drive's real early warning. Its row
+ADR-0012 item 137, as item 139 amends it (#478), and as items 288 and 289 changed the rule: every unit
+continues on the next cartridge at the early warning, with no opt-in, so this run proves the one
+behaviour every write has. It uses the one test cartridge, EW7VWMVKF6, as two volumes in turn:
+- **Tape 1** holds a unit that the drive's real early warning ends. Its row
   is `range`, and what was written past the warning reads back (item 114).
-- **RESTORE.sh's default mode** spools tape 1's range into scratch and is held at its prompt.
+- **RESTORE.sh's default mode** restores tape 1's range, slice by slice into one tar run, and is held at its prompt.
 - **A rebuild of tape 1** records the range and names the slices it lacks.
 - **Tape 2:** the same cartridge is written again as a whole copy, and the held restore finishes
   from scratch plus tape 2.
@@ -295,9 +298,9 @@ part and the drive time without touching anything.
 - **The filler** (`spn-filler`) is staged from a little more than one slice and given slice rows
   that all name its one staged file (`examples/short_seal_filler.rs`, `fill`). Here it is a whole
   unit that ends at the fill ceiling (97% of 2.5 TB, 2.425 TB).
-- **The unit that may span** (`spn-span`, `allow_spanning = true` in its dotfile) comes after
-  it. With such a unit queued, whole units stop at the ceiling, and that unit is planned last, past
-  the plan bound to its end (items 83 and 123).
+- **The real unit** (`spn-span`, a unit like any other: its dotfile is left as `unit init` wrote it) sorts after
+  it, so the queue holds the filler first. The unit that carries the plan past the plan bound is
+  planned to its end and is the last (items 288 and 289), and the warning ends it on the tape.
 
 The drive's warning came near 2.502 TB on this cartridge (2026-10-21), so about 77 GB of a 100 GB
 unit lands on tape 1. The cartridge keeps the generation table's 2.5 TB, as production does: unlike
@@ -325,11 +328,12 @@ slice, and tape 2 holds it whole, written from the staging tape 1 kept (`--keep-
 
 **The held restore.** RESTORE.sh's input is a FIFO the script holds open and answers in step 5.
 It waits through steps 3 and 4 (an hour or so on home2) with no timeout and no tape device open;
-the script checks its descriptors at the prompt and again before it answers. Its scratch keeps
-only ciphertext.
+the script checks its descriptors at the prompt and again before it answers. Layout 3 keeps no
+slice in its work directory (item 267): at the prompt it holds only the unpacked envelope
+(`env.*`).
 
 **Before the run.**
-- [ ] The whole chain is green on the 1.7.0 candidate, including the mhvtl rehearsal:
+- [ ] The whole chain is green on the candidate, including the mhvtl rehearsal:
       `scripts/span-acceptance.sh --mhvtl --device /dev/tape/by-id/scsi-XYZZY_A3-nst` (an LTO-6
       emulation). It runs the same steps with a generated 48 MiB unit, 1 MiB slices, the drive's
       `capacity_override` at 200 MB and the store's test hook `TAPECTL_TEST_EARLY_WARNING_AT`
@@ -342,15 +346,14 @@ only ciphertext.
       root's, so make it first: `sudo install -d -o mikmorg -g ultimate -m 750
       /srv/acache/tapectl-span-$(date +%Y%m%d)` (the script refuses a `--work` it cannot create).
       `~/.cache` (/srv/home) has about 80 GB and is refused.
-- [ ] The dar on `PATH` is 2.7.9 or later (home2's `/usr/local/bin/dar` is 2.7.21); RESTORE.sh
-      restores a unit across tapes only with it.
+- [ ] GNU `tar` and `age` on `PATH` (the script names any other tool it needs and refuses without it).
 - [ ] EW7VWMVKF6 loaded; `sudo systemctl stop tapectl-drive-poll.timer`; nothing else uses the
       drive; the host is quiet while the tape moves (`docs/operator-guide.md`, "A quiet host while
       the tape runs"). Start it inside tmux.
 
 ```bash
 TAPECTL_HOME="$HOME/.cache/tapectl/spn-home-$(date +%Y%m%d)" \
-TAPECTL_BIN=/path/to/tapectl-1.7.0 FIXTURE_BIN=/path/to/short_seal_filler \
+TAPECTL_BIN=/path/to/tapectl FIXTURE_BIN=/path/to/short_seal_filler \
   scripts/span-acceptance.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst \
     --i-will-lose-the-cartridge EW7VWMVKF6 \
     --span-source /path/to/about-100-GB --work /srv/acache/spn-work-$(date +%Y%m%d)
@@ -364,7 +367,6 @@ It refuses (exit 2, nothing touched) when any of these fails:
 - The drive-poll timer is active, or the tape lock is held.
 - `--span-source` is missing, unreadable, or too small.
 - `--work` is not empty, is inside production's home or staging, or lacks the room.
-- The dar on `PATH` is older than 2.7.9.
 
 **The steps, what each must show, and its time on home2** (the write at ~152 MiB/s and the reads
 at ~108 MiB/s, as 1.6.0's run measured them):
@@ -373,11 +375,11 @@ at ~108 MiB/s, as 1.6.0's run measured them):
 |---|---|---|
 | 1a setup | no tape. The home and config (`post_warning_bytes = "99008M"`, `min_copies = 1`, no global excludes), the copy, both units staged, the manifest, the filler's rows; `volume plan` shows the filler `committed` and `spn-span` the `tail` | the copy and manifest ~30 min; staging (see above) |
 | 1b init | whatever the cartridge held erased by this home's `cartridge erase`; `SPN-0001` initialised, the medium's capacity 2.5 TB | ~5 min |
-| 1c write | exit 0, `"ending": "short"`, `ended_after` K; `range_units` names `spn-span` slices 1 to K1, nothing cut or deferred, the staging kept; rows `completed` (the filler) and `range` (`may_span` set); `spn-span`'s written positions consecutive, ending at K; the version `staged`; the confirm phase's bytes cover the slice at file K and the seal (item 114); File 0 and the short seal at K+1 state `requires = ["short-seal", "spanning"]` | ~4.5 h |
-| 2 spool | RESTORE.sh off tape 1, `--restore --unit spn-span --scratch`: one prompt for slice K1+1; slices 1 to K1 in its scratch directory, each age ciphertext of its recorded size; alive, with its input on the FIFO and no tape device open | ~15 min |
+| 1c write | exit 0, `"ending": "short"`, `ended_after` K; `range_units` names `spn-span` slices 1 to K1, no `cut_units` key, nothing deferred, the staging kept; rows `completed` (the filler) and `range`; `spn-span`'s written positions consecutive, ending at K; the version `staged`; the confirm phase's bytes cover the slice at file K and the seal (item 114); File 0 and the short seal at K+1 state `requires = []` (Layout 3 names no feature a reader must know, item 258(a)) | ~4.5 h |
+| 2 restore 1 | RESTORE.sh off tape 1, `--restore --unit spn-span`: tape 1's range restored in one tar run, then one prompt, "Load the cartridge that holds slice K1+1"; its work directory holds the unpacked envelope and no slice file; alive, with its input on the FIFO and no tape device open | ~15 min |
 | 3 rebuild | `catalog rebuild --from-volume` into a second home: `range_units` 1 to K1 of N; `spans_in_progress` names slices K1+1 to N missing, with no holder (a tape never names a later one); `spn-span` `staged`; `short_seal_filler compare` agrees | ~5 min |
 | 4a re-init | `volume retire SPN-0001` refused ("Finish the span first"); `cartridge erase --dry-run` refused, naming `volume retire`; the filler released; one filemark at BOT; `volume init SPN-0002 --force` warns that `SPN-0001` is now marked erased, and it is | ~5 min |
-| 4b write | `SPN-0002` seals full: `spn-span` `completed` with slices 1 to N, the version `current`; File 0 still states both features | ~15 min |
+| 4b write | `SPN-0002` seals full: `spn-span` `completed` with slices 1 to N, the version `current`; File 0 states `requires = []` | ~15 min |
 | 5 answer | ENTER on the FIFO: RESTORE.sh takes `SPN-0002` ("It gives slice(s) K1+1 to N", by the hashes its seal covers), "RESTORE COMPLETE", exit 0, its scratch removed; the restored tree equals the source's manifest | ~1 h |
 | 6 close | `RESULT.txt` and the cleanup commands; nothing is erased | — |
 
@@ -433,17 +435,17 @@ second, on `d3b7068d`, passed every step (2026-10-29).
 without LBP. If the HP returns no valid CRC for such blocks when LBP_R is armed, 1.7.2 cannot
 verify or restore them with LBP_R, and item 175's fallback applies: LBP_R only for the confirm
 of a session that wrote with LBP. The build carries the switch (`tape::lbp::LBP_R_POLICY`).
-Step 1 answers it two ways:
+Step 1 answers it:
 - **The prototype's route** (`docs/research/lbp-prototype/`). 16 random blocks go to the tape
   with `dd` and the page clear. They are read back with the page armed by hand (method 01h,
   LBP_W and LBP_R) and st at 524,292 bytes. `lbp.py`, a CRC implementation that is not
   tapectl's, checks every CRC, and every payload is compared with what was written. This
-  answers for the drive alone, in a minute.
-- **tapectl's route.** `OLD_BIN`, a tapectl before 1.7.2, writes and seals `LBA-0001`. The
-  candidate's `volume verify --full` reads it back, and its session log says what the
-  candidate armed for the read. This is the path the switch governs.
+  answers for the drive alone, in a minute. It is the only route the script runs now: the
+  second one had a tapectl before 1.7.2 write a Layout 2 tape for the candidate to verify, and
+  a Layout 3 candidate reads no tape of another layout (ADR-0012 items 258 and 269). R1 was
+  answered YES on the HP on 2026-10-28 by both routes.
 
-Both yes, with the candidate built for every read: item 162 stands. The prototype's route says
+Yes, with the candidate built for every read: item 162 stands. The prototype's route says
 no: the run stops and names the policy to build. `--r1-only` stops after step 1 either way, so
 the switch can be decided in about 15 minutes, before the long steps.
 
@@ -457,10 +459,7 @@ the switch can be decided in about 15 minutes, before the long steps.
       past it), so the rehearsal's heir reads only file 2 against the leftover; on the real
       drive every heir read there runs under a time limit, and a hang is a FAIL. Its step 1a runs at a 262,144-byte payload, and mhvtl computes a
       CRC for every block it returns, so its R1 "yes" says nothing of the HP.
-- [ ] Both binaries on home2: the candidate (`TAPECTL_BIN`; 1.8.0's, by ADR-0012 item 183,
-      which carries 1.7.2) and a tapectl from 1.6.0 to
-      1.7.1 (`OLD_BIN`: the installed production one once it is 1.6.0 or later; while home2
-      still runs 1.5.0, the 1.7.0 acceptance build, `~/tapectl-1.7.0-f66d0ff/tapectl`). A debug candidate writes at
+- [ ] The candidate on home2 (`TAPECTL_BIN`). A debug candidate writes at
       about 117 MB/s with the CRC (build plan F9); the rate step says which it measured.
 - [ ] EW7VWMVKF6 loaded; `sudo systemctl stop tapectl-drive-poll.timer`; nothing else uses the
       drive; the host quiet (`docs/operator-guide.md`, "A quiet host while the tape runs").
@@ -468,7 +467,7 @@ the switch can be decided in about 15 minutes, before the long steps.
 
 ```bash
 TAPECTL_HOME="$HOME/.cache/tapectl/lba-home-$(date +%Y%m%d)" \
-TAPECTL_BIN=/path/to/tapectl-1.7.2 OLD_BIN=/usr/local/bin/tapectl \
+TAPECTL_BIN=/path/to/tapectl \
   scripts/lbp-acceptance.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst \
     --i-will-lose-the-cartridge EW7VWMVKF6
 ```
@@ -476,7 +475,7 @@ TAPECTL_BIN=/path/to/tapectl-1.7.2 OLD_BIN=/usr/local/bin/tapectl \
 It refuses (exit 2, nothing touched) when any of these fails:
 - `TAPECTL_HOME` is unset, not empty, or one of production's homes (as for 1.6.0's run).
 - The drive is not HUJ808A5L4, or the chip serial is not EW7VWMVKF6.
-- `TAPECTL_BIN` is older than 1.7.2, or `OLD_BIN` is missing, or not from 1.6.0 to 1.7.1.
+- `TAPECTL_BIN` is older than 1.7.2 (2.0.0 for Layout 3).
 - `TAPECTL_TEST_LBP_CORRUPT_BLOCK` or `TAPECTL_TEST_EARLY_WARNING_AT` is set.
 - The drive's page does not read method 0 with neither check on, or this login cannot open the
   sg node read-write.
@@ -489,7 +488,7 @@ filemark at BOT and `volume init --force`, which marks the volume it displaces `
 | step | must show | time |
 |---|---|---|
 | 0 preflight | read only: the page (current and changeable), block limits, `sg_inq`; the page reads method 0 | ~1 min |
-| 1 r1 | 1a: 16 blocks written without LBP read back with LBP_R, every CRC valid by `lbp.py`, every payload equal; 1b: `OLD_BIN` seals `LBA-0001`, the candidate's verify passes with LBP_R armed. `R1.txt` says what the answer means for item 175 | ~15 min |
+| 1 r1 | 1a: 16 blocks written without LBP read back with LBP_R, every CRC valid by `lbp.py`, every payload equal. `R1.txt` says what the answer means for item 175 | ~15 min |
 | 2 write | three units staged; `LBA-0002` written with `--full-confirm`: `write_lbp` `on`, the session log names the page armed, no fallback warning, a passed full readback; `volume info`'s Write check line | ~45 min (debug staging) |
 | 3 refusal | `LBA-0003` with `TAPECTL_TEST_LBP_CORRUPT_BLOCK=n` in the middle of the data: exit 0, one `write_lbp_retry` event, the session log's item 174 line, sealed, a passed full readback; `dmesg` and the log pages around it | ~5 min |
 | 4 second | `LBA-0004` with the hook at A and at every block from B to C (default A mid-data, B..C = A+64..A+320; `--second-refusal-blocks A,B[-C]`): exit 4, the session interrupted after one `write_lbp_retry`, the message naming the second refusal; then `volume resume` seals it with `write_lbp` `on` | ~5 min |

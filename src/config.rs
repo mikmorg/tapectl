@@ -99,8 +99,11 @@ pub fn default_home() -> PathBuf {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// GNU tar, the writer of Layout 3's data zone (`volume-format-v3.md`
+    /// §3.1; D11). A `[dar]` table is an unknown key, refused by name
+    /// (ADR-0012 item 258(d)).
     #[serde(default)]
-    pub dar: DarConfig,
+    pub tar: TarConfig,
 
     #[serde(default)]
     pub backends: BackendsConfig,
@@ -312,11 +315,29 @@ pub const HOST_CHECK_EXAMPLE: &str = r#"
 # max_io_pressure_pct = 10.0      # /proc/pressure/io full avg60
 "#;
 
+/// `[tar]`: the one key `binary` (D11), a bare name found on `PATH`, or a
+/// path. The floor it is held to is GNU tar 1.35 built with ACL support
+/// (ADR-0012 item 274; `tar::probe`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DarConfig {
-    #[serde(default = "default_dar_binary")]
+pub struct TarConfig {
+    #[serde(default = "default_tar_binary")]
     pub binary: String,
+}
+
+/// Bare `tar`, found on `PATH` when run: never a hard-coded `/usr/bin/tar`,
+/// since a host whose system tar is below the floor has the writer's tar in
+/// `/usr/local` (ADR-0012 item 275).
+fn default_tar_binary() -> String {
+    "tar".to_string()
+}
+
+impl Default for TarConfig {
+    fn default() -> Self {
+        Self {
+            binary: default_tar_binary(),
+        }
+    }
 }
 
 /// `device_sg` as written in the file: a string, never an empty one. Absence
@@ -336,22 +357,6 @@ where
         ));
     }
     Ok(s)
-}
-
-fn default_dar_binary() -> String {
-    // Bare and PATH-resolved (issue #124) -- portable across distros that
-    // install dar to /usr/bin, /usr/local/bin, or elsewhere, and honored by
-    // `config check` (issue #119) exactly like the runtime honors it via
-    // `Command::new`.
-    "dar".to_string()
-}
-
-impl Default for DarConfig {
-    fn default() -> Self {
-        Self {
-            binary: default_dar_binary(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -559,7 +564,7 @@ const AGE_TAG_BYTES: u64 = 16;
 /// payload nonce. 4 KiB is room for a score of recipients.
 const AGE_HEADER_ALLOWANCE_BYTES: u64 = 4096;
 
-/// What one dar slice of `slice_size` bytes takes on the tape once age has
+/// What one slice of `slice_size` bytes takes on the tape once age has
 /// encrypted it and the writer has padded it to whole blocks.
 pub fn slice_bytes_on_tape(slice_size: u64) -> u64 {
     let chunks = slice_size.div_ceil(AGE_CHUNK_BYTES);
@@ -620,7 +625,7 @@ impl LtoBackendConfig {
     }
 
     /// The **plan bound** for a volume of `capacity_bytes` (ADR-0012 item 113;
-    /// `volume-format-v2.md` §4.3, the closing paragraph): how far a plan may
+    /// `volume-format-v3.md` §5.2, the closing paragraph): how far a plan may
     /// reach past the fill ceiling. `Some(capacity_bytes)` — 100% of the
     /// cartridge's nominal capacity, the figure decided at `volume init`
     /// (ADR-0010), never a figure of this drive's — when this drive declares
@@ -789,9 +794,9 @@ impl TapeBudget {
             None => self.describe(),
             Some(bound) => format!(
                 "{}; a batch may reach past the fill ceiling to {} ({bound} bytes), the whole \
-                 nominal capacity, because the drive declares post_warning_bytes: the units \
-                 planned past the ceiling are on the tape only if it reaches them before its \
-                 early warning (ADR-0012 item 113)",
+                 nominal capacity, because the drive declares post_warning_bytes: the unit \
+                 that carries a batch past that continues on the next cartridge, where the \
+                 tape's early warning ends it (ADR-0012 items 113, 288 and 289)",
                 self.describe(),
                 crate::util::format_bytes_decimal(i64::try_from(bound).unwrap_or(i64::MAX)),
             ),
@@ -833,17 +838,16 @@ pub struct ArchiveSetConfig {
     pub required_locations: Option<Vec<String>>,
     pub encrypt: Option<bool>,
     pub compression: Option<String>,
+    /// Item 287: the level this set's `compression` packs at. Absent means
+    /// the set does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_level: Option<i64>,
     pub checksum_mode: Option<String>,
     pub verify_interval_days: Option<i32>,
     pub slice_size: Option<String>,
     pub preserve_xattrs: Option<bool>,
     pub preserve_acls: Option<bool>,
-    pub preserve_fsa: Option<bool>,
     pub dirty_on_metadata_change: Option<bool>,
-    /// #478 (ADR-0012 item 82): whether this set's units may span tapes.
-    /// Absent means the set does not say, and `[defaults]` decides; `sync`
-    /// writes the catalog column only when the table names it.
-    pub allow_spanning: Option<bool>,
     /// #493 (ADR-0012 items 149, 155, 156): how many copies this set's units
     /// should hold at each named location, `copies_at = { home = 1, offsite
     /// = 1 }`. Absent means the set does not say; `sync` writes the catalog
@@ -860,24 +864,21 @@ pub struct DefaultsConfig {
     pub slice_size: String,
     #[serde(default = "default_compression")]
     pub compression: String,
+    /// The level `compression` packs each slice at (item 287; D15): within
+    /// the algorithm's own range (gzip 1-9, xz 0-9, zstd 1-19). Absent: the
+    /// algorithm's default (gzip 6, xz 6, zstd 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_level: Option<i64>,
     #[serde(default = "default_checksum_mode")]
     pub checksum_mode: String,
     #[serde(default = "default_true")]
     pub encrypt: bool,
-    /// Archive extended attributes — and with them POSIX ACLs, which Linux
-    /// stores as extended attributes. `false` drops them all (dar `-u "*"`,
-    /// issue #347; it used to add `-am`, which never touched them).
+    /// Archive extended attributes: gives tar `--xattrs` (D11).
     #[serde(default = "default_true")]
     pub preserve_xattrs: bool,
-    /// No effect of its own: dar has no separate ACL switch, so ACLs follow
-    /// `preserve_xattrs` (issue #50). `config check` notes a value that
-    /// disagrees with it (`policy::subsumed`).
+    /// Archive POSIX ACLs: gives tar `--acls` (D11).
     #[serde(default = "default_true")]
     pub preserve_acls: bool,
-    /// Archive filesystem-specific attributes (Linux chattr flags). `false`
-    /// passes dar `--fsa-scope none` (issue #347).
-    #[serde(default = "default_true")]
-    pub preserve_fsa: bool,
     /// Resolved by the policy chain but read by nothing yet: dirty
     /// detection compares path, size and mtime only. `config check` notes
     /// `true` (`policy::decorative`, issue #347).
@@ -916,12 +917,6 @@ pub struct DefaultsConfig {
     /// that switches the clock off (a very large number comes closest).
     #[serde(default = "default_verify_interval_days")]
     pub verify_interval_days: i64,
-    /// Whether a unit may span tapes by its slices (#478, ADR-0012 item 82),
-    /// as the bottom layer of the policy chain: an `[[archive_sets]]` entry's
-    /// `allow_spanning`, then a unit's dotfile, overrides it. Off when the key
-    /// is absent: every unit is written whole on one tape, as before 1.7.0.
-    #[serde(default)]
-    pub allow_spanning: bool,
     /// Per-location copy targets (#493, ADR-0012 items 149, 156), as the
     /// bottom layer of the policy chain: a map of location name to how many
     /// copies each unit should hold there. An `[[archive_sets]]` entry's
@@ -935,6 +930,39 @@ pub struct DefaultsConfig {
     /// serialized `[defaults]` puts the table after the plain keys.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub copies_at: BTreeMap<String, i64>,
+    /// How many days may pass after the newest recorded heir drill
+    /// (`drill record`) before `audit` warns (`drill_age`; D18, ADR-0012
+    /// item 247). Absent means [`DEFAULT_DRILL_INTERVAL_DAYS`]; at least 1
+    /// ([`validate_drill_interval_days`]). Not written back when absent, so
+    /// `init`'s file is unchanged. Read it through [`Defaults::drill_interval_days`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill_interval_days: Option<i64>,
+}
+
+/// The `[defaults] drill_interval_days` in force when the key is absent: a
+/// year (D18).
+pub const DEFAULT_DRILL_INTERVAL_DAYS: i64 = 365;
+
+impl DefaultsConfig {
+    /// The drill interval in force: the key, or [`DEFAULT_DRILL_INTERVAL_DAYS`].
+    pub fn drill_interval_days(&self) -> i64 {
+        self.drill_interval_days
+            .unwrap_or(DEFAULT_DRILL_INTERVAL_DAYS)
+    }
+}
+
+/// A `drill_interval_days`: at least one day. At 0 or below every drill is
+/// always overdue, an off switch wearing an interval's clothes.
+pub fn validate_drill_interval_days(days: i64) -> std::result::Result<(), String> {
+    if days >= 1 {
+        Ok(())
+    } else {
+        Err(
+            "must be >= 1 (how many days may pass after the newest recorded heir drill \
+             before `audit` warns that one is due)"
+                .to_string(),
+        )
+    }
 }
 
 /// The `[defaults] verify_interval_days` in force when the key is absent: a
@@ -947,7 +975,7 @@ fn default_verify_interval_days() -> i64 {
 
 fn default_slice_size() -> String {
     // Ratified 2026-10-06 (ADR-0012, amendment 2026-10-06; was 10G from
-    // 2026-07-22, docs/design/v2-open-questions.md §1.3). dar -s is an exact
+    // 2026-07-22, docs/design/v2-open-questions.md §1.3). `slice_size` is an exact
     // per-slice cut and a per-unit max; 1G ≈ 2,300 slices per LTO-6 tape. A
     // slice is the unit that must still fit after the drive's early warning
     // once a short seal exists (#420), and the most a single-file restore or a
@@ -979,25 +1007,23 @@ impl Default for DefaultsConfig {
         Self {
             slice_size: default_slice_size(),
             compression: default_compression(),
+            compression_level: None,
             checksum_mode: default_checksum_mode(),
             encrypt: true,
             preserve_xattrs: true,
             preserve_acls: true,
-            preserve_fsa: true,
             dirty_on_metadata_change: false,
-            global_excludes: vec![
-                "*.nfo".into(),
-                "Thumbs.db".into(),
-                ".DS_Store".into(),
-                "*.tmp".into(),
-            ],
+            // ADR-0012 item 252 (#542): no file is left out unless the
+            // operator names the pattern. The old list (`*.nfo`, `Thumbs.db`,
+            // `.DS_Store`, `*.tmp`) was a guess about what is junk.
+            global_excludes: Vec::new(),
             large_file_warn_threshold: default_large_file_warn(),
             min_copies: default_min_copies(),
             min_locations: default_min_locations(),
             warehouse_copies: 0,
             verify_interval_days: DEFAULT_VERIFY_INTERVAL_DAYS,
-            allow_spanning: false,
             copies_at: BTreeMap::new(),
+            drill_interval_days: None,
         }
     }
 }
@@ -1007,12 +1033,6 @@ impl Default for DefaultsConfig {
 pub struct StagingConfig {
     #[serde(default = "default_staging_dir")]
     pub directory: String,
-    /// How many source files one `stage create` hashes at once (issue
-    /// #366), at most the host's cores. Each thread reads its own file, so
-    /// on a single spinning disk more threads can mean more seeking; 1 is
-    /// the serial pass.
-    #[serde(default = "default_hash_threads")]
-    pub hash_threads: usize,
     /// How many units `stage create`, `collection run` and first-run stage
     /// at once (issue #368); `stage create --jobs` and `collection run
     /// --jobs` override it. 1 stages one unit after another.
@@ -1022,10 +1042,6 @@ pub struct StagingConfig {
 
 fn default_stage_jobs() -> usize {
     crate::staging::jobs::DEFAULT_JOBS
-}
-
-fn default_hash_threads() -> usize {
-    crate::staging::validate::DEFAULT_HASH_THREADS
 }
 
 /// Issue #140: this was `/mnt/staging`, a path that does not exist on a
@@ -1051,7 +1067,6 @@ impl Default for StagingConfig {
     fn default() -> Self {
         Self {
             directory: default_staging_dir(),
-            hash_threads: default_hash_threads(),
             jobs: default_stage_jobs(),
         }
     }
@@ -1498,15 +1513,6 @@ impl Config {
     /// [`Config::load_tolerating_backend_ambiguity`] and
     /// [`Config::from_text`] share.
     fn from_text_without_backend_check(content: &str, path: &Path) -> Result<Self> {
-        // ADR-0010 renamed `backends.lto[].media_type`/`.nominal_capacity` to
-        // `.generation`/`.capacity_override`, and `LtoBackendConfig` now
-        // rejects unknown fields — a stale config with either old key would
-        // otherwise fail with serde's generic "unknown field" message. Catch
-        // it here, before serde ever sees it, so the operator gets the exact
-        // remediation instead.
-        if let Some(msg) = stale_lto_fields_message(content) {
-            return Err(TapectlError::Config(format!("{}: {msg}", path.display())));
-        }
         // Issue #171 / ADR-0012: every section now carries
         // `#[serde(deny_unknown_fields)]`, so a typo anywhere in the file —
         // not just `[[backends.lto]]` — fails here by name, naming the FILE
@@ -1569,8 +1575,21 @@ impl Config {
     /// pins a substring of one) are unaffected by this refactor.
     pub(crate) fn size_problems(&self, path: &Path) -> Vec<String> {
         let mut problems = Vec::new();
-        if let Err(e) = crate::staging::parse_size_to_bytes(&self.defaults.slice_size) {
-            problems.push(format!("{}: defaults.slice_size = {e}", path.display()));
+        match crate::staging::parse_size_to_bytes(&self.defaults.slice_size) {
+            Err(e) => problems.push(format!("{}: defaults.slice_size = {e}", path.display())),
+            Ok(bytes) => {
+                if let Some(e) = slice_size_block_problem(bytes) {
+                    problems.push(format!(
+                        "{}: defaults.slice_size = {:?}: {e}",
+                        path.display(),
+                        self.defaults.slice_size
+                    ));
+                }
+            }
+        }
+        if let Some(e) = level_problem(&self.defaults.compression, self.defaults.compression_level)
+        {
+            problems.push(format!("{}: defaults.{e}", path.display()));
         }
         if let Err(e) =
             crate::staging::parse_size_to_bytes(&self.defaults.large_file_warn_threshold)
@@ -1622,14 +1641,49 @@ impl Config {
         // (issue #200's rule: one parser per field, never a second one).
         for (i, as_cfg) in self.archive_sets.iter().enumerate() {
             if let Some(s) = &as_cfg.slice_size {
-                if let Err(e) = crate::staging::parse_size_to_bytes(s) {
-                    problems.push(format!(
+                match crate::staging::parse_size_to_bytes(s) {
+                    Err(e) => problems.push(format!(
                         "{}: archive_sets[{i}] (\"{}\").slice_size = {e}",
+                        path.display(),
+                        as_cfg.name
+                    )),
+                    Ok(bytes) => {
+                        if let Some(e) = slice_size_block_problem(bytes) {
+                            problems.push(format!(
+                                "{}: archive_sets[{i}] (\"{}\").slice_size = {s:?}: {e}",
+                                path.display(),
+                                as_cfg.name
+                            ));
+                        }
+                    }
+                }
+            }
+            // A level is judged against the set's own algorithm when it names
+            // one; otherwise against the algorithm a unit resolves, at stage.
+            if let (Some(c), Some(_)) = (&as_cfg.compression, as_cfg.compression_level) {
+                if let Some(e) = level_problem(c, as_cfg.compression_level) {
+                    problems.push(format!(
+                        "{}: archive_sets[{i}] (\"{}\").{e}",
                         path.display(),
                         as_cfg.name
                     ));
                 }
             }
+        }
+        let origin = format!("{}: defaults.global_excludes", path.display());
+        problems.extend(
+            self.defaults
+                .global_excludes
+                .iter()
+                .filter_map(|p| crate::staging::exclude::pattern_problem(p, &origin)),
+        );
+        for c in &self.collections {
+            let origin = format!("{}: collections \"{}\" exclude", path.display(), c.name);
+            problems.extend(
+                c.exclude
+                    .iter()
+                    .filter_map(|p| crate::staging::exclude::pattern_problem(p, &origin)),
+            );
         }
         problems
     }
@@ -1638,7 +1692,7 @@ impl Config {
     /// `[defaults].compression` / `.checksum_mode` used to accept any
     /// string even though the archive-set path already validates the same
     /// two fields (`cli::archive_set::validate_compression_capability`), so
-    /// a typo here surfaced as a raw `dar -zbanana` failure at stage time,
+    /// a typo here surfaced as a failure at stage time,
     /// hours later, or an opaque SQLite CHECK-constraint failure when a
     /// unit was finally written with a bad `checksum_mode`.
     ///
@@ -1795,6 +1849,15 @@ impl Config {
                 ));
             }
         }
+        // D18: the drill clock's interval.
+        if let Some(days) = self.defaults.drill_interval_days {
+            if let Err(e) = validate_drill_interval_days(days) {
+                problems.push(format!(
+                    "{}: defaults.drill_interval_days = {days} {e}",
+                    path.display()
+                ));
+            }
+        }
         // ADR-0012 2026-10-16 item 75 (#455): a collection's snapshot hook.
         for (i, lib) in self.collections.iter().enumerate() {
             for (key, value) in [
@@ -1884,18 +1947,6 @@ impl Config {
                  is flagged when its corrected read errors per GiB rise by more than this \
                  factor between two verifies)",
                 path.display()
-            ));
-        }
-        // `[staging] hash_threads` (issue #366): 0 would hash nothing, and a
-        // count past any host's cores is a typo, not a plan.
-        let threads = self.staging.hash_threads;
-        if !(1..=crate::staging::validate::MAX_HASH_THREADS).contains(&threads) {
-            problems.push(format!(
-                "{}: staging.hash_threads = {threads} must be between 1 and {} (how many \
-                 source files `stage create` hashes at once; it never runs more than the \
-                 host's cores)",
-                path.display(),
-                crate::staging::validate::MAX_HASH_THREADS
             ));
         }
         // `[staging] jobs` (issue #368).
@@ -2111,215 +2162,6 @@ fn config_file_named(config_file: Option<&Path>) -> String {
     )
 }
 
-/// If `content` (raw, unparsed config TOML) still carries a key with a
-/// known history — renamed, deleted outright, or merely confusable with a
-/// different real setting — return the exact remediation message for it,
-/// rather than serde's generic "unknown field" line.
-///
-/// Several cases feed this. ADR-0010 RENAMED `backends.lto[].media_type` /
-/// `.nominal_capacity`, so their message says where the fact went. Spec W4
-/// DELETED `backends.lto[].block_size`, `.hardware_compression` and
-/// `packing.min_free_for_append` outright because nothing ever read them;
-/// issue #172 deletes four more the same way — `packing.strategy`,
-/// `packing.fill_threshold`, `labels.format`, `defaults.hash` — which is
-/// also why the WHOLE `[packing]` and `[labels]` sections are gone rather
-/// than just those fields: with `min_free_for_append` already deleted,
-/// `strategy`/`fill_threshold` were `PackingConfig`'s only members, and
-/// `format` was `LabelsConfig`'s only member. Every "deleted outright"
-/// message says why there is nowhere for the value to go. Issue #348
-/// RENAMED `defaults.min_copies_for_tape_only` / `.min_locations_for_tape_only`
-/// to `defaults.min_copies` / `.min_locations`, so their message names the
-/// new keys. As of issue #171 / ADR-0012,
-/// EVERY section carries `#[serde(deny_unknown_fields)]`, so serde alone
-/// would already reject all of these — this pre-scan exists to say
-/// something more useful than "unknown field" for the keys whose history we
-/// actually know, not to catch what serde otherwise misses.
-///
-/// Parses `content` as generic `toml::Value` rather than scanning lines by
-/// hand, so comments and quoting are handled the way TOML actually defines
-/// them, not approximately. Returns `None` (letting the normal parse error
-/// surface unchanged) when `content` is not even syntactically valid TOML —
-/// this check only ever *sharpens* an error that was going to happen anyway,
-/// never introduces a new failure mode of its own.
-///
-/// The `[[backends.lto]]`, `[packing]`, `[labels]` and `[defaults]` scans
-/// are INDEPENDENT: a config missing any three of the four sections must
-/// still be told about a stale key in the fourth, so none may short-circuit
-/// the others.
-fn stale_lto_fields_message(content: &str) -> Option<String> {
-    let value: toml::Value = toml::from_str(content).ok()?;
-    if let Some(msg) = stale_backend_fields_message(&value) {
-        return Some(msg);
-    }
-    if let Some(msg) = stale_packing_fields_message(&value) {
-        return Some(msg);
-    }
-    if let Some(msg) = stale_labels_fields_message(&value) {
-        return Some(msg);
-    }
-    stale_defaults_fields_message(&value)
-}
-
-/// The `[[backends.lto]]` half of [`stale_lto_fields_message`].
-fn stale_backend_fields_message(value: &toml::Value) -> Option<String> {
-    let backends = value.get("backends")?.get("lto")?.as_array()?;
-    for entry in backends {
-        let table = entry.as_table()?;
-        let name = table.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-        if table.contains_key("media_type") || table.contains_key("nominal_capacity") {
-            return Some(format!(
-                "backends.lto[\"{name}\"]: \"media_type\" and \"nominal_capacity\" moved — \
-                 declare the DRIVE's generation as generation = \"LTO-6\"; capacity now \
-                 follows the cartridge's generation (ADR-0010); capacity_override is for \
-                 virtual drives only"
-            ));
-        }
-        if table.contains_key("block_size") {
-            return Some(format!(
-                "backends.lto[\"{name}\"]: \"block_size\" was removed — the write path's block \
-                 size is a FORMAT CONSTANT (512 KiB, volume-format-v2.md §1/D7), not a drive \
-                 setting: the on-tape recovery text an heir reads has it baked in, so a \
-                 per-drive value could only ever disagree with the tape. Delete the line."
-            ));
-        }
-        if table.contains_key("hardware_compression") {
-            return Some(format!(
-                "backends.lto[\"{name}\"]: \"hardware_compression\" was removed — the write \
-                 path disables drive compression unconditionally on every open \
-                 (TapeStore::open -> MTCOMPRESSION 0), so the knob could never re-enable it \
-                 and a true value was silently ignored. Delete the line."
-            ));
-        }
-        // Issue #391 (ADR-0012, 2026-10-06 item 16): renamed, same meaning —
-        // the fraction of a cartridge's capacity a write may fill. Refused
-        // by name rather than silently reinterpreted, as #348's renames were.
-        if table.contains_key("usable_capacity_factor") {
-            return Some(format!(
-                "backends.lto[\"{name}\"]: \"usable_capacity_factor\" was renamed \
-                 \"fill_ceiling\", with the same meaning: the fraction of a cartridge's \
-                 capacity a write may fill (ADR-0012, 2026-10-06; the default is now 0.97). \
-                 Rename the line to keep your value, or delete it to take the default."
-            ));
-        }
-    }
-    None
-}
-
-/// The `[packing]` half of [`stale_lto_fields_message`].
-///
-/// The whole `[packing]` table is gone as of issue #172: `min_free_for_append`
-/// was already deleted (spec W4, ADR-0003 — append is rejected outright), and
-/// `strategy`/`fill_threshold` were `PackingConfig`'s only other fields, with
-/// no reader anywhere (`grep -rn 'packing\.' src/ --include=*.rs` outside this
-/// file returns nothing) — the real batch selector is alphabetical next-fit
-/// (`src/collection/`), never a configurable best-fit-decreasing strategy,
-/// and no code ever consulted a fill threshold.
-fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
-    let packing = value.get("packing")?.as_table()?;
-    if packing.contains_key("min_free_for_append") {
-        return Some(
-            "packing.min_free_for_append was removed — append is rejected outright \
-             (ADR-0003), so there has never been an append path for this to gate. \
-             Delete the line."
-                .to_string(),
-        );
-    }
-    if packing.contains_key("strategy") || packing.contains_key("fill_threshold") {
-        return Some(
-            "the [packing] section was removed (ADR-0012) — `strategy` and \
-             `fill_threshold` were parsed but never read: the real batch selector is \
-             alphabetical next-fit (src/collection/), not a configurable best-fit \
-             strategy, and no code ever consulted a fill threshold. Delete the \
-             [packing] table."
-                .to_string(),
-        );
-    }
-    None
-}
-
-/// The `[labels]` half of [`stale_lto_fields_message`] (issue #172):
-/// `format` was `LabelsConfig`'s only field and had no reader — volume
-/// labels are always operator-supplied (`--label`), never generated from a
-/// template, so the whole `[labels]` section is gone.
-fn stale_labels_fields_message(value: &toml::Value) -> Option<String> {
-    let labels = value.get("labels")?.as_table()?;
-    if labels.contains_key("format") {
-        return Some(
-            "the [labels] section was removed (ADR-0012) — `format` was \
-             parsed but never read: volume labels are always operator-supplied \
-             (`--label`), not generated from a template. Delete the [labels] table."
-                .to_string(),
-        );
-    }
-    None
-}
-
-/// The `[defaults]` half of [`stale_lto_fields_message`].
-///
-/// Issue #348 (CTO ruling 2026-09-28; no ADR records it — ADR-0012's
-/// 2026-09-28 amendment is the home2 move only):
-/// `min_copies_for_tape_only` / `min_locations_for_tape_only` were renamed
-/// `min_copies` / `min_locations`. The old names said "tape-only", but the
-/// copy requirement is the bottom layer of every unit's policy
-/// (`policy::resolve`), not a tape-only rule — the name misled operators.
-/// Same meaning, same values: a stale config is refused with the rename to
-/// make, never silently reinterpreted. This inverts issue #129's refusal,
-/// which turned `defaults.min_copies` away because it was then NOT the real
-/// knob; it now is.
-///
-/// Both old names get the one message, naming both new keys, because a
-/// config written by an older `init` carries both.
-///
-/// `hash` is issue #172's fourth deletion: every checksum path is sha256,
-/// hardcoded (`sha2` crate, `checksum_mode` governs WHEN it runs, never
-/// which algorithm), so the field had no reader to disagree with a
-/// non-default value in the first place.
-fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
-    let defaults = value.get("defaults")?.as_table()?;
-    let renamed: Vec<&str> = RENAMED_DEFAULTS_KEYS
-        .iter()
-        .filter(|(old, _)| defaults.contains_key(*old))
-        .map(|(old, _)| *old)
-        .collect();
-    if !renamed.is_empty() {
-        return Some(format!(
-            "defaults.{} renamed: the keys are now defaults.min_copies and \
-             defaults.min_locations, with the same meaning — the copy requirement every \
-             unit starts from (an [[archive_sets]] entry's min_copies overrides it) and \
-             the number of distinct locations a tape-only unit's copies must span. Rename \
-             {}; the values carry over unchanged.",
-            match renamed.as_slice() {
-                [one] => format!("{one} was"),
-                _ => format!("{} were", renamed.join(" and defaults.")),
-            },
-            if renamed.len() == 1 {
-                "the line"
-            } else {
-                "the lines"
-            },
-        ));
-    }
-    if defaults.contains_key("hash") {
-        return Some(
-            "defaults.hash was removed (ADR-0012) — nothing ever read it: \
-             every checksum tapectl computes is sha256, hardcoded; `defaults.checksum_mode` \
-             is the real knob (it governs WHEN a checksum is taken, not which algorithm). \
-             Delete the line."
-                .to_string(),
-        );
-    }
-    None
-}
-
-/// `[defaults]` keys renamed by issue #348, old name first. Shared by the
-/// load-time refusal ([`stale_defaults_fields_message`]) and `config
-/// check`'s `[defaults]` scan (`policy::unknown_keys`), so the two cannot
-/// disagree about what the new names are.
-pub const RENAMED_DEFAULTS_KEYS: &[(&str, &str)] = &[
-    ("min_copies_for_tape_only", "min_copies"),
-    ("min_locations_for_tape_only", "min_locations"),
-];
-
 /// Membership check shared by every ADR-0012 boundary validator (issue
 /// #171): compression, checksum mode, and each `--status` filter across the
 /// CLI (`cli::cartridge`, `cli::unit`, `cli::stage`, `cli::snapshot`,
@@ -2341,16 +2183,36 @@ pub fn validate_closed_set(
     }
 }
 
-/// Compression algorithms `dar` accepts via `-z`. Moved here from
-/// `cli::archive_set` under issue #171 so `[defaults].compression` and an
-/// `[[archive_sets]]` entry's `compression` share one syntactic check —
-/// previously only the archive-set path validated this at all, so a typo in
-/// `[defaults]` surfaced as a raw `dar -zbanana` failure at stage time.
-/// Whether the LOCAL `dar` binary was actually compiled with a given codec
-/// is a separate, capability-probing question
-/// (`cli::archive_set::validate_compression_capability`), which wraps this.
-pub const VALID_COMPRESSION_VALUES: &[&str] =
-    &["none", "gzip", "bzip2", "lzo", "xz", "lzma", "zstd", "lz4"];
+/// #562: a `slice_size` is a positive multiple of 512 bytes wherever it is
+/// set, so that a slice's cut is whole tar blocks (`volume-format-v3.md`
+/// §3.3). The problem, or `None`.
+pub fn slice_size_block_problem(bytes: i64) -> Option<String> {
+    if bytes > 0 && bytes % 512 == 0 {
+        return None;
+    }
+    Some(format!(
+        "{bytes} bytes is not a positive multiple of 512: a slice holds whole tar blocks \
+         (volume-format-v3.md §3.3); use a multiple of 512 bytes, such as 1G"
+    ))
+}
+
+/// Item 287: a `compression_level` beside `compression`, in the algorithm's
+/// own range. `compression_level = …` and why, or `None`. A level beside
+/// `none`, or beside an algorithm Layout 3 does not carry (refused where
+/// the algorithm is), is not judged here.
+pub fn level_problem(compression: &str, level: Option<i64>) -> Option<String> {
+    let level = level?;
+    if !matches!(compression, "gzip" | "xz" | "zstd") {
+        return None;
+    }
+    crate::staging::pack_level_problem(compression, level)
+}
+
+/// The compression values: `none` and the three algorithms tapectl carries
+/// and compresses in-process (ADR-0012 items 285, 286; D11). One check for
+/// `[defaults].compression` and an `[[archive_sets]]` entry's `compression`
+/// (issue #171); there is no capability probe, because no host tool is asked.
+pub const VALID_COMPRESSION_VALUES: &[&str] = &["none", "gzip", "xz", "zstd"];
 
 pub fn validate_compression(value: &str) -> std::result::Result<(), String> {
     validate_closed_set("compression", value, VALID_COMPRESSION_VALUES)
@@ -2719,7 +2581,6 @@ pub struct TapectlPaths {
     pub config_file: PathBuf,
     pub db_file: PathBuf,
     pub keys_dir: PathBuf,
-    pub catalogs_dir: PathBuf,
     /// The per-stage-set text reports `stage create` writes (slice sizes
     /// and hashes). Not "receipts": that word means the recipient list a
     /// stage set was encrypted to (CONTEXT.md, issue #361).
@@ -2727,17 +2588,12 @@ pub struct TapectlPaths {
     pub logs_dir: PathBuf,
 }
 
-/// The directory stage reports lived in before issue #361, moved to
-/// [`TapectlPaths::stage_reports_dir`] once by [`TapectlPaths::ensure_dirs`].
-const LEGACY_STAGE_REPORTS_DIR: &str = "receipts";
-
 impl TapectlPaths {
     pub fn new(home: PathBuf) -> Self {
         Self {
             config_file: home.join("config.toml"),
             db_file: home.join("tapectl.db"),
             keys_dir: home.join("keys"),
-            catalogs_dir: home.join("catalogs"),
             stage_reports_dir: home.join("stage-reports"),
             logs_dir: home.join("logs"),
             home,
@@ -2758,7 +2614,7 @@ impl TapectlPaths {
     /// (freshly created or pre-existing) to 0700.
     ///
     /// Issue #41: `~/.tapectl` holds the plaintext content-metadata index
-    /// (`tapectl.db`, stage reports, dar catalogs) the on-tape format works hard
+    /// (`tapectl.db`, stage reports, file tables) the on-tape format works hard
     /// to keep out of plaintext — leaving the directory tree at whatever
     /// the process umask hands out (0755 on a stock single-user box)
     /// contradicts that. Tightening runs every call, not just on first
@@ -2786,10 +2642,6 @@ impl TapectlPaths {
     /// not give the group stays 0700 — fail closed, never open to the group
     /// it happened to have.
     pub fn ensure_dirs_shared(&self, ops_group: Option<&str>) -> Result<()> {
-        // Before the create loop, or it would create an empty
-        // stage-reports/ first and the "both exist" rule below would then
-        // block the move for good.
-        self.move_legacy_stage_reports_dir();
         let gid = ops_group.and_then(|name| {
             let found = nix::unistd::Group::from_name(name).ok().flatten();
             if found.is_none() {
@@ -2810,7 +2662,6 @@ impl TapectlPaths {
         for dir in [
             &self.home,
             &self.keys_dir,
-            &self.catalogs_dir,
             &self.stage_reports_dir,
             &self.logs_dir,
             &locks_dir,
@@ -2879,33 +2730,6 @@ impl TapectlPaths {
         }
     }
 
-    /// Issue #361: a home created before the rename keeps its stage
-    /// reports in `<home>/receipts/`. Move that directory to
-    /// `stage_reports_dir` once — only when the new one does not exist yet.
-    /// When both exist, both are left exactly as they are (nothing is
-    /// merged) and new reports go to `stage-reports/`.
-    ///
-    /// Never fails the caller, like the rest of `ensure_dirs`: a rename
-    /// that cannot happen (permissions, a read-only home) is a warning, and
-    /// the create loop then makes an empty `stage-reports/` beside the old
-    /// directory — the same "both exist" state an operator can resolve by
-    /// hand.
-    fn move_legacy_stage_reports_dir(&self) {
-        let legacy = self.home.join(LEGACY_STAGE_REPORTS_DIR);
-        if !legacy.is_dir() || self.stage_reports_dir.exists() {
-            return;
-        }
-        if let Err(e) = std::fs::rename(&legacy, &self.stage_reports_dir) {
-            tracing::warn!(
-                from = %legacy.display(),
-                to = %self.stage_reports_dir.display(),
-                error = %e,
-                "could not move the stage-report directory to its new name; \
-                 new stage reports go to the new directory, the old ones stay where they are"
-            );
-        }
-    }
-
     /// Check if tapectl has been initialized (DB exists).
     pub fn is_initialized(&self) -> bool {
         self.db_file.exists()
@@ -2918,7 +2742,7 @@ mod tests {
     //! so it ends up whatever the process umask hands out — on a stock
     //! single-user box (umask 022) that's 0755 dirs / 0644 files, which
     //! leaves the plaintext content-metadata index (tapectl.db, stage reports,
-    //! dar catalogs) world-readable. These tests assert actual mode bits,
+    //! file tables) world-readable. These tests assert actual mode bits,
     //! never "does it not error", since that's exactly the class of test
     //! that would pass whether or not the fix is present.
     use super::*;
@@ -2937,7 +2761,6 @@ mod tests {
         vec![
             ("home", paths.home.clone()),
             ("keys_dir", paths.keys_dir.clone()),
-            ("catalogs_dir", paths.catalogs_dir.clone()),
             ("stage_reports_dir", paths.stage_reports_dir.clone()),
             ("logs_dir", paths.logs_dir.clone()),
             // Issue #393: made by the home's preparation, not first by the
@@ -3146,12 +2969,12 @@ mod tests {
         );
     }
 
-    // --- receipts/ -> stage-reports/ (issue #361) ---------------------------
+    // --- stage-reports/ (issue #361) ----------------------------------------
     //
     // "Receipt" means the recipient list a stage set was encrypted to
     // (CONTEXT.md); the per-stage-set text files are stage reports, in
-    // <home>/stage-reports/. An existing home's <home>/receipts/ is moved
-    // there once, by `ensure_dirs` (every initialized command runs it).
+    // <home>/stage-reports/. A 1.x home's receipts/ is not moved (ADR-0012
+    // item 258(d)).
 
     #[test]
     fn ensure_dirs_creates_stage_reports_not_receipts() {
@@ -3160,52 +2983,6 @@ mod tests {
         TapectlPaths::new(home.clone()).ensure_dirs().unwrap();
         assert!(home.join("stage-reports").is_dir());
         assert!(!home.join("receipts").exists());
-    }
-
-    #[test]
-    fn ensure_dirs_moves_a_legacy_receipts_dir_to_stage_reports_once() {
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path().join(".tapectl");
-        let legacy = home.join("receipts");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("20260901_7.txt"), b"old report").unwrap();
-
-        let paths = TapectlPaths::new(home.clone());
-        paths.ensure_dirs().unwrap();
-
-        let moved = home.join("stage-reports").join("20260901_7.txt");
-        assert_eq!(std::fs::read(&moved).unwrap(), b"old report");
-        assert!(
-            !legacy.exists(),
-            "the legacy directory was moved, not copied"
-        );
-        assert_eq!(mode_of(&home.join("stage-reports")), 0o700);
-
-        // Idempotent: a second run finds nothing to move and changes nothing.
-        paths.ensure_dirs().unwrap();
-        assert_eq!(std::fs::read(&moved).unwrap(), b"old report");
-        assert!(!legacy.exists());
-    }
-
-    #[test]
-    fn ensure_dirs_leaves_both_when_stage_reports_already_exists() {
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path().join(".tapectl");
-        let legacy = home.join("receipts");
-        let current = home.join("stage-reports");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::write(legacy.join("old.txt"), b"old").unwrap();
-        std::fs::write(current.join("new.txt"), b"new").unwrap();
-
-        TapectlPaths::new(home.clone()).ensure_dirs().unwrap();
-
-        assert_eq!(std::fs::read(legacy.join("old.txt")).unwrap(), b"old");
-        assert_eq!(std::fs::read(current.join("new.txt")).unwrap(), b"new");
-        assert!(
-            !current.join("old.txt").exists(),
-            "nothing is merged when both exist"
-        );
     }
 
     #[test]
@@ -3349,189 +3126,123 @@ mod tests {
         assert_ne!(dir, "/mnt/staging");
     }
 
-    // ---- ADR-0010: stale-field pre-scan ----
-
-    #[test]
-    fn stale_media_type_is_named_with_the_exact_remediation() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\nmedia_type = \"LTO-6\"\n\
-                     nominal_capacity = \"2.5TB\"\n";
-        let msg = stale_lto_fields_message(text).expect("must be flagged");
-        assert!(msg.contains("backends.lto[\"lto1\"]"), "{msg}");
-        assert!(
-            msg.contains("media_type") && msg.contains("nominal_capacity"),
-            "{msg}"
-        );
-        assert!(msg.contains("ADR-0010"), "{msg}");
-    }
-
-    #[test]
-    fn stale_nominal_capacity_alone_is_also_flagged() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
-                     nominal_capacity = \"2.5TB\"\n";
-        assert!(stale_lto_fields_message(text).is_some());
-    }
-
-    #[test]
-    fn a_clean_generation_only_backend_is_not_flagged() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n";
-        assert!(stale_lto_fields_message(text).is_none());
-    }
-
-    // ---- Spec W4: removed keys are named, with the reason ----
-
-    #[test]
-    fn a_removed_block_size_is_named_with_the_format_constant_reason() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
-                     block_size = \"512K\"\n";
-        let msg = stale_lto_fields_message(text).expect("must be flagged");
-        assert!(msg.contains("block_size"), "{msg}");
-        assert!(msg.contains("FORMAT CONSTANT"), "{msg}");
-        assert!(msg.contains("volume-format-v2.md"), "{msg}");
-    }
-
-    #[test]
-    fn a_removed_hardware_compression_is_named_with_the_always_off_reason() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
-                     hardware_compression = false\n";
-        let msg = stale_lto_fields_message(text).expect("must be flagged");
-        assert!(msg.contains("hardware_compression"), "{msg}");
-        assert!(msg.contains("MTCOMPRESSION"), "{msg}");
-    }
-
-    /// `PackingConfig` now carries `#[serde(deny_unknown_fields)]` too
-    /// (issue #171), so serde alone would already reject a stale
-    /// `min_free_for_append` — this pre-scan exists to give the ADR-0003
-    /// reason instead of serde's generic "unknown field" line.
-    #[test]
-    fn a_removed_min_free_for_append_is_named_with_adr_0003() {
-        let text = "[packing]\nmin_free_for_append = \"50G\"\n";
-        let msg = stale_lto_fields_message(text).expect("must be flagged");
-        assert!(msg.contains("min_free_for_append"), "{msg}");
-        assert!(msg.contains("ADR-0003"), "{msg}");
-    }
-
-    /// The scans must not short-circuit each other: a config with a
-    /// stale `[packing]` key and no `[[backends.lto]]` at all is the exact
-    /// shape a naive single-expression scan would miss.
-    #[test]
-    fn a_stale_packing_key_is_found_with_no_backends_configured() {
-        let text = "[packing]\nstrategy = \"best_fit_decreasing\"\n\
-                     min_free_for_append = \"50G\"\n";
-        assert!(stale_lto_fields_message(text).is_some());
-    }
-
-    #[test]
-    fn config_load_rejects_a_removed_key_with_the_friendly_message() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-             device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
-             block_size = \"512K\"\nhardware_compression = false\n",
-        )
-        .unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("block_size"), "{msg}");
-        assert!(msg.contains("was removed"), "{msg}");
-    }
-
-    /// Issue #172 item 4's pin, and ADR-0012's ratified acceptance
-    /// criterion verbatim: "a config carrying `packing.fill_threshold`
-    /// fails to load naming the key". This is INTENTIONAL, not a
-    /// regression to soften later — #171's ruling on `deny_unknown_fields`
-    /// is explicit that a key which silently reads as its default is the
-    /// failure that never gets noticed. Before #172 this exact fixture
-    /// (`[packing] strategy = ...` / `fill_threshold = ...`) was the
-    /// positive control proving `[packing]` still had LIVE, non-stale keys
-    /// — it flips here because #172 establishes that it never did.
-    #[test]
-    fn a_config_carrying_packing_fill_threshold_fails_to_load_naming_the_key() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[packing]\nstrategy = \"best_fit_decreasing\"\nfill_threshold = 0.95\n",
-        )
-        .unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("fill_threshold"), "{msg}");
-        assert!(msg.contains("removed"), "{msg}");
-    }
-
-    #[test]
-    fn a_config_carrying_labels_format_fails_to_load_naming_the_key() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[labels]\nformat = \"L{gen}-{seq:04}\"\n").unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("format"), "{msg}");
-        assert!(msg.contains("removed"), "{msg}");
-    }
-
-    /// Issue #348 (CTO ruling 2026-09-28): `[defaults]
-    /// min_copies_for_tape_only` / `min_locations_for_tape_only` were renamed
-    /// `min_copies` / `min_locations` — same meaning, the bottom policy layer
-    /// for every unit. A config still carrying either old name is refused
-    /// with a message naming the new ones, one key at a time or both at once.
-    #[test]
-    fn a_config_carrying_the_old_tape_only_names_is_refused_naming_the_new_keys() {
-        for body in [
-            "[defaults]\nmin_copies_for_tape_only = 3\n",
-            "[defaults]\nmin_locations_for_tape_only = 1\n",
-            "[defaults]\nmin_copies_for_tape_only = 3\nmin_locations_for_tape_only = 1\n",
-        ] {
-            let tmp = TempDir::new().unwrap();
-            let path = tmp.path().join("config.toml");
-            std::fs::write(&path, body).unwrap();
-            let msg = Config::load(&path).unwrap_err().to_string();
-            assert!(msg.contains("renamed"), "{body:?} -> {msg}");
-            assert!(
-                msg.contains("defaults.min_copies ") || msg.contains("defaults.min_copies,"),
-                "must name the new copy key: {body:?} -> {msg}"
-            );
-            assert!(
-                msg.contains("defaults.min_locations"),
-                "must name the new location key: {body:?} -> {msg}"
-            );
-            // #468: only the copy requirement starts every unit; the place
-            // floor binds a tape-only unit alone.
-            assert!(
-                msg.contains("distinct locations a tape-only unit's copies must span"),
-                "must say whom min_locations binds: {body:?} -> {msg}"
-            );
-            assert!(
-                !msg.contains("copy and location requirement every unit starts from"),
-                "min_locations is not every unit's requirement: {body:?} -> {msg}"
-            );
-        }
-    }
-
     // ---- issue #391: the fill ceiling ----
 
     const LTO_BLOCK: &str = "[[backends.lto]]\nname = \"d\"\ndevice_tape = \"/dev/null\"\n\
                              device_sg = \"/dev/null\"\ngeneration = \"LTO-6\"\n";
 
-    /// `usable_capacity_factor` was renamed `fill_ceiling` (ADR-0012,
-    /// 2026-10-06 item 16): a config still carrying it is refused by name,
-    /// with the new key, never silently read as the old 0.92 or dropped.
-    #[test]
-    fn a_config_carrying_usable_capacity_factor_is_refused_naming_fill_ceiling() {
+    // ---- ADR-0012 item 258(d): an old key is an unknown key ----
+    //
+    // 1.x refused these by name, with a remediation; 2.0 keeps no list of
+    // them. Each is refused by the same `deny_unknown_fields` as a typo, and
+    // none may ever load.
+
+    /// `Config::load` of `body`, which must fail as an unknown field naming
+    /// `key`.
+    fn assert_refused_as_unknown(body: &str, key: &str) {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(&path, format!("{LTO_BLOCK}usable_capacity_factor = 0.92\n")).unwrap();
-        let msg = Config::load(&path).unwrap_err().to_string();
-        assert!(msg.contains("usable_capacity_factor"), "{msg}");
-        assert!(msg.contains("renamed"), "{msg}");
-        assert!(msg.contains("fill_ceiling"), "{msg}");
+        std::fs::write(&path, body).unwrap();
+        let msg = Config::load(&path)
+            .expect_err(&format!("{body:?} must not load"))
+            .to_string();
+        assert!(msg.contains("unknown field"), "{body:?} -> {msg}");
+        assert!(msg.contains(key), "{body:?} -> {msg}");
+        assert!(
+            !msg.contains("renamed") && !msg.contains("was removed"),
+            "{msg}"
+        );
+    }
+
+    /// `[[backends.lto]]`: ADR-0010's `media_type`/`nominal_capacity`, spec
+    /// W4's `block_size`/`hardware_compression`, #391's
+    /// `usable_capacity_factor`.
+    #[test]
+    fn the_old_backend_keys_are_refused_as_unknown() {
+        for key in [
+            "media_type = \"LTO-6\"",
+            "nominal_capacity = \"2.5TB\"",
+            "block_size = \"512K\"",
+            "hardware_compression = false",
+            "usable_capacity_factor = 0.92",
+        ] {
+            let name = key.split(' ').next().unwrap();
+            assert_refused_as_unknown(&format!("{LTO_BLOCK}{key}\n"), name);
+        }
+    }
+
+    /// `[packing]` is gone (#172): `min_free_for_append`, `strategy` and
+    /// `fill_threshold` were its only members.
+    #[test]
+    fn the_packing_table_is_refused_as_unknown() {
+        assert_refused_as_unknown("[packing]\nmin_free_for_append = \"50G\"\n", "packing");
+        assert_refused_as_unknown(
+            "[packing]\nstrategy = \"best_fit_decreasing\"\nfill_threshold = 0.95\n",
+            "packing",
+        );
+    }
+
+    /// `[labels]` is gone (#172): `format` was its only member.
+    #[test]
+    fn the_labels_table_is_refused_as_unknown() {
+        assert_refused_as_unknown("[labels]\nformat = \"L{gen}-{seq:04}\"\n", "labels");
+    }
+
+    /// `[defaults]`: #348's `min_copies_for_tape_only` and
+    /// `min_locations_for_tape_only`, #172's `hash`.
+    #[test]
+    fn the_old_defaults_keys_are_refused_as_unknown() {
+        for (body, key) in [
+            (
+                "[defaults]\nmin_copies_for_tape_only = 3\n",
+                "min_copies_for_tape_only",
+            ),
+            (
+                "[defaults]\nmin_locations_for_tape_only = 1\n",
+                "min_locations_for_tape_only",
+            ),
+            ("[defaults]\nhash = \"sha256\"\n", "hash"),
+        ] {
+            assert_refused_as_unknown(body, key);
+        }
+    }
+
+    /// `[dar]` is gone with dar (D11, item 241): the table is an unknown key,
+    /// named in the refusal; `[tar]` is the one that takes a binary.
+    #[test]
+    fn the_dar_table_is_refused_as_unknown() {
+        assert_refused_as_unknown("[dar]\nbinary = \"dar\"\n", "dar");
+        assert_refused_as_unknown("[dar]\nbinary = \"/usr/bin/dar\"\n", "dar");
+        assert!(load_text("[tar]\nbinary = \"tar\"\n").is_ok());
+    }
+
+    /// `preserve_fsa` is gone (D11, item 253): refused by name in
+    /// `[defaults]` and in an `[[archive_sets]]` table, as any unknown key is.
+    /// `[staging] hash_threads` went earlier (D11) and stays refused.
+    #[test]
+    fn preserve_fsa_and_hash_threads_are_refused_as_unknown() {
+        assert_refused_as_unknown("[defaults]\npreserve_fsa = true\n", "preserve_fsa");
+        assert_refused_as_unknown(
+            "[[archive_sets]]\nname = \"a\"\npreserve_fsa = false\n",
+            "preserve_fsa",
+        );
+        assert_refused_as_unknown("[staging]\nhash_threads = 2\n", "hash_threads");
+    }
+
+    /// `compression` takes `none` and the three algorithms tapectl carries,
+    /// and nothing else (items 285, 286): the values dar alone could take are
+    /// refused at load, with no probe of any host tool.
+    #[test]
+    fn compression_takes_only_the_carried_algorithms() {
+        for ok in ["none", "gzip", "xz", "zstd"] {
+            let text = format!("[defaults]\ncompression = \"{ok}\"\n");
+            assert!(load_text(&text).is_ok(), "{ok}");
+        }
+        for bad in ["bzip2", "lzo", "lzma", "lz4"] {
+            let text = format!("[defaults]\ncompression = \"{bad}\"\n");
+            let msg = load_text(&text).unwrap_err();
+            assert!(msg.contains(bad), "{bad}: {msg}");
+        }
     }
 
     /// The default is the ruled 97%, and an explicit value loads and is the
@@ -3704,7 +3415,7 @@ mod tests {
             text.starts_with(&b.describe())
                 && text.contains(&format!("({} bytes)", b.capacity_bytes))
                 && text.contains("post_warning_bytes")
-                && text.contains("ADR-0012 item 113"),
+                && text.contains("ADR-0012 items 113, 288 and 289"),
             "{text}"
         );
         // Another generation's cartridge is bounded at its own capacity.
@@ -3940,7 +3651,7 @@ mod tests {
         );
     }
 
-    /// The positive control for the refusal above: the new names load, and
+    /// The positive control for the refusals above: the new names load, and
     /// the values reach the fields every policy reader uses.
     #[test]
     fn a_config_with_the_new_min_copies_and_min_locations_names_loads() {
@@ -3957,39 +3668,55 @@ mod tests {
         assert!(!serialized.contains("_for_tape_only"), "{serialized}");
     }
 
+    /// ADR-0012 item 252 (#542): `init` writes no exclusion at all, so no
+    /// file is left out of a unit unless the operator said so. A config that
+    /// names patterns keeps them.
     #[test]
-    fn a_config_carrying_defaults_hash_fails_to_load_naming_the_key() {
+    fn init_writes_an_empty_exclusion_list_and_a_named_list_is_kept() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[defaults]\nhash = \"sha256\"\n").unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("defaults.hash"), "{msg}");
-        assert!(msg.contains("removed"), "{msg}");
-    }
+        Config::default().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("global_excludes = []"), "{text}");
+        assert!(Config::load(&path)
+            .unwrap()
+            .defaults
+            .global_excludes
+            .is_empty());
 
-    #[test]
-    fn syntactically_invalid_toml_is_not_flagged_here() {
-        // Not this function's job — the normal toml::from_str error surfaces
-        // unchanged for a genuinely broken file.
-        assert!(stale_lto_fields_message("this is not [ toml").is_none());
-    }
-
-    #[test]
-    fn config_load_rejects_a_stale_backend_with_the_friendly_message() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
         std::fs::write(
             &path,
-            "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-             device_sg = \"/dev/sg0\"\nmedia_type = \"LTO-6\"\n\
-             nominal_capacity = \"2.5TB\"\n",
+            "[defaults]\nglobal_excludes = [\"*.nfo\", \".cache/\"]\n",
         )
         .unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("moved"), "{msg}");
-        assert!(msg.contains("ADR-0010"), "{msg}");
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.global_excludes,
+            vec!["*.nfo".to_string(), ".cache/".to_string()]
+        );
+    }
+
+    /// #542: a pattern the matcher rejects is refused at load, naming the
+    /// pattern and the key, for `[defaults] global_excludes` and a
+    /// collection's `exclude`.
+    #[test]
+    fn a_rejected_exclusion_pattern_is_refused_at_load_by_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let err = Config::from_text("[defaults]\nglobal_excludes = [\"*.ok\", \"[\"]\n", &path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("global_excludes") && err.contains("\"[\""),
+            "{err}"
+        );
+
+        let err = Config::from_text(
+            "[[collections]]\nname = \"c\"\nroot = \"/x\"\ntenant = \"t\"\nexclude = [\"[x\"]\n",
+            &path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exclude") && err.contains("\"[x\""), "{err}");
     }
 
     #[test]
@@ -4757,37 +4484,6 @@ mod tests {
         assert_eq!(Config::load(&path).unwrap().staging.jobs, 1);
     }
 
-    /// Issue #366: `[staging] hash_threads` is 1 to 64; 0 would hash nothing.
-    #[test]
-    fn config_load_takes_hash_threads_and_refuses_zero() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[staging]\nhash_threads = 0\n").unwrap();
-        let msg = Config::load(&path).unwrap_err().to_string();
-        assert!(msg.contains("staging.hash_threads = 0"), "{msg}");
-        std::fs::write(&path, "[staging]\nhash_threads = 2\n").unwrap();
-        assert_eq!(Config::load(&path).unwrap().staging.hash_threads, 2);
-        std::fs::write(&path, "[staging]\n").unwrap();
-        assert_eq!(
-            Config::load(&path).unwrap().staging.hash_threads,
-            crate::staging::validate::DEFAULT_HASH_THREADS
-        );
-    }
-
-    /// ADR-0012, 2026-10-07 amendment, item 12: `[staging] hash_threads`
-    /// defaults to 1 (the one-file-at-a-time pass) until home2's
-    /// measurements at 1/2/4/8 are in. A literal, not the constant: a test
-    /// comparing the default to `DEFAULT_HASH_THREADS` passes at any value.
-    #[test]
-    fn hash_threads_defaults_to_one() {
-        assert_eq!(crate::staging::validate::DEFAULT_HASH_THREADS, 1);
-        assert_eq!(StagingConfig::default().hash_threads, 1);
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[staging]\n").unwrap();
-        assert_eq!(Config::load(&path).unwrap().staging.hash_threads, 1);
-    }
-
     #[test]
     fn config_load_rejects_a_negative_utilization_threshold() {
         let tmp = TempDir::new().unwrap();
@@ -4865,68 +4561,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("archive_sets[0]"), "{msg}");
         assert!(msg.contains("slice_size"), "{msg}");
-    }
-
-    /// #478 (ADR-0012 item 82): `allow_spanning` is a `[defaults]` key, off
-    /// when absent, and an `[[archive_sets]]` key, `None` ("the set does not
-    /// say") when absent. `config check`'s lenient read finds nothing to
-    /// report about either.
-    #[test]
-    fn allow_spanning_loads_in_defaults_and_an_archive_set_and_is_off_when_absent() {
-        assert!(!Config::default().defaults.allow_spanning);
-        assert!(!load_text("[defaults]\n").unwrap().defaults.allow_spanning);
-
-        let text = "[defaults]\nallow_spanning = true\n\n\
-                    [[archive_sets]]\nname = \"whole\"\nallow_spanning = false\n\n\
-                    [[archive_sets]]\nname = \"silent\"\nmin_copies = 3\n";
-        let cfg = load_text(text).unwrap();
-        assert!(cfg.defaults.allow_spanning);
-        assert_eq!(cfg.archive_sets[0].allow_spanning, Some(false));
-        assert_eq!(cfg.archive_sets[1].allow_spanning, None);
-
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, text).unwrap();
-        let report = crate::policy::lenient_config::check(text, &path);
-        assert!(report.valid, "{:?}", report.problems);
-        assert!(report.problems.is_empty(), "{:?}", report.problems);
-    }
-
-    /// #478: a misspelling of the spanning key is refused by name, in
-    /// `[defaults]` and in an `[[archive_sets]]` table, by the load every
-    /// command runs and by `config check` (ADR-0012: unknown keys are errors
-    /// everywhere).
-    #[test]
-    fn a_misspelled_allow_spanning_is_refused_by_name_in_defaults_and_an_archive_set() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        for bad in ["allow_span", "allowSpanning"] {
-            for (text, key) in [
-                (
-                    format!("[defaults]\n{bad} = true\n"),
-                    format!("defaults.{bad}"),
-                ),
-                (
-                    format!("[[archive_sets]]\nname = \"a\"\n{bad} = true\n"),
-                    format!("archive_sets[0].{bad}"),
-                ),
-            ] {
-                let msg = load_text(&text).unwrap_err();
-                assert!(msg.contains(bad), "{key}: {msg}");
-                assert!(msg.contains("unknown field"), "{key}: {msg}");
-                std::fs::write(&path, &text).unwrap();
-                let report = crate::policy::lenient_config::check(&text, &path);
-                assert!(!report.valid, "{key}");
-                assert!(
-                    report
-                        .problems
-                        .iter()
-                        .any(|p| p == &format!("unknown key: {key}")),
-                    "{key}: {:?}",
-                    report.problems
-                );
-            }
-        }
     }
 
     /// #493 (ADR-0012 items 149, 155): `copies_at` is a `[defaults]` key,
@@ -5083,6 +4717,47 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&path).expect("one day is a legitimate interval");
         assert_eq!(cfg.archive_sets[0].verify_interval_days, Some(1));
+    }
+
+    /// D18 (#548): `[defaults] drill_interval_days` resolves to 365 when
+    /// absent (and is not written back), loads as a day count, and is refused
+    /// below one day by name at load and by `config check`.
+    #[test]
+    fn drill_interval_days_resolves_and_a_bad_value_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        assert_eq!(Config::default().defaults.drill_interval_days(), 365);
+        std::fs::write(&path, "[defaults]\nmin_copies = 2\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.drill_interval_days(),
+            365
+        );
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!written.contains("drill_interval_days"), "{written}");
+        std::fs::write(&path, "[defaults]\ndrill_interval_days = 90\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.drill_interval_days(),
+            90
+        );
+        for days in [0, -7] {
+            let body = format!("[defaults]\ndrill_interval_days = {days}\n");
+            std::fs::write(&path, &body).unwrap();
+            let msg = Config::load(&path).unwrap_err().to_string();
+            assert!(
+                msg.contains(&format!("defaults.drill_interval_days = {days}")),
+                "{msg}"
+            );
+            let report = crate::policy::lenient_config::check(&body, &path);
+            assert!(!report.valid);
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("defaults.drill_interval_days")),
+                "{:?}",
+                report.problems
+            );
+        }
     }
 
     /// Issue #453 (ADR-0012 2026-10-15 later, item 66): `[defaults]
@@ -5358,7 +5033,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         std::fs::write(
             &path,
-            "[dar]\nbinary = \"dar\"\n\n\
+            "[tar]\nbinary = \"tar\"\n\n\
              [defaults]\nslice_size = \"1M\"\n\n\
              [compaction]\nutilization_threshold = 0.95\n\n\
              [[backends.lto]]\nname = \"lifecycle\"\ndevice_tape = \"/dev/null\"\n\

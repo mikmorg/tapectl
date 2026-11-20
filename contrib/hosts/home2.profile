@@ -3,7 +3,7 @@
 # port). Sourced by `scripts/first-run.sh --profile contrib/hosts/home2.profile`;
 # any flag on the command line overrides a value here. Run
 # contrib/hosts/home2-prep.sh --apply first: it creates the directories, the
-# dar and the service-user home this file names.
+# GNU tar and the service-user home this file names.
 #
 # Decided with the operator on 2026-09-28; the reason for each is beside it.
 
@@ -86,9 +86,10 @@ STAGING_DIR=/srv/acache/tapectl-staging
 # It is the catalog only, never keys (install-systemd.sh), and encrypted at rest.
 BACKUP_DIR=/srv/local_backup/tapectl
 
-# Buster ships dar 2.6.2; the suite and the real-drive rehearsals ran on 2.7.x.
-# home2-prep.sh builds 2.7.21 here, statically linked to its own libdar.
-DAR_BIN=/usr/local/bin/dar
+# Buster ships GNU tar 1.30, below the writer's floor (1.35 with ACL support;
+# ADR-0012 item 274). home2-prep.sh builds 1.35 here and leaves /bin/tar alone;
+# step 7 writes it into [tar] binary.
+TAR_BIN=/usr/local/bin/tar
 
 # No /scratch on this host: the build lock and the step-12 rehearsal's
 # throwaway homes live under the operator's cache (/srv/home, ~80 GB free).

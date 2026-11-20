@@ -50,6 +50,12 @@ rand = "0.9"
 tar = "0.4"
 tempfile = "3"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+# Compression of a slice alone (ADR-0012 items 284 to 286; the plan's D15; T0.6
+# accepted each in the static musl build): gzip through miniz_oxide (pure Rust),
+# xz and zstd from their bundled C source.
+flate2 = "1.1"
+liblzma = { version = "0.4", features = ["static"] }
+zstd = "0.14"
 
 [features]
 # Issue #488: the write-shaping experiment knobs (`TAPECTL_EXP_*`, `crate::research`).

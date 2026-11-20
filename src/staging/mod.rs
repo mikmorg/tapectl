@@ -1,12 +1,18 @@
+pub(crate) mod archive;
 pub mod clean;
-pub mod dar_report;
+pub(crate) mod cut;
 pub mod exclude;
 mod files;
 pub mod jobs;
 pub mod lock;
+pub(crate) mod pack;
+pub(crate) use files::SLICE_SUFFIX;
 #[cfg(test)]
 mod plaintext_audit;
 pub mod release;
+pub mod tar_report;
+#[cfg(test)]
+mod tar_stage_tests;
 pub mod validate;
 pub mod view;
 
@@ -18,7 +24,6 @@ use rusqlite::{params, Connection};
 use tracing::info;
 
 use crate::config::{Config, TapectlPaths};
-use crate::dar;
 use crate::db::busy::{self, BusyPolicy};
 use crate::db::{events, models, queries};
 use crate::error::{Result, TapectlError};
@@ -60,7 +65,7 @@ pub struct SnapshotOutcome {
 ///
 /// `config.defaults.global_excludes` (issue #49 item 5) is passed through
 /// to `walk_directory` so the recorded `files` rows never include
-/// a file dar itself was never going to archive (the unit's own dotfile
+/// a file the stage was never going to archive (the unit's own dotfile
 /// excludes are read internally by `walk_directory`, keyed off
 /// `source_path`). `config` also supplies `defaults.large_file_warn_threshold`
 /// for the large-file warning (issue #52, design line 203).
@@ -125,7 +130,17 @@ pub fn snapshot_create_detailed_reading(
     // Walk directory and build manifest — the ONLY walk this function
     // performs. Both the content-match short-circuit immediately below and
     // the mint path that follows it reuse `walked` (issue #159).
-    let (total_size, file_count, walked) = walk_directory(&read_path, global_excludes)?;
+    let Walk {
+        total_size,
+        file_count,
+        entries: walked,
+        left_out,
+    } = walk_directory_reporting(&read_path, global_excludes).map_err(|e| match e {
+        // #569: a refusal of the walk (a name that is not UTF-8, say)
+        // names the unit it refuses.
+        TapectlError::Other(msg) => TapectlError::Other(format!("unit \"{unit_name}\": {msg}")),
+        other => other,
+    })?;
 
     // ADR-0012 / issue #159: does this walk already match the unit's most
     // recent snapshot? `content_match::latest_snapshot` is the exact same
@@ -230,9 +245,12 @@ pub fn snapshot_create_detailed_reading(
             )?;
             let snapshot_id = tx.last_insert_rowid();
 
+            // What the patterns and the socket rule left out (#542).
+            crate::db::snapshot_left_out::insert(&tx, snapshot_id, &left_out)?;
+
             // The version's file list (`db::files`, migration 030): each
             // path interned once per unit, one narrow row per entry.
-            // Mode/uid/gid/xattrs live in dar's own catalogue, which is what
+            // Mode/uid/gid/xattrs live in the tar stream, which is what
             // a restore reads (ADR-0012 item 7).
             crate::db::files::insert_version(
                 &tx,
@@ -510,19 +528,17 @@ fn span_slice_sources(
     Ok(chosen)
 }
 
-/// Full stage pipeline: validate → dar → encrypt → checksums.
+/// Full stage pipeline: validate → tar → cut → pack → encrypt → checksums.
 ///
 /// Everything that can refuse without touching the source runs first,
 /// before the `stage_sets` INSERT (issue #354): the escrow recipient, the
 /// tenant's and operator's keys, and the staging directory (created, then
-/// proved writable). A staging directory too small for the unit is refused
-/// after the sha256 pass and before dar: that pass reads every byte, and
-/// nothing short of reading the content bounds what dar stores (see
-/// [`check_staging_space`]). One that MAY be too small — the need cannot be
-/// pinned down — is asked about (ADR-0008 Tier 2): `assume_yes` (the global
-/// `--yes`) is that consent given in advance, and without it a
-/// non-interactive run refuses. What remains to fail after dar is the work
-/// itself.
+/// proved writable). A staging directory that MAY be too small for the unit
+/// — the need is an estimate made before tar runs ([`stream_estimate`]) — is
+/// asked about (ADR-0008 Tier 2; [`check_staging_space`]): `assume_yes`
+/// (the global `--yes`) is that consent given in advance, and without it a
+/// non-interactive run refuses. What remains to fail after tar starts is
+/// the work itself.
 ///
 /// Thin wrapper around `stage_create_inner` (issue #54): on failure, best-effort cleanup runs before the original
 /// error is returned unchanged — cleanup never masks the real error.
@@ -545,11 +561,11 @@ pub fn stage_create(
 
 /// [`stage_create`], hashing and archiving the unit's files from `view`'s
 /// snapshot of the collection root instead of the unit's own folder (ADR-0012
-/// 2026-10-16 item 75, issue #455): the source check, the sha256 pass, `dar
-/// -c -R` and the post-dar recheck all read the snapshot's copy, so a file
-/// that changes in the living source after the snapshot was taken is not
-/// this stage's business. The recorded source path, and the `-R` in
-/// `stage_sets.dar_command`, stay the unit's real folder.
+/// 2026-10-16 item 75, issue #455): the source check, tar (run in the
+/// snapshot's folder) and the recheck after it all read the snapshot's copy,
+/// so a file that changes in the living source after the snapshot was taken
+/// is not this stage's business. The recorded source path stays the unit's
+/// real folder, and `stage_sets.tar_command` names no folder at all.
 pub fn stage_create_reading(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -658,7 +674,7 @@ pub(crate) fn stage_create_admitting(
                     "stage create",
                     crate::db::phase_timings::Subject::StageSet(stage_set_id),
                 );
-                after_failed_stage(conn, paths, config, stage_set_id, &e);
+                after_failed_stage(conn, config, stage_set_id, &e);
             }
             // Issue #404: a stop is a clean end, and says what to run next.
             // Staging resumes by starting the unit over; everything this
@@ -694,13 +710,7 @@ pub(crate) fn stage_create_admitting(
 ///   returns), and `stage clean` reclaims it.
 /// - A set that reached `staged` before the error is complete: its slices
 ///   are the stage, never garbage.
-fn after_failed_stage(
-    conn: &Connection,
-    paths: &TapectlPaths,
-    config: &Config,
-    stage_set_id: i64,
-    e: &TapectlError,
-) {
+fn after_failed_stage(conn: &Connection, config: &Config, stage_set_id: i64, e: &TapectlError) {
     let staged = conn
         .query_row(
             "SELECT status = 'staged' FROM stage_sets WHERE id = ?1",
@@ -715,7 +725,7 @@ fn after_failed_stage(
             "stage_create stopped; its staging files were left in place"
         );
     } else {
-        cleanup_failed_stage_set(conn, paths, config, stage_set_id);
+        cleanup_failed_stage_set(conn, config, stage_set_id);
     }
 }
 
@@ -733,13 +743,13 @@ fn stage_create_inner(
     notices: &mut dyn Write,
 ) -> Result<i64> {
     // ADR-0005 / issue #115. First thing, before the `stage_sets` INSERT and
-    // long before dar: without a registered escrow recipient,
+    // long before tar: without a registered escrow recipient,
     // `recipient_list_with_escrow` below is a silent no-op and every slice
     // this run produces is encrypted to tenant + operator only. Those slices
     // are exactly what the escrow line exists to be able to open, and
     // `volume write`'s pre-flight now refuses them
     // (`LayoutError::StageSetLacksEscrow`) — so staging them at all would
-    // spend hours of dar + age on material that cannot be written and cannot
+    // spend hours of tar + age on material that cannot be written and cannot
     // be repaired in place. Fail here, cheaply, with the remedy.
     //
     // The check belongs to this caller, not to `recipient_list_with_escrow`:
@@ -775,29 +785,21 @@ fn stage_create_inner(
     // stage_create used to read config.defaults.* unconditionally, so an
     // archive_set or dotfile override of slice_size/compression/preserve_*
     // was silently discarded even where #48 gives archive_set_id a writer.
-    // Resolved before the size check (#478): whether the unit may span
-    // decides which limit it is held to.
     let resolved = crate::policy::resolve(conn, config, &unit)?;
     // #493 (ADR-0012 item 148): the policy resolved with the source present,
     // so freeze the dotfile's own `[policy.copies_at]` for when it is gone.
     // After `resolve`, so a dotfile it refuses is never frozen.
     crate::policy::freeze_copies_at(conn, &unit)?;
-    check_unit_fits_one_tape(
-        config,
-        &unit.name,
-        &snapshot,
-        resolved.allow_spanning,
-        notices,
-    )?;
+    check_unit_fits_staging(config, &unit.name, &snapshot, notices)?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
 
     // Issue #354 (c): the recipient list is a pure database read, so it is
     // built — and every refusal it can raise is raised — here, before the
-    // `stage_sets` INSERT and before dar, beside the escrow check above. It
-    // used to be built at the top of the encryption loop, after dar had
+    // `stage_sets` INSERT and before tar, beside the escrow check above. It
+    // used to be built at the top of the encryption loop, after tar had
     // archived the whole unit, so a tenant with no active keys cost a full
-    // dar run to discover.
+    // tar run to discover.
     let tenant_keys = queries::get_active_keys_for_tenant(conn, unit.tenant_id)?;
     // Refuse rather than silently encrypt operator-only: a tenant with zero
     // active keys (e.g. an interrupted rotation, pre-H13 fix) would otherwise
@@ -824,46 +826,91 @@ fn stage_create_inner(
     let all_pubkeys = queries::recipient_list_with_escrow(conn, all_pubkeys)?;
     // Parse every recipient now, for the same reason: a malformed public key
     // in the database would otherwise surface from the first slice's
-    // encryption, after dar had started. The encryptor itself is rebuilt
+    // encryption, after tar had started. The encryptor itself is rebuilt
     // per slice (age draws a fresh file key each time); this one is only the
     // check.
     build_encryptor(&all_pubkeys)?;
 
+    // #562: `slice_size` is a multiple of 512 wherever it is set, so that a
+    // slice's cut is whole tar blocks (`volume-format-v3.md` §3.3). Refused
+    // before anything is made.
+    let slice_size = u64::try_from(resolved.slice_size).unwrap_or(0);
+    if slice_size == 0 || !slice_size.is_multiple_of(512) {
+        return Err(TapectlError::Other(format!(
+            "the slice_size in force for unit \"{}\" (its dotfile's [policy], its archive set \
+             or [defaults]) is {} bytes, which is not a positive multiple of 512: a slice holds \
+             whole tar blocks (volume-format-v3.md §3.3). Set slice_size to a multiple of 512 \
+             bytes, such as 1G. Nothing was staged.",
+            unit.name, resolved.slice_size
+        )));
+    }
+
+    // Items 284 to 287: the staging's algorithm and level, judged before
+    // anything is made.
+    let packing =
+        pack::packing(&resolved.compression, resolved.compression_level).map_err(|e| {
+            TapectlError::Other(format!("unit \"{}\": {e} Nothing was staged.", unit.name))
+        })?;
+    let compression = match packing {
+        Some(p) => p.algorithm.name().to_string(),
+        None => "none".to_string(),
+    };
+
     // Issue #479 (ADR-0012 2026-10-17 item 100): the slice size this unit
     // will be cut at must leave a slice and the seal inside half the
-    // measured post-warning room of the smallest configured drive. The
-    // config-level check (`Config::load`) sees only `[defaults]` and the
+    // measured post-warning room of the smallest configured drive. A packed
+    // slice can be larger on tape than its cut, so it is held to slice_size
+    // plus its algorithm's stated worst growth (`volume-format-v3.md` §3.4).
+    // The config-level check (`Config::load`) sees only `[defaults]` and the
     // file's archive sets; this is the size in force after the unit's
-    // dotfile and its archive set's database row have had their say. It
-    // runs before the staging directory is touched, the `stage_sets` INSERT
-    // and dar.
-    if let Some(problem) = config.slice_cap_problem(
-        &format!(
-            "the slice_size in force for unit \"{}\" (its dotfile's [policy], its archive set \
-             or [defaults])",
-            unit.name
+    // dotfile and its archive set's database row have had their say.
+    let (cap_what, cap_bytes) = match packing {
+        None => (
+            format!(
+                "the slice_size in force for unit \"{}\" (its dotfile's [policy], its archive \
+                 set or [defaults])",
+                unit.name
+            ),
+            slice_size,
         ),
-        resolved.slice_size.max(0) as u64,
-    ) {
+        Some(p) => (
+            format!(
+                "the slice_size in force for unit \"{}\" (its dotfile's [policy], its archive \
+                 set or [defaults]) plus {}'s stated worst growth ({} bytes)",
+                unit.name,
+                p.algorithm.name(),
+                pack::worst_growth(slice_size)
+            ),
+            files::packed_bound(slice_size),
+        ),
+    };
+    if let Some(problem) = config.slice_cap_problem(&cap_what, cap_bytes) {
         return Err(TapectlError::Other(format!(
             "{problem} Nothing was staged."
         )));
     }
 
-    // `ResolvedPolicy.slice_size` is bytes-only at every layer (even
-    // `policy::resolve`'s own default layer runs `config.defaults.slice_size`
-    // through `parse_size_to_bytes`), but dar's `-s` argument must keep
-    // receiving a *string dar parses itself* — see `resolve_slice_size_string`
-    // for why this can't simply be `resolved.slice_size.to_string()`
-    // unconditionally (issue #59's known parser defects must never reach
-    // real on-tape slicing — only the bookkeeping column below, which is
-    // `resolved.slice_size` directly now, with no second parse needed).
-    let slice_size = resolve_slice_size_string(conn, config, &unit, resolved.slice_size);
-    let compression = resolved.compression.clone();
+    // Step 1: the early refusal (ADR-0012 item 274). The writer's floor is
+    // GNU tar 1.35 built with ACL support; the proof is the stream's own
+    // check below, and this is the refusal before anything is made.
+    let tar_check = {
+        let work = home_work_dir(paths, ".tar-probe-")?;
+        crate::tar::probe(&config.tar.binary, work.path())?
+    };
+    if let Some(refusal) = tar_check.refusal() {
+        return Err(TapectlError::Other(format!(
+            "{refusal}. Nothing was staged."
+        )));
+    }
+
+    // #542: what the version left out is said here too, so a file on no tape
+    // is never silent.
+    let left_out = crate::db::snapshot_left_out::load(conn, snapshot_id)?;
+    write_left_out(notices, &unit.name, snapshot.version, &left_out);
 
     // Issue #354: the staging directory is usable, and big enough or the
     // operator agreed to try, or the stage is refused here — before the
-    // INSERT and dar. `staging` is the only way this stage creates a file
+    // INSERT and tar. `staging` is the only way this stage creates a file
     // there, and the only files it can create are ciphertext (issue #370).
     let staging_dir = Path::new(&config.staging.directory);
     let staging = files::StagingDir::prepare(staging_dir)?;
@@ -874,11 +921,12 @@ fn stage_create_inner(
     let admission = lock::acquire_admission(&paths.db_file)?;
     refuse_a_unit_already_staging(conn, &paths.db_file, &snapshot, &unit.name, admit_as)?;
     let in_flight = in_flight_staging(conn, &paths.db_file)?;
+    let estimate = stream_estimate(conn, snapshot_id, &read_root, slice_size, packing)?;
     check_staging_space(
         &StagingSpaceInputs {
             staging_dir,
             unit_name: &unit.name,
-            snapshot: &snapshot,
+            estimate,
             compression: &compression,
             assume_yes,
             in_flight,
@@ -920,8 +968,8 @@ fn stage_create_inner(
     // happens INSIDE one explicit transaction, and the flock is acquired
     // BEFORE that transaction commits. Acquiring a flock is microseconds,
     // so this does not reintroduce the long-running-transaction problem the
-    // rest of this function's comments warn about (the dar run below stays
-    // entirely outside any transaction, exactly as before).
+    // rest of this function's comments warn about (the tar run below stays
+    // entirely outside any transaction).
     #[cfg(test)]
     failpoint::hit(failpoint::BEFORE_RECORD)?;
     //
@@ -942,12 +990,11 @@ fn stage_create_inner(
     // sees it.
     drop(admission);
 
-    // Step 1: the source against the snapshot, by metadata alone (issue
-    // #364). A missing file or one at another size still refuses before dar.
-    // The content is read once, hashed as dar reads it (step 2), and the two
-    // reads are tied together afterwards (step 3). Issue #386: each step is a
-    // named phase — live progress, the session log, and a `phase_timings`
-    // row plus a stage-report line.
+    // Step 2: the source against the snapshot, by metadata alone (issue
+    // #364): a missing file or one at another size refuses before tar. The
+    // content is read once, by tar, and hashed from its stream. Issue #386:
+    // each step is a named phase — live progress, the session log, and a
+    // `phase_timings` row plus a stage-report line.
     let phase = progress::phase("check", None);
     phase.item(unit.name.clone());
     let plan = validate::plan(
@@ -956,316 +1003,235 @@ fn stage_create_inner(
         &read_root,
         &config.defaults.global_excludes,
     )?;
+    // Step 3: the list is the snapshot's own entries in bytewise path order,
+    // never a new walk; each is looked at before tar runs.
+    let scan = archive::scan(conn, snapshot_id, Path::new(&read_root), &unit.name)?;
     phase.done();
 
-    // Step 2: Run dar
-    //
     // `archive_base` is per-*stage-set* (issue #53): it carries
-    // `stage_set_id` so two stage sets of the SAME snapshot (a re-stage
-    // after `stage clean` released the first one) never write
-    // identically-named `.age` files and silently overwrite each other.
-    // `cleanup_failed_stage_set`'s prefix derivation below must move in
-    // lockstep with this — both go through `archive_base_name`.
+    // `stage_set_id` so two stage sets of the SAME snapshot never write
+    // identically-named `.age` files. `cleanup_failed_stage_set`'s prefix
+    // derivation must move in lockstep with this — both go through
+    // `archive_base_name`.
     let archive_base = archive_base_name(&unit.uuid, snapshot.version, stage_set_id);
-
-    // Issue #49 items 2/5: dar's -X masks must see BOTH layers of
-    // "effective excludes" — config.defaults.global_excludes (today's only
-    // source) AND the unit's own dotfile `[excludes] patterns` (until this
-    // fix, read/written but never consumed here). stage_create already has
-    // both `config` and the snapshot's own `source_path` in scope, so this
-    // merge is fully local — no threading through other callers needed
-    // (contrast walk_directory/walk_fingerprint's dotfile-only interim
-    // state; see exclude::dotfile_patterns's doc comment for why).
-    let mut dar_exclude_patterns = config.defaults.global_excludes.clone();
-    dar_exclude_patterns.extend(exclude::dotfile_patterns(Path::new(&read_root))?);
-    // Issue #359 (c): split into dar's two mask kinds, so what dar archives
-    // is exactly what `walk_directory` recorded — a plain pattern is a `-X`
-    // basename mask as before, and a directory pattern (`name/`) becomes the
-    // `-P` prune masks `name` and `*/name`. Handed to `-X` raw, `name/`
-    // matched nothing in dar and the subtree reached tape uncatalogued.
-    let dar_masks = exclude::dar_masks(&dar_exclude_patterns);
-
-    // Issue #419: one isolated catalogue per STAGE SET, produced by this
-    // stage set's own dar run. dar draws a fresh random data-name label for
-    // every run and refuses (`dar -A`) a catalogue whose label is another
-    // run's, so the catalogue this run's envelopes carry must be this run's.
-    // It used to be extracted once per snapshot and reused by every later
-    // stage set of it, so a re-staged unit's tape carried a catalogue that
-    // could not rescue its slices. dar writes it on the fly (`-@`) into the
-    // tapectl home — never the staging directory — and it is re-isolated
-    // uncompressed below. The file name inside the per-stage-set directory
-    // is the one envelopes have always carried (`{uuid8}_v{V}.1.dar`).
-    let catalog_dir = stage_set_catalogue_dir(paths, &unit.uuid, stage_set_id);
-    let catalog_base = catalog_dir.join(format!("{}_v{}", &unit.uuid[..8], snapshot.version));
-    let on_fly_base = catalog_dir.join(ON_FLY_CATALOGUE);
-    // Issue #41: a fresh, nested `create_dir_all` gets whatever the umask
-    // hands out; `catalogs_dir` itself is secured by `ensure_dirs`, but a
-    // parent's mode does not propagate to children it didn't create.
-    fs::create_dir_all(&catalog_dir)?;
-    if let Some(unit_dir) = catalog_dir.parent() {
-        crate::config::secure_path(unit_dir, 0o700);
-    }
-    crate::config::secure_path(&catalog_dir, 0o700);
-
-    // Step 2: dar, slices and encryption in one pass, with no plaintext on
-    // the staging device (issue #370; ADR-0012, 2026-10-06 amendment item
-    // 4). dar writes its archive to standard output; `dar::slice::cut_stream`
-    // frames it into dar slices exactly as dar frames its own (what
-    // `dar_xform -s` makes of the same stream), and each slice is encrypted
-    // in memory straight into its `.age` (`files::StagingDir`). Memory is a
-    // 1 MiB read buffer and age's 64 KiB chunk, whatever the slice size.
-    // The slice header is dar's own: from a tiny archive of an empty
-    // directory at the same `-s`, made in the tapectl home, never staging.
-    let template = {
-        let work = home_work_dir(paths, ".dar-slice-template-")?;
-        dar::slice::template(&config.dar.binary, &slice_size, work.path())?
-    };
 
     // fingerprint == public_key by construction for every key in this system
     // (see crypto::keys::generate_keypair and `key import`), so the recorded
-    // fingerprints are exactly the (now escrow-augmented) recipient list —
-    // keeping this audit record honest about who can actually decrypt the
-    // slices it describes, rather than a second, silently-divergent list.
+    // fingerprints are exactly the (now escrow-augmented) recipient list.
     let key_fingerprints = all_pubkeys.clone();
 
+    // Step 4: tar, its stream checked as it passes, cut into slices of whole
+    // members, each packed alone when the staging is compressed and
+    // age-encrypted in memory (#370: no plaintext on the staging device).
+    // The file list holds file names, so it is written in the home's work
+    // directory and removed with it.
     let phase = progress::phase("archive", Some(plan.total_bytes()));
     phase.item(unit.name.clone());
-    // The source's sha256s, read beside dar and within
-    // `validate::READ_AHEAD_BYTES` of it, so each file leaves the disk once
-    // (issue #364). Stopped and joined on every way out.
-    // `[staging] hash_threads` files at once (issue #366), handed out in dar's
-    // read order and recorded in it.
-    let unrecorded = plan.unrecorded_regular().to_vec();
-    let hashing = validate::ConcurrentHash::spawn(
-        PathBuf::from(&read_root),
-        plan,
-        validate::hash_threads(config.staging.hash_threads),
-    )?;
-    let mut dar_run = dar::create::spawn_archive(&dar::create::DarCreateParams {
-        dar_binary: &config.dar.binary,
-        source_path: Path::new(&read_root),
-        compression: &compression,
-        exclude_patterns: &dar_masks.exclude,
-        exclude_paths: &dar_masks.prune,
-        preserve_xattrs: resolved.preserve_xattrs,
-        preserve_fsa: resolved.preserve_fsa,
-        on_fly_catalogue: &on_fly_base,
-    })?;
-    // MANIFEST.toml carries this to tape. The slicing is tapectl's, so the
-    // record says so, in terms an heir can reproduce with dar's own tools.
-    // The recorded command names the unit's real folder after `-R`, whatever
-    // folder dar was pointed at: MANIFEST.toml carries this to tape, where a
-    // transient snapshot path means nothing (ADR-0012 item 75). dar's own
-    // report (`dar_create_reports`) keeps the command as it ran.
-    let recorded_dar =
-        recorded_dar_command(&dar_run.dar_command, &read_root, &snapshot.source_path);
-    let dar_command = format!(
-        "{recorded_dar} | tapectl cuts the archive into dar slices of -s {slice_size} \
-         (the framing `dar_xform -s {slice_size} - <base>` gives) and age-encrypts each",
-    );
+    let list_dir = home_work_dir(paths, ".tar-list-")?;
+    let list = crate::tar::write_list(list_dir.path(), &scan.paths())?;
+    let params = crate::tar::CreateParams {
+        binary: &config.tar.binary,
+        root: Path::new(&read_root),
+        list: &list,
+        xattrs: resolved.preserve_xattrs,
+        acls: resolved.preserve_acls,
+    };
+    let mut run = crate::tar::spawn_archive(&params)?;
+    let tar_command = run.tar_command.clone();
+    let tar_version = tar_check.first_line.clone();
+    let level = packing.map(|p| i64::from(p.level));
     // Issue #368: other stages may hold the catalog for a moment; a stage
-    // records its progress through the busy policy (#377), never failing on
-    // a five-second wait.
-    busy::retry(BusyPolicy::DEFAULT, "the stage set's dar command", || {
+    // records its progress through the busy policy (#377).
+    busy::retry(BusyPolicy::DEFAULT, "the stage set's tar command", || {
         Ok(conn.execute(
-            "UPDATE stage_sets SET dar_version = ?1, dar_command = ?2 WHERE id = ?3",
-            params![dar_run.dar_version, dar_command, stage_set_id],
+            "UPDATE stage_sets SET tar_version = ?1, tar_command = ?2, compression_level = ?3
+             WHERE id = ?4",
+            params![tar_version, tar_command, level, stage_set_id],
         )?)
     })?;
 
-    let mut total_dar_size: i64 = 0;
-    let mut total_encrypted_size: i64 = 0;
-    let mut streamed: u64 = 0;
-    let dar_pid = dar_run.pid();
-    if let Some(pid) = dar_pid {
-        hashing.ahead().dar_started(pid);
-    }
-    let mut last_pace = std::time::Instant::now();
-    let stdout = dar_run.take_stdout();
-    let cut = dar::slice::cut_stream(
-        stdout,
-        &template,
-        |n| {
-            phase.item(format!("{} slice {n}", unit.name));
-            staging.create_slice(&archive_base, n, &all_pubkeys)
+    let on_slice = |n: u64| phase.item(format!("{} slice {n}", unit.name));
+    let slices = archive::StagedSlices {
+        conn,
+        staging: &staging,
+        stage_set_id,
+        base: &archive_base,
+        recipients: &all_pubkeys,
+        packing,
+        slice_size,
+        unit: &unit.name,
+        on_slice: &on_slice,
+        open: None,
+        totals: archive::Totals::default(),
+    };
+    let mut sink = archive::StageSink {
+        cutter: cut::Cutter::new(slice_size, slices)?,
+        rows: Vec::new(),
+    };
+    let read = crate::tar::read_stream(
+        run.take_stdout(),
+        scan.entries.iter().map(|e| e.listed.clone()),
+        crate::tar::Rules {
+            acls: resolved.preserve_acls,
         },
-        |n, slice| {
-            let path = slice.path().to_path_buf();
-            let info = slice.finish()?;
-            record_encrypted_slice(
-                conn,
-                BusyPolicy::DEFAULT,
-                stage_set_id,
-                i64::from(n),
-                &path,
-                &info,
-            )?;
-            total_dar_size += info.plain_size;
-            total_encrypted_size += info.encrypted_size;
-            info!(
-                slice = n,
-                plain_mb = info.plain_size / (1024 * 1024),
-                encrypted_mb = info.encrypted_size / (1024 * 1024),
-                "staged slice"
-            );
-            Ok(())
-        },
-        |bytes| {
-            progress::add_bytes(bytes.saturating_sub(streamed));
-            streamed = bytes;
-            // Keep dar within the read-ahead of the hasher (issue #364): how
-            // much of the source dar has read is its own read count when the
-            // kernel shows it, else the archive's length (equal without
-            // compression). Waiting here fills dar's pipe, and dar waits.
-            if last_pace.elapsed() >= std::time::Duration::from_millis(20) {
-                last_pace = std::time::Instant::now();
-                let read = dar_pid.and_then(dar::create::bytes_read).unwrap_or(bytes);
-                hashing.ahead().dar_has_read(read);
-            }
-            if hashing.ahead().hasher_failed() {
-                return Err(TapectlError::Other("the source check failed".into()));
-            }
-            // Issue #404: a stop is honoured within one read of the stream
-            // (and, while dar is silent, within `DarOutput`'s poll).
-            crate::signal::check(|| stopped_archiving(&snapshot.source_path))
-        },
+        crate::idmap::Collector::new(),
+        &mut sink,
     );
-    let summary = match cut {
-        Ok(summary) => summary,
+    // tar's own report keeps the folder it ran in beside its command (issue
+    // #455: the one place the operator sees what tar read, a snapshot's copy
+    // of the folder included); `stage_sets.tar_command` names no folder.
+    let ran_in = format!("{tar_command} (run in {read_root:?})");
+    let report = |outcome: &'static str, finish: Option<&crate::tar::TarFinish>| {
+        tar_report::TarCreateReport {
+            outcome,
+            command: ran_in.clone(),
+            exit_code: finish.and_then(|f| f.code()),
+            stderr: finish.map(|f| f.stderr().kept.clone()).unwrap_or_default(),
+            tar_version: tar_version.clone(),
+        }
+    };
+    let finished = match read {
+        Ok(finished) => finished,
         Err(e) => {
-            // dar's own failure, if it had one, is the cause to report: a
-            // short archive is how it reaches the slicer. A refusal from
-            // the source check outranks both.
-            let (dar_failed, report) = dar_run.abort_reported();
-            // Issue #343: what dar said, kept whichever way this ends.
-            record_dar_report(conn, stage_set_id, &unit.name, snapshot.version, &report);
-            if crate::signal::is_interrupted() {
+            // tar's own exit, once its stream is no longer read, and what it
+            // said: kept whichever way this ends (issue #343).
+            let finish = run.finish().ok();
+            let stopped = crate::signal::is_interrupted();
+            let outcome = if stopped {
+                tar_report::OUTCOME_STOPPED
+            } else {
+                tar_report::OUTCOME_FAILED
+            };
+            tar_report::record(
+                conn,
+                stage_set_id,
+                &unit.name,
+                snapshot.version,
+                &report(outcome, finish.as_ref()),
+            );
+            if stopped {
                 return Err(TapectlError::Interrupted(stopped_archiving(
                     &snapshot.source_path,
                 )));
             }
-            if hashing.ahead().hasher_failed() {
-                hashing.finish()?;
-            }
-            return Err(dar_failed.unwrap_or(e));
+            return Err(stream_refused(&unit.name, e, finish.as_ref()));
         }
     };
-    let (finished, report) = dar_run.finish_reported();
-    record_dar_report(conn, stage_set_id, &unit.name, snapshot.version, &report);
-    if let dar::create::DarFinish::FilesChanged { detail } = finished? {
-        return Err(TapectlError::Other(format!(
-            "DIRTY: a source file of unit \"{}\" changed while dar was reading it \
-             (dar exit 11). tapectl runs dar with --retry-on-change 0, so a file \
-             caught mid-change is refused rather than archived half-changed. dar \
-             said:\n{detail}\nNothing was staged. Stage again once the source is \
-             quiet; if the change is real, take a new snapshot (`tapectl snapshot \
-             create {}`) and stage that.",
-            unit.name, unit.name
-        )));
+    let finish = run.finish()?;
+    if !finish.is_clean() {
+        let outcome = match finish {
+            crate::tar::TarFinish::FilesChanged { .. } => tar_report::OUTCOME_FILES_CHANGED,
+            _ => tar_report::OUTCOME_FAILED,
+        };
+        tar_report::record(
+            conn,
+            stage_set_id,
+            &unit.name,
+            snapshot.version,
+            &report(outcome, Some(&finish)),
+        );
+        return Err(tar_failed(&unit.name, &finish));
     }
-    // dar has read everything; the hasher finishes on its own.
-    hashing.ahead().dar_finished();
-    let hashed = hashing.finish()?;
+    tar_report::record(
+        conn,
+        stage_set_id,
+        &unit.name,
+        snapshot.version,
+        &report(tar_report::OUTCOME_COMPLETE, Some(&finish)),
+    );
+    let archive::StageSink { cutter, rows } = sink;
+    let (made, slices) = cutter.finish()?;
+    let totals = slices.totals;
+    debug_assert_eq!(made, totals.slices);
     phase.done();
-    info!(slices = summary.slices, "dar archive staged");
+    info!(
+        slices = totals.slices,
+        members = finished.members,
+        stream_bytes = finished.stream_bytes,
+        "tar stream staged"
+    );
 
     #[cfg(test)]
     failpoint::note_staging(staging_dir);
     #[cfg(test)]
-    failpoint::hit(failpoint::AFTER_DAR)?;
+    failpoint::hit(failpoint::AFTER_TAR)?;
 
-    // Step 3 (issue #364): tie the hash to what dar read. Every hashed file
-    // must still have the size and change time it had when it was hashed —
-    // a write between the two reads moves the change time — and dar ran
-    // with `--retry-on-change 0`, so a write during its own read was exit
-    // 11 above. Only then is the source validated.
+    // Step 5: each entry is what it was before tar ran (invariant 7), and a
+    // file inside the racy window hashes on disk as it did in the stream.
     let phase = progress::phase("recheck", None);
-    validate::recheck(Path::new(&read_root), &hashed)?;
+    let stream_sha: std::collections::HashMap<&str, [u8; 32]> = rows
+        .iter()
+        .filter_map(|r| r.sha256.map(|h| (r.path.as_str(), h)))
+        .collect();
+    archive::recheck(Path::new(&read_root), &scan, &stream_sha)?;
+    // Step 6: each stream hash against the version's recorded sha256, for
+    // every path but the unit's dotfile (#562; issue #32/H6's commitment
+    // point): the size equals the snapshot's, so a difference is content
+    // drift at a constant size — bitrot, not an edit. A hash not yet
+    // recorded is filled in.
+    let baselines = plan.baselines();
+    let mut checksums: Vec<(String, String)> = Vec::with_capacity(stream_sha.len());
+    for row in &rows {
+        let Some(sha) = row.sha256 else { continue };
+        let hex = crate::db::files::sha256_to_hex(&sha);
+        if !crate::unit::dotfile::is_unit_dotfile(&row.path) {
+            if let Some(baseline) = baselines.get(row.path.as_str()) {
+                if *baseline != hex {
+                    return Err(TapectlError::Other(format!(
+                        "BITROT suspected: {} — sha256 differs at an unchanged size ({} \
+                         bytes): baseline={baseline}, current={hex}. Refusing to stage; \
+                         investigate before re-staging (`tapectl unit check-integrity <unit>` \
+                         checks every file against its recorded baseline).",
+                        row.path, row.size
+                    )));
+                }
+            }
+        }
+        checksums.push((row.path.clone(), hex));
+    }
     busy::retry(BusyPolicy::DEFAULT, "the source check", || {
         Ok(conn.execute(
             "UPDATE stage_sets SET source_validated_at = datetime('now') WHERE id = ?1",
             params![stage_set_id],
         )?)
     })?;
-    let checksums = hashed.checksums();
     phase.done();
 
-    // Step 3: this run's catalogue, uncompressed (ADR-0012, 2026-10-06
-    // amendment item 3: envelope catalogues stay uncompressed, so an heir's
-    // dar needs no bzip2). `-@` always compresses; isolating the isolated
-    // catalogue again keeps its label and drops the compression.
-    let phase = progress::phase("catalog", None);
-    info!("isolating this stage set's dar catalogue");
-    dar::create::reisolate_catalogue(&config.dar.binary, &on_fly_base, &catalog_base)?;
-    let on_fly_file = PathBuf::from(format!("{}.1.dar", on_fly_base.display()));
-    fs::remove_file(&on_fly_file)
-        .map_err(|e| staging_io_error("cannot remove", &on_fly_file, e))?;
-    // dar wrote the catalog file itself via subprocess, with no mode of its
-    // own — tighten what it produced after the fact.
-    secure_catalog_files(&catalog_dir);
-    // ...and nor did it sync it (issue #409).
-    sync_catalogue(&catalog_base)?;
-    // Issue #464: the catalogue lists every file that was hashed (and
-    // nothing unexplained) — checked before the set can be marked staged, so
-    // `files` and the on-tape `catalog.db` never record a file dar skipped.
-    // dar's listing is read from a pipe and kept in memory only.
-    let mut listed = validate::CatalogueCheck::new(&hashed, &unrecorded);
-    dar::list::regular_files(&config.dar.binary, &catalog_base, &mut |path| {
-        listed.saw(path)
-    })?;
-    listed.finish()?;
-    busy::retry(BusyPolicy::DEFAULT, "the stage set's catalogue", || {
-        Ok(conn.execute(
-            "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
-            params![catalog_base.to_string_lossy().to_string(), stage_set_id],
-        )?)
-    })?;
-    phase.done();
-
-    // Issue #54: finalization only, not the whole pipeline, runs inside a
-    // transaction — matching the `conn.unchecked_transaction()` pattern
-    // already established at `src/volume/session.rs:778`,
-    // `src/volume/write.rs:1262`, `src/cli/operations.rs:38`
-    // (`snapshot_purge`), and `src/cli/key.rs:224`.
+    // Step 7: one transaction at the end (issue #54), holding the stage set's
+    // figures, the file table's rows and the id map's (ADR-0012 items 265,
+    // 272, 277).
     //
-    // Deliberately NOT wrapping the whole of `stage_create`: `unchecked_transaction`
-    // is DEFERRED, so it takes SQLite's single write lock at the first write
-    // inside it and holds it until commit — around the dar run (which can
-    // take hours) that would block every other tapectl invocation for the
-    // duration. Worse, a crash mid-dar would roll back the `stage_sets`
-    // INSERT itself, destroying the `status='staging'` row that
-    // `recover_orphaned_sessions` (`src/db/mod.rs`) relies on to mark the
-    // set `'failed'` on the next `db::open()` — the operator's only signal
-    // that something went wrong. So the incremental progress writes above
-    // (the initial INSERT, the `source_validated_at`/`dar_version`/
-    // `catalog_path` UPDATEs, and the per-slice `stage_slices` INSERTs)
-    // stay outside any transaction; only the finalization below — which
-    // only ever runs once the pipeline has fully succeeded — is atomic.
+    // Deliberately NOT wrapping the whole of `stage_create`: a DEFERRED
+    // transaction takes SQLite's single write lock at its first write and
+    // holds it until commit — around the tar run (which can take hours) that
+    // would block every other tapectl invocation. Worse, a crash mid-tar
+    // would roll back the `stage_sets` INSERT itself, destroying the
+    // `status='staging'` row that `recover_orphaned_sessions` relies on to
+    // mark the set `'failed'` on the next `db::open()`. So the incremental
+    // progress writes above stay outside any transaction; only this
+    // finalization — run once the pipeline has fully succeeded — is atomic.
     //
-    // Issue #377: IMMEDIATE (the snapshot guard reads before it writes),
-    // and retried as a whole for minutes on a busy catalog — every slice is
-    // already encrypted, and a 5-second lock wait must not throw them away.
-    // A dropped transaction rolls back, and every statement here is guarded
-    // or idempotent, so each attempt starts clean.
+    // Issue #377: IMMEDIATE, and retried as a whole for minutes on a busy
+    // catalog — every slice is already encrypted, and a 5-second lock wait
+    // must not throw them away. A dropped transaction rolls back, so each
+    // attempt starts clean.
     let phase = progress::phase("finalize", None);
     busy::retry(BusyPolicy::DEFAULT, "the stage set's finalization", || {
         let tx = busy::immediate_tx(conn)?;
 
-        // Update stage_set
         tx.execute(
-            "UPDATE stage_sets SET status = 'staged', num_slices = ?1, total_dar_size = ?2,
+            "UPDATE stage_sets SET status = 'staged', num_slices = ?1, stream_bytes = ?2,
              total_encrypted_size = ?3, key_fingerprints = ?4, staged_at = datetime('now')
              WHERE id = ?5",
             params![
-                i64::from(summary.slices),
-                total_dar_size,
-                total_encrypted_size,
+                totals.slices as i64,
+                finished.stream_bytes as i64,
+                totals.encrypted,
                 serde_json::to_string(&key_fingerprints).unwrap(),
                 stage_set_id,
             ],
         )?;
 
-        // Update snapshot status
         let updated = tx.execute(
             "UPDATE snapshots SET status = 'staged' WHERE id = ?1 AND status = 'created'",
             params![snapshot_id],
@@ -1284,17 +1250,15 @@ fn stage_create_inner(
             )?;
         }
 
-        // Backfill sha256 into files — establishes
-        // the baseline ONLY where one doesn't already exist (issue #32/H6).
-        // `validate_source` now refuses to stage (BITROT) before we ever
-        // get here if a hash disagrees with an existing baseline, but the
-        // thing that actually makes "(first stage only)" true is
-        // `backfill_checksums`'s own `sha256 IS NULL` guard on its
-        // UPDATE — not this `is_empty()` check, which only skips a no-op
-        // call.
+        // Backfill sha256 into files — establishes the baseline ONLY where
+        // one doesn't already exist (issue #32/H6): `backfill_checksums`'s
+        // own `sha256 IS NULL` guard on its UPDATE.
         if !checksums.is_empty() {
             backfill_checksums(&tx, snapshot_id, &checksums)?;
         }
+
+        crate::db::stage_files::insert(&tx, stage_set_id, rows.iter().cloned().map(Ok))?;
+        crate::db::stage_ids::insert(&tx, stage_set_id, &finished.ids)?;
 
         tx.commit()?;
         Ok(())
@@ -1336,6 +1300,14 @@ fn stage_create_inner(
     )?;
 
     Ok(stage_set_id)
+}
+
+/// Item 287: why `compression_level = level` is refused beside the
+/// algorithm `compression`, or `None` (for `config.rs`'s load checks).
+pub(crate) fn pack_level_problem(compression: &str, level: i64) -> Option<String> {
+    pack::packing(compression, Some(level))
+        .err()
+        .map(|e| e.to_string())
 }
 
 /// The `meta` key holding the highest `stage_sets.id` ever handed out.
@@ -1397,14 +1369,15 @@ fn record_encrypted_slice(
     policy: BusyPolicy,
     stage_set_id: i64,
     slice_num: i64,
+    continues: bool,
     encrypted_path: &Path,
     info: &EncryptedSliceInfo,
 ) -> Result<()> {
     let recorded = busy::retry(policy, "a staged slice", || {
         Ok(conn.execute(
             "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
-                                       sha256_plain, sha256_encrypted, staging_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                       sha256_plain, sha256_encrypted, staging_path, continues)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 stage_set_id,
                 slice_num,
@@ -1413,6 +1386,7 @@ fn record_encrypted_slice(
                 info.sha256_plain,
                 info.sha256_encrypted,
                 encrypted_path.to_string_lossy().to_string(),
+                continues,
             ],
         )?)
     });
@@ -1428,10 +1402,8 @@ fn record_encrypted_slice(
 /// The `archive_base` file-name stem for one stage set: `{uuid12}_v{version}_s{stage_set_id}`.
 ///
 /// Per-*stage-set*, not per-snapshot (issue #53) — the single place this
-/// shape is computed, so `stage_create_inner`'s dar run and
+/// shape is computed, so `stage_create_inner`'s slices and
 /// `cleanup_failed_stage_set`'s prefix scan can never drift apart again.
-/// The isolated catalogue is per stage set too since issue #419, by its
-/// directory ([`stage_set_catalogue_dir`]).
 pub(crate) fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
     format!(
         "{}_v{}_s{}",
@@ -1441,20 +1413,20 @@ pub(crate) fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64
     )
 }
 
-/// `archive_base_name(..)` plus the load-bearing trailing dot: dar names
-/// every slice `{base}.{N}.dar`, so the real filesystem prefix is
+/// `archive_base_name(..)` plus the load-bearing trailing dot: every slice
+/// is `{base}.{N}.tar.age`, so the real filesystem prefix is
 /// `{base}.`, not the bare base — without the dot, `_s1` would prefix-match
-/// `_s10.1.dar`.
+/// `_s10.1.tar.age`.
 pub(crate) fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
     format!("{}.", archive_base_name(unit_uuid, version, stage_set_id))
 }
 
 /// A fresh work directory under `<home>/tmp` (0700), removed when the
 /// returned value drops — for the plaintext a stage or a write needs for a
-/// moment (dar's slice template, the write's `catalog.db`), which must not
+/// moment (tar's file list and probe, the write's `catalog.db`), which must not
 /// go under staging (ADR-0012 2026-10-06 item 4) nor to a world-readable
 /// `/tmp`.
-pub(crate) fn home_work_dir(paths: &TapectlPaths, prefix: &str) -> Result<tempfile::TempDir> {
+pub fn home_work_dir(paths: &TapectlPaths, prefix: &str) -> Result<tempfile::TempDir> {
     let tmp = paths.home.join("tmp");
     fs::create_dir_all(&tmp).map_err(|e| staging_io_error("cannot create", &tmp, e))?;
     crate::config::secure_path(&tmp, 0o700);
@@ -1465,68 +1437,108 @@ pub(crate) fn home_work_dir(paths: &TapectlPaths, prefix: &str) -> Result<tempfi
 }
 
 /// What a stop during the archive pass says (issue #404).
-/// Keep dar's report of this stage's `dar -c` (issue #343, migration 034).
-fn record_dar_report(
-    conn: &Connection,
-    stage_set_id: i64,
-    unit_name: &str,
-    version: i64,
-    report: &dar::create::DarCreateReport,
-) {
-    dar_report::record(conn, stage_set_id, unit_name, version, report);
-}
-
 fn stopped_archiving(source: &str) -> String {
-    format!("dar was stopped while archiving {source}")
+    format!("tar was stopped while archiving {source}")
 }
 
-/// `dar_command` (as `dar::create` records it) with the folder dar was pointed
-/// at, `read`, put back to the unit's own, `real`, after `-R`. The same string
-/// when they are the same folder.
-fn recorded_dar_command(dar_command: &str, read: &str, real: &str) -> String {
-    if read == real {
-        return dar_command.to_string();
+/// The refusal of a stream that broke one of §3.2's rules, or that could
+/// not be read, with tar's own exit beside it when tar did not exit 0.
+fn stream_refused(
+    unit: &str,
+    e: crate::tar::StreamError,
+    finish: Option<&crate::tar::TarFinish>,
+) -> TapectlError {
+    let tar_said = match finish {
+        Some(f) if !f.is_clean() => format!(
+            " tar exited {}: {}",
+            f.code()
+                .map_or_else(|| "by a signal".to_string(), |c| c.to_string()),
+            f.stderr().text().trim()
+        ),
+        _ => String::new(),
+    };
+    match e {
+        crate::tar::StreamError::Refused(r) => TapectlError::Other(format!(
+            "unit \"{unit}\" is not staged: {r}.{tar_said} The stream's checks are tapectl's \
+             proof of what reaches tape (volume-format-v3.md §3.2); nothing was staged."
+        )),
+        crate::tar::StreamError::Sink(e) => e,
+        crate::tar::StreamError::Io(e) => TapectlError::Other(format!(
+            "unit \"{unit}\" is not staged: reading tar's stream failed: {e}.{tar_said} \
+             Nothing was staged."
+        )),
     }
-    let read_arg = format!("\"-R\" {:?}", std::ffi::OsStr::new(read));
-    let real_arg = format!("\"-R\" {:?}", std::ffi::OsStr::new(real));
-    dar_command.replacen(&read_arg, &real_arg, 1)
 }
 
-#[cfg(test)]
-mod recorded_dar_command_tests {
-    use super::recorded_dar_command;
-
-    /// dar's recorded argv puts the folder it was pointed at after `-R`; the
-    /// recorded command names the unit's own folder instead, and nothing else
-    /// in it moves. The same folder is a no-op.
-    #[test]
-    fn the_snapshot_folder_after_dash_r_becomes_the_units_own() {
-        let ran = "\"dar\" \"-c\" \"-\" \"-N\" \"-R\" \"/mnt/snap/tv/Show\" \"-an\" \"-X\" \"/mnt/snap/tv/Show\"";
-        assert_eq!(
-            recorded_dar_command(ran, "/mnt/snap/tv/Show", "/srv/tv/Show"),
-            "\"dar\" \"-c\" \"-\" \"-N\" \"-R\" \"/srv/tv/Show\" \"-an\" \"-X\" \"/mnt/snap/tv/Show\""
-        );
-        assert_eq!(recorded_dar_command(ran, "/x", "/x"), ran);
+/// The refusal of a staging whose tar did not exit 0 (#562): exit 1 says a
+/// file changed as tar read it; exit 2, or any other, that tar failed.
+fn tar_failed(unit: &str, finish: &crate::tar::TarFinish) -> TapectlError {
+    let said = finish.stderr().text();
+    let said = said.trim();
+    match finish {
+        crate::tar::TarFinish::FilesChanged { .. } => TapectlError::Other(format!(
+            "DIRTY: a source file of unit \"{unit}\" changed while tar was reading it (tar exit \
+             1), so it is refused rather than archived half-changed. tar said:\n{said}\nNothing \
+             was staged. Stage again once the source is quiet; if the change is real, take a \
+             new snapshot (`tapectl snapshot create {unit}`) and stage that."
+        )),
+        _ => TapectlError::Other(format!(
+            "tar failed archiving unit \"{unit}\" (exit {}). tar said:\n{said}\nNothing was \
+             staged.",
+            finish
+                .code()
+                .map_or_else(|| "by a signal".to_string(), |c| c.to_string()),
+        )),
     }
 }
 
-/// The base name dar's on-the-fly catalogue (`-@`) is written under, inside
-/// [`stage_set_catalogue_dir`]; removed once it is re-isolated.
-const ON_FLY_CATALOGUE: &str = "onfly";
+/// How many left-out things `stage create` names before it counts the rest.
+const LEFT_OUT_NAMED: usize = 20;
 
-/// The directory holding one stage set's isolated dar catalogue (issue
-/// #419): `<home>/catalogs/{uuid8}/s{stage_set_id}/`. Per stage set, because
-/// each dar run labels its archive afresh and dar accepts only that run's
-/// catalogue against it.
-pub(crate) fn stage_set_catalogue_dir(
-    paths: &TapectlPaths,
-    unit_uuid: &str,
-    stage_set_id: i64,
-) -> PathBuf {
-    paths
-        .catalogs_dir
-        .join(unit_uuid.get(..8).unwrap_or(unit_uuid))
-        .join(format!("s{stage_set_id}"))
+/// #542: the lines naming what the version's snapshot left out (a pattern's
+/// match, or a socket), as `snapshot create` names them; nothing when
+/// nothing was. Names are escaped as the index escapes them.
+fn write_left_out(
+    notices: &mut dyn Write,
+    unit: &str,
+    version: i64,
+    rows: &[crate::db::snapshot_left_out::LeftOut],
+) {
+    use crate::db::snapshot_left_out::Reason;
+    if rows.is_empty() {
+        return;
+    }
+    let mut out = format!(
+        "unit \"{unit}\" v{version}: its snapshot left out {}, so this stage does not \
+         archive {}:",
+        crate::render::plural(rows.len() as i64, "entry", "entries"),
+        if rows.len() == 1 { "it" } else { "them" }
+    );
+    for row in rows.iter().take(LEFT_OUT_NAMED) {
+        let why = match (row.reason, &row.pattern) {
+            (Reason::Pattern, Some(p)) => format!("pattern {p}"),
+            _ => "socket".to_string(),
+        };
+        let what = if row.folder {
+            format!(
+                "folder, {why}, {} under it, {}",
+                crate::render::plural(row.files, "file", "files"),
+                crate::util::format_bytes_binary(row.bytes)
+            )
+        } else if row.reason == Reason::Socket {
+            why
+        } else {
+            format!("{why}, {}", crate::util::format_bytes_binary(row.bytes))
+        };
+        out.push_str(&format!("\n  left out: {} ({what})", row.path));
+    }
+    if rows.len() > LEFT_OUT_NAMED {
+        out.push_str(&format!(
+            "\n  and {} more left out; `tapectl snapshot create --json` lists them all",
+            rows.len() - LEFT_OUT_NAMED
+        ));
+    }
+    let _ = writeln!(notices, "{out}");
 }
 
 /// Best-effort cleanup of a `stage_set` that `stage_create` failed to
@@ -1534,16 +1546,14 @@ pub(crate) fn stage_set_catalogue_dir(
 ///
 /// Two discovery strategies, both kept:
 ///
-/// - **By filesystem prefix.** The `.dar.age` being written when the stage
+/// - **By filesystem prefix.** The `.tar.age` being written when the stage
 ///   failed has no `stage_slices` row yet (a slice is recorded once it is
-///   complete and synced; issue #370 writes it straight from dar's stream).
+///   complete and synced; issue #370 writes it straight from tar's stream).
 ///   [`files::SliceWriter`] removes its own file when dropped unfinished,
-///   so this catches only what that could not. Plaintext `.dar`/`.sha512`
-///   are matched too: tapectl no longer writes them, but a staging
-///   directory can still hold them from a version that did.
-///   `archive_base_name` (issue #53) carries `stage_set_id`, so the
-///   dot-terminated prefix is unique per stage set and can never match a
-///   sibling stage set of the same snapshot.
+///   so this catches only what that could not. `archive_base_name` (issue
+///   #53) carries `stage_set_id`, so the dot-terminated prefix is unique
+///   per stage set and can never match a sibling stage set of the same
+///   snapshot.
 ///
 /// - **By DB row (`stage_slices.staging_path`).** Every recorded `.age`,
 ///   whatever its name — precise, and independent of the prefix rule.
@@ -1553,19 +1563,14 @@ pub(crate) fn stage_set_catalogue_dir(
 /// `recover_orphaned_sessions` (`src/db/mod.rs`) mark it `'failed'` on the
 /// next `db::open()`, which is the operator's only signal that this stage
 /// attempt didn't complete.
-fn cleanup_failed_stage_set(
-    conn: &Connection,
-    paths: &TapectlPaths,
-    config: &Config,
-    stage_set_id: i64,
-) {
+fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i64) {
     let staging_dir = Path::new(&config.staging.directory);
 
     // Resolve this stage set's archive_base prefix via the SAME
     // `archive_base_name`/`archive_base_prefix` helpers `stage_create_inner`
     // used to build it — the lockstep issue #53 requires: this is not a
     // parallel re-derivation, it's the identical computation.
-    let (prefix, uuid) = match conn
+    let prefix = match conn
         .query_row(
             "SELECT u.uuid, sn.version
              FROM stage_sets ss
@@ -1577,7 +1582,7 @@ fn cleanup_failed_stage_set(
         )
         .ok()
     {
-        Some((uuid, version)) => (archive_base_prefix(&uuid, version, stage_set_id), uuid),
+        Some((uuid, version)) => archive_base_prefix(&uuid, version, stage_set_id),
         None => {
             tracing::warn!(
                 stage_set_id,
@@ -1594,9 +1599,7 @@ fn cleanup_failed_stage_set(
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with(&prefix)
-                && (name.ends_with(".dar.age")
-                    || name.ends_with(".dar")
-                    || name.ends_with(".sha512"))
+                && name.ends_with(files::SLICE_SUFFIX)
                 && fs::remove_file(entry.path()).is_ok()
             {
                 removed += 1;
@@ -1631,22 +1634,6 @@ fn cleanup_failed_stage_set(
         tracing::warn!(stage_set_id, error = %e, "cleanup: could not delete stage_slices rows");
     }
 
-    // Issue #419: this stage set's own isolated catalogue (and dar's
-    // on-the-fly one, if the run died before it was re-isolated). Nothing
-    // else uses the directory: it is per stage set.
-    let catalogue_dir = stage_set_catalogue_dir(paths, &uuid, stage_set_id);
-    if catalogue_dir.exists() {
-        match fs::remove_dir_all(&catalogue_dir) {
-            Ok(()) => removed += 1,
-            Err(e) => tracing::warn!(
-                stage_set_id,
-                path = %catalogue_dir.display(),
-                error = %e,
-                "cleanup: could not remove the stage set's catalogue directory"
-            ),
-        }
-    }
-
     tracing::warn!(
         stage_set_id,
         files_removed = removed,
@@ -1665,7 +1652,7 @@ fn cleanup_failed_stage_set(
 /// `tapectl.db` does (unit/tenant names, paths, sizes, checksums) — they
 /// get `write_private_file`'s 0600-from-creation treatment instead of a
 /// plain `fs::write` at whatever mode the process umask hands out.
-/// Factored out of `stage_create` so it's testable without a real dar
+/// Factored out of `stage_create` so it's testable without a real tar
 /// binary or a full stage pipeline.
 ///
 /// The name is `<YYYYMMDD>_<stage set id>.txt`. A report is never written over
@@ -1707,193 +1694,32 @@ fn write_stage_report(paths: &TapectlPaths, stage_set_id: i64, report: &str) -> 
     )))
 }
 
-/// Best-effort tighten every regular file dar's `-C` catalog extraction
-/// wrote inside `catalog_dir` to 0600.
+/// Refuse to stage a unit bigger than the staging area (ADR-0012 items 85
+/// and 288), before the `stage_sets` INSERT and before tar: such a unit could
+/// be staged, hours of tar and age, and then never written. Every unit may
+/// continue on the next cartridge at the early warning (item 288), so the size
+/// of a tape no longer limits one (the refusal of a unit above one tape, issue
+/// #395, is gone with the opt-in).
 ///
-/// dar writes these itself via subprocess, so unlike `write_private_file`
-/// there's no `open()` call under our control to set the mode at creation
-/// time — this tightens what dar produced after the fact instead. Same
-/// content-metadata exposure as issue #41's `tapectl.db`/stage reports, just
-/// produced by an external process. Non-fatal by design (`secure_path`):
-/// a directory listing failure here must not sink an otherwise-successful
-/// stage.
-fn secure_catalog_files(catalog_dir: &Path) {
-    let Ok(entries) = fs::read_dir(catalog_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            crate::config::secure_path(&entry.path(), 0o600);
-        }
-    }
-}
-
-/// The literal STRING to hand `dar -s` for this unit's stage, resolved
-/// through the SAME dotfile > archive_set > default priority as
-/// `policy::resolve` — but never by reformatting an already-parsed byte
-/// count back into a suffixed string. `resolved_bytes` must be
-/// `policy::resolve(..).slice_size` for the same `unit`, so the
-/// archive_set fallback below is always consistent with whatever the
-/// resolver already decided.
-///
-/// Why this isn't simply `resolved_bytes.to_string()` unconditionally:
-/// `parse_size_to_bytes` (issue #59) silently maps any suffix outside
-/// K/KB/M/MB/G/GB/T/TB to a multiplier of 1 — a real defect that today is
-/// confined to the `stage_sets.slice_size` *bookkeeping* column, which
-/// nothing downstream trusts for the real cut (dar re-parses its own `-s`
-/// argument independently). Routing dar's actual argument through that
-/// same parser — even indirectly, via a byte count computed from it —
-/// would let that defect reach real on-tape slice boundaries for every
-/// unit, including the overwhelmingly common case with no override at
-/// all. So: whichever layer has a native operator-facing string (the
-/// dotfile's raw TOML value, or the system default's config string) hands
-/// that string to dar untouched, exactly as before issue #47. Only the
-/// archive_set layer has no string to fall back on — `archive_sets.slice_size`
-/// has been byte-typed in the schema since M6, so `resolved_bytes` is its
-/// only representation — but handing dar that exact byte count with no
-/// suffix is lossless and valid syntax: dar's own manual states a bare
-/// `-s` number means exactly that many bytes ("'20M' means 20 megabytes,
-/// by default, it is the same as giving 20971520 as argument").
-fn resolve_slice_size_string(
-    conn: &Connection,
-    config: &Config,
-    unit: &models::Unit,
-    resolved_bytes: i64,
-) -> String {
-    // Layer 1 (highest priority): the unit dotfile's own [policy] slice_size.
-    //
-    // Still read as raw TOML here, but NOT for the reason this comment gave
-    // until 2026-09-17 (issue #212 residual). It claimed `slice_size` "isn't
-    // part of the structured `UnitDotfile`/`PolicySection` model" — it is,
-    // since #212 added it so `unit rename`'s read/write round trip stopped
-    // silently dropping it. The raw read is now merely redundant, not
-    // required.
-    //
-    // It is also harmless: `policy::resolve` runs first (see the caller) and
-    // its `?` means a dotfile with a bad `[policy]` never reaches here at all
-    // (#211) — including, since issue #263, a misspelled TOP-LEVEL table
-    // name (`[polcy]` instead of `[policy]`), which `policy::resolve` now
-    // refuses by name too rather than letting it look like an absent
-    // `[policy]` section. Left as-is rather than rewired. dar itself is
-    // handed the string's byte count (`dar::slice::dar_slice_arg`), which
-    // cuts the same slices as any string dar's `-s` took (its suffixes are
-    // binary too).
-    if let Some(ref path) = unit.current_path {
-        let dotfile_path = Path::new(path).join(".tapectl-unit.toml");
-        if let Ok(contents) = fs::read_to_string(&dotfile_path) {
-            if let Ok(toml) = contents.parse::<toml::Table>() {
-                if let Some(v) = toml
-                    .get("policy")
-                    .and_then(|p| p.as_table())
-                    .and_then(|p| p.get("slice_size"))
-                    .and_then(|v| v.as_str())
-                {
-                    return v.to_string();
-                }
-            }
-        }
-    }
-
-    // Layer 2: archive_set. Byte-only column — the resolved byte count
-    // (already computed by `policy::resolve`) is the only faithful string.
-    if let Some(as_id) = unit.archive_set_id {
-        let has_override: bool = conn
-            .query_row(
-                "SELECT slice_size IS NOT NULL FROM archive_sets WHERE id = ?1",
-                params![as_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if has_override {
-            return resolved_bytes.to_string();
-        }
-    }
-
-    // Layer 3: system default — unchanged from before issue #47: dar
-    // receives the config string verbatim, never round-tripped through
-    // `parse_size_to_bytes`.
-    config.defaults.slice_size.clone()
-}
-
-/// Refuse to stage a unit bigger than one tape (issue #395, ADR-0012
-/// 2026-10-06 item 17) unless it allows spanning (#478, items 82 and 94),
-/// and one that allows spanning but is bigger than the staging area (items
-/// 85 and 94). Both are refused here, before the `stage_sets` INSERT and
-/// before dar: such a unit could be staged — hours of dar and age — and then
-/// never written.
-///
-/// - **A unit that does not allow spanning** (`allow_spanning`, resolved
-///   dotfile, archive set, `[defaults]`) is never split across cartridges,
-///   so it is refused above one tape, naming the limit for the cartridge
-///   generation and the key. The limit is the most any configured drive's
-///   native generation can take
-///   ([`crate::config::LtoBackendConfig::planning_tape_budget`]: capacity x
-///   fill ceiling - end-of-tape reserve); with no drive configured there is
-///   no generation to name and nothing is refused here — `volume write`'s
-///   pre-flight gate still refuses a layout that does not fit.
-/// - **A unit that allows spanning** may be any size against one tape (item
-///   94). But it is staged whole before its first tape is written, and its
-///   slices are released only as each tape gives them their copies (items 85
-///   and 129), so it must fit the staging area: one larger than the staging
-///   filesystem's TOTAL size (`f_blocks` x `f_frsize`, coordinator ruling
-///   X14) could never be staged, and is refused by name. Free space is the
-///   pre-stage space check's concern ([`check_staging_space`]), not this
-///   one's.
+/// A unit is staged whole before its first tape is written, and its slices are
+/// released only as each tape gives them their copies (items 85 and 129), so
+/// it must fit the staging area: one larger than the staging filesystem's
+/// TOTAL size (`f_blocks` x `f_frsize`, coordinator ruling X14) could never be
+/// staged, and is refused by name. Free space is the pre-stage space check's
+/// concern ([`check_staging_space`]), not this one's.
 ///
 /// The size is the snapshot's own `total_size` (the walk's sum of file
 /// sizes), the same figure `collection plan` sizes a unit by; it is checked
 /// before compression and errs toward refusing (2026-10-07 item 8).
-fn check_unit_fits_one_tape(
+fn check_unit_fits_staging(
     config: &Config,
     unit_name: &str,
     snapshot: &models::Snapshot,
-    allow_spanning: bool,
     notices: &mut dyn Write,
 ) -> Result<()> {
     let Some(size) = snapshot.total_size.map(|s| s.max(0) as u64) else {
         return Ok(());
     };
-    if allow_spanning {
-        return check_spannable_unit_fits_staging(config, unit_name, size, notices);
-    }
-    let Some(limit) = config
-        .backends
-        .lto
-        .iter()
-        .filter_map(|b| b.planning_tape_budget(None).ok())
-        .max_by_key(|b| b.bytes)
-    else {
-        return Ok(());
-    };
-    if size <= limit.bytes {
-        return Ok(());
-    }
-    let over = size - limit.bytes;
-    Err(TapectlError::Other(format!(
-        "unit \"{unit_name}\" is {size} bytes ({}), {over} bytes ({}) more than one cartridge \
-         can take — {}. A unit that does not allow spanning (allow_spanning) is never split \
-         across cartridges (ADR-0012), so it cannot be written; nothing was staged. To let it \
-         span cartridges, set `allow_spanning = true` in the [policy] of its \
-         .tapectl-unit.toml, in its archive set or in [defaults]; a span is written only by a \
-         drive whose `[[backends.lto]]` entry declares `post_warning_bytes`. The fill ceiling \
-         is the drive's `fill_ceiling` in its `[[backends.lto]]` entry of config.toml (default \
-         97%).",
-        crate::util::format_bytes_binary(i64::try_from(size).unwrap_or(i64::MAX)),
-        crate::util::format_bytes_binary(i64::try_from(over).unwrap_or(i64::MAX)),
-        limit.describe(),
-    )))
-}
-
-/// [`check_unit_fits_one_tape`]'s half for a unit that allows spanning: it
-/// must not be larger than the staging filesystem's total size (ADR-0012
-/// items 85 and 94, ruling X14). A size that cannot be read is said in
-/// `notices` and refuses nothing, as the free-space check does.
-fn check_spannable_unit_fits_staging(
-    config: &Config,
-    unit_name: &str,
-    size: u64,
-    notices: &mut dyn Write,
-) -> Result<()> {
     use crate::util::format_bytes_binary as fmt;
     let staging_dir = Path::new(&config.staging.directory);
     let total = match staging_total_bytes(staging_dir) {
@@ -1902,8 +1728,7 @@ fn check_spannable_unit_fits_staging(
             let _ = writeln!(
                 notices,
                 "warning: could not read the size of staging directory {} ({e}); staging \
-                 unit \"{unit_name}\", which allows spanning, without checking that it fits \
-                 the staging area",
+                 unit \"{unit_name}\" without checking that it fits the staging area",
                 staging_dir.display()
             );
             return Ok(());
@@ -1914,13 +1739,12 @@ fn check_spannable_unit_fits_staging(
     }
     let as_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
     Err(TapectlError::Other(format!(
-        "unit \"{unit_name}\" allows spanning (allow_spanning) and is {size} bytes ({}), larger \
-         than the staging area: the filesystem of staging directory {} is {total} bytes ({}) in \
-         all. A unit that spans cartridges is staged whole before its first tape is written, \
-         and its slices are released only as each tape gives them their copies (ADR-0012 \
-         items 85 and 94), so it cannot be staged here; nothing was staged. It can be once the \
-         staging area is larger than the unit: grow that filesystem, or point `[staging] \
-         directory` in config.toml at a larger one.",
+        "unit \"{unit_name}\" is {size} bytes ({}), larger than the staging area: the \
+         filesystem of staging directory {} is {total} bytes ({}) in all. A unit is staged \
+         whole before its first tape is written, and its slices are released only as each \
+         tape gives them their copies (ADR-0012 items 85 and 129), so it cannot be staged \
+         here; nothing was staged. It can be once the staging area is larger than the unit: \
+         grow that filesystem, or point `[staging] directory` in config.toml at a larger one.",
         fmt(as_i64(size)),
         staging_dir.display(),
         fmt(as_i64(total)),
@@ -1934,7 +1758,7 @@ fn check_spannable_unit_fits_staging(
 /// what `catalog search`, `locate` and the tape's `catalog.db` are built
 /// from. Since #374 both land in one transaction, but a snapshot minted
 /// before that could have committed its row and then lost the rest of its
-/// file list to a Ctrl-C or a busy catalog, and nothing detected it: dar
+/// file list to a Ctrl-C or a busy catalog, and nothing detected it: the archiver
 /// would archive the files anyway, and the tape's catalog would carry the
 /// gap. A NULL `file_count` (never written by `snapshot create`) is not a
 /// count to compare, so it passes.
@@ -2015,18 +1839,94 @@ fn staging_io_error(operation: &str, path: &Path, e: std::io::Error) -> TapectlE
     TapectlError::Other(format!("{operation} {}: {e}", path.display()))
 }
 
-/// dar's per-entry overhead in an archive: each entry's inline header plus
-/// its record in the catalog dar appends at the end. Measured at ~290 bytes
-/// per file on dar 2.7.13 (2,001 files, `compression = none`); rounded up,
-/// because this only ever widens the "may not fit" band, never a refusal.
-const DAR_ENTRY_OVERHEAD_BYTES: i64 = 1024;
+/// The space estimate's figures for each entry of the stream (T4.5,
+/// determined; `volume-format-v3.md` §3.4): its headers, and its extension
+/// headers when it has an ACL or an extended attribute. Measured: about
+/// 1,951 bytes of stream for a small file, more with a long name or an ACL.
+const ENTRY_HEADER_BYTES: u64 = 2560;
+const ENTRY_XATTR_BYTES: u64 = 4096;
+/// And for each slice the estimate comes to.
+const SLICE_OVERHEAD_BYTES: u64 = 1024;
+/// What another stage in flight is held to for each of its files, when only
+/// its snapshot's counts are at hand: an entry's headers and a path of up to
+/// 256 bytes (twice that, rounded up to 512).
+const IN_FLIGHT_ENTRY_BYTES: i64 = (ENTRY_HEADER_BYTES + 512) as i64;
+
+/// `n` rounded up to 512.
+fn round_up_512(n: u64) -> u64 {
+    n.div_ceil(512) * 512
+}
+
+/// The space a staging is expected to write before tar runs (T4.5,
+/// determined): the files' bytes, then for each entry 2,560 bytes plus twice
+/// the length of its path rounded up to 512, plus 4,096 for an entry that
+/// has an ACL or an extended attribute, then 1,024 for each slice the
+/// estimate comes to. It never counts on compression to make room: bytes
+/// that do not shrink grow a little, so a packed staging is held to its
+/// algorithm's worst growth for each slice too. The space accounting while
+/// the stage runs still catches a stream that outgrows it.
+fn stream_estimate(
+    conn: &Connection,
+    snapshot_id: i64,
+    root: &str,
+    slice_size: u64,
+    packing: Option<pack::Packing>,
+) -> Result<i64> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.path, fv.kind, fv.size_bytes FROM {} WHERE fv.snapshot_id = ?1",
+        crate::db::files::VERSION_FILES
+    ))?;
+    let rows = stmt.query_map(params![snapshot_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, crate::db::files::FileKind>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let root = Path::new(root);
+    let mut bytes: u64 = 0;
+    for row in rows {
+        let (path, kind, size) = row?;
+        if kind == crate::db::files::FileKind::Regular {
+            bytes = bytes.saturating_add(size.max(0) as u64);
+        }
+        bytes = bytes
+            .saturating_add(ENTRY_HEADER_BYTES)
+            .saturating_add(round_up_512(2 * path.len() as u64));
+        let full = std::ffi::CString::new(
+            root.join(
+                crate::volume::index::unescape_os(&path).unwrap_or_else(|_| path.clone().into()),
+            )
+            .as_os_str()
+            .as_bytes(),
+        );
+        // SAFETY: a NUL-terminated string; a null buffer of length 0 asks
+        // only for the attribute list's size.
+        let has_xattr = full.is_ok_and(|c| unsafe {
+            nix::libc::llistxattr(c.as_ptr(), std::ptr::null_mut(), 0) > 0
+        });
+        if has_xattr {
+            bytes = bytes.saturating_add(ENTRY_XATTR_BYTES);
+        }
+    }
+    let slices = bytes.div_ceil(slice_size.max(1)).max(1);
+    bytes = bytes.saturating_add(slices.saturating_mul(SLICE_OVERHEAD_BYTES));
+    if packing.is_some() {
+        bytes = bytes.saturating_add(slices.saturating_mul(pack::worst_growth(slice_size)));
+    }
+    Ok(StagingSpaceInputs::peak(
+        i64::try_from(bytes).unwrap_or(i64::MAX),
+    ))
+}
 
 /// What the staging-space check needs to know about the stage it guards.
 struct StagingSpaceInputs<'a> {
     staging_dir: &'a Path,
     unit_name: &'a str,
-    snapshot: &'a models::Snapshot,
-    /// The resolved dar compression (`"none"` or an algorithm).
+    /// The most the stage is expected to write ([`stream_estimate`]).
+    estimate: i64,
+    /// The resolved compression (`"none"` or an algorithm).
     compression: &'a str,
     /// Tier-2 consent given in advance (the global `--yes`) for a stage
     /// that may not fit (issue #354).
@@ -2045,15 +1945,15 @@ struct InFlight {
     bytes: i64,
 }
 
-/// The most a stage of a snapshot of `total_size` bytes in `file_count`
-/// files writes to staging with `compression = none` (see
-/// [`StagingSpaceInputs::upper`]).
+/// The most another stage in flight, of a snapshot of `total_size` bytes in
+/// `file_count` files, is taken to write to staging, from its snapshot's
+/// counts alone.
 fn stage_upper_bound(total_size: Option<i64>, file_count: Option<i64>) -> i64 {
     StagingSpaceInputs::peak(
         total_size.unwrap_or(0).saturating_add(
             file_count
                 .unwrap_or(0)
-                .saturating_mul(DAR_ENTRY_OVERHEAD_BYTES),
+                .saturating_mul(IN_FLIGHT_ENTRY_BYTES),
         ),
     )
 }
@@ -2135,20 +2035,12 @@ fn refuse_a_unit_already_staging(
 }
 
 impl StagingSpaceInputs<'_> {
-    /// Staging's peak for a dar archive of `archive` bytes: the archive
-    /// itself, as ciphertext — only `.age` slices are written there (issue
-    /// #370), each about 1/4096 longer than its plaintext (age's 16-byte tag
-    /// per 64 KiB chunk), plus its header.
-    fn peak(archive: i64) -> i64 {
-        archive.saturating_add(archive / 4096).saturating_add(4096)
-    }
-
-    /// The most the stage is expected to need with `compression = none`,
-    /// as near as it can be told without reading the files: the snapshot's
-    /// recorded size — the sum of its regular files' apparent sizes — plus
-    /// [`DAR_ENTRY_OVERHEAD_BYTES`] a file.
-    fn upper(&self) -> i64 {
-        stage_upper_bound(self.snapshot.total_size, self.snapshot.file_count)
+    /// Staging's peak for `stream` bytes of slices: the slices themselves,
+    /// as ciphertext — only `.age` slices are written there (issue #370),
+    /// each about 1/4096 longer than its plaintext (age's 16-byte tag per 64
+    /// KiB chunk), plus its header.
+    fn peak(stream: i64) -> i64 {
+        stream.saturating_add(stream / 4096).saturating_add(4096)
     }
 
     fn free(&self, notices: &mut dyn Write) -> Option<i64> {
@@ -2172,23 +2064,22 @@ impl StagingSpaceInputs<'_> {
 /// (issue #364).
 ///
 /// - free space covers the upper bound: nothing to say;
-/// - otherwise the stage may or may not fit — dar stores runs of zeros as
-///   holes and a hard-linked file once, and compression can shrink anything
-///   — so the operator is ASKED, with the figures ([`ask_to_stage_anyway`]:
-///   ADR-0008 Tier 2; `--yes` proceeds, a non-interactive run without it
-///   refuses). Never a hard refusal.
+/// - otherwise the stage may or may not fit — a hard-linked file is stored
+///   once, and a packed staging can shrink — so the operator is ASKED, with
+///   the figures ([`ask_to_stage_anyway`]: ADR-0008 Tier 2; `--yes`
+///   proceeds, a non-interactive run without it refuses). Never a hard
+///   refusal.
 ///
-/// It used to refuse outright below a lower bound, the unit's non-zero
-/// bytes, which the sha256 pass before dar counted. Since issue #364 there
-/// is no pass before dar to count them: the source is read once, beside
-/// dar. A stage that goes ahead and runs out of space stops cleanly.
+/// The source is read once, by tar; there is no pass before it to count the
+/// unit's bytes. A stage that goes ahead and runs out of space stops
+/// cleanly.
 fn check_staging_space(inputs: &StagingSpaceInputs, notices: &mut dyn Write) -> Result<()> {
     use crate::util::format_bytes_binary as fmt;
 
     let Some(free) = inputs.free(notices) else {
         return Ok(());
     };
-    let upper = inputs.upper();
+    let upper = inputs.estimate;
     // Issue #368: what the stages running beside this one may still write
     // is not free for this one.
     let spoken_for = inputs.in_flight.bytes;
@@ -2209,10 +2100,10 @@ fn check_staging_space(inputs: &StagingSpaceInputs, notices: &mut dyn Write) -> 
         String::new()
     };
     let how = if inputs.compression == "none" {
-        "dar stores runs of zeros as holes and a hard-linked file once".to_string()
+        "a hard-linked file is stored once".to_string()
     } else {
         format!(
-            "its data may compress (compression = \"{}\")",
+            "a hard-linked file is stored once, or its data may compress (compression = \"{}\")",
             inputs.compression
         )
     };
@@ -2220,8 +2111,8 @@ fn check_staging_space(inputs: &StagingSpaceInputs, notices: &mut dyn Write) -> 
         inputs,
         format!(
             "staging directory {} may be too small for unit \"{}\": {} free{in_flight}, and \
-             staging it needs up to {}, its encrypted slices at the snapshot's full size (less \
-             if {how}); {STAGING_RUNS_OUT}",
+             staging it needs up to {}, its encrypted slices at the snapshot's full size and \
+             tar's headers (less if {how}); {STAGING_RUNS_OUT}",
             inputs.staging_dir.display(),
             inputs.unit_name,
             fmt(free),
@@ -2471,15 +2362,17 @@ pub(crate) fn encrypt_data_with_header_len(
 }
 
 /// Sizes and hashes recorded for one staged slice
-/// ([`files::SliceWriter::finish`]): the plaintext dar slice's size and
-/// sha256, and its `.age` file's. Only the plaintext pair is a pure function
-/// of the content — age draws a fresh key, nonce and grease stanza for
-/// every file.
+/// ([`files::SliceWriter::finish`]): the cut's size and sha256 (before
+/// packing, `volume-format-v3.md` §3.4), and its `.age` file's. Only the
+/// cut's pair is a pure function of the content — age draws a fresh key,
+/// nonce and grease stanza for every file.
 pub struct EncryptedSliceInfo {
     pub plain_size: i64,
     pub sha256_plain: String,
     pub encrypted_size: i64,
     pub sha256_encrypted: String,
+    /// The packed frame's length, for a packed slice.
+    pub packed_size: Option<u64>,
 }
 
 /// Force `file`'s bytes, then the directory entry that names it, to stable
@@ -2495,32 +2388,6 @@ fn make_durable(file: &fs::File, path: &Path) -> Result<()> {
     }
     #[cfg(test)]
     durability::note(durability::Event::Synced(path.to_path_buf()));
-    Ok(())
-}
-
-/// Sync the isolated dar catalogue `dar -C` just wrote at `catalog_base`
-/// (`{catalog_base}.N.dar`; other snapshots' catalogues share the directory
-/// and are left alone) — issue #409. Every later stage set of the snapshot
-/// reuses this file instead of extracting it again, so it is written once
-/// and must survive a power loss like the slices it indexes.
-fn sync_catalogue(catalog_base: &Path) -> Result<()> {
-    let (Some(dir), Some(base)) = (catalog_base.parent(), catalog_base.file_name()) else {
-        return Ok(());
-    };
-    let prefix = format!("{}.", base.to_string_lossy());
-    let entries = fs::read_dir(dir)
-        .map_err(|e| staging_io_error("cannot read catalogue directory", dir, e))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| staging_io_error("cannot read catalogue directory", dir, e))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(".dar") {
-            let path = entry.path();
-            let file = fs::File::open(&path)
-                .map_err(|e| staging_io_error("cannot open catalogue", &path, e))?;
-            make_durable(&file, &path)?;
-        }
-    }
     Ok(())
 }
 
@@ -2556,15 +2423,15 @@ pub(crate) mod durability {
 
 /// Test-only: make `stage_create` fail at a named point on this thread, the
 /// way a crash or an io error there would — how a test reaches the cleanup
-/// of a stage set that died after dar.
+/// of a stage set that died after tar.
 #[cfg(test)]
 pub(crate) mod failpoint {
     use std::cell::Cell;
 
     use crate::error::{Result, TapectlError};
 
-    /// Right after dar has finished and its command is recorded.
-    pub(crate) const AFTER_DAR: &str = "after dar";
+    /// Right after tar has exited and its stream is staged.
+    pub(crate) const AFTER_TAR: &str = "after tar";
 
     /// Just before the stage set is recorded.
     pub(crate) const BEFORE_RECORD: &str = "before the stage set is recorded";
@@ -2612,18 +2479,18 @@ pub(crate) mod failpoint {
     }
 
     thread_local! {
-        static STAGING_AFTER_DAR: std::cell::RefCell<Option<Vec<String>>> =
+        static STAGING_AFTER_TAR: std::cell::RefCell<Option<Vec<String>>> =
             const { std::cell::RefCell::new(None) };
     }
 
-    /// Record the staging directory's file names when dar has finished,
+    /// Record the staging directory's file names when tar has exited,
     /// on this thread's next stage.
-    pub(crate) fn observe_staging_after_dar() {
-        STAGING_AFTER_DAR.with(|o| *o.borrow_mut() = Some(Vec::new()));
+    pub(crate) fn observe_staging_after_tar() {
+        STAGING_AFTER_TAR.with(|o| *o.borrow_mut() = Some(Vec::new()));
     }
 
     pub(crate) fn note_staging(dir: &std::path::Path) {
-        STAGING_AFTER_DAR.with(|o| {
+        STAGING_AFTER_TAR.with(|o| {
             if let Some(names) = o.borrow_mut().as_mut() {
                 let mut found: Vec<String> = std::fs::read_dir(dir)
                     .map(|rd| {
@@ -2639,8 +2506,8 @@ pub(crate) mod failpoint {
     }
 
     /// What [`note_staging`] recorded, clearing it.
-    pub(crate) fn staging_after_dar() -> Option<Vec<String>> {
-        STAGING_AFTER_DAR.with(|o| o.borrow_mut().take())
+    pub(crate) fn staging_after_tar() -> Option<Vec<String>> {
+        STAGING_AFTER_TAR.with(|o| o.borrow_mut().take())
     }
 }
 
@@ -2906,23 +2773,65 @@ fn walk_directory(
     path: &str,
     global_excludes: &[String],
 ) -> Result<(i64, i64, Vec<ManifestEntry>)> {
-    use std::os::unix::fs::MetadataExt;
+    let walk = walk_directory_reporting(path, global_excludes)?;
+    Ok((walk.total_size, walk.file_count, walk.entries))
+}
+
+/// What one walk of a unit found, and what it left out (#542).
+struct Walk {
+    total_size: i64,
+    file_count: i64,
+    entries: Vec<ManifestEntry>,
+    /// Everything a pattern or the socket rule kept out, by path.
+    left_out: Vec<crate::db::snapshot_left_out::LeftOut>,
+}
+
+/// What lies under the folder `dir`, for the report of a folder a pattern
+/// left out: every entry that is not a directory, and the bytes of the
+/// regular files among them. Never follows a link; an entry it cannot read
+/// counts for nothing.
+fn count_under(dir: &Path) -> (i64, i64) {
+    let (mut files, mut bytes) = (0i64, 0i64);
+    for e in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if e.file_type().is_dir() {
+            continue;
+        }
+        files += 1;
+        if e.file_type().is_file() {
+            bytes += e.metadata().map(|m| m.len() as i64).unwrap_or(0);
+        }
+    }
+    (files, bytes)
+}
+
+/// [`walk_directory`], with what the walk left out (ADR-0012 items 252 and
+/// 270, #542): each file an exclusion pattern kept out, each folder one
+/// pruned (with what was under it; the folder's own entry stays, empty),
+/// and each socket. Sockets are left out of every unit, pattern or none.
+fn walk_directory_reporting(path: &str, global_excludes: &[String]) -> Result<Walk> {
+    use crate::db::snapshot_left_out::{LeftOut, Reason};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use walkdir::WalkDir;
 
     let base = Path::new(path);
     // Issue #49 items 3+5: global excludes + the unit's own dotfile exclude
     // patterns, compiled once per walk (not per entry). A plain pattern never
-    // matches a directory (dar's own `-X` rule); a directory pattern
-    // (`name/`, issue #359) prunes the subtree below `name`, which dar
-    // receives as `-P` masks (`exclude::dar_masks`, in `stage_create`).
+    // matches a directory; a directory pattern (`name/`, issue #359) prunes
+    // the subtree below `name`. tar is given what this walk records (D14).
     let exclude_compiled = exclude::effective_compiled(base, global_excludes)?;
     let mut entries = Vec::new();
     let mut total_size: i64 = 0;
     let mut file_count: i64 = 0;
+    let mut left_out: Vec<LeftOut> = Vec::new();
 
     // Issue #359 (c): a directory INSIDE a pruned subtree is neither
-    // recorded nor descended — dar's `-P` + `-D` store the pruned directory
-    // itself, empty, and nothing below it. The pruned directory's own entry
+    // recorded nor descended — the pruned directory itself is kept, empty,
+    // and nothing below it. The pruned directory's own entry
     // passes (`excludes_dir_entry` keeps it) and its non-directory children
     // are dropped by `is_excluded` below. `file_type()` here is the lstat
     // type (`follow_links(false)`), the same fact `is_dir` is below.
@@ -2945,31 +2854,62 @@ fn walk_directory(
             .map_err(|e| TapectlError::Other(e.to_string()))?;
         let is_dir = meta.is_dir();
 
+        // #542: a folder a directory pattern prunes keeps its own entry,
+        // empty (below); what was under it is reported, with the pattern.
+        if is_dir {
+            if let Some(pattern) = exclude_compiled.dir_self_pattern(entry.path()) {
+                let (files, bytes) = count_under(entry.path());
+                left_out.push(LeftOut {
+                    reason: Reason::Pattern,
+                    pattern: Some(pattern.to_string()),
+                    path: crate::volume::index::escape_os(rel.as_os_str()).into_owned(),
+                    folder: true,
+                    files,
+                    bytes,
+                });
+            }
+        }
+
         // Issue #49: a non-directory entry matching an exclude pattern is
         // dropped before any further work (symlink-target read, manifest
-        // row) — dar will never archive it (`stage_create` hands dar the
-        // same patterns, as `-X` and `-P` masks via `exclude::dar_masks`),
-        // so the manifest/files table must not record it either. Checked
+        // row) — it is never archived (tar is given what this walk records,
+        // D14), so the manifest/files table must not record it either. Checked
         // before the file_type classification below so an excluded entry
         // costs nothing beyond the pattern match.
-        if !is_dir && exclude::is_excluded(entry.path(), &exclude_compiled) {
-            continue;
+        if !is_dir {
+            // Inside a folder a directory pattern pruned: the folder was
+            // reported once, with all that lies under it.
+            if exclude_compiled.excludes_dir_entry(entry.path()) {
+                continue;
+            }
+            // #542: said, with the pattern, instead of dropped without a
+            // word. A pattern is the operator's rule and is named before the
+            // socket rule (item 270), which holds for every unit.
+            let reported = if let Some(pattern) = exclude_compiled.file_pattern(entry.path()) {
+                Some((Reason::Pattern, Some(pattern.to_string())))
+            } else if entry.file_type().is_socket() {
+                Some((Reason::Socket, None))
+            } else {
+                None
+            };
+            if let Some((reason, pattern)) = reported {
+                left_out.push(LeftOut {
+                    reason,
+                    pattern,
+                    path: crate::volume::index::escape_os(rel.as_os_str()).into_owned(),
+                    folder: false,
+                    files: 1,
+                    bytes: if meta.is_file() { meta.len() as i64 } else { 0 },
+                });
+                continue;
+            }
         }
-        // Issue #465: names are recorded as UTF-8 text, and one that is not
-        // used to be stored lossily — every stage of the unit then failed as
-        // "source file missing", and two names that collapsed to the same
-        // text collided on the paths index. Refused here, once, naming the
-        // path (`{:?}` escapes the bytes that are not UTF-8). Checked after
-        // the exclusion above: a name dar will not archive is not recorded
-        // and not a reason to refuse. A symlink's target is not a name tapectl
-        // looks up, and stays lossy.
-        let Some(rel_path) = rel.to_str().map(str::to_string) else {
-            return Err(TapectlError::Other(format!(
-                "cannot record the file name {rel:?} under {path}: it is not valid UTF-8, \
-                 and tapectl records and looks up names as text. Rename it (for example \
-                 with `convmv -f latin1 -t utf8`), or move it out of the unit"
-            )));
-        };
+        // A name is bytes (ADR-0012 item 297, #569): it is recorded in the
+        // escaped form of `volume-format-v3.md` §1.5, the one the catalog, the
+        // file table and the index hold, and nothing converts it lossily. A
+        // name that is UTF-8 with no backslash, TAB, LF or CR is recorded as
+        // it is.
+        let rel_path = crate::volume::index::escape_os(rel.as_os_str()).into_owned();
         // lstat's own size for the entry — for a symlink this is the length
         // of the *target path string*, not any real content size. Kept
         // as-is (not zeroed for a symlink/special below): it's what
@@ -3002,7 +2942,10 @@ fn walk_directory(
             let target = fs::read_link(entry.path()).map_err(|e| {
                 TapectlError::Other(format!("cannot read symlink target: {rel_path} ({e})"))
             })?;
-            ("symlink", Some(target.to_string_lossy().to_string()))
+            (
+                "symlink",
+                Some(crate::volume::index::escape_os(target.as_os_str()).into_owned()),
+            )
         } else if ft.is_file() {
             ("regular", None)
         } else {
@@ -3020,8 +2963,8 @@ fn walk_directory(
 
         if !is_dir {
             // Every non-directory entry counts toward file_count, same as
-            // before this fix (dar will archive and catalog a symlink or
-            // special file as a real entry even though it carries no
+            // before this fix (tar archives a symlink or special file as a
+            // member of its own even though it carries no
             // content payload).
             file_count += 1;
             // Only real content bytes count as archival payload — a
@@ -3043,7 +2986,13 @@ fn walk_directory(
         });
     }
 
-    Ok((total_size, file_count, entries))
+    left_out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(Walk {
+        total_size,
+        file_count,
+        entries,
+        left_out,
+    })
 }
 
 /// Test-only cross-module seam (issue #49): the relative, non-directory
@@ -3107,6 +3056,45 @@ mod tests {
         kp.public_key
     }
 
+    /// ADR-0012 item 297 (#569): the walk records a name's bytes in the escaped
+    /// form (it used to refuse such a unit by name), a symbolic link's target
+    /// likewise, and a pattern reads a name that is not UTF-8 by that form: a
+    /// glob matches it, and what it leaves out is reported escaped.
+    #[test]
+    fn walk_directory_records_names_that_are_not_utf8_in_the_escaped_form() {
+        use std::os::unix::ffi::OsStrExt;
+        let os = std::ffi::OsStr::from_bytes;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(os(b"caf\xe9.txt")), b"kept").unwrap();
+        fs::write(tmp.path().join(os(b"caf\xe9.tmp")), b"junk").unwrap();
+        fs::write(tmp.path().join("back\\slash.txt"), b"slash").unwrap();
+        fs::create_dir(tmp.path().join(os(b"n\xe9"))).unwrap();
+        fs::write(tmp.path().join(os(b"n\xe9")).join("inside"), b"x").unwrap();
+        std::os::unix::fs::symlink(os(b"\xfe\xfdtarget"), tmp.path().join(os(b"l\xe9"))).unwrap();
+
+        let walk = walk_directory_reporting(
+            tmp.path().to_str().unwrap(),
+            &["*.tmp".to_string(), "n*/".to_string()],
+        )
+        .unwrap();
+        let mut paths: Vec<&str> = walk.entries.iter().map(|e| e.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            ["back\\\\slash.txt", "caf\\xe9.txt", "l\\xe9", "n\\xe9"],
+            "the escaped forms; the .tmp is out, the pruned folder stays, empty"
+        );
+        let link = walk.entries.iter().find(|e| e.path == "l\\xe9").unwrap();
+        assert_eq!(link.link_target.as_deref(), Some("\\xfe\\xfdtarget"));
+        let mut left: Vec<(&str, bool)> = walk
+            .left_out
+            .iter()
+            .map(|l| (l.path.as_str(), l.folder))
+            .collect();
+        left.sort_unstable();
+        assert_eq!(left, [("caf\\xe9.tmp", false), ("n\\xe9", true)]);
+    }
+
     #[test]
     fn walk_directory_records_symlink_file_type_target_and_excludes_it_from_total_size() {
         // Reproduces the mhvtl gate's exact fixture shape: target.txt holds
@@ -3137,8 +3125,8 @@ mod tests {
             "a symlink's target-string length must not count as payload"
         );
 
-        // Both non-directory entries count toward file_count — dar will
-        // archive and catalog the symlink as a real entry even though it
+        // Both non-directory entries count toward file_count — tar will
+        // archive the symlink as a member of its own even though it
         // carries no content payload (see commit message for the
         // file_count-vs-total_size rationale: this preserves today's
         // `if !is_dir { file_count += 1 }` behavior verbatim; only
@@ -3194,6 +3182,133 @@ mod tests {
         assert_eq!(file_count, 2, "the FIFO still counts toward file_count");
     }
 
+    // ── issue #542, ADR-0012 items 252 and 270: what a snapshot left out ──
+
+    /// What `snapshot_left_out` holds for `snapshot_id`, in `seq` order:
+    /// (reason, pattern, path, kind, files, bytes).
+    type LeftOutRow = (String, Option<String>, String, String, i64, i64);
+
+    fn left_out_rows(conn: &Connection, snapshot_id: i64) -> Vec<LeftOutRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT reason, pattern, path, kind, files, bytes
+                 FROM snapshot_left_out WHERE snapshot_id = ?1 ORDER BY seq",
+            )
+            .unwrap();
+        stmt.query_map(params![snapshot_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn a_snapshot_reports_a_socket_an_excluded_file_and_an_excluded_folder() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, config, src) =
+            setup_unit_with_excludes(&tmp, vec!["*.nfo".to_string(), ".cache/".to_string()]);
+
+        fs::write(src.join("keep.txt"), b"kept").unwrap();
+        fs::write(src.join("a.nfo"), b"12345").unwrap();
+        fs::create_dir_all(src.join(".cache/sub")).unwrap();
+        fs::write(src.join(".cache/x"), b"123").unwrap();
+        fs::write(src.join(".cache/sub/y"), b"1234").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(src.join("s.sock")).unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
+
+        let mut rows = left_out_rows(&conn, snap_id);
+        rows.sort_by(|a, b| a.2.cmp(&b.2));
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "pattern".to_string(),
+                    Some(".cache/".to_string()),
+                    ".cache".to_string(),
+                    "folder".to_string(),
+                    2,
+                    7
+                ),
+                (
+                    "pattern".to_string(),
+                    Some("*.nfo".to_string()),
+                    "a.nfo".to_string(),
+                    "file".to_string(),
+                    1,
+                    5
+                ),
+                (
+                    "socket".to_string(),
+                    None,
+                    "s.sock".to_string(),
+                    "file".to_string(),
+                    1,
+                    0
+                ),
+            ]
+        );
+
+        // Left out of the file list too; the pruned folder's own entry stays.
+        for gone in ["a.nfo", "s.sock", ".cache/x", ".cache/sub/y"] {
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, snap_id, Some(gone)),
+                0,
+                "{gone} must not be in the file list"
+            );
+        }
+        for kept in ["keep.txt", ".cache"] {
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, snap_id, Some(kept)),
+                1,
+                "{kept} must be in the file list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_socket_is_left_out_and_reported_with_no_pattern_configured() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("keep.txt"), b"kept").unwrap();
+        fs::create_dir_all(src.join("d")).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(src.join("d/s.sock")).unwrap();
+
+        let outcome = snapshot_create_detailed(&conn, "unit1", &config).unwrap();
+        assert_eq!(
+            left_out_rows(&conn, outcome.snapshot_id),
+            vec![(
+                "socket".to_string(),
+                None,
+                "d/s.sock".to_string(),
+                "file".to_string(),
+                1,
+                0
+            )]
+        );
+        // keep.txt and the unit's own dotfile; the socket is not counted.
+        let count: i64 = conn
+            .query_row(
+                "SELECT file_count FROM snapshots WHERE id = ?1",
+                params![outcome.snapshot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "the socket is not counted");
+        assert_eq!(
+            crate::db::files::fixture::count(&conn, outcome.snapshot_id, Some("d/s.sock")),
+            0
+        );
+    }
+
     // ── issue #53: archive_base is per-stage-set, not per-snapshot ──
 
     #[test]
@@ -3213,14 +3328,14 @@ mod tests {
     fn archive_base_prefix_is_the_name_plus_a_trailing_dot_and_stays_lockstep_with_cleanup() {
         // `cleanup_failed_stage_set` derives its plaintext-scan prefix via
         // this exact helper (not a parallel re-derivation) — this test
-        // proves the shape stays what dar's `{base}.{N}.dar` naming needs,
-        // and that the dot prevents `_s1` from prefix-matching `_s10.1.dar`.
+        // proves the shape stays what the `{base}.{N}.tar.age` naming needs,
+        // and that the dot prevents `_s1` from prefix-matching `_s10.1.tar.age`.
         let p1 = archive_base_prefix("abcdef0123456789", 3, 1);
         let p10 = archive_base_prefix("abcdef0123456789", 3, 10);
         assert_eq!(p1, "abcdef012345_v3_s1.");
         assert_eq!(p10, "abcdef012345_v3_s10.");
         assert!(
-            !"abcdef012345_v3_s10.1.dar".starts_with(&p1),
+            !"abcdef012345_v3_s10.1.tar.age".starts_with(&p1),
             "trailing dot must stop _s1 from prefix-matching _s10's files"
         );
     }
@@ -3231,8 +3346,8 @@ mod tests {
     /// defect: `[excludes] pattern = [...]` (singular — the real key is
     /// `patterns`) parses cleanly today because `ExcludesSection` carries
     /// no `#[serde(deny_unknown_fields)]`, so `read_dotfile` silently
-    /// returns `exclude_patterns: []`. `stage_create` then hands dar zero
-    /// `-X` masks, and the material the operator meant to exclude is
+    /// returns `exclude_patterns: []`. The walk then leaves out nothing,
+    /// and the material the operator meant to exclude is
     /// archived, encrypted, and written to write-once media — inside a
     /// valid sha256, so nothing downstream ever notices. This must now
     /// fail LOUDLY instead: the whole point is that silently including the
@@ -3253,7 +3368,6 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string();
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
@@ -3291,7 +3405,7 @@ mod tests {
 
         // `snapshot_create` walks the source directory too (`walk_directory`
         // -> `exclude::effective_compiled` -> `dotfile_patterns`, the same
-        // shared helper `stage_create`'s dar `-X` masks use), so the fix
+        // shared helper every walk uses), so the fix
         // actually closes this gap even earlier than `stage_create` — at
         // manifest-build time. Either stage failing loudly satisfies this
         // test; the one thing that must NOT happen is the whole pipeline
@@ -3309,7 +3423,7 @@ mod tests {
     /// The core claim of issue #47: `stage_create` must resolve
     /// `slice_size` through `policy::resolve` (dotfile > archive_set >
     /// default), not read `config.defaults.slice_size` unconditionally.
-    /// Exercises the REAL pipeline end to end (real `dar`, real tenant
+    /// Exercises the REAL pipeline end to end (real `tar`, real tenant
     /// keys via `tenant::add_tenant`) so the assertion is against what
     /// actually lands in `stage_sets`, not a mocked shortcut.
     ///
@@ -3326,8 +3440,8 @@ mod tests {
     /// from newly-written dotfiles unless the operator sets them
     /// explicitly — so `init_unit`'s dotfile no longer shadows this
     /// archive_set field, and this test proves that end to end. Because the
-    /// archive set names a real compressor, it also runs dar's `-z` codepath,
-    /// which #92 made reachable for the first time.
+    /// archive set names a real compressor, it also packs each slice with
+    /// it, the path #92 made reachable for the first time.
     #[test]
     fn stage_create_uses_archive_set_resolved_slice_size_not_global_default() {
         let tmp = TempDir::new().unwrap();
@@ -3342,7 +3456,6 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string(); // PATH, not a hardcoded distro path (issue #43)
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
         config.defaults.slice_size = "100M".to_string();
         // Leave the default at "none" and have the archive set override it to
@@ -3350,7 +3463,7 @@ mod tests {
         // the fix: pre-#92, `init_unit`'s dotfile hardcoded `compression =
         // "none"`, so an assertion expecting "none" would have passed for the
         // wrong reason. Expecting "gzip" can only succeed if the dotfile has
-        // stopped shadowing. It also drives dar's real `-z` codepath.
+        // stopped shadowing. It also drives the real packing path.
         config.defaults.compression = "none".to_string();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
@@ -3421,7 +3534,7 @@ mod tests {
         );
     }
 
-    /// End-to-end proof (real dar, real encryption) that two stage sets of
+    /// End-to-end proof (real tar, real encryption) that two stage sets of
     /// the SAME snapshot never collide: their `.age` slice paths differ,
     /// and both sets of ciphertext survive on disk simultaneously —
     /// something the old per-snapshot `archive_base` could not guarantee.
@@ -3440,7 +3553,6 @@ mod tests {
 
         let mut config = Config::default();
         config.staging.directory = staging_dir.to_string_lossy().to_string();
-        config.dar.binary = "dar".to_string();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
         crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
@@ -3498,112 +3610,19 @@ mod tests {
         );
     }
 
-    /// Decrypt every `.age` slice of `stage_set_id` with the tenant `alice`'s
-    /// keys into `out/arch.N.dar` — the plaintext dar archive an heir gets
-    /// after `age -d` — and return its base, `out/arch`, for `dar -t`/`-x`.
-    pub(super) fn decrypt_staged_set(
-        conn: &Connection,
-        paths: &TapectlPaths,
-        stage_set_id: i64,
-        out: &Path,
-    ) -> PathBuf {
-        let identities =
-            crate::crypto::keys::load_tenant_identities(conn, &paths.keys_dir, "alice").unwrap();
-        assert!(!identities.is_empty(), "alice has keys");
-        let slices: Vec<(i64, String)> = conn
-            .prepare(
-                "SELECT slice_number, staging_path FROM stage_slices
-                 WHERE stage_set_id = ?1 ORDER BY slice_number",
-            )
-            .unwrap()
-            .query_map(params![stage_set_id], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        assert!(!slices.is_empty(), "stage set {stage_set_id} has slices");
-        fs::create_dir_all(out).unwrap();
-        for (n, path) in slices {
-            let decryptor = age::Decryptor::new(fs::File::open(&path).unwrap()).unwrap();
-            let mut reader = decryptor
-                .decrypt(identities.iter().map(|i| i as &dyn age::Identity))
-                .unwrap();
-            let mut plain = fs::File::create(out.join(format!("arch.{n}.dar"))).unwrap();
-            std::io::copy(&mut reader, &mut plain).unwrap();
-        }
-        out.join("arch")
-    }
-
-    /// `dar -t <archive> -A <catalogue>`: does dar accept `catalogue` as
-    /// the isolated catalogue of `archive`? dar compares the archive's
-    /// random data-name label with the catalogue's.
-    pub(super) fn dar_accepts_catalogue(archive: &Path, catalogue: &str) -> (bool, String) {
-        let out = std::process::Command::new("dar")
-            .arg("-t")
-            .arg(archive)
-            .arg("-A")
-            .arg(catalogue)
-            .arg("-Q")
-            .output()
-            .expect("dar must be on PATH (tests/test_dependencies.rs)");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    }
-
-    /// Issue #419: every stage set has its own isolated catalogue, produced
-    /// by its own dar run, so dar's catalogue rescue (`-A`) works against
-    /// that stage set's slices. Before, the catalogue was extracted once per
-    /// snapshot and every later stage set reused the first run's — whose
-    /// random data-name label dar refuses against a later run's slices.
-    #[test]
-    fn a_restaged_snapshots_catalogue_matches_its_own_slices() {
-        let tmp = TempDir::new().unwrap();
-        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        fs::write(src.join("f.txt"), b"restaged content").unwrap();
-        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let set_1 = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
-        let set_2 = restage(&conn, &paths, &config, snap_id).unwrap();
-
-        let catalogue = |id: i64| -> String {
-            conn.query_row(
-                "SELECT catalog_path FROM stage_sets WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        let archive_2 = decrypt_staged_set(&conn, &paths, set_2, &tmp.path().join("plain2"));
-
-        let (ok, err) = dar_accepts_catalogue(&archive_2, &catalogue(set_2));
-        assert!(
-            ok,
-            "the second stage set's catalogue must be its own archive's: {err}"
-        );
-        // Positive control: dar does refuse a catalogue from another run.
-        let (ok, _) = dar_accepts_catalogue(&archive_2, &catalogue(set_1));
-        assert!(
-            !ok,
-            "dar refuses the first run's catalogue for the second run's slices"
-        );
-    }
-
     // ── issue #54: stage failure hygiene ──
 
-    /// A failure after dar has finished — every slice written and recorded,
+    /// A failure after tar has finished — every slice written and recorded,
     /// the stage not yet finalized — leaves nothing in staging. Before issue
-    /// #54 the plaintext `.dar` slices dar had written then were never
-    /// cleaned up; since issue #370 there are none, and the recorded `.age`
+    /// #54 the plaintext slices written then were never cleaned up; since
+    /// issue #370 there are none, and the recorded `.age`
     /// slices are what the cleanup must remove.
     ///
-    /// The failure is injected right after dar (`failpoint::AFTER_DAR`).
+    /// The failure is injected right after tar (`failpoint::AFTER_TAR`).
     /// It used to be injected with a tenant that had no active keys, until
-    /// issue #354 moved that refusal before dar, and then by making
-    /// `catalogs_dir` a file, until issue #419 created the stage set's
-    /// catalogue directory before dar (dar writes the catalogue into it).
-    /// The cleanup also removes that directory.
+    /// issue #354 moved that refusal before tar.
     #[test]
-    fn a_failure_after_dar_leaves_nothing_in_staging() {
+    fn a_failure_after_tar_leaves_nothing_in_staging() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -3616,7 +3635,6 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string(); // PATH, not a hardcoded distro path (issue #43)
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
@@ -3644,9 +3662,9 @@ mod tests {
         .unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        // The injected post-dar failure (see the doc comment).
-        failpoint::arm(failpoint::AFTER_DAR);
-        failpoint::observe_staging_after_dar();
+        // The injected post-tar failure (see the doc comment).
+        failpoint::arm(failpoint::AFTER_TAR);
+        failpoint::observe_staging_after_tar();
         let result = stage_create(&conn, &paths, &config, snap_id, false);
 
         assert!(
@@ -3654,21 +3672,21 @@ mod tests {
             "expected stage_create to fail at the injected point, got {result:?}"
         );
 
-        // Positive control: the failure must have come AFTER dar, with its
+        // Positive control: the failure must have come AFTER tar, with its
         // slices written, or the assertion below would pass vacuously.
-        let dar_ran: bool = conn
+        let tar_ran: bool = conn
             .query_row(
-                "SELECT dar_command IS NOT NULL FROM stage_sets WHERE snapshot_id = ?1",
+                "SELECT tar_command IS NOT NULL FROM stage_sets WHERE snapshot_id = ?1",
                 params![snap_id],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(
-            dar_ran,
-            "the injected failure must land after dar -c, got: {result:?}"
+            tar_ran,
+            "the injected failure must land after tar, got: {result:?}"
         );
         assert_eq!(
-            failpoint::staging_after_dar().map(|names| names.len()),
+            failpoint::staging_after_tar().map(|names| names.len()),
             Some(1),
             "positive control: one slice was in staging when the failure hit"
         );
@@ -3682,18 +3700,6 @@ mod tests {
             leaked.is_empty(),
             "the failed stage set's files are all removed — found: {leaked:?}"
         );
-
-        // Issue #419: dar wrote this stage set's on-the-fly catalogue into its
-        // own catalogue directory; the cleanup removes that too.
-        let unit_catalogues = paths.catalogs_dir.read_dir().unwrap().flatten();
-        for unit_dir in unit_catalogues {
-            let left: Vec<_> = fs::read_dir(unit_dir.path()).unwrap().flatten().collect();
-            assert!(
-                left.is_empty(),
-                "the failed stage set's catalogue directory is removed: {:?}",
-                left.iter().map(|e| e.path()).collect::<Vec<_>>()
-            );
-        }
 
         // The stage_sets row must survive the failure — that 'staging'
         // status is what recover_orphaned_sessions (src/db/mod.rs) sweeps
@@ -3715,15 +3721,15 @@ mod tests {
 
     /// Cleanup must not reach across snapshot versions of the same unit.
     ///
-    /// `archive_base` is `{uuid12}_v{version}` and dar names slices
-    /// `{base}.{N}.dar`, so the scan prefix must carry a trailing dot.
-    /// Without it `..._v1` is a prefix of `..._v10.1.dar`, and a failed
-    /// stage of version 1 deletes the in-flight plaintext of a concurrent
-    /// stage of version 10 — silent cross-stage data destruction, the exact
+    /// `archive_base` is `{uuid12}_v{version}_s{id}` and slices are
+    /// `{base}.{N}.tar.age`, so the scan prefix must carry a trailing dot.
+    /// Without it `..._s1` is a prefix of `..._s10.1.tar.age`, and a failed
+    /// stage deletes the in-flight slices of a concurrent stage — silent
+    /// cross-stage data destruction, the exact
     /// hazard the `.age` cleanup is deliberately DB-row-keyed to avoid.
     ///
     /// Drives `cleanup_failed_stage_set` directly against hand-placed decoy
-    /// files, because provoking two concurrent real dar runs at versions 1
+    /// files, because provoking two concurrent real tar runs at versions 1
     /// and 10 is not worth the fixture cost to prove a string-prefix rule.
     #[test]
     fn cleanup_does_not_delete_a_higher_version_stage_of_the_same_unit() {
@@ -3778,13 +3784,13 @@ mod tests {
         let sibling_set = conn.last_insert_rowid();
 
         let base12 = &uuid[..12];
-        let failed_slice = staging_dir.join(format!("{base12}_v1_s{failed_set}.1.dar"));
-        let sibling_slice = staging_dir.join(format!("{base12}_v1_s{sibling_set}.1.dar"));
-        let sibling_hash = staging_dir.join(format!("{base12}_v1_s{sibling_set}.1.dar.sha512"));
-        // Issue #370: the `.dar.age` being written has no row yet, so it is
+        let failed_slice = staging_dir.join(format!("{base12}_v1_s{failed_set}.2.tar.age"));
+        let sibling_slice = staging_dir.join(format!("{base12}_v1_s{sibling_set}.2.tar.age"));
+        let sibling_hash = staging_dir.join(format!("{base12}_v1_s{sibling_set}.3.tar.age"));
+        // Issue #370: the `.tar.age` being written has no row yet, so it is
         // found by the same prefix rule.
-        let failed_age = staging_dir.join(format!("{base12}_v1_s{failed_set}.1.dar.age"));
-        let sibling_age = staging_dir.join(format!("{base12}_v1_s{sibling_set}.1.dar.age"));
+        let failed_age = staging_dir.join(format!("{base12}_v1_s{failed_set}.1.tar.age"));
+        let sibling_age = staging_dir.join(format!("{base12}_v1_s{sibling_set}.1.tar.age"));
         for f in [
             &failed_slice,
             &sibling_slice,
@@ -3795,21 +3801,21 @@ mod tests {
             fs::write(f, b"x").unwrap();
         }
 
-        cleanup_failed_stage_set(&conn, &paths, &config, failed_set);
+        cleanup_failed_stage_set(&conn, &config, failed_set);
 
         assert!(
             !failed_slice.exists(),
-            "the failed stage set's own orphaned plaintext slice must be removed"
+            "the failed stage set's own orphaned slice must be removed"
         );
         assert!(
             sibling_slice.exists(),
-            "a sibling stage set's in-flight plaintext slice must survive this \
+            "a sibling stage set's in-flight slice must survive this \
              cleanup — a prefix without the stage_set_id/trailing-dot discipline \
              would have deleted it"
         );
         assert!(
             sibling_hash.exists(),
-            "the sibling's hash file must survive this cleanup for the same reason"
+            "the sibling's other slice must survive this cleanup for the same reason"
         );
         assert!(
             !failed_age.exists(),
@@ -3844,7 +3850,7 @@ mod tests {
                  VALUES (1, 1024, 'none', 1);"
         ))
         .unwrap();
-        let age = staging_dir.join(format!("{}.1.dar.age", archive_base_name(uuid, 1, 1)));
+        let age = staging_dir.join(format!("{}.1.tar.age", archive_base_name(uuid, 1, 1)));
         fs::write(&age, b"ciphertext").unwrap();
         (tmp, db_path, conn, config, 1, age)
     }
@@ -3855,6 +3861,7 @@ mod tests {
             sha256_plain: "p".into(),
             encrypted_size: 10,
             sha256_encrypted: "e".into(),
+            packed_size: None,
         }
     }
 
@@ -3880,8 +3887,8 @@ mod tests {
         let holder = Connection::open(&db_path).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        let err =
-            record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &age, &slice_info()).unwrap_err();
+        let err = record_encrypted_slice(&conn, QUICK, stage_set_id, 1, false, &age, &slice_info())
+            .unwrap_err();
         assert!(matches!(err, TapectlError::CatalogBusy(_)), "{err:?}");
         assert_eq!(slice_rows(&conn), 0);
         assert!(
@@ -3891,7 +3898,7 @@ mod tests {
 
         holder.execute_batch("ROLLBACK").unwrap();
         fs::write(&age, b"ciphertext").unwrap();
-        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &age, &slice_info()).unwrap();
+        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, false, &age, &slice_info()).unwrap();
         assert_eq!(slice_rows(&conn), 1);
         assert!(age.exists());
     }
@@ -3902,12 +3909,11 @@ mod tests {
     /// does clean them up.
     #[test]
     fn a_busy_error_keeps_the_stage_sets_files_and_any_other_error_cleans_them() {
-        let (tmp, _db_path, conn, config, stage_set_id, age) = slice_being_recorded();
-        let paths = TapectlPaths::new(tmp.path().join("home"));
-        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &age, &slice_info()).unwrap();
+        let (_tmp, _db_path, conn, config, stage_set_id, age) = slice_being_recorded();
+        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, false, &age, &slice_info()).unwrap();
 
         let busy_err = TapectlError::CatalogBusy("the stage set's finalization".into());
-        after_failed_stage(&conn, &paths, &config, stage_set_id, &busy_err);
+        after_failed_stage(&conn, &config, stage_set_id, &busy_err);
         assert!(
             age.exists(),
             "a busy catalog must not discard encrypted slices"
@@ -3916,16 +3922,15 @@ mod tests {
 
         after_failed_stage(
             &conn,
-            &paths,
             &config,
             stage_set_id,
-            &TapectlError::Other("dar failed".into()),
+            &TapectlError::Other("tar failed".into()),
         );
         assert!(!age.exists(), "any other failure still cleans up");
         assert_eq!(slice_rows(&conn), 0);
     }
 
-    // ── issue #49: exclusions end-to-end (dotfile+global -> dar, walk, validation) ──
+    // ── issue #49: exclusions end-to-end (dotfile+global -> walk, list, validation) ──
 
     /// Shared setup for the issue #49 tests below: a real tenant + unit
     /// (via `unit::init_unit`, so a real dotfile + real tenant keys exist —
@@ -3957,6 +3962,35 @@ mod tests {
         )
     }
 
+    /// A tar that passes `--version` and the probe (its archive of one file
+    /// in the probe's own directory) through to the real tar, and refuses a
+    /// real archive run, saying `tar-must-never-run`: how a test shows a
+    /// refusal came before tar archived anything, now that the probe runs
+    /// before anything is made.
+    pub(super) fn never_archiving_tar() -> String {
+        static TAR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        TAR.get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::Builder::new()
+                .prefix("never-archiving-tar-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            let p = dir.join("tar");
+            fs::write(
+                &p,
+                "#!/bin/sh\n\
+                 if [ \"$1\" = --create ] && [ ! -e acl-probe ]; then \
+                 echo tar-must-never-run >&2; exit 2; fi\n\
+                 exec tar \"$@\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().into_owned()
+        })
+        .clone()
+    }
+
     pub(super) fn setup_unit_with_excludes(
         tmp: &TempDir,
         exclude_patterns: Vec<String>,
@@ -3971,7 +4005,6 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string(); // PATH, not a hardcoded distro path (issue #43)
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
@@ -4007,12 +4040,12 @@ mod tests {
     /// Issue #115 / ADR-0005. Staging without a registered escrow recipient
     /// silently produces slices the escrow key can never open — the whole
     /// point of the escrow line — and `volume write` now refuses to put them
-    /// on tape. So the refusal belongs here, before dar and age burn hours
+    /// on tape. So the refusal belongs here, before tar and age burn hours
     /// on material that cannot be written, not at the drive afterwards.
     ///
     /// The two halves that matter are both about *when*: no `stage_sets` row
-    /// may be left behind, and dar must never start. `dar.binary` is pointed
-    /// at a path that cannot exist, so reaching dar at all would produce a
+    /// may be left behind, and tar must never start. `tar.binary` is pointed
+    /// at a path that cannot exist, so reaching tar at all would produce a
     /// visibly different error.
     #[test]
     fn stage_create_refuses_when_no_escrow_recipient_is_registered() {
@@ -4023,9 +4056,9 @@ mod tests {
         // that must run without one.
         conn.execute("DELETE FROM encryption_keys WHERE is_escrow = 1", [])
             .unwrap();
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
-        fs::write(src.join("f.txt"), b"content that must never reach dar").unwrap();
+        fs::write(src.join("f.txt"), b"content that must never reach tar").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
         let before: i64 = conn
@@ -4043,8 +4076,8 @@ mod tests {
             "the refusal must name both ways to register one: {msg}"
         );
         assert!(
-            !msg.contains("dar-must-never-run"),
-            "the refusal must precede the dar run, not follow it: {msg}"
+            !msg.contains("tar-must-never-run"),
+            "the refusal must precede the tar run, not follow it: {msg}"
         );
 
         let after: i64 = conn
@@ -4067,18 +4100,18 @@ mod tests {
         );
     }
 
-    /// Issue #354 (c): a tenant with no active keys is refused BEFORE dar,
+    /// Issue #354 (c): a tenant with no active keys is refused BEFORE tar,
     /// the same way the escrow refusal above is. It used to be checked at
-    /// the top of the encryption loop — after `dar -c` had archived the
+    /// the top of the encryption loop — after `tar` had archived the
     /// whole unit and the catalog had been extracted — so a large unit
-    /// spent its entire dar run to reach a refusal that needed nothing but
+    /// spent its entire archive run to reach a refusal that needed nothing but
     /// a database read.
     ///
-    /// Same two "when" halves as the escrow test: dar never starts (its
+    /// Same two "when" halves as the escrow test: tar never starts (its
     /// binary is a path that cannot exist, so reaching it would change the
     /// error), and no `stage_sets` row is left for the startup sweep.
     #[test]
-    fn stage_create_refuses_a_tenant_with_no_active_keys_before_dar_runs() {
+    fn stage_create_refuses_a_tenant_with_no_active_keys_before_tar_runs() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         conn.execute(
@@ -4087,9 +4120,9 @@ mod tests {
             [],
         )
         .unwrap();
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
-        fs::write(src.join("f.txt"), b"content that must never reach dar").unwrap();
+        fs::write(src.join("f.txt"), b"content that must never reach tar").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
         let before: i64 = conn
@@ -4103,8 +4136,8 @@ mod tests {
             "expected the no-active-keys refusal, got: {msg}"
         );
         assert!(
-            !msg.contains("dar-must-never-run"),
-            "the refusal must precede the dar run, not follow it: {msg}"
+            !msg.contains("tar-must-never-run"),
+            "the refusal must precede the tar run, not follow it: {msg}"
         );
 
         let after: i64 = conn
@@ -4156,7 +4189,7 @@ mod tests {
         fs::write(&not_a_dir, b"x").unwrap();
         let staging = not_a_dir.join("staging");
         config.staging.directory = staging.to_string_lossy().into_owned();
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
         fs::write(src.join("f.txt"), b"content").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
@@ -4185,12 +4218,12 @@ mod tests {
     /// Issue #354 (a): a staging directory that exists but cannot be written
     /// is refused before anything else touches it — named, with the
     /// operation. It used to pass every check, spend the whole sha256
-    /// validation pass over the source, and only then fail inside dar.
+    /// validation pass over the source, and only then fail inside the archiver.
     ///
     /// Permission bits do not bind root, so the test skips there (the
     /// ENOTDIR test above is the root-safe half of this behaviour).
     #[test]
-    fn an_unwritable_staging_directory_is_refused_before_dar_naming_it() {
+    fn an_unwritable_staging_directory_is_refused_before_tar_naming_it() {
         use std::os::unix::fs::PermissionsExt;
         if nix::unistd::geteuid().is_root() {
             eprintln!("skipping: permission bits do not bind root");
@@ -4200,7 +4233,7 @@ mod tests {
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         let staging = PathBuf::from(&config.staging.directory);
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o500)).unwrap();
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
         fs::write(src.join("f.txt"), b"content").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
@@ -4214,8 +4247,8 @@ mod tests {
             "the error must name the operation and the directory: {msg}"
         );
         assert!(
-            !msg.contains("dar-must-never-run"),
-            "the refusal must precede the dar run: {msg}"
+            !msg.contains("tar-must-never-run"),
+            "the refusal must precede the tar run: {msg}"
         );
         assert_eq!(os_error_mentions(&msg), 1, "printed once: {msg}");
         let rows: i64 = conn
@@ -4289,7 +4322,7 @@ mod tests {
              what `volume write` checks the slices against (issue #115): {recipients:?}"
         );
 
-        // And the bytes on disk really are age ciphertext, not plaintext dar.
+        // And the bytes on disk really are age ciphertext, not plaintext tar.
         let slice_path: String = conn
             .query_row(
                 "SELECT staging_path FROM stage_slices WHERE stage_set_id = ?1",
@@ -4331,8 +4364,8 @@ mod tests {
 
     // ── issue #354 (b) and #364: staging space, asked about before staging ──
 
-    /// `len` bytes with no zero byte anywhere — nothing dar could store as a
-    /// hole — written and synced, so its allocation is on record.
+    /// `len` bytes with no zero byte anywhere — nothing an archiver could
+    /// store as a hole — written and synced, so its allocation is on record.
     fn write_dense_file(path: &Path, len: usize) {
         let data: Vec<u8> = (0..len as u32)
             .map(|i| ((i.wrapping_mul(2_654_435_761) >> 13) as u8) | 1)
@@ -4342,23 +4375,13 @@ mod tests {
         f.sync_all().unwrap();
     }
 
-    /// A file's allocation on disk, capped at its length — what a bound read
-    /// off `st_blocks` would count for it.
-    fn allocated(path: &Path) -> i64 {
-        use std::os::unix::fs::MetadataExt;
-        let m = fs::metadata(path).unwrap();
-        m.len().min(m.blocks() * 512) as i64
+    /// The figure the space check states (`stream_estimate`), at the
+    /// default slice size, uncompressed.
+    fn upper_bound(conn: &Connection, snapshot: &models::Snapshot) -> i64 {
+        stream_estimate(conn, snapshot.id, &snapshot.source_path, 1 << 30, None).unwrap()
     }
 
-    /// The figure the space check states: the snapshot's recorded size plus
-    /// dar's per-file overhead, as ciphertext.
-    fn upper_bound(snapshot: &models::Snapshot) -> i64 {
-        StagingSpaceInputs::peak(
-            snapshot.total_size.unwrap() + snapshot.file_count.unwrap() * DAR_ENTRY_OVERHEAD_BYTES,
-        )
-    }
-
-    /// Issue #364: with no pre-dar read there is no content lower bound, so
+    /// Issue #364: with no pre-tar read there is no content lower bound, so
     /// a staging directory short of the snapshot's size is ASKED about, never
     /// refused outright: with `--yes` the stage goes ahead, with a notice
     /// carrying the figures. Before, free space under the non-zero bytes the
@@ -4417,14 +4440,14 @@ mod tests {
         conn.execute(
             "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
                                        sha256_plain, sha256_encrypted, staging_path)
-             VALUES (?1, 1, ?2, ?2, 'p', 'e', '/elsewhere/s.1.dar.age')",
+             VALUES (?1, 1, ?2, ?2, 'p', 'e', '/elsewhere/s.1.tar.age')",
             params![other, 4i64 << 20],
         )
         .unwrap();
         let other_lock = lock::acquire(&paths.db_file, other).unwrap();
 
         let still_to_write = stage_upper_bound(Some(10 << 20), Some(1)) - (4 << 20);
-        let free = upper_bound(&snapshot) + still_to_write / 2;
+        let free = upper_bound(&conn, &snapshot) + still_to_write / 2;
         let _free = FreeSpaceOverride::set(free as u64);
 
         let mut notices = Vec::new();
@@ -4486,7 +4509,7 @@ mod tests {
     /// finishes (its set `staged`) before the second reaches admission. The
     /// second must not stage v1 again. Under the admission lock a `staged`
     /// sibling refuses, as a live `staging` one does — before anything is
-    /// recorded and before dar.
+    /// recorded and before tar.
     #[test]
     fn a_unit_staged_while_this_stage_waited_is_not_staged_again() {
         let tmp = TempDir::new().unwrap();
@@ -4501,7 +4524,7 @@ mod tests {
         )
         .unwrap();
         let sibling = conn.last_insert_rowid();
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
         let err = stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut Vec::new())
             .expect_err("v1 is already staged")
@@ -4511,7 +4534,7 @@ mod tests {
                 && err.contains(&format!("stage set {sibling}")),
             "{err}"
         );
-        assert!(!err.contains("dar-must-never-run"), "{err}");
+        assert!(!err.contains("tar-must-never-run"), "{err}");
         let sets: i64 = conn
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();
@@ -4520,18 +4543,18 @@ mod tests {
 
     /// Issue #368 (and #377's rule 3): a stage's writes wait out a catalog
     /// another stage holds past `busy_timeout`, rather than fail — before
-    /// dar (recording the stage set, which with `--jobs` would stop the
+    /// tar (recording the stage set, which with `--jobs` would stop the
     /// run) and after it (a finished archive). Another connection takes the
     /// write lock at that point and keeps it for longer than the 5-second
     /// wait.
     #[test]
-    fn a_catalog_held_past_busy_timeout_is_waited_out_before_dar() {
+    fn a_catalog_held_past_busy_timeout_is_waited_out_before_tar() {
         catalog_held_past_busy_timeout_is_waited_out_at(failpoint::BEFORE_RECORD);
     }
 
     #[test]
-    fn a_catalog_held_past_busy_timeout_is_waited_out_after_dar() {
-        catalog_held_past_busy_timeout_is_waited_out_at(failpoint::AFTER_DAR);
+    fn a_catalog_held_past_busy_timeout_is_waited_out_after_tar() {
+        catalog_held_past_busy_timeout_is_waited_out_at(failpoint::AFTER_TAR);
     }
 
     fn catalog_held_past_busy_timeout_is_waited_out_at(point: &'static str) {
@@ -4564,7 +4587,7 @@ mod tests {
         assert_eq!(status, "staged");
     }
 
-    /// A hard-linked file is one inode, which dar stores once, while the
+    /// A hard-linked file is one inode, which tar stores once (a link member), while the
     /// snapshot's recorded size counts every link — so the figure overstates
     /// the need, and a unit that fits must not be turned away: asked about,
     /// and with `--yes` staged, with a notice carrying the figure.
@@ -4578,7 +4601,7 @@ mod tests {
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let snapshot = get_snapshot(&conn, snap_id).unwrap();
 
-        let upper = upper_bound(&snapshot);
+        let upper = upper_bound(&conn, &snapshot);
         // Room for the inode once (64 KiB and change), not for both links.
         let free = 100 * 1024;
         assert!(
@@ -4594,63 +4617,10 @@ mod tests {
         assert!(
             notices.contains("may be too small for unit \"unit1\"")
                 && notices.contains(&format!("needs up to {}", fmt(upper)))
-                && notices.contains("a hard-linked file once")
+                && notices.contains("a hard-linked file is stored once")
                 && notices.contains("staging anyway (--yes given)"),
             "the notice must carry the figure ({}): {notices:?}",
             fmt(upper)
-        );
-    }
-
-    /// The adversarial review's probe (issue #354): a DENSE file of zeros —
-    /// written, not seeked, so every block is allocated — costs dar almost
-    /// nothing, because dar stores zero runs as holes by default
-    /// (`--sparse-file-min-size` 15; measured: 16 MiB of zeros made a
-    /// 752-byte archive). A bound read off the file's allocation would refuse
-    /// a stage that needs a few KiB, with no way past it — preallocated disk
-    /// images, fallocate'd databases and zero-padded ISOs all look like this.
-    /// It is asked about, and with `--yes` it runs.
-    #[test]
-    fn a_dense_file_of_zeros_that_fits_is_staged_not_refused() {
-        let tmp = TempDir::new().unwrap();
-        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        let zeros = src.join("disk.img");
-        {
-            let mut f = fs::File::create(&zeros).unwrap();
-            f.write_all(&vec![0u8; 8 * 1024 * 1024]).unwrap();
-            f.sync_all().unwrap();
-        }
-        assert!(
-            allocated(&zeros) >= 8 * 1024 * 1024,
-            "fixture: the zeros must be allocated on disk (dense, not sparse), \
-             or this test cannot tell an allocation bound from a content one"
-        );
-        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let free: u64 = 4 * 1024 * 1024;
-        let _free = FreeSpaceOverride::set(free);
-
-        let mut notices = Vec::new();
-        let stage_set_id =
-            stage_create_reporting(&conn, &paths, &config, snap_id, true, &mut notices).expect(
-                "8 MiB of zeros needs a few KiB of staging: it must be staged, not refused",
-            );
-
-        // It really did fit: dar's archive is a sliver of the 4 MiB "free".
-        let dar_size: i64 = conn
-            .query_row(
-                "SELECT total_dar_size FROM stage_sets WHERE id = ?1",
-                params![stage_set_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            dar_size < 64 * 1024,
-            "dar stored the zeros as holes: {dar_size} bytes"
-        );
-        let notices = String::from_utf8(notices).unwrap();
-        assert!(
-            notices.contains("may be too small for unit \"unit1\"")
-                && notices.contains("runs of zeros as holes"),
-            "the notice says why the figure may overstate the need: {notices:?}"
         );
     }
 
@@ -4680,7 +4650,7 @@ mod tests {
     }
 
     /// Issue #354 (b), the compressed case: whether the unit fits cannot be
-    /// known before dar runs, so a short staging directory is ASKED about
+    /// known before tar runs, so a short staging directory is ASKED about
     /// (ADR-0008 Tier 2) — and a non-interactive run without `--yes`
     /// refuses, with the figures, rather than printing a notice and
     /// carrying on. Asked before the source is read: no `stage_sets` row,
@@ -4691,7 +4661,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         config.defaults.compression = "gzip".to_string();
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
         write_dense_file(&src.join("big.bin"), 64 * 1024);
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let _free = FreeSpaceOverride::set(1024);
@@ -4720,17 +4690,17 @@ mod tests {
 
     /// Issue #354 (b) and #364, `compression = none`: short space may or may
     /// not be enough — asked about before anything is read, and refused
-    /// without consent in a non-interactive run: no `stage_sets` row, dar
+    /// without consent in a non-interactive run: no `stage_sets` row, tar
     /// never ran, staging is left empty. `--yes` is the way past it.
     #[test]
     fn short_staging_space_is_refused_without_consent() {
         use crate::util::format_bytes_binary as fmt;
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
         write_dense_file(&src.join("a.bin"), 64 * 1024);
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let upper = upper_bound(&get_snapshot(&conn, snap_id).unwrap());
+        let upper = upper_bound(&conn, &get_snapshot(&conn, snap_id).unwrap());
         let _free = FreeSpaceOverride::set(32 * 1024);
 
         let mut notices = Vec::new();
@@ -4746,7 +4716,7 @@ mod tests {
                 && msg.contains(&format!("{} free", fmt(32 * 1024))),
             "the refusal carries the figures: {msg}"
         );
-        assert!(!msg.contains("dar-must-never-run"), "before dar: {msg}");
+        assert!(!msg.contains("tar-must-never-run"), "before tar: {msg}");
         // Issue #409: it names the fix, since what fills staging is often a
         // failed stage's files or slices already on tape.
         assert!(
@@ -4764,8 +4734,9 @@ mod tests {
             .collect();
         assert!(left.is_empty(), "nothing left in staging: {left:?}");
 
-        // The way past the refusal it names: the same stage with `--yes`.
-        config.dar.binary = "dar".to_string();
+        // The way past the refusal it names: the same stage with `--yes`
+        // (and a tar that runs).
+        config.tar.binary = "tar".to_string();
         let mut notices = Vec::new();
         stage_create_reporting(&conn, &paths, &config, snap_id, true, &mut notices)
             .expect("re-run with --yes, the refused stage proceeds");
@@ -4939,13 +4910,13 @@ mod tests {
 
     /// THE core claim of issue #49 (its own re-triage escalation): a unit
     /// must not be permanently blocked from staging by content drift in a
-    /// file dar was never going to archive. Write this FIRST — it must
+    /// file the stage was never going to archive. Write this FIRST — it must
     /// fail against the pre-#49 code (see the PR report for the captured
     /// pre-fix failure): `walk_directory` used to record every file
     /// unfiltered, so `backfill_checksums` established a sha256 baseline
     /// for the excluded junk file too, and this re-stage's same-size
     /// content drift then tripped `validate_source`'s BITROT refusal for
-    /// content dar was never going to touch.
+    /// content the stage was never going to touch.
     #[test]
     fn excluded_junk_file_content_drift_at_stable_size_does_not_false_positive_bitrot() {
         let tmp = TempDir::new().unwrap();
@@ -4963,7 +4934,7 @@ mod tests {
         fs::write(src.join("junk.tmp"), b"BBBB").unwrap();
 
         // Re-staging the SAME snapshot (a real "stage create" retry) must
-        // succeed cleanly — never raise BITROT over content dar was never
+        // succeed cleanly — never raise BITROT over content the stage was never
         // going to archive.
         let result = restage(&conn, &paths, &config, snap_id);
         assert!(
@@ -5022,54 +4993,55 @@ mod tests {
         );
     }
 
+    /// The paths of `stage_set_id`'s file table (the stream's members).
+    fn stream_paths(conn: &Connection, stage_set_id: i64) -> Vec<String> {
+        crate::db::stage_files::load(conn, stage_set_id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect()
+    }
+
+    /// Issue #49 items 2/5, D14: the unit dotfile's own patterns and the
+    /// global ones both keep a file out of what is archived. tar is given
+    /// the snapshot's exact list, so what they left out is in no member of
+    /// the stream.
     #[test]
-    fn dotfile_exclude_patterns_reach_dars_constructed_arguments() {
-        // "Dotfile patterns reach dar (assert on the constructed dar
-        // arguments)" — stage_sets.dar_command records the exact
-        // Command::Debug-formatted string create_archive ran.
+    fn dotfile_and_global_exclude_patterns_keep_files_out_of_the_stream() {
         let tmp = TempDir::new().unwrap();
-        let (conn, paths, config, src) =
+        let (conn, paths, mut config, src) =
             setup_unit_with_excludes(&tmp, vec!["*.unusual-dotfile-pattern".to_string()]);
+        // Item 252: `init` no longer writes a default list; the test names one.
+        config.defaults.global_excludes = vec!["Thumbs.db".to_string()];
 
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
+        fs::write(src.join("x.unusual-dotfile-pattern"), b"left out").unwrap();
+        fs::write(src.join("Thumbs.db"), b"left out too").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
         let stage_set_id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
 
-        let dar_command: String = conn
-            .query_row(
-                "SELECT dar_command FROM stage_sets WHERE id = ?1",
-                params![stage_set_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let members = stream_paths(&conn, stage_set_id);
         assert!(
-            dar_command.contains("*.unusual-dotfile-pattern"),
-            "the dotfile's own exclude pattern must reach dar's constructed \
-             -X arguments, got: {dar_command}"
+            members.contains(&"keep.txt".to_string()),
+            "positive control: {members:?}"
         );
-        // The pre-existing global excludes must still be present too (this
-        // fix merges, not replaces).
         assert!(
-            dar_command.contains("Thumbs.db"),
-            "config.defaults.global_excludes must still reach dar, got: {dar_command}"
+            !members
+                .iter()
+                .any(|p| p == "x.unusual-dotfile-pattern" || p == "Thumbs.db"),
+            "the dotfile's and the global pattern keep their files out of the stream: \
+             {members:?}"
         );
     }
 
     /// Issue #359 (c): a directory pattern (`name/`) keeps the subtree out
-    /// of the DAR ARCHIVE, not only out of the manifest, the `files` table
-    /// and the dirty scan. Before, `stage_create` handed dar every pattern
-    /// as a raw `-X` basename mask and no `-P` prune, so `.cache/` matched
-    /// nothing in dar and the cache's bytes were archived, encrypted and
-    /// written to tape while the catalog said they were not there.
-    ///
-    /// The archive is read back through the isolated catalog dar extracted
-    /// from it (`stage_sets.catalog_path` — the plaintext slices are gone
-    /// once encrypted): `dar -l` lists every entry the archive holds. The
-    /// pruned directory itself stays, empty (`-D`), in the archive and in
-    /// the manifest alike; a directory INSIDE it is in neither.
+    /// of the archive, not only out of the manifest, the `files` table and
+    /// the dirty scan. The stream's members are the file table's rows: the
+    /// pruned directory itself stays, empty, in the stream and in the
+    /// manifest alike; a directory INSIDE it is in neither.
     #[test]
-    fn a_directory_exclude_keeps_the_subtree_out_of_the_dar_archive() {
+    fn a_directory_exclude_keeps_the_subtree_out_of_the_stream() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, config, src) =
             setup_unit_with_excludes(&tmp, vec![".cache/".to_string()]);
@@ -5083,26 +5055,7 @@ mod tests {
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let stage_set_id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
-
-        let catalog: String = conn
-            .query_row(
-                "SELECT catalog_path FROM stage_sets WHERE id = ?1",
-                params![stage_set_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let out = std::process::Command::new("dar")
-            .arg("-l")
-            .arg(&catalog)
-            .arg("-Q")
-            .output()
-            .expect("dar must be on PATH (tests/test_dependencies.rs)");
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+        let listing = stream_paths(&conn, stage_set_id).join("\n");
 
         // Positive control: the listing is real and holds what was kept.
         for kept in ["keep.txt", "kept-nested.txt", ".cache"] {
@@ -5128,56 +5081,61 @@ mod tests {
         assert_eq!(
             recorded(".cache/deepdir"),
             0,
-            "a directory inside a pruned subtree is not recorded, as dar -D does not store it"
+            "a directory inside a pruned subtree is not recorded, nor archived"
         );
         assert_eq!(recorded(".cache/cached-top.bin"), 0);
     }
 
-    /// Issue #465 item 4: a file name that is not UTF-8 was stored lossily
-    /// (`to_string_lossy`), so every stage of the unit was refused as "source
-    /// file missing" and two names that collapsed to the same text collided
-    /// on the paths index. `snapshot create` refuses it instead, naming the
-    /// path with the bytes that are not UTF-8 escaped. A name inside an
-    /// excluded subtree is not archived, so it is not refused.
+    /// ADR-0012 item 297 (#569), which replaces issue #465's refusal: a file
+    /// name that is not UTF-8 is recorded by its bytes in the escaped form
+    /// (`volume-format-v3.md` 1.5), never lossily, so two names cannot collapse
+    /// to one and every stage finds the file. A name inside an excluded
+    /// subtree is not recorded.
     #[test]
-    fn snapshot_create_refuses_a_file_name_that_is_not_utf8_naming_it() {
+    fn snapshot_create_records_a_file_name_that_is_not_utf8_escaped() {
         use std::os::unix::ffi::OsStrExt;
         let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
-        for (dir, shown) in [("", "caf\\xE9.txt"), ("sub", "sub/caf\\xE9.txt")] {
+        let other = std::ffi::OsStr::from_bytes(b"caf\xe8.txt");
+        for (dir, recorded) in [("", "caf\\xe9.txt"), ("sub", "sub/caf\\xe9.txt")] {
             let tmp = TempDir::new().unwrap();
             let (conn, _paths, _config, src) = setup_unit_with_excludes(&tmp, vec![]);
             fs::write(src.join("keep.txt"), b"kept").unwrap();
             fs::create_dir_all(src.join(dir)).unwrap();
             fs::write(src.join(dir).join(latin1), b"latin one").unwrap();
+            // Two names that a lossy conversion would make one.
+            fs::write(src.join(dir).join(other), b"latin two").unwrap();
 
-            let err = snapshot_create(&conn, "unit1", &Config::default())
-                .expect_err("a name that is not UTF-8 cannot be recorded");
-            let msg = err.to_string();
-            assert!(
-                msg.contains(shown),
-                "{dir:?}: names the path, escaped: {msg}"
+            let snap = snapshot_create(&conn, "unit1", &Config::default())
+                .expect("a name that is not UTF-8 is recorded");
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, snap, Some(recorded)),
+                1,
+                "{dir:?}: recorded escaped"
             );
-            assert!(msg.contains("UTF-8"), "{dir:?}: says why: {msg}");
-            let snapshots: i64 = conn
-                .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(snapshots, 0, "{dir:?}: nothing was recorded");
+            let twin = recorded.replace("xe9", "xe8");
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, snap, Some(&twin)),
+                1,
+                "{dir:?}: the other name is its own row"
+            );
         }
 
-        // Positive control for the exception: the same name under an
-        // excluded directory is neither archived nor recorded, so it is not
-        // a reason to refuse.
+        // The same name under an excluded directory is neither archived nor
+        // recorded.
         let tmp = TempDir::new().unwrap();
         let (conn, _paths, _config, src) =
             setup_unit_with_excludes(&tmp, vec![".cache/".to_string()]);
         fs::write(src.join("keep.txt"), b"kept").unwrap();
         fs::create_dir_all(src.join(".cache")).unwrap();
         fs::write(src.join(".cache").join(latin1), b"cache").unwrap();
-        let snap = snapshot_create(&conn, "unit1", &Config::default())
-            .expect("an excluded name is not a reason to refuse");
+        let snap = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         assert_eq!(
             crate::db::files::fixture::count(&conn, snap, Some("keep.txt")),
             1
+        );
+        assert_eq!(
+            crate::db::files::fixture::count(&conn, snap, Some(".cache/caf\\xe9.txt")),
+            0
         );
     }
 
@@ -5268,9 +5226,9 @@ mod tests {
     }
 
     /// Issue #464: a file the snapshot listed and the stage now excludes was
-    /// hashed (`backfill_checksums` recorded its sha256) while dar skipped it,
+    /// hashed (`backfill_checksums` recorded its sha256) while the archiver skipped it,
     /// so `files` and the on-tape `catalog.db` said the version held a file
-    /// the tape did not. The stage is refused before dar starts, naming the
+    /// the tape did not. The stage is refused before tar starts, naming the
     /// file, and the remedy is a new snapshot, which then stages. A literal
     /// name and a `*.ext` pattern are the two shapes the issue names.
     #[test]
@@ -5352,53 +5310,31 @@ mod tests {
         stage_create(&conn, &paths, &config, fresh, false).expect("a fresh snapshot stages");
     }
 
-    /// Issue #464: the tapectl walk matches a directory pattern one path
-    /// component at a time; dar matches its `-P` mask against the whole
-    /// relative path, and dar's `*` spans `/` (`staging::exclude`'s module
-    /// doc). With `x*z/`, dar prunes `xdir/sub/z` while the walk still
-    /// records and hashes the files in it. The pre-dar check cannot see that
-    /// (the walk finds the file); the comparison of the hashed files with
-    /// the catalogue dar produced does, and refuses before the set is
-    /// `staged`.
+    /// Issue #464, B15 of #542: tapectl's matcher is the only one (D14). A
+    /// directory pattern with a wildcard inside its name, `x*z/`, matched
+    /// one path component at a time, leaves `xdir/sub/z` in the walk, and
+    /// tar, given the exact list, archives exactly what the walk recorded:
+    /// the file is a member of the stream and its hash is the stream's.
+    /// (The archiver before 2.0 matched `*` across `/`, pruned it, and the
+    /// stage was refused.)
     #[test]
-    fn a_file_dar_prunes_but_the_walk_records_is_refused_after_dar() {
+    fn a_wildcard_directory_pattern_archives_exactly_what_the_walk_records() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
         fs::create_dir_all(src.join("xdir/sub/z")).unwrap();
-        fs::write(src.join("xdir/sub/z/inside.txt"), b"dar will prune this").unwrap();
+        fs::write(src.join("xdir/sub/z/inside.txt"), b"the walk keeps this").unwrap();
 
         let snap = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         set_dotfile_excludes(&src, &["x*z/"]);
 
-        let err = stage_create(&conn, &paths, &config, snap, false)
-            .expect_err("dar skipped a file the stage hashed");
-        let msg = err.to_string();
+        let id = stage_create(&conn, &paths, &config, snap, false)
+            .expect("one matcher: what the walk records is what tar archives");
+        let members = stream_paths(&conn, id);
         assert!(
-            msg.contains("xdir/sub/z/inside.txt"),
-            "names the file: {msg}"
+            members.contains(&"xdir/sub/z/inside.txt".to_string()),
+            "{members:?}"
         );
-        assert!(msg.contains("dar"), "says dar did not archive it: {msg}");
-        let staged: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM stage_sets WHERE snapshot_id = ?1 AND status = 'staged'",
-                params![snap],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(staged, 0, "the set never reached staged");
-        assert!(
-            fs::read_dir(&config.staging.directory)
-                .unwrap()
-                .next()
-                .is_none(),
-            "a refused stage leaves nothing under staging"
-        );
-
-        // The control: the same unit with an exclude both sides read the
-        // same way stages, and its catalogue lists what it archived.
-        set_dotfile_excludes(&src, &[]);
-        stage_create(&conn, &paths, &config, snap, false).expect("no exclude stages");
     }
 
     #[test]
@@ -5439,12 +5375,12 @@ mod tests {
     // ── issue #49 (second half): global excludes must reach both walks ──
     //
     // The ticket's own headline example: `config.defaults.global_excludes`
-    // (Thumbs.db/.DS_Store/*.nfo/*.tmp by default) reached dar only —
+    // (Thumbs.db/.DS_Store/*.nfo/*.tmp by default) reached the archiver only —
     // neither walk saw it. For a unit with NO dotfile override (the common
     // case), `walk_directory` recorded the globally-excluded file into
     // `files`, `backfill_checksums` gave it a sha256 baseline, and a
     // same-size content regeneration then tripped `validate_source`'s
-    // BITROT refusal for content dar was never going to archive — see the
+    // BITROT refusal for content the stage was never going to archive — see the
     // PR report for the captured pre-fix failure. These tests use
     // `setup_unit_with_excludes(&tmp, vec![])` (no dotfile override) and
     // pass the REAL `config.defaults.global_excludes` returned by that
@@ -5456,7 +5392,9 @@ mod tests {
     #[test]
     fn global_default_excluded_file_content_drift_at_stable_size_does_not_false_positive_bitrot() {
         let tmp = TempDir::new().unwrap();
-        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        // Item 252: `init` no longer writes these; the test names its own.
+        config.defaults.global_excludes = vec!["Thumbs.db".to_string()];
 
         fs::write(src.join("keep.txt"), b"real archival content, kept").unwrap();
         fs::write(src.join("Thumbs.db"), b"AAAA").unwrap();
@@ -5479,7 +5417,9 @@ mod tests {
     #[test]
     fn global_default_excluded_files_do_not_appear_in_files_table() {
         let tmp = TempDir::new().unwrap();
-        let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let (conn, _paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        // Item 252: `init` no longer writes these; the test names its own.
+        config.defaults.global_excludes = vec!["Thumbs.db".to_string()];
 
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
         fs::write(src.join("Thumbs.db"), b"thumbnail cache junk").unwrap();
@@ -5500,7 +5440,9 @@ mod tests {
     #[test]
     fn global_default_excluded_files_never_receive_a_sha256_baseline() {
         let tmp = TempDir::new().unwrap();
-        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        // Item 252: `init` no longer writes these; the test names its own.
+        config.defaults.global_excludes = vec!["Thumbs.db".to_string()];
 
         fs::write(src.join("keep.txt"), b"kept content, baselined").unwrap();
         fs::write(src.join("Thumbs.db"), b"thumbnail cache junk").unwrap();
@@ -5908,7 +5850,7 @@ mod tests {
     /// a stage report, in its header as well as its directory — "receipt"
     /// now means only the recipient list a stage set was encrypted to
     /// (CONTEXT.md). The `write_stage_report` tests below pass their own
-    /// body; this drives the real producer through a real stage (real dar).
+    /// body; this drives the real producer through a real stage (real tar).
     #[test]
     fn stage_create_writes_a_stage_report_not_a_receipt() {
         let tmp = TempDir::new().unwrap();
@@ -5944,9 +5886,8 @@ mod tests {
 
     /// Issue #386: inside a progress session, `stage create` records its
     /// phases in order against the stage set and writes them into the stage
-    /// report; archive (dar, slicing, encryption and the source's hashing in
-    /// one pass since issues #370 and #364) counts the bytes of dar's
-    /// stream.
+    /// report; archive (tar, the stream's checks and hashes, slicing and
+    /// encryption in one pass) counts the bytes of tar's stream.
     #[test]
     fn stage_create_records_its_phases_in_the_catalog_and_the_report() {
         let tmp = TempDir::new().unwrap();
@@ -5960,14 +5901,11 @@ mod tests {
 
         let rows = crate::db::phase_timings::latest_for_stage_set(&conn, stage_set_id).unwrap();
         let names: Vec<&str> = rows.iter().map(|r| r.phase.as_str()).collect();
-        assert_eq!(
-            names,
-            ["check", "archive", "recheck", "catalog", "finalize"]
-        );
+        assert_eq!(names, ["check", "archive", "recheck", "finalize"]);
         assert!(rows
             .iter()
             .all(|r| r.outcome == "ok" && r.operation == "stage create"));
-        // dar's stream holds the file and the unit's dotfile, at least.
+        // tar's stream holds the file and the unit's dotfile, at least.
         assert!(
             rows[1].bytes.unwrap_or(0) >= content.len() as i64,
             "archive counts the stream it reads: {:?}",
@@ -5988,38 +5926,38 @@ mod tests {
         }
     }
 
-    /// Issue #370: dar writes nothing under the staging directory. When dar
-    /// has finished, the staging directory holds only `.age` ciphertext —
-    /// before, it held the whole plaintext archive as `.dar` slices until
-    /// each was encrypted and deleted.
+    /// Issue #370: tar writes nothing under the staging directory. When tar
+    /// has finished, the staging directory holds only `.age` ciphertext.
     #[test]
-    fn when_dar_finishes_staging_holds_only_ciphertext() {
+    fn when_tar_finishes_staging_holds_only_ciphertext() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         config.defaults.slice_size = "64K".to_string();
         fs::write(src.join("noise.bin"), noise(200 * 1024)).unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
-        failpoint::observe_staging_after_dar();
+        failpoint::observe_staging_after_tar();
         stage_create(&conn, &paths, &config, snap_id, false).unwrap();
-        let names = failpoint::staging_after_dar().expect("the stage reached dar's end");
+        let names = failpoint::staging_after_tar().expect("the stage reached tar's end");
         assert!(
             names.len() >= 2,
-            "positive control: several slices exist when dar ends: {names:?}"
+            "positive control: several slices exist when tar ends: {names:?}"
         );
         for name in &names {
             assert!(
-                name.ends_with(".dar.age"),
-                "only ciphertext may be in staging when dar ends, found {name}: {names:?}"
+                name.ends_with(".tar.age"),
+                "only ciphertext may be in staging when tar ends, found {name}: {names:?}"
             );
         }
     }
 
-    /// Issue #370: the recorded dar command (MANIFEST.toml's `dar_command`)
-    /// is dar's archive on standard output, with retry-on-change off and the
-    /// on-the-fly catalogue, and names no path under the staging directory.
+    /// Issue #370, §3.1: the recorded tar command is §3.1's line, the
+    /// archive on standard output (`--file=-`), the list written `<list>`
+    /// (its real path is a name in the home's work directory), and it names
+    /// no path under the staging directory, nor the folder tar ran in (a
+    /// transient snapshot path means nothing on tape, ADR-0012 item 75).
     #[test]
-    fn the_recorded_dar_command_writes_to_stdout_and_names_no_staging_path() {
+    fn the_recorded_tar_command_writes_to_stdout_and_names_no_staging_path() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
         fs::write(src.join("f.txt"), b"command content").unwrap();
@@ -6027,33 +5965,36 @@ mod tests {
         let id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
         let cmd: String = conn
             .query_row(
-                "SELECT dar_command FROM stage_sets WHERE id = ?1",
+                "SELECT tar_command FROM stage_sets WHERE id = ?1",
                 params![id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(cmd.contains(r#""-c" "-""#), "{cmd}");
-        assert!(cmd.contains(r#""--retry-on-change" "0""#), "{cmd}");
-        assert!(cmd.contains(r#""-@""#), "{cmd}");
-        assert!(
-            cmd.contains(&src.to_string_lossy().into_owned()),
-            "positive control: the source is named: {cmd}"
-        );
+        for arg in [
+            r#""--create""#,
+            r#""--file=-""#,
+            r#""--format=pax""#,
+            r#""--numeric-owner""#,
+            r#""--files-from=<list>""#,
+        ] {
+            assert!(cmd.contains(arg), "{arg} in {cmd}");
+        }
         let staging = Path::new(&config.staging.directory);
         for spelling in [staging.to_path_buf(), staging.canonicalize().unwrap()] {
             assert!(
                 !cmd.contains(&*spelling.to_string_lossy()),
-                "dar is given no path under the staging directory: {cmd}"
+                "tar is given no path under the staging directory: {cmd}"
             );
         }
+        assert!(!cmd.contains(&*src.to_string_lossy()), "{cmd}");
     }
 
-    /// Issue #370: a source file that changes while dar reads it refuses the
-    /// stage as DIRTY (dar runs with `--retry-on-change 0` and exits 11),
-    /// and no slice is left in staging. Before, dar retried the file and a
-    /// change that outlasted the retries failed as a bare dar error.
+    /// Issue #370, invariant 7: a source file that changes while tar reads
+    /// it refuses the stage as DIRTY (tar's exit 1, or tapectl's own
+    /// before-and-after comparison, whichever sees it), and no slice is left
+    /// in staging.
     #[test]
-    fn a_file_changing_while_dar_reads_it_refuses_the_stage_as_dirty() {
+    fn a_file_changing_while_tar_reads_it_refuses_the_stage_as_dirty() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
         let busy = src.join("busy.bin");
@@ -6079,26 +6020,26 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         toucher.join().unwrap();
 
-        let err = result.expect_err("a file changing under dar refuses the stage");
+        let err = result.expect_err("a file changing under tar refuses the stage");
         assert!(err.to_string().contains("DIRTY"), "{err}");
-        // Issue #343: dar's report of the refused run is kept — the run an
+        // Issue #343: tar's report of the refused run is kept — the run an
         // operator most needs to read later. Which of the two checks saw
-        // the change first decides how dar ended: dar's own (exit 11), or
-        // the source check stopping the stage while dar still ran.
+        // the change first decides how tar ended: tar's own (exit 1), or
+        // tapectl's comparison after a clean exit.
         let (outcome, code, stderr): (String, Option<i64>, Vec<u8>) = conn
             .query_row(
-                "SELECT outcome, dar_exit_code, dar_stderr FROM dar_create_reports",
+                "SELECT outcome, tar_exit_code, tar_stderr FROM tar_create_reports",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .expect("one dar report row");
+            .expect("one tar report row");
         assert!(
-            ["files_changed", "failed", "aborted"].contains(&outcome.as_str()),
+            ["files_changed", "complete"].contains(&outcome.as_str()),
             "{outcome}"
         );
         if outcome == "files_changed" {
-            assert_eq!(code, Some(11));
-            assert!(!stderr.is_empty(), "dar said why");
+            assert_eq!(code, Some(1));
+            assert!(!stderr.is_empty(), "tar said why");
         }
         let left: Vec<_> = fs::read_dir(&config.staging.directory)
             .unwrap()
@@ -6108,10 +6049,10 @@ mod tests {
         assert!(left.is_empty(), "nothing is left in staging: {left:?}");
     }
 
-    /// Issue #343: a clean stage keeps dar's report too — exit 0, the
+    /// Issue #343: a clean stage keeps tar's report too — exit 0, the
     /// command, the version — against its stage set.
     #[test]
-    fn a_clean_stage_keeps_dars_report_against_its_stage_set() {
+    fn a_clean_stage_keeps_tars_report_against_its_stage_set() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
         fs::write(src.join("a.txt"), b"some content").unwrap();
@@ -6119,9 +6060,9 @@ mod tests {
         let stage_set_id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
         let row: (Option<i64>, String, String, Option<i64>, String, String) = conn
             .query_row(
-                "SELECT stage_set_id, unit_name, outcome, dar_exit_code, dar_command,
-                        dar_version
-                   FROM dar_create_reports",
+                "SELECT stage_set_id, unit_name, outcome, tar_exit_code, tar_command,
+                        tar_version
+                   FROM tar_create_reports",
                 [],
                 |r| {
                     Ok((
@@ -6134,81 +6075,19 @@ mod tests {
                     ))
                 },
             )
-            .expect("one dar report row");
+            .expect("one tar report row");
         assert_eq!(row.0, Some(stage_set_id));
         assert_eq!(row.1, "unit1");
         assert_eq!((row.2.as_str(), row.3), ("complete", Some(0)));
-        assert!(row.4.contains("\"-c\""), "{}", row.4);
-        assert!(!row.5.is_empty(), "dar's version is kept");
+        assert!(row.4.contains("\"--create\""), "{}", row.4);
+        assert!(row.5.starts_with("tar (GNU tar) "), "tar's version is kept");
     }
 
-    /// Issue #370: slices cut from dar's stream are dar slices. Decrypted
-    /// (what an heir does with `age -d`), `dar -t` accepts them, and
-    /// `dar -x` restores the source exactly — the path RESTORE.sh takes,
-    /// unchanged. Several slices, a subdirectory, a symlink and an empty file.
-    #[test]
-    fn streamed_slices_restore_with_dar_alone() {
-        let tmp = TempDir::new().unwrap();
-        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        config.defaults.slice_size = "64K".to_string();
-        fs::create_dir_all(src.join("sub/deeper")).unwrap();
-        fs::write(src.join("noise.bin"), noise(300 * 1024)).unwrap();
-        fs::write(src.join("sub/deeper/text.txt"), b"some text\n".repeat(500)).unwrap();
-        fs::write(src.join("sub/empty"), b"").unwrap();
-        std::os::unix::fs::symlink("deeper/text.txt", src.join("sub/link")).unwrap();
-        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
-
-        let archive = decrypt_staged_set(&conn, &paths, id, &tmp.path().join("plain"));
-        assert!(
-            tmp.path().join("plain/arch.3.dar").exists(),
-            "positive control: several slices"
-        );
-        let dar = |args: &[&std::ffi::OsStr]| {
-            let out = std::process::Command::new("dar")
-                .args(args)
-                .output()
-                .expect("dar must be on PATH (tests/test_dependencies.rs)");
-            assert!(
-                out.status.success(),
-                "dar {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        dar(&["-t".as_ref(), archive.as_os_str(), "-Q".as_ref()]);
-        let restored = tmp.path().join("restored");
-        fs::create_dir_all(&restored).unwrap();
-        dar(&[
-            "-x".as_ref(),
-            archive.as_os_str(),
-            "-R".as_ref(),
-            restored.as_os_str(),
-            "-O".as_ref(),
-            "-Q".as_ref(),
-        ]);
-        for rel in [
-            "noise.bin",
-            "sub/deeper/text.txt",
-            "sub/empty",
-            ".tapectl-unit.toml",
-        ] {
-            assert_eq!(
-                fs::read(restored.join(rel)).unwrap(),
-                fs::read(src.join(rel)).unwrap(),
-                "{rel} restored exactly"
-            );
-        }
-        assert_eq!(
-            fs::read_link(restored.join("sub/link")).unwrap(),
-            Path::new("deeper/text.txt")
-        );
-    }
-
-    /// Issue #364: the sha256 recorded for a file must be of the bytes dar
-    /// archived. A file rewritten after it was hashed — here at once, before
-    /// dar can have read it — is refused as DIRTY. Before, the hash pass and
-    /// dar were two reads with nothing tying them together, and the stage
-    /// succeeded with a baseline that did not match the archive.
+    /// Issue #364, invariant 7: the sha256 recorded for a file must be of
+    /// the bytes archived. A file rewritten in place once tar has read it
+    /// (same size, other bytes: a test hook at the member's row, not a race)
+    /// is refused as DIRTY by tapectl's own before-and-after comparison,
+    /// whatever tar said.
     #[test]
     fn a_file_rewritten_after_it_is_hashed_refuses_the_stage() {
         let tmp = TempDir::new().unwrap();
@@ -6217,19 +6096,15 @@ mod tests {
         fs::write(&target, noise(64 * 1024)).unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
-        // The snapshot records the canonical path (/tmp may be a symlink).
-        let src = src.canonicalize().unwrap();
-        let hook_target = target.canonicalize().unwrap();
-        validate::hash_hook::set(&src, move |path| {
-            if path == hook_target {
-                // Same size, other bytes: an in-place edit.
-                let mut other = noise(64 * 1024);
-                other.reverse();
-                fs::write(path, other).unwrap();
-            }
+        let hook_target = target.clone();
+        archive::row_hook::on("f.bin", move || {
+            // Same size, other bytes: an in-place edit.
+            let mut other = noise(64 * 1024);
+            other.reverse();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            fs::write(&hook_target, other).unwrap();
         });
         let result = stage_create(&conn, &paths, &config, snap_id, false);
-        validate::hash_hook::clear(&src);
 
         assert_ne!(
             fs::read(&target).unwrap(),
@@ -6247,11 +6122,11 @@ mod tests {
         assert!(left.is_empty(), "nothing is left in staging: {left:?}");
     }
 
-    /// Issue #364: BITROT is found while dar runs now, not before it — and
-    /// still refuses the stage, stops dar, and leaves staging empty, with
+    /// Issue #364: BITROT is found while tar runs now, not before it — and
+    /// still refuses the stage, stops tar, and leaves staging empty, with
     /// the baseline untouched.
     #[test]
-    fn bitrot_found_while_dar_runs_refuses_the_stage() {
+    fn bitrot_found_while_tar_runs_refuses_the_stage() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         config.defaults.slice_size = "64K".to_string();
@@ -6287,11 +6162,10 @@ mod tests {
     }
 
     /// Issue #409: every `.age` reaches stable storage BEFORE its
-    /// `stage_slices` row is written, and the isolated dar catalogue is
-    /// synced once it is re-isolated. Driven through a real stage (real dar)
+    /// `stage_slices` row is written. Driven through a real stage (real tar)
     /// cut into several slices; the order is read off the pipeline's own
     /// durability log. Since issue #370 there is no plaintext slice to
-    /// delete: none is ever written (`when_dar_finishes_staging_holds_only_ciphertext`).
+    /// delete: none is ever written (`when_tar_finishes_staging_holds_only_ciphertext`).
     #[test]
     fn every_slice_is_synced_before_it_is_recorded() {
         use durability::Event;
@@ -6337,24 +6211,10 @@ mod tests {
                 age.display()
             );
         }
-
-        let catalogue: String = conn
-            .query_row(
-                "SELECT catalog_path FROM stage_sets WHERE id = ?1",
-                params![stage_set_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            log.iter().any(|e| matches!(e, Event::Synced(p)
-                if p.to_string_lossy().starts_with(&format!("{catalogue}."))
-                    && p.to_string_lossy().ends_with(".dar"))),
-            "the dar catalogue was never synced: {log:?}"
-        );
     }
 
-    /// Issue #41: `write_stage_report` and `secure_catalog_files` tested
-    /// directly and hermetically — no dar binary, no full `stage_create`
+    /// Issue #41: `write_stage_report` tested directly and hermetically — no
+    /// archiver, no full `stage_create`
     /// pipeline — per the same reasoning `crypto::keys`'s tests already
     /// apply to secret keys: a permission bug belongs to the function that
     /// sets (or fails to set) the mode, not to everything that happens to
@@ -6433,61 +6293,6 @@ mod tests {
             );
             assert_eq!(mode_of(&path), 0o600);
         }
-
-        #[test]
-        fn secure_catalog_files_tightens_a_loose_file_dar_wrote() {
-            let tmp = TempDir::new().unwrap();
-            let catalog_dir = tmp.path().join("catalogs").join("abcd1234");
-            fs::create_dir_all(&catalog_dir).unwrap();
-            // Simulate what dar's `-C` extraction leaves behind: a file
-            // written by an external subprocess, at whatever mode the
-            // process umask handed out — not tapectl's own `OpenOptions`.
-            let catalog_file = catalog_dir.join("abcd1234_v1.1.dar");
-            fs::write(&catalog_file, b"fake dar catalog bytes").unwrap();
-            fs::set_permissions(&catalog_file, fs::Permissions::from_mode(0o644)).unwrap();
-            assert_eq!(mode_of(&catalog_file), 0o644, "fixture must start loose");
-
-            secure_catalog_files(&catalog_dir);
-
-            assert_eq!(
-                mode_of(&catalog_file),
-                0o600,
-                "a catalog file dar wrote should be tightened to 0600"
-            );
-        }
-
-        #[test]
-        fn secure_catalog_files_tightens_every_file_present() {
-            let tmp = TempDir::new().unwrap();
-            let catalog_dir = tmp.path().join("catalogs").join("multi");
-            fs::create_dir_all(&catalog_dir).unwrap();
-            for name in ["a.1.dar", "a.2.dar", "a.3.dar"] {
-                let p = catalog_dir.join(name);
-                fs::write(&p, b"slice").unwrap();
-                fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
-            }
-
-            secure_catalog_files(&catalog_dir);
-
-            for name in ["a.1.dar", "a.2.dar", "a.3.dar"] {
-                assert_eq!(
-                    mode_of(&catalog_dir.join(name)),
-                    0o600,
-                    "{name} should be 0600"
-                );
-            }
-        }
-
-        #[test]
-        fn secure_catalog_files_on_missing_dir_does_not_panic() {
-            let tmp = TempDir::new().unwrap();
-            let ghost = tmp.path().join("does-not-exist");
-            // Best-effort: must not panic even if the directory somehow
-            // isn't there (e.g. dar failed before this is ever reached in
-            // the real call site, though that path already returns `?`
-            // earlier and never gets here).
-            secure_catalog_files(&ghost);
-        }
     }
 
     // --- issue #372: the checksum backfill is linear ---
@@ -6506,9 +6311,8 @@ mod tests {
 
     /// The pin: each backfill UPDATE finds its row by the version's primary
     /// key, after one lookup of the path in `paths`' UNIQUE(unit_id, path)
-    /// index (migration 030). Before migration 027 the second UPDATE, into
-    /// `manifest_entries`, searched by `manifest_id` alone and scanned the
-    /// whole manifest per file.
+    /// index. In 1.x a second UPDATE, into the per-version manifest, searched
+    /// by the version alone and scanned the whole manifest per file.
     #[test]
     fn backfill_checksums_searches_the_indexes() {
         let conn = crate::db::open_memory().unwrap();
@@ -6526,7 +6330,7 @@ mod tests {
 
     /// Timing-independent linearity: the backfill never takes a full-scan
     /// step, and the virtual-machine steps it spends per file do not grow
-    /// with the snapshot's size. A per-file scan (the pre-027 shape) makes
+    /// with the snapshot's size. A per-file scan (1.x's manifest shape) makes
     /// the per-file cost proportional to the file count.
     #[test]
     fn backfill_checksums_costs_the_same_per_file_at_any_snapshot_size() {
@@ -6580,23 +6384,22 @@ mod tests {
              {large:.1} at 4000"
         );
 
-        // Positive control: the same measurement on the UPDATE this
-        // replaced (schema 26, `manifest_entries` searched by `manifest_id`
-        // alone) sees the per-file cost grow with the manifest.
+        // Positive control: the same measurement on an UPDATE that finds its
+        // row by the version alone and scans the version's files for the
+        // path (the shape of the per-version list this replaced, searched
+        // by its version only) sees the per-file cost grow with the list.
         fn old_steps_per_file(files: i64) -> f64 {
-            let conn = crate::db::open_memory_at_version(26);
+            let conn = crate::db::open_memory().unwrap();
             conn.execute_batch(
-                "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 1, 'active');
-                 INSERT INTO units (id, uuid, name, tenant_id) VALUES (1, 'u', 'u', 1);
-                 INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (1, 1, 1, '/s');
-                 INSERT INTO manifests (id, snapshot_id) VALUES (1, 1);",
+                "CREATE TABLE version_list (snapshot_id INTEGER NOT NULL, path TEXT NOT NULL,
+                                            sha256 TEXT);
+                 CREATE INDEX version_list_snapshot ON version_list(snapshot_id);",
             )
             .unwrap();
             let tx = conn.unchecked_transaction().unwrap();
             for f in 0..files {
                 tx.execute(
-                    "INSERT INTO manifest_entries (manifest_id, path, size_bytes, mtime)
-                     VALUES (1, ?1, 1, 'm')",
+                    "INSERT INTO version_list (snapshot_id, path) VALUES (1, ?1)",
                     params![format!("f{f:06}")],
                 )
                 .unwrap();
@@ -6604,9 +6407,8 @@ mod tests {
             tx.commit().unwrap();
             let mut stmt = conn
                 .prepare(
-                    "UPDATE manifest_entries SET sha256 = ?1
-                     WHERE manifest_id = (SELECT id FROM manifests WHERE snapshot_id = ?2 LIMIT 1)
-                     AND path = ?3 AND sha256 IS NULL",
+                    "UPDATE version_list SET sha256 = ?1
+                     WHERE snapshot_id = ?2 AND path = ?3 AND sha256 IS NULL",
                 )
                 .unwrap();
             for f in 0..files {
@@ -6618,7 +6420,7 @@ mod tests {
         let (old_small, old_large) = (old_steps_per_file(500), old_steps_per_file(4_000));
         assert!(
             old_large > old_small * 4.0,
-            "the measurement must see the pre-027 quadratic: {old_small:.1} vs {old_large:.1}"
+            "the measurement must see a per-file scan: {old_small:.1} vs {old_large:.1}"
         );
     }
 
@@ -6685,12 +6487,12 @@ mod tests {
 
     /// `stage create` refuses a snapshot whose `files` rows are fewer than
     /// its `file_count` (one minted before #374 and interrupted), naming
-    /// both numbers and the recovery, before any stage set or dar run.
+    /// both numbers and the recovery, before any stage set or tar run.
     #[test]
     fn stage_create_refuses_a_snapshot_with_a_short_file_list() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
         for i in 0..4 {
             fs::write(src.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
         }
@@ -6722,87 +6524,11 @@ mod tests {
                 && msg.contains("tapectl snapshot create unit1"),
             "the message names the recovery: {msg}"
         );
-        assert!(!msg.contains("dar-must-never-run"), "{msg}");
+        assert!(!msg.contains("tar-must-never-run"), "{msg}");
         let stage_sets: i64 = conn
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
-    }
-
-    /// Issue #395 (ADR-0012 2026-10-06 item 17): a unit bigger than one
-    /// cartridge is refused at `stage create`, before the `stage_sets`
-    /// INSERT and before dar, naming the limit for the generation and by
-    /// how much the unit is over. The limit is the LARGEST any configured
-    /// drive's generation takes: two virtual drives, 1 MB and 3 MB (each at
-    /// 100% and no reserve), and a unit of a little over 2 MiB — it fits
-    /// the larger, so it stages; with only the smaller configured it is
-    /// refused. dar is pointed nowhere in the refused case, so reaching it
-    /// would change the error.
-    #[test]
-    fn stage_create_refuses_a_unit_bigger_than_one_cartridge() {
-        let tmp = TempDir::new().unwrap();
-        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
-        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let drive = |name: &str, dev: &str, cap: &str| crate::config::LtoBackendConfig {
-            name: name.into(),
-            device_tape: dev.into(),
-            device_sg: "/dev/null".into(),
-            generation: "LTO-6".into(),
-            capacity_override: Some(cap.into()),
-            fill_ceiling: 1.0,
-            enospc_buffer: "0".into(),
-            post_warning_bytes: None,
-        };
-        config.backends.lto.push(drive("small", "/dev/null", "1M"));
-        let real_dar = std::mem::replace(
-            &mut config.dar.binary,
-            "/nonexistent/dar-must-never-run".to_string(),
-        );
-
-        let msg = stage_create(&conn, &paths, &config, snap_id, false)
-            .unwrap_err()
-            .to_string();
-        // The snapshot's own size: the 2 MiB file plus the unit's dotfile.
-        let size: i64 = conn
-            .query_row(
-                "SELECT total_size FROM snapshots WHERE id = ?1",
-                params![snap_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(size > 2 * 1024 * 1024, "positive control: {size}");
-        assert!(
-            msg.contains(&format!(
-                "unit \"unit1\" is {size} bytes (2.0 MiB), {} bytes",
-                size - 1_000_000
-            )),
-            "the size and the overage: {msg}"
-        );
-        assert!(
-            msg.contains(
-                "one LTO-6 tape takes 1.0 MB (1000000 bytes): its 1.0 MB capacity (the drive's \
-                 capacity_override) at the 100% fill ceiling"
-            ),
-            "the limit for the generation, and its figures: {msg}"
-        );
-        assert!(msg.contains("never split"), "{msg}");
-        assert!(
-            msg.contains("`fill_ceiling`") && msg.contains("[[backends.lto]]"),
-            "names the config key that sets the ceiling (stage create has no flag): {msg}"
-        );
-        assert!(!msg.contains("dar-must-never-run"), "{msg}");
-        let stage_sets: i64 = conn
-            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
-
-        // Positive control: a second, larger drive raises the limit, and the
-        // same unit stages.
-        config.backends.lto.push(drive("big", "/dev/zero", "3M"));
-        config.dar.binary = real_dar;
-        stage_create(&conn, &paths, &config, snap_id, false)
-            .expect("a unit that fits the largest configured generation stages");
     }
 
     /// Issue #402 as item 129 amends it: a slice released on its own
@@ -6897,44 +6623,6 @@ mod tests {
             enospc_buffer: "0".into(),
             post_warning_bytes: None,
         });
-    }
-
-    /// #478 (ADR-0012 items 82 and 94): a unit that does not allow spanning
-    /// is still refused above one tape, and the refusal now says why
-    /// (a unit that does not allow spanning is never split) and names the
-    /// key, instead of "waits for planned spanning, which is not built yet".
-    #[test]
-    fn stage_create_refuses_a_non_spannable_unit_larger_than_one_tape_naming_allow_spanning() {
-        let tmp = TempDir::new().unwrap();
-        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
-        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        one_small_drive(&mut config);
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
-
-        let msg = stage_create(&conn, &paths, &config, snap_id, false)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            msg.contains("more than one cartridge can take"),
-            "positive control, the one-tape refusal: {msg}"
-        );
-        assert!(
-            msg.contains(
-                "A unit that does not allow spanning (allow_spanning) is never split across \
-                 cartridges"
-            ),
-            "{msg}"
-        );
-        assert!(msg.contains("`allow_spanning = true`"), "{msg}");
-        assert!(
-            !msg.contains("not built yet"),
-            "the stale text is gone: {msg}"
-        );
-        let stage_sets: i64 = conn
-            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
     }
 
     /// #493 (ADR-0012 item 148, the coordinator's freeze mechanics):
@@ -7043,22 +6731,21 @@ mod tests {
         );
     }
 
-    /// #478 (ADR-0012 item 94): a unit that allows spanning is admitted
-    /// whatever its size against one tape — here larger than the only
+    /// ADR-0012 items 94 and 288: a unit is admitted whatever its size
+    /// against one tape — here larger than the only
     /// configured drive's cartridge, a staging area larger than it — and
     /// stages.
     #[test]
-    fn stage_create_admits_a_spannable_unit_larger_than_one_tape() {
+    fn stage_create_admits_a_unit_larger_than_one_tape() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         one_small_drive(&mut config);
-        config.defaults.allow_spanning = true;
         let _total = TotalSpaceOverride::set(1 << 40);
 
         stage_create(&conn, &paths, &config, snap_id, false)
-            .expect("a spannable unit larger than one tape is admitted and staged");
+            .expect("a unit larger than one tape is admitted and staged");
         let status: String = conn
             .query_row(
                 "SELECT status FROM stage_sets WHERE snapshot_id = ?1",
@@ -7069,20 +6756,19 @@ mod tests {
         assert_eq!(status, "staged");
     }
 
-    /// #478 (ADR-0012 items 85 and 94, ruling X14): a unit that allows
-    /// spanning but is larger than the staging filesystem's TOTAL size is
-    /// refused by name, before the INSERT and before dar, saying why (it is
+    /// ADR-0012 items 85 and 288 (ruling X14): a unit larger than the
+    /// staging filesystem's TOTAL size is
+    /// refused by name, before the INSERT and before tar, saying why (it is
     /// staged whole) and what would change it (staging grows). The positive
     /// control is the same unit with a staging area one byte larger than it,
-    /// which passes this check (and dar, pointed nowhere, then fails).
+    /// which passes this check (and tar, pointed nowhere, then fails).
     #[test]
-    fn stage_create_refuses_a_spannable_unit_larger_than_the_staging_area() {
+    fn stage_create_refuses_a_unit_larger_than_the_staging_area() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        config.defaults.allow_spanning = true;
-        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
         let size: u64 = conn
             .query_row(
                 "SELECT total_size FROM snapshots WHERE id = ?1",
@@ -7096,9 +6782,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            msg.contains(&format!(
-                "unit \"unit1\" allows spanning (allow_spanning) and is {size} bytes"
-            )),
+            msg.contains(&format!("unit \"unit1\" is {size} bytes")),
             "{msg}"
         );
         assert!(
@@ -7112,7 +6796,7 @@ mod tests {
             msg.contains("once the staging area is larger than the unit"),
             "says what would change it: {msg}"
         );
-        assert!(!msg.contains("dar-must-never-run"), "{msg}");
+        assert!(!msg.contains("tar-must-never-run"), "{msg}");
         let stage_sets: i64 = conn
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();
@@ -7147,7 +6831,7 @@ mod tests {
     /// Issue #479 (ADR-0012 2026-10-17 item 100): with a measured
     /// post-warning room on a configured drive, `stage create` refuses a
     /// slice size whose slice plus the seal does not fit in half of it,
-    /// before the `stage_sets` INSERT and before dar. Two routes to the same
+    /// before the `stage_sets` INSERT and before tar. Two routes to the same
     /// refusal: `[defaults]`, and the unit's own dotfile (which the
     /// config-level check never sees). Absent key and a slice size that fits
     /// are the controls.
@@ -7171,10 +6855,7 @@ mod tests {
         // 16 MiB; a 100 MiB slice cannot be sealed after the warning.
         config.backends.lto.push(drive(Some("60M")));
         config.defaults.slice_size = "100M".into();
-        let real_dar = std::mem::replace(
-            &mut config.dar.binary,
-            "/nonexistent/dar-must-never-run".to_string(),
-        );
+        let real_tar = std::mem::replace(&mut config.tar.binary, never_archiving_tar());
 
         let msg = stage_create(&conn, &paths, &config, snap_id, false)
             .unwrap_err()
@@ -7187,7 +6868,7 @@ mod tests {
                 && msg.contains("Nothing was staged."),
             "names the unit, the key, the drive and the numbers: {msg}"
         );
-        assert!(!msg.contains("dar-must-never-run"), "{msg}");
+        assert!(!msg.contains("tar-must-never-run"), "{msg}");
         let stage_sets: i64 = conn
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();
@@ -7209,11 +6890,11 @@ mod tests {
         );
 
         // Control: the same 100M slice size with the key absent stages (real
-        // dar), so the refusals above were the key's and nothing else's.
+        // tar), so the refusals above were the key's and nothing else's.
         config.defaults.slice_size = "100M".into();
         df.slice_size = None;
         crate::unit::dotfile::write_dotfile(&dotfile, &df).unwrap();
-        config.dar.binary = real_dar;
+        config.tar.binary = real_tar;
         config.backends.lto.clear();
         config.backends.lto.push(drive(None));
         stage_create(&conn, &paths, &config, snap_id, false)

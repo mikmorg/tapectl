@@ -10,46 +10,6 @@ use crate::config::Config;
 use crate::db::events;
 use crate::error::{Result, TapectlError};
 
-/// Syntactic check first, then capability check against the locally
-/// installed `dar` binary (issue #97): a value from
-/// `crate::config::VALID_COMPRESSION_VALUES` can still be one the local dar
-/// was not compiled to support (`lzo`, `zstd`, `lz4`, `lzma` are commonly
-/// absent from distro builds), which otherwise only surfaces as a runtime
-/// `dar -z` failure at archive time.
-///
-/// The syntactic half moved to `crate::config::validate_compression` under
-/// issue #171 so `[defaults].compression` and an archive_set's `compression`
-/// share ONE check instead of `[defaults]` accepting any string while this
-/// path validated it — see `crate::config::Config::validate_closed_sets`.
-///
-/// Fails open on capability-probe trouble: if `dar::version::capabilities`
-/// itself errors (binary missing, unreadable, etc.), that is a pre-existing,
-/// separately-reported condition (`config check`'s dar depth-check) — this
-/// function does not pile a second, redundant error on top, and simply lets
-/// the value through so the syntactic check remains authoritative in that
-/// case.
-fn validate_compression_capability(value: &str, config: &Config) -> Result<()> {
-    crate::config::validate_compression(value).map_err(TapectlError::Other)?;
-
-    if let Ok(caps) = crate::dar::version::capabilities(&config.dar.binary) {
-        if !caps.supports(value) {
-            let supported: Vec<&str> = crate::config::VALID_COMPRESSION_VALUES
-                .iter()
-                .filter(|alg| caps.supports(alg))
-                .copied()
-                .collect();
-            return Err(TapectlError::Other(format!(
-                "compression \"{value}\" is not supported by the local dar binary ({}): \
-                 it supports {}",
-                config.dar.binary,
-                supported.join(", ")
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 /// Parse a `--required-locations` value (comma-separated) and refuse any
 /// name that is not a registered location (issue #348).
 ///
@@ -149,6 +109,33 @@ fn check_registered_locations(conn: &Connection, field: &str, names: &[String]) 
     Ok(())
 }
 
+/// Item 287: a level is a whole number in its algorithm's range (gzip 1-9,
+/// xz 0-9, zstd 1-19). Beside an algorithm it is judged against that one;
+/// alone, against the widest range, and again against the resolved
+/// algorithm when a slice is packed.
+fn check_compression_level(compression: Option<&str>, level: i64) -> Result<()> {
+    match compression {
+        Some(c) => match crate::config::level_problem(c, Some(level)) {
+            Some(e) => Err(TapectlError::Other(e)),
+            None => Ok(()),
+        },
+        None if (0..=19).contains(&level) => Ok(()),
+        None => Err(TapectlError::Other(format!(
+            "compression_level = {level} is outside every algorithm's levels (gzip 1 to 9, \
+             xz 0 to 9, zstd 1 to 19)"
+        ))),
+    }
+}
+
+/// A slice size: parsed, and a positive multiple of 512 bytes (#562).
+fn parse_slice_size(s: &str) -> Result<i64> {
+    let bytes = crate::staging::parse_size_to_bytes(s)?;
+    match crate::config::slice_size_block_problem(bytes) {
+        Some(e) => Err(TapectlError::Other(format!("{s:?}: {e}"))),
+        None => Ok(bytes),
+    }
+}
+
 /// The policy columns `archive-set create` and `edit` take as flags — one
 /// definition for both (issue #346), so a column one command can set is a
 /// column the other can too. Every flag is optional: `create` leaves an
@@ -166,9 +153,16 @@ pub struct PolicyArgs {
     /// Encryption enabled (true/false)
     #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub encrypt: Option<bool>,
-    /// Compression mode
+    /// Compression mode: none, gzip, xz or zstd
+    ///
+    /// Each slice is packed alone, after the cut and before it is encrypted.
     #[arg(long, value_name = "MODE")]
     pub compression: Option<String>,
+    /// Compression level (gzip 1-9, xz 0-9, zstd 1-19)
+    ///
+    /// Never set means the algorithm's own default (gzip 6, xz 6, zstd 3).
+    #[arg(long, value_name = "N")]
+    pub compression_level: Option<i64>,
     /// Checksum mode
     #[arg(long, value_name = "MODE")]
     pub checksum_mode: Option<String>,
@@ -185,29 +179,19 @@ pub struct PolicyArgs {
     pub warehouse_copies: Option<i64>,
     /// Keep extended attributes (true/false)
     ///
-    /// And the POSIX ACLs stored as them; false drops them all.
+    /// tar's --xattrs; the raw POSIX ACL attribute is never among them.
     #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub preserve_xattrs: Option<bool>,
-    /// Keep POSIX ACLs (true/false; with --preserve-xattrs)
+    /// Keep POSIX ACLs (true/false)
     ///
-    /// No effect of its own: ACLs are kept or dropped with the extended
-    /// attributes they are stored as.
+    /// tar's --acls: the text ACL record, every entry by number.
     #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub preserve_acls: Option<bool>,
-    /// Keep filesystem attributes, chattr flags (true/false)
-    #[arg(long, value_name = "BOOL", hide_possible_values = true)]
-    pub preserve_fsa: Option<bool>,
     /// A metadata change makes a unit dirty (true/false)
     ///
     /// Not read yet: dirty detection compares path, size and mtime only.
     #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub dirty_on_metadata_change: Option<bool>,
-    /// Units may span tapes by their slices (true/false)
-    ///
-    /// From tapectl 1.7.0. Never set means "defer to [defaults]", which is
-    /// off.
-    #[arg(long, value_name = "BOOL", hide_possible_values = true)]
-    pub allow_spanning: Option<bool>,
     /// Copies at a location, NAME=N (repeatable)
     ///
     /// E.g. --copies-at home=1 --copies-at offsite=1; each NAME must be a
@@ -302,7 +286,7 @@ impl ColumnValue {
 /// `create`, `edit` and `sync` all write through this (issue #346). Before
 /// it, each had its own column list: `sync` knew seven columns, `create` and
 /// `edit` nine, and four keys `[[archive_sets]]` accepts —
-/// `preserve_xattrs`, `preserve_acls`, `preserve_fsa`,
+/// `preserve_xattrs`, `preserve_acls`,
 /// `dirty_on_metadata_change` — reached no column through any of them.
 /// Adding a column here is what makes it writable everywhere.
 #[derive(Debug, Default)]
@@ -311,6 +295,7 @@ struct PolicyWrite {
     required_locations: Option<Vec<String>>,
     encrypt: Option<bool>,
     compression: Option<String>,
+    compression_level: Option<i64>,
     checksum_mode: Option<String>,
     /// Bytes, already parsed.
     slice_size: Option<i64>,
@@ -318,9 +303,7 @@ struct PolicyWrite {
     warehouse_copies: Option<i64>,
     preserve_xattrs: Option<bool>,
     preserve_acls: Option<bool>,
-    preserve_fsa: Option<bool>,
     dirty_on_metadata_change: Option<bool>,
-    allow_spanning: Option<bool>,
     /// #493: the set's whole `copies_at` map, stored as a JSON object.
     copies_at: Option<BTreeMap<String, i64>>,
     description: Option<String>,
@@ -334,15 +317,14 @@ impl PolicyWrite {
             required_locations,
             encrypt,
             compression,
+            compression_level,
             checksum_mode,
             slice_size,
             verify_interval_days,
             warehouse_copies,
             preserve_xattrs,
             preserve_acls,
-            preserve_fsa,
             dirty_on_metadata_change,
-            allow_spanning,
             copies_at,
             description,
         } = self;
@@ -351,15 +333,14 @@ impl PolicyWrite {
             && required_locations.is_none()
             && encrypt.is_none()
             && compression.is_none()
+            && compression_level.is_none()
             && checksum_mode.is_none()
             && slice_size.is_none()
             && verify_interval_days.is_none()
             && warehouse_copies.is_none()
             && preserve_xattrs.is_none()
             && preserve_acls.is_none()
-            && preserve_fsa.is_none()
             && dirty_on_metadata_change.is_none()
-            && allow_spanning.is_none()
             && copies_at.is_none()
             && description.is_none()
     }
@@ -367,9 +348,13 @@ impl PolicyWrite {
     /// Validate `create`/`edit` flags and turn them into a write. Every
     /// check runs here, before either command's dry-run return, so a dry
     /// run refuses exactly what the real run would (#241).
-    fn from_args(conn: &Connection, config: &Config, args: &PolicyArgs) -> Result<Self> {
+    fn from_args(conn: &Connection, args: &PolicyArgs) -> Result<Self> {
         if let Some(c) = &args.compression {
-            validate_compression_capability(c, config)?;
+            crate::config::validate_compression(c).map_err(TapectlError::Other)?;
+        }
+        if let Some(level) = args.compression_level {
+            check_compression_level(args.compression.as_deref(), level)
+                .map_err(|e| TapectlError::Other(format!("--compression-level: {e}")))?;
         }
         if let Some(m) = &args.checksum_mode {
             // ADR-0012 "same treatment" as compression (issue #171): was
@@ -399,8 +384,9 @@ impl PolicyWrite {
         let slice_size = args
             .slice_size
             .as_ref()
-            .map(|s| crate::staging::parse_size_to_bytes(s))
-            .transpose()?;
+            .map(|s| parse_slice_size(s))
+            .transpose()
+            .map_err(|e| TapectlError::Other(format!("--slice-size: {e}")))?;
         // No flag is "not given", never an empty map.
         let copies_at = (!args.copies_at.is_empty())
             .then(|| parse_copies_at(conn, &args.copies_at))
@@ -410,15 +396,14 @@ impl PolicyWrite {
             required_locations,
             encrypt: args.encrypt,
             compression: args.compression.clone(),
+            compression_level: args.compression_level,
             checksum_mode: args.checksum_mode.clone(),
             slice_size,
             verify_interval_days: args.verify_interval_days,
             warehouse_copies: args.warehouse_copies,
             preserve_xattrs: args.preserve_xattrs,
             preserve_acls: args.preserve_acls,
-            preserve_fsa: args.preserve_fsa,
             dirty_on_metadata_change: args.dirty_on_metadata_change,
-            allow_spanning: args.allow_spanning,
             copies_at,
             description: args.description.clone(),
         })
@@ -444,24 +429,27 @@ impl PolicyWrite {
             crate::config::validate_copies_at(map)
                 .map_err(|e| TapectlError::Other(format!("copies_at {e}")))?;
         }
+        if let Some(level) = as_cfg.compression_level {
+            check_compression_level(as_cfg.compression.as_deref(), level)?;
+        }
         Ok(Self {
             min_copies: as_cfg.min_copies.map(i64::from),
             required_locations: as_cfg.required_locations.clone(),
             encrypt: as_cfg.encrypt,
             compression: as_cfg.compression.clone(),
+            compression_level: as_cfg.compression_level,
             checksum_mode: as_cfg.checksum_mode.clone(),
             slice_size: as_cfg
                 .slice_size
                 .as_ref()
-                .map(|s| crate::staging::parse_size_to_bytes(s))
-                .transpose()?,
+                .map(|s| parse_slice_size(s))
+                .transpose()
+                .map_err(|e| TapectlError::Other(format!("slice_size {e}")))?,
             verify_interval_days: as_cfg.verify_interval_days.map(i64::from),
             warehouse_copies: None,
             preserve_xattrs: as_cfg.preserve_xattrs,
             preserve_acls: as_cfg.preserve_acls,
-            preserve_fsa: as_cfg.preserve_fsa,
             dirty_on_metadata_change: as_cfg.dirty_on_metadata_change,
-            allow_spanning: as_cfg.allow_spanning,
             copies_at: as_cfg.copies_at.clone(),
             description: None,
         })
@@ -489,6 +477,10 @@ impl PolicyWrite {
             self.compression.clone().map(ColumnValue::Text),
         );
         push(
+            "compression_level",
+            self.compression_level.map(ColumnValue::Int),
+        );
+        push(
             "checksum_mode",
             self.checksum_mode.clone().map(ColumnValue::Text),
         );
@@ -506,12 +498,10 @@ impl PolicyWrite {
             self.preserve_xattrs.map(ColumnValue::Bool),
         );
         push("preserve_acls", self.preserve_acls.map(ColumnValue::Bool));
-        push("preserve_fsa", self.preserve_fsa.map(ColumnValue::Bool));
         push(
             "dirty_on_metadata_change",
             self.dirty_on_metadata_change.map(ColumnValue::Bool),
         );
-        push("allow_spanning", self.allow_spanning.map(ColumnValue::Bool));
         push(
             "copies_at",
             self.copies_at
@@ -661,15 +651,14 @@ struct ArchiveSetInfo {
     required_locations: Option<String>,
     encrypt: Option<i64>,
     compression: Option<String>,
+    compression_level: Option<i64>,
     checksum_mode: Option<String>,
     slice_size: Option<i64>,
     verify_days: Option<i64>,
     warehouse_copies: Option<i64>,
     preserve_xattrs: Option<i64>,
     preserve_acls: Option<i64>,
-    preserve_fsa: Option<i64>,
     dirty_on_metadata_change: Option<i64>,
-    allow_spanning: Option<i64>,
     /// The stored JSON object text, or NULL (#493).
     copies_at: Option<String>,
     unit_count: i64,
@@ -683,10 +672,10 @@ impl ArchiveSetInfo {
             .query_row(
                 "SELECT a.description, a.min_copies, a.required_locations, a.encrypt,
                         a.compression, a.checksum_mode, a.slice_size, a.verify_interval_days,
-                        a.warehouse_copies, a.preserve_xattrs, a.preserve_acls, a.preserve_fsa,
+                        a.warehouse_copies, a.preserve_xattrs, a.preserve_acls,
                         a.dirty_on_metadata_change, a.created_at, a.updated_at,
                         (SELECT COUNT(*) FROM units u WHERE u.archive_set_id = a.id),
-                        a.allow_spanning, a.copies_at
+                        a.copies_at, a.compression_level
                  FROM archive_sets a WHERE a.name = ?1",
                 params![name],
                 |row| {
@@ -703,13 +692,12 @@ impl ArchiveSetInfo {
                         warehouse_copies: row.get(8)?,
                         preserve_xattrs: row.get(9)?,
                         preserve_acls: row.get(10)?,
-                        preserve_fsa: row.get(11)?,
-                        dirty_on_metadata_change: row.get(12)?,
-                        created: row.get(13)?,
-                        updated: row.get(14)?,
-                        unit_count: row.get(15)?,
-                        allow_spanning: row.get(16)?,
-                        copies_at: row.get(17)?,
+                        dirty_on_metadata_change: row.get(11)?,
+                        created: row.get(12)?,
+                        updated: row.get(13)?,
+                        unit_count: row.get(14)?,
+                        copies_at: row.get(15)?,
+                        compression_level: row.get(16)?,
                     })
                 },
             )
@@ -749,14 +737,13 @@ fn info_json(info: &ArchiveSetInfo) -> serde_json::Value {
     serde_json::json!({
         "name": info.name, "description": info.description, "min_copies": info.min_copies,
         "locations": locations, "encrypt": flag(info.encrypt),
-        "compression": info.compression, "checksum_mode": info.checksum_mode,
+        "compression": info.compression, "compression_level": info.compression_level,
+        "checksum_mode": info.checksum_mode,
         "slice_size": info.slice_size, "verify_days": info.verify_days,
         "warehouse_copies": info.warehouse_copies,
         "preserve_xattrs": flag(info.preserve_xattrs),
         "preserve_acls": flag(info.preserve_acls),
-        "preserve_fsa": flag(info.preserve_fsa),
         "dirty_on_metadata_change": flag(info.dirty_on_metadata_change),
-        "allow_spanning": flag(info.allow_spanning),
         "copies_at": copies_at,
         "units": info.unit_count,
     })
@@ -785,6 +772,10 @@ fn info_text(info: &ArchiveSetInfo) -> String {
     out.push_str(&format!(
         "  Compression:      {}\n",
         text(&info.compression)
+    ));
+    out.push_str(&format!(
+        "  Compr. level:     {}\n",
+        int(info.compression_level)
     ));
     out.push_str(&format!(
         "  Checksum mode:    {}\n",
@@ -818,16 +809,8 @@ fn info_text(info: &ArchiveSetInfo) -> String {
         flag(info.preserve_acls)
     ));
     out.push_str(&format!(
-        "  Preserve FSA:     {}\n",
-        flag(info.preserve_fsa)
-    ));
-    out.push_str(&format!(
         "  Dirty on metadata change: {}\n",
         flag(info.dirty_on_metadata_change)
-    ));
-    out.push_str(&format!(
-        "  Allow spanning:   {}\n",
-        flag(info.allow_spanning)
     ));
     out.push_str(&format!("  Copies at:        {}\n", text(&info.copies_at)));
     out.push_str(&format!("  Units using:      {}\n", info.unit_count));
@@ -848,7 +831,7 @@ pub fn run(
 ) -> Result<()> {
     match command {
         ArchiveSetCommands::Create { name, policy } => {
-            let write = PolicyWrite::from_args(conn, config, policy)?;
+            let write = PolicyWrite::from_args(conn, policy)?;
 
             // Issue #241: pure precheck-then-INSERT with no policy gate —
             // every validation already ran in `from_args`, so this only adds
@@ -886,7 +869,7 @@ pub fn run(
         }
 
         ArchiveSetCommands::Edit { name, policy } => {
-            let write = PolicyWrite::from_args(conn, config, policy)?;
+            let write = PolicyWrite::from_args(conn, policy)?;
             // Issue #363: no flag is nothing to edit — said, not reported
             // as an update after an empty transaction.
             if write.is_empty() {
@@ -986,7 +969,7 @@ pub fn run(
             // Same guard as create/edit: `sync` writes archive_sets rows
             // straight from config.toml, so without this a bogus `compression`
             // in the config file walks past the CLI validation and only fails
-            // later at `dar -z` (issue #92). Validated for EVERY entry up
+            // later at staging (issue #92). Validated for EVERY entry up
             // front, before any row is written, and the writes below run in
             // one transaction — `sync` is all-or-nothing.
             let mut writes = Vec::with_capacity(config.archive_sets.len());
@@ -995,7 +978,8 @@ pub fn run(
                     TapectlError::Other(format!("archive set \"{}\": {e}", as_cfg.name))
                 };
                 if let Some(c) = &as_cfg.compression {
-                    validate_compression_capability(c, config).map_err(named)?;
+                    crate::config::validate_compression(c)
+                        .map_err(|e| named(TapectlError::Other(e)))?;
                 }
                 // ADR-0012 "same treatment" as compression (issue #171).
                 if let Some(m) = &as_cfg.checksum_mode {
@@ -1161,10 +1145,8 @@ mod tests {
             "encrypt",
             "preserve_xattrs",
             "preserve_acls",
-            "preserve_fsa",
             "dirty_on_metadata_change",
             "warehouse_copies",
-            "allow_spanning",
             "copies_at",
         ] {
             assert_eq!(value[key], serde_json::Value::Null, "{key}: {value}");
@@ -1192,8 +1174,8 @@ mod tests {
 
     /// Issue #92: since a dotfile no longer unconditionally shadows the
     /// archive_set's `compression`, a bogus value now actually reaches
-    /// `dar -z <value>` at write time — reject it here instead of letting
-    /// it surface as a runtime dar failure.
+    /// the compression at write time — reject it here instead of letting
+    /// it surface as a runtime failure.
     #[test]
     fn create_rejects_invalid_compression() {
         let conn = fresh_conn();
@@ -1255,66 +1237,30 @@ mod tests {
         );
     }
 
-    /// Writes a fake `dar` executable to a tempdir that answers `-V` with a
-    /// synthetic capability block missing `lzo`, and answers `--version`
-    /// with a real-looking version line so `validate_compression` (via
-    /// `dar::version::check`/`capabilities`, both invoked through the same
-    /// `Command::new(dar_binary)` shape) works against it. Real dar on this
-    /// dev machine reports YES for every codec (per issue #97's context),
-    /// so capability *rejection* can only be exercised against a synthetic
-    /// binary, never the real one.
-    fn fake_dar_missing_lzo() -> (tempfile::TempDir, String) {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("dar");
-        std::fs::write(
-            &path,
-            r#"#!/bin/sh
-if [ "$1" = "-V" ]; then
-  echo " Using libdar 6.7.1 built with compilation time options:"
-  echo "   gzip compression (libz)      : YES"
-  echo "   bzip2 compression (libbzip2) : YES"
-  echo "   lzo compression (liblzo2)    : NO"
-  echo "   xz compression (liblzma)     : YES"
-  echo "   zstd compression (libzstd)   : YES"
-  echo "   lz4 compression (liblz4)     : YES"
-else
-  echo "dar version 2.7.13, Copyright (C) 2002-2052 Denis Corbin"
-fi
-"#,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        (tmp, path.to_str().unwrap().to_string())
-    }
-
-    /// Issue #97: an algorithm from `VALID_COMPRESSION_VALUES` that the
-    /// local (synthetic) dar was not compiled to support must be rejected,
-    /// and the error must name what the binary DOES support.
+    /// Issue #97, 2.0.0: a value outside the carried three (`none`, `gzip`,
+    /// `xz`, `zstd`) is refused by name with no probe of any host tool, and
+    /// the error names what is carried.
     #[test]
-    fn create_rejects_syntactically_valid_but_locally_unsupported_compression() {
-        let (_tmp, dar_path) = fake_dar_missing_lzo();
+    fn create_rejects_a_compression_tapectl_does_not_carry() {
         let conn = fresh_conn();
-        let mut config = Config::default();
-        config.dar.binary = dar_path;
+        let config = Config::default();
 
-        let err = run(
-            &conn,
-            &config,
-            &create_cmd("cold", None, Some("lzo")),
-            false,
-            false,
-        )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("lzo"), "must name the rejected value: {msg}");
-        assert!(
-            msg.contains("gzip"),
-            "must name a supported value in the message: {msg}"
-        );
+        for value in ["lzo", "bzip2", "lz4", "lzma"] {
+            let err = run(
+                &conn,
+                &config,
+                &create_cmd("cold", None, Some(value)),
+                false,
+                false,
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(value), "must name the rejected value: {msg}");
+            assert!(
+                msg.contains("gzip") && msg.contains("xz") && msg.contains("zstd"),
+                "must name the carried values: {msg}"
+            );
+        }
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM archive_sets WHERE name = 'cold'",
@@ -1323,19 +1269,15 @@ fi
             )
             .unwrap(),
             0,
-            "no archive_set row should be created when compression is unsupported"
+            "no archive_set row should be created when compression is not carried"
         );
     }
 
-    /// Issue #97: an outright invalid name must still hit the syntactic
-    /// error path, not the capability-check path — even against a dar
-    /// binary that would otherwise reject it for a different reason.
+    /// An outright invalid name hits the same closed-set error.
     #[test]
-    fn create_rejects_invalid_name_with_syntactic_error_even_with_capability_probe_available() {
-        let (_tmp, dar_path) = fake_dar_missing_lzo();
+    fn create_rejects_invalid_name_with_syntactic_error() {
         let conn = fresh_conn();
-        let mut config = Config::default();
-        config.dar.binary = dar_path;
+        let config = Config::default();
 
         let err = run(
             &conn,
@@ -1349,32 +1291,31 @@ fi
         assert!(msg.contains("accepted values are"), "got: {msg}");
     }
 
-    /// Issue #97: a syntactically valid, locally-supported algorithm must
-    /// still succeed against the synthetic capability-aware dar.
+    /// Each carried algorithm is accepted, whatever tools the host has.
     #[test]
-    fn create_accepts_locally_supported_compression() {
-        let (_tmp, dar_path) = fake_dar_missing_lzo();
-        let conn = fresh_conn();
-        let mut config = Config::default();
-        config.dar.binary = dar_path;
-
-        run(
-            &conn,
-            &config,
-            &create_cmd("cold", None, Some("gzip")),
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM archive_sets WHERE name = 'cold'",
-                [],
-                |row| row.get::<_, i64>(0)
+    fn create_accepts_every_carried_compression() {
+        for (i, value) in ["none", "gzip", "xz", "zstd"].into_iter().enumerate() {
+            let conn = fresh_conn();
+            let config = Config::default();
+            let name = format!("cold{i}");
+            run(
+                &conn,
+                &config,
+                &create_cmd(&name, None, Some(value)),
+                false,
+                false,
             )
-            .unwrap(),
-            1
-        );
+            .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT compression FROM archive_sets WHERE name = ?1",
+                    params![name],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                value
+            );
+        }
     }
 
     fn add_location(conn: &Connection, name: &str) {
@@ -1597,14 +1538,13 @@ fi
             required_locations: None,
             encrypt: None,
             compression: None,
+            compression_level: None,
             checksum_mode: None,
             verify_interval_days: None,
             slice_size: None,
             preserve_xattrs: None,
             preserve_acls: None,
-            preserve_fsa: None,
             dirty_on_metadata_change: None,
-            allow_spanning: None,
             copies_at: None,
         }
     }
@@ -1672,7 +1612,7 @@ fi
         assert_eq!(column_i64(&conn, "cold", "min_copies"), Some(4));
     }
 
-    /// Issue #346: `preserve_xattrs`, `preserve_acls`, `preserve_fsa` and
+    /// Issue #346: `preserve_xattrs`, `preserve_acls` and
     /// `dirty_on_metadata_change` were accepted in `[[archive_sets]]` and
     /// never written, so the columns stayed NULL and the set silently
     /// deferred to `[defaults]`. Every accepted key must reach its column,
@@ -1684,18 +1624,14 @@ fi
         let mut media = set_config("media");
         media.preserve_xattrs = Some(false);
         media.preserve_acls = Some(false);
-        media.preserve_fsa = Some(false);
         media.dirty_on_metadata_change = Some(true);
-        media.allow_spanning = Some(true);
         config.archive_sets.push(media);
 
         run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
         for (column, want) in [
             ("preserve_xattrs", 0),
             ("preserve_acls", 0),
-            ("preserve_fsa", 0),
             ("dirty_on_metadata_change", 1),
-            ("allow_spanning", 1),
         ] {
             assert_eq!(
                 column_i64(&conn, "media", column),
@@ -1704,17 +1640,11 @@ fi
             );
         }
 
-        config.archive_sets[0].preserve_fsa = Some(true);
+        config.archive_sets[0].preserve_acls = Some(true);
         config.archive_sets[0].dirty_on_metadata_change = Some(false);
-        config.archive_sets[0].allow_spanning = Some(false);
         run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
         assert_eq!(
-            column_i64(&conn, "media", "allow_spanning"),
-            Some(0),
-            "update"
-        );
-        assert_eq!(
-            column_i64(&conn, "media", "preserve_fsa"),
+            column_i64(&conn, "media", "preserve_acls"),
             Some(1),
             "update"
         );
@@ -1738,14 +1668,12 @@ fi
         if let ArchiveSetCommands::Create { policy, .. } = &mut cmd {
             policy.preserve_xattrs = Some(false);
             policy.preserve_acls = Some(false);
-            policy.preserve_fsa = Some(true);
             policy.dirty_on_metadata_change = Some(true);
         }
         run(&conn, &config, &cmd, false, false).unwrap();
         for (column, want) in [
             ("preserve_xattrs", 0),
             ("preserve_acls", 0),
-            ("preserve_fsa", 1),
             ("dirty_on_metadata_change", 1),
         ] {
             assert_eq!(column_i64(&conn, "media", column), Some(want), "{column}");
@@ -1804,80 +1732,6 @@ fi
         );
     }
 
-    /// #478 (ADR-0012 item 82): `allow_spanning` reaches its column through
-    /// `create`, `edit` and `sync`, and NULL means "not set" (defer to
-    /// `[defaults]`): a set created without the flag stays NULL, and a sync
-    /// of a table that does not name the key leaves it NULL, changes nothing
-    /// and logs nothing.
-    #[test]
-    fn allow_spanning_reaches_its_column_and_null_means_not_set() {
-        let conn = fresh_conn();
-        let mut config = Config::default();
-        run(
-            &conn,
-            &config,
-            &create_cmd("plain", None, None),
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(column_i64(&conn, "plain", "allow_spanning"), None);
-        config.archive_sets.push(set_config("plain"));
-        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
-        assert_eq!(
-            column_i64(&conn, "plain", "allow_spanning"),
-            None,
-            "a table that does not name the key must not write a 0"
-        );
-        let synced: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE entity_type = 'archive_set' \
-                 AND action = 'synced'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(synced, 0, "an unnamed key is no change");
-
-        let mut cmd = create_cmd("span", None, None);
-        if let ArchiveSetCommands::Create { policy, .. } = &mut cmd {
-            policy.allow_spanning = Some(true);
-        }
-        run(&conn, &config, &cmd, false, false).unwrap();
-        assert_eq!(column_i64(&conn, "span", "allow_spanning"), Some(1));
-        run(
-            &conn,
-            &config,
-            &ArchiveSetCommands::Edit {
-                name: "span".to_string(),
-                policy: PolicyArgs {
-                    allow_spanning: Some(false),
-                    ..PolicyArgs::default()
-                },
-            },
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(column_i64(&conn, "span", "allow_spanning"), Some(0));
-        let edited: (Option<String>, String) = conn
-            .query_row(
-                "SELECT old_value, new_value FROM events WHERE entity_type = 'archive_set' \
-                 AND action = 'edited' AND field = 'allow_spanning'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(edited, (Some("true".to_string()), "false".to_string()));
-
-        let mut span = set_config("span");
-        span.allow_spanning = Some(true);
-        config.archive_sets.push(span);
-        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
-        assert_eq!(column_i64(&conn, "span", "allow_spanning"), Some(1));
-        assert_eq!(column_i64(&conn, "plain", "allow_spanning"), None);
-    }
-
     /// `sync` re-applies the same config every run; a set whose columns
     /// already match is `unchanged` and logs nothing, and a changed column
     /// is logged once as a `synced` field event with its old value.
@@ -1887,7 +1741,7 @@ fi
         let mut config = Config::default();
         let mut cold = set_config("cold");
         cold.min_copies = Some(3);
-        cold.preserve_fsa = Some(false);
+        cold.preserve_acls = Some(false);
         config.archive_sets.push(cold);
 
         run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
@@ -1928,9 +1782,7 @@ fi
             warehouse_copies: Some(1),
             preserve_xattrs: Some(0),
             preserve_acls: Some(1),
-            preserve_fsa: None,
             dirty_on_metadata_change: Some(1),
-            allow_spanning: Some(1),
             verify_days: Some(90),
             ..ArchiveSetInfo::default()
         });
@@ -1938,9 +1790,7 @@ fi
             "  Warehouse copies: 1\n",
             "  Preserve xattrs:  no\n",
             "  Preserve ACLs:    yes\n",
-            "  Preserve FSA:     -\n",
             "  Dirty on metadata change: yes\n",
-            "  Allow spanning:   yes\n",
             "  Verify interval:  90 days\n",
             "  Slice size:       -\n",
         ] {
@@ -2073,7 +1923,7 @@ fi
                 name: "cold".to_string(),
                 policy: PolicyArgs {
                     min_copies: Some(5),
-                    compression: Some("lzma".to_string()),
+                    compression: Some("xz".to_string()),
                     ..PolicyArgs::default()
                 },
             },
@@ -2106,7 +1956,7 @@ fi
 
         let compression_event = rows.iter().find(|(f, _, _)| f == "compression").unwrap();
         assert_eq!(compression_event.1.as_deref(), Some("none"));
-        assert_eq!(compression_event.2, "lzma");
+        assert_eq!(compression_event.2, "xz");
     }
 
     /// Issue #48 item 5: the 8 field UPDATEs used to autocommit

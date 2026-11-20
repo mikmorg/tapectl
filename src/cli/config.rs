@@ -8,9 +8,9 @@
 //! through [`crate::config_edit`], which checks the edited file before it
 //! is written. Everything else here only reads.
 //!
-//! Every `config check` scan below (shadowing, subsumed, decorative keys,
+//! Every `config check` scan below (shadowing, decorative keys,
 //! unknown `[defaults]` keys, unsupported compression, and the
-//! dar/staging/tape depth checks) is ADVISORY — it advises, never rewrites
+//! tar/staging/tape depth checks) is ADVISORY — it advises, never rewrites
 //! operator-owned files, and never touches the exit code. That contract is load-bearing
 //! (ADR-0004 and the #50/#92 "surface, do not delete" precedent); preserve
 //! it.
@@ -278,41 +278,45 @@ fn run_check(
     // fails to strictly load — at which point `report.problems` already
     // names the same key via its own "unknown key: …" entries. This scan is
     // no longer reachable on a config that loads cleanly; kept for its
-    // `[defaults]`-specific remediation text (e.g. the issue #348 renames,
-    // "min_copies_for_tape_only was renamed to min_copies") which
-    // `report.problems`'s generic message does not carry.
+    // `[defaults]`-scoped wording.
     let unknown_key_hits = crate::policy::unknown_keys::scan(&toml_str);
 
-    // Advisory scan (issue #50/#92 precedent): a `preserve_acls` that
-    // disagrees with its layer's `preserve_xattrs` cannot take effect (dar
-    // has no independent ACL switch; ACLs ride EAs, issue #347).
-    let subsumed_hits = match loaded {
-        Some(cfg) if paths.db_file.exists() => crate::policy::subsumed::scan(cfg, conn),
-        Some(cfg) => crate::policy::subsumed::scan(cfg, &rusqlite::Connection::open_in_memory()?),
-        None => Vec::new(),
-    };
-
     // Decorative-key advisory (issue #62, #92/#50 precedent; populated by
-    // issue #347). Reads the `archive_sets` table too, like `subsumed`.
+    // issue #347). Reads the `archive_sets` table too.
     let decorative_hits = match loaded {
         Some(cfg) if paths.db_file.exists() => crate::policy::decorative::scan(cfg, conn),
         Some(cfg) => crate::policy::decorative::scan(cfg, &rusqlite::Connection::open_in_memory()?),
         None => Vec::new(),
     };
 
-    // Advisory scan (issue #97): a pre-existing archive_sets row whose
-    // compression the local dar cannot perform.
+    // Advisory scan (issue #97): an archive_sets row whose compression is
+    // not one of the algorithms tapectl carries.
     let unsupported_compression_hits = match loaded {
-        Some(cfg) if paths.db_file.exists() => {
-            crate::policy::compression_capability::scan(conn, &cfg.dar.binary)
-        }
+        Some(_) if paths.db_file.exists() => crate::policy::compression_capability::scan(conn),
         _ => Vec::new(),
     };
 
     // Depth checks (issue #62): does the config actually work, not just
     // parse? Warnings only — never touch the exit code, never open a tape
     // device.
-    let dar_check = loaded.map(|cfg| crate::policy::depth_check::check_dar(&cfg.dar.binary));
+    // The writer's floor (ADR-0012 item 274), probed as `stage create`
+    // probes it: its one file with an ACL is made in the home's work
+    // directory when there is a home, else in the system's.
+    let tar_check = match loaded {
+        Some(cfg) => {
+            let scratch = if paths.home.is_dir() {
+                Some(crate::staging::home_work_dir(paths, ".tar-probe-")?)
+            } else {
+                None
+            };
+            let dir = scratch
+                .as_ref()
+                .map(|d| d.path().to_path_buf())
+                .unwrap_or_else(std::env::temp_dir);
+            Some(crate::policy::depth_check::check_tar(&cfg.tar.binary, &dir))
+        }
+        None => None,
+    };
     let staging_check =
         loaded.map(|cfg| crate::policy::depth_check::check_staging(&cfg.staging.directory));
     // Issue #140: the third staging check — is it big enough for one
@@ -357,6 +361,12 @@ fn run_check(
         .map(|cfg| check_notes(paths.db_file.exists().then_some(conn), cfg))
         .unwrap_or_default();
 
+    // #571 / ADR-0012 item 298: the memory a restore of what this config
+    // stages would hold, against what the host has now (read once, here).
+    let memory_warnings = loaded
+        .map(|cfg| restore_memory_warnings(cfg, crate::staging::jobs::mem_available()))
+        .unwrap_or_default();
+
     let verify_interval_days = loaded.map(|cfg| cfg.defaults.verify_interval_days);
     let defaults_json = loaded.map(|cfg| {
         serde_json::json!({
@@ -368,10 +378,9 @@ fn run_check(
         print_json(
             &report,
             &shadowing_hits,
-            &subsumed_hits,
             &decorative_hits,
             &unknown_key_hits,
-            dar_check.as_ref(),
+            tar_check.as_ref(),
             staging_check.as_ref(),
             staging_space_check.as_ref(),
             &tape_device_checks,
@@ -382,6 +391,7 @@ fn run_check(
             &ops_lines,
             defaults_json,
             &notes,
+            &memory_warnings,
             home,
         );
     } else {
@@ -389,10 +399,9 @@ fn run_check(
             &report,
             &shadowing_hits,
             &unreadable_dotfiles,
-            &subsumed_hits,
             &decorative_hits,
             &unknown_key_hits,
-            dar_check.as_ref(),
+            tar_check.as_ref(),
             staging_check.as_ref(),
             staging_space_check.as_ref(),
             &tape_device_checks,
@@ -403,6 +412,7 @@ fn run_check(
             &ops_lines,
             verify_interval_days,
             &notes,
+            &memory_warnings,
             home,
         );
     }
@@ -447,10 +457,9 @@ fn derived_sg_nodes(toml_str: &str, cfg: &crate::config::Config) -> Vec<(String,
 fn print_json(
     report: &crate::policy::lenient_config::LenientReport,
     shadowing_hits: &[crate::policy::shadowing::ShadowingDotfile],
-    subsumed_hits: &[crate::policy::subsumed::SubsumedAcls],
     decorative_hits: &[crate::policy::decorative::DecorativeHit],
     unknown_key_hits: &[crate::policy::unknown_keys::UnknownKeyHit],
-    dar_check: Option<&crate::policy::depth_check::DarCheck>,
+    tar_check: Option<&crate::policy::depth_check::TarToolCheck>,
     staging_check: Option<&crate::policy::depth_check::StagingCheck>,
     staging_space_check: Option<&crate::policy::depth_check::StagingSpaceCheck>,
     tape_device_checks: &[crate::policy::depth_check::TapeDeviceCheck],
@@ -461,6 +470,7 @@ fn print_json(
     ops_lines: &[String],
     defaults_json: Option<serde_json::Value>,
     notes: &[String],
+    memory_warnings: &[String],
     home: Option<&crate::startup::Startup>,
 ) {
     let shadowing_json: Vec<_> = shadowing_hits
@@ -471,17 +481,6 @@ fn print_json(
                 "dotfile_path": h.dotfile_path.display().to_string(),
                 "checksum_mode_set": h.checksum_mode_set,
                 "compression_set": h.compression_set,
-            })
-        })
-        .collect();
-    let subsumed_json: Vec<_> = subsumed_hits
-        .iter()
-        .map(|h| {
-            serde_json::json!({
-                "source": h.source,
-                "field": "preserve_acls",
-                "value": h.preserve_acls,
-                "note": crate::policy::subsumed::describe(h),
             })
         })
         .collect();
@@ -503,26 +502,28 @@ fn print_json(
             })
         })
         .collect();
-    let dar_json = match dar_check {
+    let tar_json = match tar_check {
         None => serde_json::Value::Null,
-        Some(crate::policy::depth_check::DarCheck::Missing { path }) => {
+        Some(crate::policy::depth_check::TarToolCheck::Missing { path }) => {
             serde_json::json!({"status": "missing", "path": path})
         }
-        Some(crate::policy::depth_check::DarCheck::NotExecutable { path }) => {
-            serde_json::json!({"status": "not_executable", "path": path})
-        }
-        Some(crate::policy::depth_check::DarCheck::Unreadable { path, detail }) => {
+        Some(crate::policy::depth_check::TarToolCheck::Unreadable { path, detail }) => {
             serde_json::json!({"status": "unreadable", "path": path, "detail": detail})
         }
-        Some(crate::policy::depth_check::DarCheck::TooOld {
+        Some(crate::policy::depth_check::TarToolCheck::Refused {
             path,
-            found,
-            minimum,
+            first_line,
+            refusal,
         }) => {
-            serde_json::json!({"status": "too_old", "path": path, "found": found, "minimum": minimum})
+            serde_json::json!({"status": "refused", "path": path, "version": first_line,
+                               "refusal": refusal})
         }
-        Some(crate::policy::depth_check::DarCheck::Ok { path, version }) => {
-            serde_json::json!({"status": "ok", "path": path, "version": version})
+        Some(crate::policy::depth_check::TarToolCheck::Ok {
+            path,
+            first_line,
+            acl,
+        }) => {
+            serde_json::json!({"status": "ok", "path": path, "version": first_line, "acl": acl})
         }
     };
     let staging_json = match staging_check {
@@ -589,10 +590,9 @@ fn print_json(
         "problems": report.problems,
         "slice_cap_problems": report.slice_cap_problems,
         "shadowing_dotfiles": shadowing_json,
-        "subsumed_policy_fields": subsumed_json,
         "decorative_keys": decorative_json,
         "unknown_keys": unknown_key_json,
-        "dar": dar_json,
+        "tar": tar_json,
         "staging": staging_json,
         "staging_space": staging_space_json,
         "tape_devices": tape_devices_json,
@@ -606,6 +606,7 @@ fn print_json(
         "ops": ops_lines,
         "defaults": defaults_json,
         "notes": notes,
+        "restore_memory": memory_warnings,
         "home": home.map(|h| h.paths.home.display().to_string()),
         "home_source": home.map(|h| h.source.key()),
     }));
@@ -616,10 +617,9 @@ fn print_human(
     report: &crate::policy::lenient_config::LenientReport,
     shadowing_hits: &[crate::policy::shadowing::ShadowingDotfile],
     unreadable_dotfiles: &[crate::policy::shadowing::UnreadableDotfile],
-    subsumed_hits: &[crate::policy::subsumed::SubsumedAcls],
     decorative_hits: &[crate::policy::decorative::DecorativeHit],
     unknown_key_hits: &[crate::policy::unknown_keys::UnknownKeyHit],
-    dar_check: Option<&crate::policy::depth_check::DarCheck>,
+    tar_check: Option<&crate::policy::depth_check::TarToolCheck>,
     staging_check: Option<&crate::policy::depth_check::StagingCheck>,
     staging_space_check: Option<&crate::policy::depth_check::StagingSpaceCheck>,
     tape_device_checks: &[crate::policy::depth_check::TapeDeviceCheck],
@@ -630,6 +630,7 @@ fn print_human(
     ops_lines: &[String],
     verify_interval_days: Option<i64>,
     notes: &[String],
+    memory_warnings: &[String],
     home: Option<&crate::startup::Startup>,
 ) {
     if report.valid {
@@ -686,12 +687,9 @@ fn print_human(
              an ABSENT key is always fine and defers to the archive set or defaults"
         );
     }
-    for hit in subsumed_hits {
-        println!("{}", crate::policy::subsumed::describe(hit));
-    }
-    match dar_check {
-        Some(check) => println!("{}", crate::policy::depth_check::describe_dar(check)),
-        None => println!("note: dar could not be checked — the config did not parse well enough"),
+    match tar_check {
+        Some(check) => println!("{}", crate::policy::depth_check::describe_tar(check)),
+        None => println!("note: tar could not be checked — the config did not parse well enough"),
     }
     match staging_check {
         Some(check) => println!("{}", crate::policy::depth_check::describe_staging(check)),
@@ -745,6 +743,9 @@ fn print_human(
     for note in notes {
         println!("note: {note}");
     }
+    for line in memory_warnings {
+        println!("{line}");
+    }
     if let Some(days) = verify_interval_days {
         println!(
             "defaults: verify_interval_days = {days} (`audit` warns when a unit has gone \
@@ -752,6 +753,58 @@ fn print_human(
              own interval overrides this for its units)"
         );
     }
+}
+
+/// The restore-memory warning for a config that loads (#571, ADR-0012 item
+/// 298), as lines: the largest figure among `[defaults]` and each archive
+/// set's effective level (a set's own `slice_size` and `compression`, else
+/// the defaults'), compressed levels doubled by
+/// [`crate::volume::restore::restore_memory_figure`], against `available`
+/// (`MemAvailable`, read once by the caller; `None` when the host does not
+/// say). Empty when it fits. Advisory: the exit code never moves.
+pub(crate) fn restore_memory_warnings(
+    cfg: &crate::config::Config,
+    available: Option<u64>,
+) -> Vec<String> {
+    use crate::volume::restore::{restore_memory_figure, restore_memory_warning};
+    let compressed = |name: &str| matches!(crate::staging::pack::packing(name, None), Ok(Some(_)));
+    let mut levels = vec![(
+        "[defaults]".to_string(),
+        cfg.defaults.slice_size.clone(),
+        cfg.defaults.compression.clone(),
+    )];
+    for set in &cfg.archive_sets {
+        levels.push((
+            format!("archive set \"{}\"", set.name),
+            set.slice_size
+                .clone()
+                .unwrap_or_else(|| cfg.defaults.slice_size.clone()),
+            set.compression
+                .clone()
+                .unwrap_or_else(|| cfg.defaults.compression.clone()),
+        ));
+    }
+    let worst = levels
+        .into_iter()
+        .filter_map(|(at, size, compression)| {
+            let bytes = u64::try_from(crate::staging::parse_size_to_bytes(&size).ok()?).ok()?;
+            let compressed = compressed(&compression);
+            Some((
+                restore_memory_figure(bytes, compressed),
+                at,
+                size,
+                bytes,
+                compressed,
+            ))
+        })
+        .max_by_key(|(figure, ..)| *figure);
+    let Some((_, at, size, bytes, compressed)) = worst else {
+        return Vec::new();
+    };
+    restore_memory_warning(bytes, compressed, available)
+        .map(|line| format!("{line} (the largest: {at} slice_size = {size})"))
+        .into_iter()
+        .collect()
 }
 
 /// `config check`'s notes on a config that loads (ADR-0012 item 214): each
@@ -937,6 +990,62 @@ pub(crate) fn describe_host_check(present: bool, hc: &crate::config::HostCheckCo
 mod tests {
     use super::*;
     use crate::config::HostCheckConfig;
+
+    /// #571: the restore-memory warning takes the largest figure among
+    /// `[defaults]` and the archive sets (a set's own `slice_size` and
+    /// `compression`, else the defaults'), doubled where compressed, and
+    /// compares it with the memory passed in. Nothing here reads the host.
+    #[test]
+    fn config_check_names_the_level_with_the_largest_restore_memory_figure() {
+        const G: u64 = 1 << 30;
+        let mut cfg = crate::config::Config::default();
+        cfg.defaults.slice_size = "1G".into();
+        cfg.defaults.compression = "none".into();
+        assert!(
+            restore_memory_warnings(&cfg, Some(G)).is_empty(),
+            "1G fits 1G"
+        );
+        assert!(
+            restore_memory_warnings(&cfg, None).is_empty(),
+            "no reading, no warning"
+        );
+        let w = restore_memory_warnings(&cfg, Some(G - 1));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("[defaults] slice_size = 1G"), "{w:?}");
+
+        let set = |name: &str, slice: Option<&str>, compression: Option<&str>| {
+            let mut a: crate::config::ArchiveSetConfig =
+                toml::from_str(&format!("name = \"{name}\"")).unwrap();
+            a.slice_size = slice.map(String::from);
+            a.compression = compression.map(String::from);
+            a
+        };
+        // A set that only turns compression on doubles the defaults' size.
+        cfg.archive_sets.push(set("squeezed", None, Some("zstd")));
+        assert!(restore_memory_warnings(&cfg, Some(2 * G)).is_empty());
+        let w = restore_memory_warnings(&cfg, Some(2 * G - 1));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("archive set \"squeezed\" slice_size = 1G"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("holds up to 2.0 GiB"), "{w:?}");
+        // A bigger uncompressed set is not doubled, and 1.5G < 2G.
+        cfg.archive_sets
+            .push(set("big", Some("1.5G"), Some("none")));
+        let w = restore_memory_warnings(&cfg, Some(2 * G - 1));
+        assert!(w[0].contains("squeezed"), "the largest figure wins: {w:?}");
+        cfg.archive_sets.push(set("huge", Some("3G"), None));
+        let w = restore_memory_warnings(&cfg, Some(2 * G));
+        assert!(
+            w[0].contains("archive set \"huge\" slice_size = 3G"),
+            "{w:?}"
+        );
+        // A size that does not parse is for `config check`'s own problems.
+        let mut bad = crate::config::Config::default();
+        bad.defaults.slice_size = "huge".into();
+        assert!(restore_memory_warnings(&bad, Some(0)).is_empty());
+    }
 
     /// Issue #431: `config check` says which backends' `device_sg` it
     /// derived — those the file does not set, and only those that now carry a

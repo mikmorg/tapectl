@@ -51,13 +51,47 @@ needs preparing first has a prep script beside it. The profiles in
 | the tape drive attached, visible under `/dev/tape/by-id/` | step 6 finds it **by serial**; `/dev/nstN` numbers move across reboots on any host with more than one SCSI device (`docs/lto6-drive-passthrough.md`) | `ls -l /dev/tape/by-id/` |
 | a clone of this repository, on a filesystem the build can use | tapectl is built from source; the toolchain is pinned in `rust-toolchain.toml` (1.94.1) | step 1 |
 | `rustup` (installed by step 1 if absent) | the distro `cargo` cannot build this crate | step 1 |
-| `dar` >= 2.6 (2.7.20+ recommended), `mt-st`, `sg3-utils`, `acl`, `python3`, `lsscsi` | archives, drive control, MAM and health pages, the drive's Logical Block Protection page, ACL grants, the scripts' JSON parsing, device discovery. Of sg3-utils, tapectl runs `sg_read_attr` (the cartridge's MAM), `sg_logs` (health pages), `sg_inq` (the drive's identity) and, from 1.7.2, `sg_modes` and `sg_wr_mode` (it reads and sets the Logical Block Protection page; without them it writes without LBP and says so) | step 2 checks for `mt`, `sg_read_attr`, `sg_logs`, `sg_modes`, `sg_wr_mode`, `setfacl`, `python3`, `lsscsi` and `dar`, and offers `sudo apt install dar mt-st sg3-utils acl python3 lsscsi` |
+| GNU `tar` 1.35 or later **built with ACL support** (the writer's floor, below), `mt-st`, `sg3-utils`, `acl`, `python3`, `lsscsi` | the archive stream, drive control, MAM and health pages, the drive's Logical Block Protection page, ACL grants, the scripts' JSON parsing, device discovery. Of sg3-utils, tapectl runs `sg_read_attr` (the cartridge's MAM), `sg_logs` (health pages), `sg_inq` (the drive's identity) and, from 1.7.2, `sg_modes` and `sg_wr_mode` (it reads and sets the Logical Block Protection page; without them it writes without LBP and says so) | step 2 checks for `mt`, `sg_read_attr`, `sg_logs`, `sg_modes`, `sg_wr_mode`, `setfacl`, `python3` and `lsscsi`, reads the version of the `tar` it would use and refuses one below the floor, and offers `sudo apt install tar mt-st sg3-utils acl python3 lsscsi` where the distribution's tar is at the floor |
 | `age` (the CLI) — optional | not used by the binary (it uses the `rage` crate); needed by the on-tape `RESTORE.sh` and so by the step-12 rehearsal | step 2 offers the upstream v1.3.2 release into `/usr/local/bin` |
 | **paper and a pen** | step 7 prints the escrow *secret* exactly once and stores it nowhere (ADR-0005) | the script asks "paper ready?" before `init` |
 | on a **reinstall**: the original heir kit's cover sheet | so `init` adopts the original escrow public key instead of minting a new one — no command replaces a registered escrow identity | step 7 asks for it without `--auto`; with `--auto` it reads the profile's `ESCROW_PUBLIC_KEY` or `--escrow-public-key`, and when neither is set it refuses unless `--mint-escrow` is passed (§6) |
 | a second disk for catalog backups | the ruling says "a timer-driven `db backup` to a second disk" (ADR-0012, item 5) | step 14 warns when the backup dir shares a filesystem or a disk with the home |
 | a test cartridge you are willing to erase | the step-12 rehearsal is required before the first production write (ADR-0012, 2026-09-23) | step 12 reads the loaded cartridge's chip first and refuses an empty drive before it asks anything; then it asks for the medium serial and refuses any other cartridge |
 | free space for staging | a tape is written in one session, so staging must hold everything one tape will carry (2.5 TB for a full LTO-6) | step 7 asks for the directory, then shows what is free there |
+
+### The writer's tar
+
+tapectl 2.0 writes a unit as a tar stream made by GNU tar on the host, and checks the
+stream as it passes. It refuses to stage with a `tar` below **GNU tar 1.35 built with
+ACL support**: below 1.35 `--numeric-owner` does not reach an ACL entry, so a name would
+be written into the stream, and a 1.35 built without ACL support writes no ACL at all
+(#563, ADR-0012 items 270, 274). Debian 13 and Ubuntu 24.04 and later ship such a tar.
+`tapectl config check`, `init`, `setup` and `stage create` probe the tar they would run
+and say whether it meets the floor. The heir's `RESTORE.sh` does not need it: any tar
+reads a tape.
+
+An older host (Debian 10 and 11, Ubuntu 20.04 and 22.04) builds the release from
+upstream into `/usr/local`, which leaves the system's tar alone, then names it in
+`[tar] binary` (or has it first on `PATH`). The recipe, as proven on Debian 10
+(`docs/research/2026-11-17-t02-gnu-tar-built-on-debian-10.md`):
+
+```bash
+sudo apt install build-essential libacl1-dev libattr1-dev xz-utils acl
+curl -fsSLO https://ftp.gnu.org/gnu/tar/tar-1.35.tar.xz
+echo "4d62ff37342ec7aed748535323930c7cf94acf71c3591882b26a7ea50f3edc16  tar-1.35.tar.xz" | sha256sum -c -
+tar -xf tar-1.35.tar.xz && cd tar-1.35
+export FORCE_UNSAFE_CONFIGURE=1
+./configure --prefix=/usr/local --with-posix-acls --with-xattrs --with-selinux=no
+make -j"$(nproc)" && sudo make install
+/usr/local/bin/tar --version        # tar (GNU tar) 1.35
+```
+
+Keep the two `--with-` switches: with them a missing `libacl1-dev` fails `configure`
+instead of building a tar with no ACL support. The version number alone is not the
+proof; the proof is that ACL entries are written by number. On a file with
+`setfacl -m u:1:r,g:2:r f`, `/usr/local/bin/tar --format=pax --numeric-owner --xattrs --acls
+--xattrs-exclude='system.posix_acl_*' -cf t.tar f` stores `user:1:r--` and `group:2:r--` and
+no name. `contrib/hosts/home2-prep.sh` does all of this for home2, pinned by sha256.
 
 Staging and backups need thought on any host whose root filesystem is small. Step 7
 proposes the directory `config.toml` already names when the service user can write
@@ -80,8 +114,7 @@ scripts/first-run.sh --profile contrib/hosts/<host>.profile    # a host with one
 Interactive, in fourteen steps, each explained before it runs. Every step
 detects whether it is already done and says so; every tape-touching command
 is confirmed by name; `--from N` resumes and `--to N` stops. Before step 1,
-on every run, the script prints the effective settings and checks an existing
-home's `config.toml` for the two `[defaults]` keys this version renamed (§6).
+on every run, the script prints the effective settings.
 `--help` prints the step list and every option.
 
 **The profile is remembered.** The first run with `--profile` records the
@@ -126,7 +159,7 @@ profile and the commit. Step 7's `init` output is deliberately not logged.
 
 ### Host profiles
 
-A host's answers — its drive, where the home, staging and backups go, which dar,
+A host's answers — its drive, where the home, staging and backups go, which tar,
 its locations, tenants and collections — can live in a profile instead of on the
 command line:
 
@@ -150,7 +183,7 @@ can set the flags' own values: `DEVICE` (`--device`), `SG` (`--sg`), `DGEN`
 | `VERIFY_INTERVAL_DAYS` | 7 | `[defaults] verify_interval_days`, the full-readback clock `audit` keeps per unit and per volume (#453, #454); written with `config set defaults.verify_interval_days`. Empty leaves the config's value (absent, it is 365) |
 | `OPS_GROUP` | 7 | a group whose members run `tapectl status` and read the session logs without sudo (#393): step 7 creates it (`groupadd --system`), adds the service user and you, writes `[ops] group`, grants it traverse on the directories above the home, and writes the home pointer `/etc/tapectl/home` (§3, row 7). Empty: no group |
 | `CONTENDER_PROCESSES` | 7 | an array: `[host_check] contender_processes`, the processes `host check` names before a write. It replaces the built-in list (`cargo rustc docker Runner.Worker`), so repeat that when adding one |
-| `DAR_BIN` (`--dar`) | 2, 4, 7, 12 | the dar that is checked, tested against, and written into `[dar] binary` |
+| `TAR_BIN` (`--tar`) | 2, 4, 7, 12 | the tar that is checked against the floor, tested against, and written into `[tar] binary` |
 | `SVC_HOME_WANT` | 5 | the service user's home; step 5 refuses if an existing account's home differs |
 | `POST_WARNING_BYTES` | 8 | the drive's `post_warning_bytes`: its room past the early warning, as `scripts/lto-profile.sh` measured it, in decimal units (`99008M` is 99,008,000,000 bytes; ADR-0012 item 200). Step 8 sets it with `config set` on the drive it registers, and on a re-run over a drive that has none. A drive that already has this value is left alone; one with a different value is refused, never overwritten, and the refusal names both values and the `config set` that takes the profile's. Empty: step 8 says once what a drive without it loses (planning past the fill ceiling, and the slice cap) and points to [Profiling an LTO drive](lto-profiling.md) |
 | `LOCATIONS=("name\|description" …)` | 10 | every shelf; tape 1 is recorded at the first |
@@ -163,7 +196,7 @@ can set the flags' own values: `DEVICE` (`--device`), `SG` (`--sg`), `DGEN`
 | `ERASE_LABEL` | — | **never read from a profile**: it is consent to erase a sealed tape, so only `--erase-label` sets it (#469), and a profile's value is reported and ignored. `--mint-escrow` is a flag only for the same reason |
 
 **A host that needs preparing first** gets a one-time prep script beside its
-profile, dry-run by default: an account's home on another disk, a `dar` built
+profile, dry-run by default: an account's home on another disk, a GNU `tar` built
 from source, a sudoers rule. `contrib/hosts/home2-prep.sh` is an example. A first
 install on such a host:
 
@@ -212,9 +245,9 @@ binary (`TAPECTL_BIN`), so what it proves is what step 13 uses.
 | step | creates | owner, mode | check |
 |---|---|---|---|
 | 1 Rust toolchain | `~/.cargo/` for **you** (rustup, default profile, `--no-modify-path`), the pinned toolchain on first `cargo` run | you | `rustup show active-toolchain` |
-| 2 runtime tools | apt packages `dar mt-st sg3-utils acl python3 lsscsi`; optionally `/usr/local/bin/age` and `age-keygen` | root, 0755 | `dar --version`, `age --version`; `command -v` for `mt`, `sg_read_attr`, `sg_logs`, `sg_modes`, `sg_wr_mode`, `setfacl`, `python3`, `lsscsi` |
+| 2 runtime tools | apt packages `mt-st sg3-utils acl python3 lsscsi` (and `tar` where the distribution's is at the floor); optionally `/usr/local/bin/age` and `age-keygen`. Nothing builds tar: below the floor the step stops and names it | root, 0755 | `tar --version` against the floor, `age --version`; `command -v` for `mt`, `sg_read_attr`, `sg_logs`, `sg_modes`, `sg_wr_mode`, `setfacl`, `python3`, `lsscsi` |
 | 3 build | `target/release/tapectl` in the repo, then **`/usr/local/bin/tapectl`** — the binary's home; the service user cannot execute anything under your home | root, 0755 | `tapectl --version` |
-| 4 tests | nothing on the host (`cargo test`, ~2–3 min, needs only `dar`) | — | the script stops if red |
+| 4 tests | nothing on the host (`cargo test`, ~2–3 min, needs only the tar at the floor) | — | the script stops if red |
 | 5 service user | system account **`tapectl`**, home `/var/lib/tapectl`, shell `/usr/sbin/nologin`, comment "tapectl archival service" | — | `id tapectl` |
 | 6 the drive | `tapectl` added to the group owning `/dev/nst*` and `/dev/sg*` (usually `tape`) via `usermod -aG` | — | `sudo -u tapectl -H mt -f <by-id> status` |
 | 7 the home | **`/var/lib/tapectl/.tapectl/`** (§4), the escrow identity (secret printed once), the operator tenant and its keys (`init --operator <name>`: run as a system account such as the service user, `init` refuses to guess the operator name from the account); the staging directory (asked; the proposal is `--staging`/`STAGING_DIR` when set, else the directory `config.toml` names if the service user can write it — `<home>/staging` after a fresh `init` — else `/scratch/tapectl-staging` when `/scratch` exists), written into `[staging] directory`. Step 7 then walks that path as the service user (ADR-0012 item 199): a directory above it that the service user cannot traverse is named, with the one line that grants traverse only (`sudo setfacl -m u:tapectl:x <parent>`), and the step stops; a parent that does not exist is refused ("Is its filesystem mounted?"), because making the whole path would put staging on the filesystem below it; a staging directory missing under a parent that exists is created (`sudo mkdir -m 0700`) and given to the service user; one that exists but the service user cannot write is refused with the `setfacl -m u:tapectl:rwx` line. Nothing that exists is chowned. With `OPS_GROUP` in the profile: that group (`groupadd --system`), the service user and you added to it, and `[ops] group` in `config.toml` (issue #393: members run `tapectl status` without sudo; step 7 writes the pointer `/etc/tapectl/home`, root 0644, naming the home, issue #437) | home 0700 `tapectl` (0710, group `OPS_GROUP`, with an ops group; `logs/` 2750); staging `tapectl`, 0700 when step 7 creates it | `sudo -u tapectl -H tapectl config check`, `db fsck` |
@@ -251,26 +284,20 @@ same wherever the home is.
 
 ```
 /var/lib/tapectl/.tapectl/
-├── config.toml          dar path, [[backends.lto]], [staging], [defaults], [discovery], [[collections]]
+├── config.toml          [tar] binary, [[backends.lto]], [staging], [defaults], [discovery], [[collections]]
 ├── tapectl.db           the catalog (SQLite, WAL mode: tapectl.db-wal / -shm appear while open)
 ├── keys/                every PRIVATE key: <tenant>-<alias>.age.key, and the .age.pub beside it
-├── catalogs/            dar catalogues: <first 8 chars of the unit uuid>/s<stage set id>/, one per stage set, made by its own dar run
 ├── stage-reports/       stage reports: one text file per stage set (slice sizes and hashes)
 ├── staging/             created 0700 by init as the default [staging] directory; stays empty once step 7 points staging elsewhere
 ├── logs/                created by ensure_dirs; may stay empty
-├── tmp/                 0700: a stage's dar slice template and a write's catalog.db, each removed once used (never under staging)
+├── tmp/                 0700: a write's catalog.db, removed once used (never under staging)
 ├── locks/               stage-<id>.lock: one lockfile per stage set, held while its stage create runs (`stage clean` reclaims them)
-├── config.toml.pre-rename-<stamp>   only after the pre-step-1 check renamed old [defaults] keys (§6)
 └── config.toml.superseded-<stamp>   only after step 7 regenerated a config this version could not load
 ```
 
 The home's 0700 is what keeps it private: `tapectl.db`, each private key
 (`.age.key`) and each stage report are 0600 as well, while `config.toml` and
 the `.age.pub` files take the creating process's umask.
-
-A home made by an older tapectl has `receipts/` where `stage-reports/` is now;
-the first command run on that home renames it (if both already exist, both are
-left alone and new reports go to `stage-reports/`).
 
 Outside the home: the **staging directory** (`[staging] directory` in
 `config.toml`; ephemeral encrypted slices, re-creatable by `stage create`;
@@ -390,18 +417,6 @@ from a copy (§9), and you run `scripts/first-run.sh` again. On a host with a
 profile, run it with that `--profile`, as every run: the state directory that
 remembers the profile is yours, not the home's, so on a rebuilt machine nothing
 is recorded until the first run with `--profile` records it again.
-
-**Before step 1, the renamed `[defaults]` keys.** The copy requirement every
-unit starts from is `[defaults] min_copies` and `min_locations` (ADR-0012,
-2026-09-29 amendment). A home initialised by an older tapectl has them as
-`min_copies_for_tape_only` and `min_locations_for_tape_only`, which this
-version refuses by name. On every run, whatever `--from` says, the script
-looks for the old names in the home's `config.toml` (once the service user
-exists, or under `--no-service-user`), and when it finds them it offers to
-rename them in place. It keeps the original as
-`config.toml.pre-rename-<stamp>`. The meaning and values are unchanged. If
-you decline, every `tapectl` command refuses the config until you rename the
-two lines by hand.
 
 **Step 7 detects `tapectl.db` and does not run `init`.** It then probes whether
 *this* binary can load the existing `config.toml` (`config show` must succeed;
@@ -655,9 +670,7 @@ are not options (`--home X` and `--config X` skip their value), so
 `tapectl-op volume info write` — a volume *labelled* `write` — stays at normal
 priority, as does everything that is not in the list above. `runuser` gives
 tapectl the same user, groups and `HOME` that `sudo -u -H` does, so the command
-finds the same home and the same drive. `volume init` is not in the list: it
-writes the ID thunk and reads the chip, a few seconds of tape contact that
-stream nothing. `tapectl-drive-poll.service` carries the same priority as
+finds the same home and the same drive. `tapectl-drive-poll.service` carries the same priority as
 `Nice=`, `IOSchedulingClass=` and `IOSchedulingPriority=`; systemd applies it as
 root before it drops to `User=`. The audit and backup units are unchanged.
 
@@ -877,7 +890,17 @@ scripts/first-run.sh --profile contrib/hosts/<host>.profile --upgrade
 ```
 
 On a host installed without a profile, leave `--profile` out. `<old>` and `<new>`
-below are the two versions, such as `1.8.1` and `1.9.0`.
+below are the two versions, such as `2.0.0` and `2.0.1`.
+
+**Upgrades start from 2.0.0.** There is no upgrade from a release before 2.0.0
+(ADR-0012 item 258(c)): 2.0.0 reads and writes Layout 3 and one baseline schema
+only. `--upgrade` refuses an installed tapectl below 2.0.0 by name, and the way
+from 1.x is a fresh start: a new catalog, new keys, new units and new cartridges.
+A Layout 2 tape is read with 1.9.2 or with its own `RESTORE.sh`. The harness
+that proves this procedure on mhvtl, `scripts/upgrade-mhvtl.sh`, installs the
+previous release tag and upgrades it, so it needs a v2.x tag to start from: while
+the newest tag before HEAD is below `v2.0.0` it exits at once with a message
+saying so, and its first real run is the release after 2.0.0.
 
 **Before you start.**
 
@@ -893,8 +916,8 @@ below are the two versions, such as `1.8.1` and `1.9.0`.
 - **There is no downgrade past a migration.** An older binary refuses a catalog
   that is ahead of its migration list. The way back is the binary and the backup
   the upgrade keeps (step 13).
-- You can skip releases: a release contains the ones before it, and step 7 shows
-  the "Upgrading" notes of every release after yours.
+- You can skip releases within 2.x: a release contains the ones before it, and
+  step 7 shows the "Upgrading" notes of every release after yours.
 
 **The steps.** Each one checks what an earlier run already did and does not do
 it twice, so a run that stopped is resumed by running `--upgrade` again;
@@ -903,16 +926,16 @@ it twice, so a run that stopped is resumed by running `--upgrade` again;
 | Step | What it does | By hand, for reference |
 |---|---|---|
 | 1 | Preflight, always run: no tapectl command or tapectl unit running; the checkout exactly an annotated `v<new>` tag, with no change to a tracked file; `<new>` newer than the installed tapectl; release notes for `<new>` | `tapectl-op status`, `git describe --exact-match` |
-| 2 | Back up the catalog with the OLD binary to `<backup dir>/tapectl-pre-<new>.db` and check the copy (schema and SQLite's integrity check, read-only) | `tapectl-op db backup <backup dir>/tapectl-pre-<new>.db` |
+| 2 | Back up the catalog with the OLD binary to `<backup dir>/tapectl-pre-<new>.db` and check the copy (schema and SQLite's integrity check, read-only). A backup an earlier run took is reused only with its age stated, and, while the old binary is still installed, only if it is under an hour old (`TAPECTL_UPGRADE_BACKUP_MAX_AGE`, in seconds); an older one is replaced by a new copy | `tapectl-op db backup <backup dir>/tapectl-pre-<new>.db` |
 | 3 | Keep the old binary as `/usr/local/bin/tapectl-<old>` | `sudo cp -p /usr/local/bin/tapectl /usr/local/bin/tapectl-<old>` |
-| 4 | Build the release binary from the tag and install it; refuse a binary that is not a build of the tag | `scripts/first-run.sh --from 3 --to 3` |
+| 4 | Build the release binary from the tag and install it; refuse a binary that is not a build of the tag. Steps 4 and 5 refuse to run without step 2's backup and step 3's kept binary (`--from 4` after a run that skipped them is refused) | `scripts/first-run.sh --from 3 --to 3` |
 | 5 | `config check`, the new binary's first open: it applies the migrations, and the schema is printed before and after | `tapectl-op config check` |
 | 6 | Step 14 again: the units, the wrapper and the timers. Each installed file it leaves alone is reported `unchanged` | `scripts/first-run.sh --from 14 --to 14` |
 | 7 | Stop at the "Upgrading" notes of every release after `<old>` up to `<new>`: what only that release asks (a config key, a tool), done by you. Enter goes on | `docs/releases/` |
 | 8 | Look: `status`, `audit`, `report failed-stages` | |
 | 9 | Step 12 again: the rehearsal of the installed binary on the test cartridge, with the drive-poll timer stopped for it and started again | `scripts/first-run.sh --from 12 --to 12` |
 | 10 | Step 9 again: regenerate the Heir Kit, and check that its `tapectl-<new>` is the installed binary and that `COVER.txt` names its sha256 | `scripts/first-run.sh --from 9 --to 9` |
-| 11 | Start `tapectl-backup.service` once, so a copy made by `<new>` lands in the backup directory | `sudo systemctl start tapectl-backup.service` |
+| 11 | Start `tapectl-backup.service` once, so a copy made by `<new>` lands in the backup directory. The step says whether a copy was written, or that the service exited 75 (catalog busy) and wrote none | `sudo systemctl start tapectl-backup.service` |
 | 12 | Tidy: list what earlier runs left behind, by group with its size (candidate build directories `~/tapectl-<version>-<commit>`, older rehearsal homes under the work directory, another Heir Kit under your home, catalog copies in a backup directory the daily backup no longer uses, rollback binaries older than the newest). A group is removed only when you type `remove`, never under `--auto`. The home, the kit directory, the backup directory, the checkout, the installed binary and the newest kept one are never listed | |
 | 13 | Print the rollback | |
 
@@ -926,53 +949,32 @@ skipped, and what an older reader of the tapes refuses. After step 10, print the
 new `COVER.txt`, put the new `catalog.db.age` and `tapectl-<new>` on the media in
 each envelope ([Keys and recovery, "The Heir Kit"](keys-and-recovery.md#the-heir-kit)),
 and destroy the sheets they replace: an older kit's tapectl may refuse the tapes
-the new one writes (1.5.0's refuses every tape written by 1.6.0 or later).
-
-**From 1.8.1 to 1.9.0.** 1.9.0 is the CLI review's release (ADR-0012 items
-198-221; [its notes](releases/1.9.0.md)). It has no catalog migration (step 5
-reports the schema unchanged) and moves no byte on tape, so 1.8.1 and 1.9.0 read
-each other's tapes. What to know:
-
-- **Renamed commands and flags lose their old spelling.** An old spelling is
-  refused by name and exits 2 (`` `tapectl backend add` was renamed in 1.9.0:
-  use `tapectl drive add` ``), so a script or a cron line of your own that uses
-  one fails loudly rather than doing something else; the notes have the table.
-  The three commands every tape's File 1 prints are unchanged. The scripts in
-  the 1.9.0 checkout use the new spellings, and step 2 backs up with 1.8.1's
-  own (`db backup --to`).
-- **Step 6 re-renders `tapectl-op`** and installs the bash completion and the
-  man pages (§7).
-- **`config.toml` needs no edit.** `[[backends.lto]]` keeps its name, and the
-  `[[collections]]` tables stay. `POST_WARNING_BYTES` is a profile variable
-  now (§2), applied by step 8, which an upgrade does not run: look with
-  `tapectl-op config get post_warning_bytes`, and if the drive has none and
-  its profile measured one, set it with `tapectl-op config set
-  'backends.lto[NAME].post_warning_bytes' <value>`.
-- **The rollback is the binary alone**, since there is no migration: `sudo cp
-  -p /usr/local/bin/tapectl-1.8.1 /usr/local/bin/tapectl` puts 1.8.1 back over
-  the catalog as it is. The printed rollback below also works, and loses what
-  the catalog recorded after step 2.
-
-**From 1.8.1 or 1.9.0 to 1.9.1 or 1.9.2.** 1.9.1 is a patch (ADR-0012 items 222-234;
-[its notes](releases/1.9.1.md)): no catalog migration, no byte on tape moved, no
-spelling removed. From 1.8.1, everything above for 1.9.0 applies too; the rollback
-is still the binary alone. The scripts are unchanged, and `config.toml` needs no edit.
-1.9.2 changes only the SQLite built into the binary ([its notes](releases/1.9.2.md)).
+the new one writes.
 
 **Rolling back.** Step 13 prints the commands. With the timers stopped, import
 the backup from step 2 while the NEW binary is still installed, then put the
-kept binary back and check the catalog with it. The order matters: a 1.x binary
+kept binary back and check the catalog with it. The order matters: an older binary
 opens the catalog before every command, its `db import` included, and refuses a
 catalog a newer one has migrated, so the old binary's own `db import` would be
 refused. (This one's `db import` runs whatever state the catalog is in, §8a.) Whatever
 the catalog recorded after step 2 is lost, and the old binary may refuse a tape
 the new one wrote in between.
 
+The binary alone is not the whole rollback. Step 6 installed `<new>`'s wrappers
+(`/usr/local/lib/tapectl/`, among them the daily backup's), and a wrapper may call
+a spelling `<old>` does not have: `1.8.1` needs `db backup --to FILE`, where later
+releases take the path. After a rollback to `<old>` with `<new>`'s wrapper in place
+every nightly backup fails, in the journal only. So `<old>`'s own step 14 puts its
+wrappers back, from a checkout of `<old>`'s tag, before the timers start again.
+Step 13 prints the commands with your arguments.
+
 ```bash
 sudo systemctl stop tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer
 tapectl-op db import <backup dir>/tapectl-pre-<new>.db
 sudo cp -p /usr/local/bin/tapectl-<old> /usr/local/bin/tapectl
 tapectl-op db fsck
+git checkout v<old>
+bash scripts/first-run.sh <your usual arguments> --tapectl /usr/local/bin/tapectl --skip-build --skip-tests --from 14 --to 14
 sudo systemctl start tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer
 ```
 
@@ -1031,7 +1033,7 @@ rm -rf ~/heir-kit                      # the PRINTED, sealed kit is the artifact
 ```
 
 Tapes are not affected by any of this. A sealed volume is self-describing: with
-`mt`, `dd`, `age`, `dar`, `tar`, a few more coreutils (File 1 lists them) and a key,
+`mt`, `dd`, `age`, `tar`, a few more coreutils (File 1 lists them; `gzip`, `xz` or `zstd` for a unit stored compressed) and a key,
 `RESTORE.sh` off the tape restores it on a machine that has never seen tapectl (operator guide, "Disaster Recovery").
 
 ---

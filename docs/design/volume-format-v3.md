@@ -300,10 +300,18 @@ see the cross-tenant map.
 
 **Encoding.** UTF-8 text. The first line is a header naming the columns; every further
 line is one row; fields are separated by one TAB and rows end with one LF. Inside a
-field, four characters are escaped and nothing else: backslash as `\\`, TAB as `\t`, LF
-as `\n`, CR as `\r`. An empty field means "not known". A reader finds columns by their
+field, four characters are escaped: backslash as `\\`, TAB as `\t`, LF as `\n`, CR as
+`\r`; and each byte that is not part of a valid UTF-8 sequence is written `\xHH`, two
+lowercase hex digits (ADR-0012 item 297, #569: a file name is bytes, and a name that is not
+UTF-8 is carried by its bytes). Nothing else is escaped, so a UTF-8 name is written as it
+is, and every text stays UTF-8. The escape is reversible: `\x` follows only an escaped
+byte, since a backslash is itself escaped. The catalog keeps a path in this form too. An
+empty field means "not known". A reader finds columns by their
 header name and ignores a column it does not know. Rows are sorted as given below, so
-the bytes are deterministic for a given catalog. **This escaping is the one rule for the
+the bytes are deterministic for a given catalog. **Determined** (the coordinator, T4.17):
+wherever the format says "bytewise", the bytes compared are a path's escaped text, the
+order the catalog keeps; this differs from the order of the raw names only for a name
+holding a backslash, TAB, LF, CR or a byte outside UTF-8. **This escaping is the one rule for the
 whole format** (`volume::index::escape`): the file table, the id map and the
 damaged-file list use it too.
 
@@ -399,7 +407,9 @@ each member of the staging's tar stream, **in stream order**:
 - `start`: the offset in the stream of the member's first extension header. `end`: the
   offset just past the member's last padded block. A row's `start` is the row before's
   `end`; the first is 0 (#562).
-- `size`: the file's bytes; 0 for a kind with no data.
+- `size`: the file's bytes; 0 for a kind with no data. **Determined** (T4.3): an `h` row
+  states its target's size, as it states its target's sha256: both describe the file the
+  restore makes at that path.
 - `sha256`: of the file's bytes as they went to tape, 64 lowercase hex characters, for
   `f`; the target's, for `h`; `-` for the others.
 - `path` (**determined**): written as the index's `paths.tsv` writes a path: relative to
@@ -408,6 +418,10 @@ each member of the staging's tar stream, **in stream order**:
   as the stream has it (T0.7, item 293).
 - `link target`: for `h` only, the path of the name archived first, escaped the same
   way. A symbolic link's target is in the stream, not in the table.
+
+**Every row has eight fields** (**determined**, read from the template's bytes): the tab
+before `link target` is always written, so a row that is not `h` ends in a tab and an empty
+field. A writer writes, and a reader requires, eight fields.
 
 **Rows in stream order; a folder is two ranges** (#562): a folder's own member comes
 where the sorted list put it, and its contents follow later members; restoring a folder
@@ -629,20 +643,25 @@ not held to the floor (§7.3).
 
 ```
 tar --create --file=- --format=pax --numeric-owner \
-    [--xattrs] [--acls --xattrs-exclude='system.posix_acl_*'] \
+    [--xattrs --xattrs-exclude='system.posix_acl_*'] [--acls] \
     --no-recursion --null --verbatim-files-from --files-from=<list> \
     --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
 ```
 
 The bracketed flags follow two switches, resolved like the other policy keys and both on
-by default (D11): **`preserve_xattrs`** gives tar `--xattrs`, and **`preserve_acls`**
-gives it `--acls` with T0.1's `--xattrs-exclude='system.posix_acl_*'`.
+by default (D11): **`preserve_xattrs`** gives tar `--xattrs` with T0.1's
+`--xattrs-exclude='system.posix_acl_*'`, and **`preserve_acls`** gives it `--acls`. The
+exclude goes with `--xattrs` only (item 296's own words), because it turns `--xattrs` on:
+measured with GNU tar 1.35 (T4.1, 2026-11-18), `--acls --xattrs-exclude=…` stores user
+xattrs too, while `--acls` alone stores the text ACL record and no xattr record. *Corrected
+2026-11-18: the bracket first put the exclude beside `--acls`.*
 
 - `--format=pax`: the stream is POSIX pax (item 253).
 - `--numeric-owner` (item 270): a member's owner and group are stored by number only; the
   header's user and group name fields are empty.
-- `--xattrs` (with `preserve_xattrs`): extended attributes are kept.
-- `--acls --xattrs-exclude='system.posix_acl_*'` (with `preserve_acls`): an ACL is stored
+- `--xattrs --xattrs-exclude='system.posix_acl_*'` (with `preserve_xattrs`): extended
+  attributes are kept, and the raw ACL attribute is not among them.
+- `--acls` (with `preserve_acls`): an ACL is stored
   **once**, in the text record (`SCHILY.acl.access`,
   `SCHILY.acl.default`), with every qualifier a number (items 273, 274; measured by T0.1,
   `docs/research/2026-11-17-t01-readers-of-an-acl-stored-once.md`: GNU tar 1.30, 1.34,
@@ -659,7 +678,8 @@ stored in the raw record no reader restores with its ordinary flags (T0.1).
 - No `--sparse`: a sparse file is stored as its bytes. No compression by tar.
 
 **The list** is tapectl's: the snapshot's own entries, NUL-separated, every name prefixed
-`./`, sorted bytewise, folders listed as their own entries, the unit's dotfile included.
+`./`, sorted bytewise on each name's escaped text (§1.5), folders listed as their own
+entries, the unit's dotfile included.
 
 **The environment.** tar runs in the unit's root, with `LC_ALL=C`, and with `TAR_OPTIONS`
 and `POSIXLY_CORRECT` removed from its environment. If `--directory` is used in place of
@@ -794,7 +814,8 @@ in `[defaults]`, an archive set or a unit's dotfile, the most specific winning, 
   the algorithm's own tool writes and reads it, so that `age -d`, then the tool, gives the
   cut. gzip: one member, with no file name and a zero time in its header. xz: one `.xz`
   stream with the CRC64 check. zstd: one frame with its content checksum on and the content
-  size stated. tapectl adds nothing around the frame. A slice is compressed on one thread.
+  size not stated, written as the cut comes (corrected 2026-11-18: stating the size would
+  hold a whole slice in memory before it is packed). tapectl adds nothing around the frame. A slice is compressed on one thread.
 - **The level** is a whole number in the algorithm's own range (gzip 1 to 9, xz 0 to 9,
   zstd 1 to 19). When it is not set the algorithm's own default applies (gzip 6, xz 6,
   zstd 3). A level outside the range is refused, naming the key. The level is recorded
@@ -1405,7 +1426,18 @@ clears a `TAR_OPTIONS` in the heir's environment.
   have it" is an answer (items 255, 266, 267; §5.3 R7). It waits without a time limit and
   holds no device. A cartridge is taken only by R8. A blank, foreign or unreadable
   cartridge at the prompt is named and the prompt asks again (#521). Nothing is kept in the
-  work directory between cartridges.
+  work directory between cartridges. The answers (a determination at T4.12, 2026-11-19):
+  ENTER after loading the cartridge; `done` or the end of input for "I do not have it", after
+  which that unit is not asked for again and what it lacks is listed with the cartridges an
+  index names for it; `quit` to stop, keeping the files restored and checked. The prompt
+  comes whenever a restore, a path restore or the repair needs a slice the cartridge in the
+  drive does not hold.
+- **A later run into the same destination** (a determination at T4.12). Where the unit's
+  restored directory holds a damaged-file list (§1.7) of the same unit and version, a whole
+  restore of that unit continues it: only the files this tape holds whole that do not pass
+  their sha256 are fed, a file that passes is never rewritten, and the list is rewritten.
+  A hard-linked name whose own member was not read is made from its first name when that is
+  on disk, as tar makes it.
 - **The tool check** for each mode is drawn from one table, before the first tape read. The
   decompressor is checked for a unit that states compression, and only for such a unit.
 - **After a restore** it prints the damaged-file list, the id map of each unit restored,
@@ -1522,7 +1554,10 @@ ratified, item 290; items 287 and 288; the plan's determinations under D9).
 
 - A 2.x catalog is known by SQLite's `application_id`, set by the baseline (1.9.2 sets
   none: it reads 0). A database that has tables and lacks it is a 1.x catalog and is
-  refused by name.
+  refused by name. **Determined** (T3.1): the value is `0x54504354` ("TPCT", 1414546260,
+  `db::APPLICATION_ID`); a database with another nonzero id is refused as not a catalog of
+  tapectl's. The baseline's `user_version` is 1, and the on-tape `catalog.db` copies it, so
+  that stamp reads 1 on every Layout 3 tape (it read 41 on the last Layout 2 tapes).
 - Until `v2.0.0` is tagged the baseline is edited in place; no migration 002 is written.
   After the tag it is frozen and changes are numbered migrations again.
 

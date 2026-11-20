@@ -9,19 +9,18 @@
 //! command line is read out of the text the generators make (File 1 and
 //! File 2 from `volume::layout`, which this test only calls, never edits;
 //! the cover sheet from `crypto::escrow_kit`), and each must parse against
-//! the real clap tree and resolve to a live command, never to a stub of a
-//! removed spelling. Each mention in running text (`` `tapectl volume
+//! the real clap tree. Each mention in running text (`` `tapectl volume
 //! identify` ``) must name a live command too.
 
 use std::process::Command;
 
 use clap::{CommandFactory, Parser};
-use tapectl::cli::{renamed, Cli};
+use tapectl::cli::Cli;
 use tempfile::TempDir;
 
 /// The `tapectl …` command lines of `text`: a line (after joining a
 /// trailing `\` continuation) that is `tapectl` and a top-level command,
-/// hidden ones included, so a removed spelling is caught and not skipped.
+/// so a line naming a removed spelling is caught by `check_line`.
 fn command_lines(text: &str) -> Vec<String> {
     let top: Vec<String> = Cli::command()
         .get_subcommands()
@@ -65,25 +64,15 @@ fn inline_mentions(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// `line` parses as a whole command line and is no stub of a removed
-/// spelling, or what is wrong with it.
+/// `line` parses as a whole command line, or what is wrong with it.
 fn check_line(line: &str) -> Option<String> {
     let argv: Vec<&str> = line.split_whitespace().collect();
-    let os: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
-    if let Some(r) = renamed::find(&os) {
-        return Some(format!(
-            "{line:?} types `tapectl {}`, removed in 1.9.0",
-            r.old()
-        ));
-    }
-    match Cli::try_parse_from(&argv) {
-        Err(e) => Some(format!("{line:?} does not parse: {e}")),
-        Ok(cli) => renamed::parsed(&cli.command)
-            .map(|r| format!("{line:?} resolves to the stub of `tapectl {}`", r.old())),
-    }
+    Cli::try_parse_from(&argv)
+        .err()
+        .map(|e| format!("{line:?} does not parse: {e}"))
 }
 
-/// The command words of `mention` name a live (not hidden) command.
+/// The command words of `mention` name a live command.
 fn check_mention(mention: &str) -> Option<String> {
     let cli = Cli::command();
     let mut node = &cli;
@@ -91,11 +80,16 @@ fn check_mention(mention: &str) -> Option<String> {
     for word in mention.split_whitespace().skip(1) {
         match node.find_subcommand(word) {
             Some(sub) => {
-                if sub.is_hide_set() {
-                    return Some(format!("{mention:?} names a removed spelling"));
-                }
                 node = sub;
                 matched += 1;
+            }
+            // A command-shaped word a group does not have is a removed or
+            // misspelt spelling (`report summary`), not an argument.
+            None if node.has_subcommands()
+                && matched > 0
+                && word.chars().all(|c| c.is_ascii_lowercase() || c == '-') =>
+            {
+                return Some(format!("{mention:?} names no command `{word}`"));
             }
             None => break,
         }
@@ -108,7 +102,7 @@ fn file_1() -> String {
 }
 
 fn file_2() -> String {
-    tapectl::volume::layout::generate_restore_script_v2("L6-0001", 12)
+    tapectl::volume::heir::RESTORE_SH.to_string()
 }
 
 /// A real cover sheet: a home made by the binary's own `init` (which mints
@@ -187,19 +181,21 @@ fn the_heir_kits_cover_sheet_commands_parse_and_are_live() {
     }
 }
 
-/// The checks catch what they are for: a removed spelling, a bare removed
-/// group and a misspelt command, in a line and in running text.
+/// The checks catch what they are for: a removed nested spelling and a
+/// misspelt command, in a line and in running text. (A removed top-level
+/// word, `staging` or `backend`, is no top-level command any more, so
+/// `command_lines` does not take it for a command line at all.)
 #[test]
 fn the_checks_catch_a_removed_spelling() {
-    let text = "    tapectl staging clean --force\n    tapectl backend add --name d \\\n        \
-                --device-tape /dev/x --generation LTO-6\n    tapectl stage clean --force\n\
+    let text = "    tapectl unit status UNIT\n    tapectl catalog ls \\\n        \
+                --unit U\n    tapectl stage clean --force\n\
                 see `tapectl report summary` and `tapectl status`";
     let lines = command_lines(text);
     assert_eq!(
         lines,
         vec![
-            "tapectl staging clean --force",
-            "tapectl backend add --name d --device-tape /dev/x --generation LTO-6",
+            "tapectl unit status UNIT",
+            "tapectl catalog ls --unit U",
             "tapectl stage clean --force",
         ]
     );

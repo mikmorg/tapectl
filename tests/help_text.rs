@@ -385,9 +385,10 @@ fn the_top_level_help_lists_every_visible_command_once_in_its_group() {
         .filter(|s| s.is_hide_set())
         .map(|s| s.get_name().to_string())
         .collect();
-    // Positive controls: the tree has both kinds, `help` among the visible.
+    // Positive control: `help` is among the visible. No stub of a removed
+    // spelling is left to be hidden (ADR-0012 item 258(d)).
     assert!(visible.contains("help") && visible.contains("status"));
-    assert!(hidden.iter().any(|h| h == "backend"), "{hidden:?}");
+    assert!(hidden.is_empty(), "{hidden:?}");
 
     let grouped: Vec<String> = HELP_GROUPS
         .iter()

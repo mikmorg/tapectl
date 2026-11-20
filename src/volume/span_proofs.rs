@@ -9,7 +9,7 @@
 //! recipient are made as `tapectl init` and `tenant add` make them; each unit
 //! is a folder of files registered by `unit init`, its policy edited in its
 //! dotfile as an operator edits it; `snapshot create` and `stage create` run
-//! the real dar and age. Each cartridge is registered and each volume made by
+//! the real tar and age. Each cartridge is registered and each volume made by
 //! the real `volume init` over a [`MemStore`], and each tape is written by the
 //! real `volume write` ([`write::volume_write_contacted`] with the store
 //! injected), followed by the release the CLI runs after it. The drive's
@@ -49,7 +49,7 @@ const OPERATOR: &str = "quince-operator-main";
 const TENANT_ONE: &str = "persimmon-tenant-one";
 const TENANT_TWO: &str = "persimmon-tenant-two";
 
-/// Deterministic incompressible bytes, so dar's output is the input's size.
+/// Deterministic incompressible bytes, so tar's output is the input's size.
 fn noise(len: usize, seed: u32) -> Vec<u8> {
     let mut x = seed.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9;
     (0..len)
@@ -206,7 +206,6 @@ impl Home {
         fs::create_dir_all(&sources).unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "dar".to_string();
         config.staging.directory = staging.to_string_lossy().into_owned();
         config.defaults.slice_size = slice_size.to_string();
         config.defaults.min_copies = min_copies;
@@ -238,21 +237,13 @@ impl Home {
         }
     }
 
-    /// `unit init` of a folder of `files` for `tenant`; `allow_spanning`
-    /// set in its dotfile's `[policy]` when given, as an operator edits it.
-    fn unit(&mut self, tenant: &str, name: &str, files: Files, allow_spanning: Option<bool>) {
-        self.unit_in(tenant, name, files, allow_spanning, None);
+    /// `unit init` of a folder of `files` for `tenant`.
+    fn unit(&mut self, tenant: &str, name: &str, files: Files) {
+        self.unit_in(tenant, name, files, None);
     }
 
     /// [`Self::unit`], in archive set `archive_set` when given.
-    fn unit_in(
-        &mut self,
-        tenant: &str,
-        name: &str,
-        files: Files,
-        allow_spanning: Option<bool>,
-        archive_set: Option<&str>,
-    ) {
+    fn unit_in(&mut self, tenant: &str, name: &str, files: Files, archive_set: Option<&str>) {
         let dir = self.sources.join(name);
         fs::create_dir_all(&dir).unwrap();
         for (file, bytes) in &files {
@@ -268,19 +259,7 @@ impl Home {
             archive_set,
         )
         .unwrap();
-        if let Some(value) = allow_spanning {
-            self.set_allow_spanning(name, value);
-        }
         self.units.insert(name.to_string(), files);
-    }
-
-    /// The operator's edit of `unit`'s dotfile: `allow_spanning = value` in
-    /// its `[policy]`.
-    fn set_allow_spanning(&self, unit: &str, value: bool) {
-        let dotfile = self.sources.join(unit).join(".tapectl-unit.toml");
-        let mut d = crate::unit::dotfile::read_dotfile(&dotfile).unwrap();
-        d.allow_spanning = Some(value);
-        crate::unit::dotfile::write_dotfile(&dotfile, &d).unwrap();
     }
 
     /// `snapshot create` then `stage create` of `unit`: its stage set.
@@ -404,26 +383,26 @@ fn position_of(conn: &Connection, label: &str, unit: &str, n: i64) -> i64 {
         .unwrap_or_else(|| panic!("{unit} slice {n} is not planned on {label}"))
 }
 
-/// `(unit, writes.status, writes.may_span)` of the volume, by unit name.
-fn writes_of(conn: &Connection, label: &str) -> Vec<(String, String, bool)> {
+/// `(unit, writes.status)` of the volume, by unit name.
+fn writes_of(conn: &Connection, label: &str) -> Vec<(String, String)> {
     conn.prepare(
-        "SELECT u.name, w.status, w.may_span FROM writes w
+        "SELECT u.name, w.status FROM writes w
            JOIN volumes v ON v.id = w.volume_id
            JOIN snapshots s ON s.id = w.snapshot_id
            JOIN units u ON u.id = s.unit_id
           WHERE v.label = ?1 ORDER BY u.name",
     )
     .unwrap()
-    .query_map(params![label], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .query_map(params![label], |r| Ok((r.get(0)?, r.get(1)?)))
     .unwrap()
     .collect::<rusqlite::Result<_>>()
     .unwrap()
 }
 
-fn rows(want: &[(&str, &str, bool)]) -> Vec<(String, String, bool)> {
-    let mut v: Vec<(String, String, bool)> = want
+fn rows(want: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = want
         .iter()
-        .map(|(u, s, m)| (u.to_string(), s.to_string(), *m))
+        .map(|(u, s)| (u.to_string(), s.to_string()))
         .collect();
     v.sort();
     v
@@ -561,7 +540,9 @@ fn sealing(conn: &Connection, label: &str) -> (bool, Option<i64>) {
 // ── item 93: two copies over three tapes ──
 
 const A93: &str = "kumquat-whole-alpha";
-const B93: &str = "kumquat-span-bravo";
+// Named so that it sorts after the whole units: the queue takes the units in
+// name order (item 288), and item 93's layout has the set that spans last.
+const B93: &str = "kumquat-zspan-bravo";
 const C93: &str = "kumquat-whole-charlie";
 const T93: [&str; 3] = ["SPN93-T1", "SPN93-T2", "SPN93-T3"];
 
@@ -569,14 +550,13 @@ const T93: [&str; 3] = ["SPN93-T1", "SPN93-T2", "SPN93-T3"];
 /// copy target of 2, three blank volumes; nothing written yet.
 fn home_93() -> Home {
     let mut h = Home::new(None, 2, "64K");
-    h.unit(TENANT_ONE, A93, files("alpha-ledger", &[20_000], 1), None);
+    h.unit(TENANT_ONE, A93, files("alpha-ledger", &[20_000], 1));
     h.unit(
         TENANT_ONE,
         B93,
         files("bravo-reel", &[50_000, 50_000, 50_000], 2),
-        Some(true),
     );
-    h.unit(TENANT_TWO, C93, files("charlie-notes", &[20_000], 3), None);
+    h.unit(TENANT_TWO, C93, files("charlie-notes", &[20_000], 3));
     for unit in [A93, B93, C93] {
         h.stage(unit);
     }
@@ -621,16 +601,9 @@ fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
     );
     assert_eq!(
         writes_of(c, T93[0]),
-        rows(&[
-            (A93, "completed", false),
-            (B93, "range", true),
-            (C93, "completed", false)
-        ])
+        rows(&[(A93, "completed"), (B93, "range"), (C93, "completed")])
     );
-    assert_eq!(
-        requires_line(h.files(T93[0])),
-        "requires = [\"short-seal\", \"spanning\"]"
-    );
+    assert_eq!(requires_line(h.files(T93[0])), "requires = []");
     assert_eq!(
         write::recorded_ranges(c, T93[0]).unwrap(),
         [range(B93, 1, 2)]
@@ -665,11 +638,7 @@ fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
     assert_eq!(sealing(c, T93[1]), (true, None), "a full seal");
     assert_eq!(
         writes_of(c, T93[1]),
-        rows(&[
-            (A93, "completed", false),
-            (B93, "completed", true),
-            (C93, "completed", false)
-        ])
+        rows(&[(A93, "completed"), (B93, "completed"), (C93, "completed")])
     );
     assert!(write::recorded_ranges(c, T93[1]).unwrap().is_empty());
     assert_eq!(
@@ -694,7 +663,7 @@ fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
     h.write(T93[2], Warn::Never);
     let c = &h.conn;
     assert_eq!(sealing(c, T93[2]), (true, None));
-    assert_eq!(writes_of(c, T93[2]), rows(&[(B93, "range", true)]));
+    assert_eq!(writes_of(c, T93[2]), rows(&[(B93, "range")]));
     assert_eq!(
         write::recorded_ranges(c, T93[2]).unwrap(),
         [range(B93, 3, 3)]
@@ -717,7 +686,7 @@ fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
     for (label, holds) in [(T93[0], [1, 2]), (T93[2], [3, 3])] {
         assert_eq!(
             requires_line(h.files(label)),
-            "requires = [\"short-seal\", \"spanning\"]",
+            "requires = []",
             "{label} holds {holds:?}"
         );
     }
@@ -738,8 +707,25 @@ const T94: [&str; 3] = ["SPN94-T1", "SPN94-T2", "SPN94-T3"];
 /// cut; its positive control says so if the tape's own files ever grow. They
 /// grew by five blocks with 1.8.0's RESTORE.sh (#498, ADR-0012 items 181, 182
 /// and 184), and the figure by the same 20,480 bytes, which keeps every cut
-/// where it was.
-const CAP94: u64 = 2_749_480;
+/// where it was. With staging on tar (T4.5) `S`'s slices hold whole members
+/// (its dotfile alone in slice 1, each file a run of 128K slices), so the
+/// figure is three blocks into tape 1's slice 17 at nominal and about three
+/// and a half blocks before slice 16 ends at 1% sooner. Layout 3's envelopes
+/// carry each staging's file table and id map (T4.6, §1.4, §1.6): the tape's
+/// own files grew by four blocks (720,896 bytes before `S`'s slice 1), and
+/// the figure by the same 16,384 bytes. Layout 3's RESTORE.sh (T4.10, a new
+/// script in the tree) is far smaller than 1.8.0's: the tape's own files
+/// shrank, and the figure by the same 245,760 bytes. Since T4.11
+/// the figure is computed from File 2's size in blocks (RESTORE.sh alone,
+/// `build.rs`), so a change to the script moves it by exactly what the tape's
+/// own files moved and every cut stays where it was. Layout 3's File 1 and
+/// RECOVERY.md (T4.13) moved the bytes before `S`'s slice 1 from 552,960 to
+/// 585,728, and the figure by the same 32,768. 2,465,792 bytes is the rest of
+/// the figure: a change to any other file before `S`'s slice 1 still moves it
+/// by hand, as above.
+const CAP94: u64 = 2_465_792 + RESTORE_SH_BLOCKS * BS as u64;
+/// File 2's size in blocks: RESTORE.sh, padded to the block.
+const RESTORE_SH_BLOCKS: u64 = (crate::volume::heir::RESTORE_SH.len() as u64).div_ceil(BS as u64);
 
 /// Item 94's catalog at a copy target of 1: `W` whole (under half a tape)
 /// staged first, so 1.6.0's order would put it first, then `S`, which may
@@ -752,14 +738,8 @@ fn home_94() -> Home {
         TENANT_TWO,
         W94,
         files("waiting-ledger", &[380_000, 380_000], 21),
-        None,
     );
-    h.unit(
-        TENANT_ONE,
-        S94,
-        files("sequoia-reel", &[775_000; 6], 22),
-        Some(true),
-    );
+    h.unit(TENANT_ONE, S94, files("sequoia-reel", &[775_000; 6], 22));
     h.stage(W94);
     h.stage(S94);
     for label in T94 {
@@ -839,7 +819,7 @@ fn item_94_a_set_larger_than_one_tape_starts_first_and_the_unit_it_displaces_fol
     // Tape 1: S first, W waits.
     h.write(T94[0], Warn::AtBytes(CAP94));
     let c = &h.conn;
-    assert_eq!(writes_of(c, T94[0]), rows(&[(S94, "range", true)]));
+    assert_eq!(writes_of(c, T94[0]), rows(&[(S94, "range")]));
     let (first, k1, s1) = written_run(c, T94[0], S94);
     assert_eq!(first, 1);
     assert!(sealing(c, T94[0]).1.is_some(), "the warning ended tape 1");
@@ -876,7 +856,7 @@ fn item_94_a_set_larger_than_one_tape_starts_first_and_the_unit_it_displaces_fol
     // Tape 2: the owed run, from K1+1, to the warning; W still waits.
     h.write(T94[1], Warn::AtBytes(CAP94));
     let c = &h.conn;
-    assert_eq!(writes_of(c, T94[1]), rows(&[(S94, "range", true)]));
+    assert_eq!(writes_of(c, T94[1]), rows(&[(S94, "range")]));
     let (first, k2, _) = written_run(c, T94[1], S94);
     assert_eq!(first, k1 + 1, "the owed run continues the range");
     assert!(k2 < n, "tape 2 ends inside S");
@@ -891,7 +871,7 @@ fn item_94_a_set_larger_than_one_tape_starts_first_and_the_unit_it_displaces_fol
     assert_eq!(sealing(c, T94[2]), (true, None));
     assert_eq!(
         writes_of(c, T94[2]),
-        rows(&[(S94, "range", true), (W94, "completed", false)])
+        rows(&[(S94, "range"), (W94, "completed")])
     );
     let (first, last, _) = written_run(c, T94[2], S94);
     assert_eq!((first, last), (k2 + 1, n));
@@ -968,7 +948,7 @@ fn item_94_a_warning_1_percent_before_nominal_costs_the_span_no_tape() {
     assert_eq!(sealing(c, T94[2]), (true, None));
     assert_eq!(
         writes_of(c, T94[2]),
-        rows(&[(S94, "range", true), (W94, "completed", false)])
+        rows(&[(S94, "range"), (W94, "completed")])
     );
     assert!(position_of(c, T94[2], W94, 1) > position_of(c, T94[2], S94, n));
     assert!(tape_bytes(&h, T94[2]) <= CAP94);
@@ -1087,8 +1067,11 @@ fn assert_restored(h: &Home, unit: &str, dest: &Path) {
 /// from tape 1 reads its range and asks for the live whole copy on tape 2
 /// for the rest (a whole copy first, not tape 3's range), by label; from
 /// tape 2 alone it needs no other cartridge; `--from` tape 3, which does not
-/// hold slice 1, is refused before anything is read, naming the holders of
-/// slice 1. Every restored file is byte-identical.
+/// hold slice 1, is no longer refused (item 266: a restore may start on any
+/// tape of a span): it asks for the whole copy on tape 2 and restores the
+/// version whole, and answered "skip" (I do not have it) it restores the files
+/// tape 3 holds whole and lists the rest. Every restored file is
+/// byte-identical.
 #[test]
 fn item_131_restore_unit_crosses_the_written_cartridges() {
     let h = written_93();
@@ -1125,30 +1108,54 @@ fn item_131_restore_unit_crosses_the_written_cartridges() {
     assert_restored(&h, B93, dest.path());
     assert!(b.asked.is_empty(), "tape 2 holds the version whole");
 
-    // Named, the refusal comes before the drive (the dry run is that path).
-    let dest = TempDir::new().unwrap();
-    let err = crate::volume::restore::restore_unit(
-        &h.conn,
-        &h.paths,
-        &h.config,
+    // Item 266: tape 3 holds only the last slice. A restore started on it asks
+    // for the cartridge that holds slice 1 (the whole copy), by label...
+    let mut b = bay(&h, T93[2], &[Reply::Load(T93[1])]);
+    let (r, dest) = restore(
+        &h,
         B93,
-        T93[2],
-        &dest.path().to_string_lossy(),
-        DEVICE,
-        BS,
-        None,
-        true,
+        What::Unit,
+        Some(T93[2]),
         &RestoreOptions::default(),
-    )
-    .unwrap_err()
-    .to_string();
-    for needle in [
-        format!("volume \"{}\" holds only slice 3", T93[2]),
-        format!("Slice 1 is on \"{}\"", T93[0]),
-        format!("--from {}", T93[0]),
-    ] {
-        assert!(err.contains(&needle), "{needle}: {err}");
+        &mut b,
+    );
+    r.unwrap_or_else(|e| panic!("from {}: {e}", T93[2]));
+    assert_restored(&h, B93, dest.path());
+    assert_eq!(b.asked_labels(), [T93[1]], "the whole copy, by label");
+
+    // ...and "I do not have it" restores what tape 3 holds whole and lists the
+    // rest: the files of the last slice are there and the others are named.
+    let mut b = bay(&h, T93[2], &[Reply::Skip]);
+    let (r, dest) = restore(
+        &h,
+        B93,
+        What::Unit,
+        Some(T93[2]),
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    let err = r
+        .expect_err("files that no cartridge given holds are listed")
+        .to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
+    let last = num_slices(&h.conn, B93) as u64;
+    let rows = crate::db::stage_files::load(&h.conn, stage_set_of(&h.conn, B93)).unwrap();
+    let on_tape_3: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.slice == last && r.kind == crate::volume::filetable::Kind::File)
+        .map(|r| r.path.as_str())
+        .collect();
+    assert!(!on_tape_3.is_empty(), "tape 3 holds a file whole");
+    for (file, bytes) in &h.units[B93] {
+        let there = fs::read(dest.path().join(file)).ok();
+        if on_tape_3.contains(&file.as_str()) {
+            assert_eq!(there.as_ref(), Some(bytes), "{file} is on tape 3");
+        } else {
+            assert!(there.is_none(), "{file} is not on tape 3");
+            assert!(err.contains(file.as_str()), "{file} is named: {err}");
+        }
     }
+    assert_eq!(b.asked_labels(), [T93[1]], "asked once, not again");
 
     // A whole unit of the same tapes restores as in 1.6.0.
     let mut b = bay(&h, T93[0], &[]);
@@ -1167,9 +1174,8 @@ fn item_131_restore_unit_crosses_the_written_cartridges() {
 
 /// Item 131 on item 94's tapes, which hold the version only as three
 /// ranges: `restore unit --from` tape 1 asks for tapes 2 and 3 in slice
-/// order; `restore unit` of the loaded tape 1 does the same, and so does
-/// `--spool`; `restore file` of a file whose bytes are on the later tapes
-/// reads across the cartridges. Every file comes back byte for byte.
+/// order; `restore unit` of the loaded tape 1 does the same; `restore file`
+/// of a file whose bytes are on the later tapes reads across the cartridges. Every file comes back byte for byte.
 #[test]
 fn item_131_restore_crosses_three_written_ranges() {
     let h = written_94();
@@ -1186,7 +1192,20 @@ fn item_131_restore_crosses_three_written_ranges() {
     );
     let report = r.unwrap_or_else(|e| panic!("--from {}: {e}", T94[0]));
     assert_restored(&h, S94, dest.path());
-    assert_eq!(report.slices as i64, num_slices(&h.conn, S94));
+    // Every slice that holds a member is read; a last slice that holds only
+    // the stream's tail (tar's end blocks) is not.
+    let rows = crate::db::stage_files::load(&h.conn, stage_set_of(&h.conn, S94)).unwrap();
+    let slice_size =
+        crate::volume::restore::stage_facts(&h.conn, stage_set_of(&h.conn, S94), &rows)
+            .unwrap()
+            .slice_size;
+    let member_slices = rows
+        .iter()
+        .flat_map(|r| r.slices(slice_size))
+        .collect::<std::collections::BTreeSet<u64>>()
+        .len();
+    assert_eq!(report.slices, member_slices);
+    assert!(member_slices as i64 <= num_slices(&h.conn, S94));
     assert_eq!(b.asked_labels(), [T94[1], T94[2]], "in slice order");
     for (prompt, (label, first)) in b.asked.iter().zip([
         (T94[1], written_run(&h.conn, T94[1], S94).0),
@@ -1213,15 +1232,6 @@ fn item_131_restore_crosses_three_written_ranges() {
     assert_restored(&h, S94, dest.path());
     assert_eq!(b.asked_labels(), [T94[1], T94[2]]);
 
-    let spool = RestoreOptions {
-        spool: true,
-        ..RestoreOptions::default()
-    };
-    let mut b = bay(&h, T94[0], &later);
-    let (r, dest) = restore(&h, S94, What::Unit, Some(T94[0]), &spool, &mut b);
-    r.unwrap_or_else(|e| panic!("--spool: {e}"));
-    assert_restored(&h, S94, dest.path());
-
     let (file, bytes) = h.units[S94].last().unwrap().clone();
     let mut b = bay(&h, T94[0], &later);
     let (r, dest) = restore(
@@ -1234,10 +1244,26 @@ fn item_131_restore_crosses_three_written_ranges() {
     );
     r.unwrap_or_else(|e| panic!("restore file {file}: {e}"));
     assert_eq!(fs::read(dest.path().join(&file)).unwrap(), bytes);
+    // Only the slices that hold the file are read (the archive's catalogue
+    // is no slice any more): the later tapes that hold some of them are
+    // asked for, in slice order, and no other.
+    let rows = crate::db::stage_files::load(&h.conn, stage_set_of(&h.conn, S94)).unwrap();
+    let row = rows.iter().find(|r| r.path == file).unwrap();
+    let slice_size =
+        crate::volume::restore::stage_facts(&h.conn, stage_set_of(&h.conn, S94), &rows)
+            .unwrap()
+            .slice_size;
+    let wanted: Vec<i64> = row.slices(slice_size).map(|n| n as i64).collect();
+    let holds = |label: &str| {
+        let (first, last, _) = written_run(&h.conn, label, S94);
+        wanted.iter().any(|n| (first..=last).contains(n))
+    };
+    let expected: Vec<&str> = T94[1..].iter().copied().filter(|l| holds(l)).collect();
+    assert!(!expected.is_empty(), "the file's bytes are on a later tape");
     assert_eq!(
         b.asked_labels(),
-        [T94[1], T94[2]],
-        "the file's bytes, and the archive's end, are on the later tapes"
+        expected,
+        "the file's slices, and no other, are read from the later tapes"
     );
 
     // The whole unit written after the span's tail restores alone.
@@ -1257,21 +1283,19 @@ fn item_131_restore_crosses_three_written_ranges() {
 
 // ── catalog rebuild of each tape (items 130 and 144) ──
 
-/// Every write: `(label, unit, status, may_span, snapshot status)`.
-type WriteRow = (String, String, String, bool, String);
+/// Every write: `(label, unit, status, snapshot status)`.
+type WriteRow = (String, String, String, String);
 
 fn write_rows(conn: &Connection) -> Vec<WriteRow> {
     conn.prepare(
-        "SELECT v.label, u.name, w.status, w.may_span, s.status FROM writes w
+        "SELECT v.label, u.name, w.status, s.status FROM writes w
            JOIN volumes v ON v.id = w.volume_id
            JOIN snapshots s ON s.id = w.snapshot_id
            JOIN units u ON u.id = s.unit_id
           ORDER BY v.label, u.name",
     )
     .unwrap()
-    .query_map([], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-    })
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
     .unwrap()
     .collect::<rusqlite::Result<_>>()
     .unwrap()
@@ -1418,6 +1442,8 @@ fn items_130_and_144_each_tape_rebuilt_in_any_order_gives_the_writing_catalogs_r
                 T93[n]
             );
         }
+        // A Layout 3 block states no spanning key: the rows a rebuild records
+        // are the rows the write recorded.
         assert_eq!(write_rows(&fresh), writes, "{order:?}");
         assert_eq!(position_rows(&fresh), positions, "{order:?}");
         assert_eq!(slice_rows(&fresh), slices, "{order:?}");
@@ -1519,12 +1545,13 @@ fn manifest_block(manifest: &str, unit: &str) -> String {
         .to_string()
 }
 
-/// Item 125 from the real write: on every tape whose plan holds a slice of
-/// a spannable set, the operator envelope's block of it states `may_span =
-/// true` and lists every slice of the set, giving `tape_position` only to
-/// the slices this tape's plan holds; whole units' blocks have no
-/// `may_span` and a position for every slice; and RECOVERY.md has its
-/// section on a unit across tapes.
+/// Item 125 from the real write, as Layout 3 states it (§1.9, §5.3; item
+/// 288): on every tape whose plan holds a slice of a spannable set, the
+/// operator envelope's block of it lists every slice of the set, giving
+/// `tape_position` only to the slices this tape's plan holds; whole units'
+/// blocks give a position to every slice; no block states the old span key, and
+/// `requires` is empty (D1). RECOVERY.md has its section on a unit across
+/// tapes where the block gives a slice no position (T4.13 rewrites it).
 #[test]
 fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
     let h = written_93();
@@ -1541,7 +1568,6 @@ fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
             .iter()
             .find(|u| u.name == B93)
             .unwrap_or_else(|| panic!("{label} lists {B93}"));
-        assert!(b.may_span, "{label}");
         assert_eq!(
             b.slices.iter().map(|s| s.number).collect::<Vec<_>>(),
             [1, 2, 3],
@@ -1559,33 +1585,31 @@ fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
                 assert_eq!(p, position_of(&h.conn, label, B93, s.number), "{label}");
             }
         }
-        assert!(
-            manifest_block(&text, B93).contains("may_span = true\n"),
-            "{label}"
-        );
+        assert!(!text.contains(concat!("may", "_span")), "{label}: {text}");
+        assert!(manifest_block(&text, B93).contains("payload = \"tar\"\n"));
         for whole in manifest.units.iter().filter(|u| u.name != B93) {
-            assert!(!whole.may_span, "{label}: {}", whole.name);
             assert!(
                 whole.slices.iter().all(|s| s.tape_position.is_some()),
                 "{label}: {}",
                 whole.name
             );
-            assert!(!manifest_block(&text, &whole.name).contains("may_span"));
+            assert!(!manifest_block(&text, &whole.name).contains(concat!("may", "_span")));
         }
         let recovery = member(&members, "RECOVERY.md");
-        assert!(
+        assert_eq!(
             recovery.contains("## A unit across tapes"),
+            planned != [1, 2, 3],
             "{label}: {recovery}"
         );
         assert_eq!(
             seal_requires_line(h.files(label)),
-            "requires = [\"short-seal\", \"spanning\"]",
+            "requires = []",
             "{label}"
         );
     }
 }
 
-// ── the isolation scan (`volume-format-v2.md` §2) ──
+// ── the isolation scan (`volume-format-v3.md` §2) ──
 
 /// Everything the isolation invariant says no plaintext file may reveal,
 /// for `h`: tenant, unit and file names, each file's sha256 and each
@@ -1689,7 +1713,7 @@ fn scan_every_tape(h: &Home) {
     }
 }
 
-/// The isolation scan (`volume-format-v2.md` §2, §4.4: nothing new is
+/// The isolation scan (`volume-format-v3.md` §2, §5.3: nothing new is
 /// readable without a key) over every raw tape image of item 93's span:
 /// no tenant, unit or file name, no plaintext hash, no key, and no other
 /// tape's label is anywhere on a tape in the clear, File 1, the front index
@@ -1709,7 +1733,7 @@ fn no_tape_of_a_three_range_span_reveals_a_tenant_unit_file_hash_or_key() {
     scan_every_tape(&h);
 }
 
-// ── allow_spanning off everywhere is 1.6.0's ──
+// ── a short seal under the one rule (item 288) ──
 
 const A0: &str = "loquat-whole-alpha";
 const B0: &str = "loquat-whole-bravo";
@@ -1728,26 +1752,18 @@ fn write_completed(conn: &Connection, label: &str) -> String {
     .unwrap()
 }
 
-/// A write with `allow_spanning` off at every layer is 1.6.0's. Volume 1 is
-/// written with the key absent everywhere (a home from before 1.7.0: the
-/// units' dotfiles and their archive set do not name it, `[defaults]` is
-/// off); volume 2 with it set `false` at every layer (dotfile, archive set,
-/// `[defaults]`). Each is cut by the early warning inside `b`, as 1.6.0's
-/// short seal cuts it.
-/// - The rows are 1.6.0's: whole units in the order staged (none moved),
-///   `a` completed and `b` and `c` cut, `may_span` unset, no range, no
-///   deferral, no tapes to keep together, and the `write_completed` event
-///   and recorded ending 1.6.0 wrote.
-/// - The bytes are 1.6.0's: File 0 and the seal state `requires =
-///   ["short-seal"]`, no block names `may_span`, every slice has a
-///   position, RECOVERY.md has no section on a unit across tapes; and the
-///   two volumes agree byte for byte on every whole unit's slices, front
-///   index entries and MANIFEST block.
-///
-/// The next write writes the cut units whole, as 1.6.0's does.
+/// A short seal under the one rule, for units that never opted in to
+/// anything: the tape is cut by the early warning inside `b`. The rows are
+/// the three-way split (item 288): `a` completed, `b` a range of the slices
+/// that reached the tape, and `c`, planned after the warning and not
+/// written, has no row; `c` is named in `deferred_units` and in the
+/// `write_completed` event as `unwritten_units`, and stays staged. The bytes
+/// state `requires = []` and every block gives every slice a position. The
+/// next write lays `b`'s owed slice first, then `c`, and `b` is whole across
+/// the two tapes.
 #[test]
-fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
-    let mut h = Home::new(None, 2, "64K");
+fn a_short_seal_leaves_a_range_and_a_set_planned_and_not_written() {
+    let mut h = Home::new(None, 1, "64K");
     crate::cli::archive_set::run(
         &h.conn,
         &h.config,
@@ -1763,21 +1779,18 @@ fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
         TENANT_ONE,
         A0,
         files("loquat-alpha", &[20_000], 11),
-        None,
         Some(SET0),
     );
     h.unit_in(
         TENANT_ONE,
         B0,
         files("loquat-bravo", &[50_000, 50_000, 50_000], 12),
-        None,
         Some(SET0),
     );
     h.unit_in(
         TENANT_TWO,
         C0,
         files("loquat-charlie", &[20_000], 13),
-        None,
         Some(SET0),
     );
     for unit in [A0, B0, C0] {
@@ -1788,57 +1801,32 @@ fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
         h.volume(label);
     }
 
-    // Volume 1: the key absent everywhere.
-    assert!(!h.config.defaults.allow_spanning);
     h.write(T0[0], Warn::InSlice(B0, 2));
-
-    // Volume 2: the key `false` at every layer.
-    crate::cli::archive_set::run(
-        &h.conn,
-        &h.config,
-        &crate::cli::archive_set::ArchiveSetCommands::Edit {
-            name: SET0.into(),
-            policy: crate::cli::archive_set::PolicyArgs {
-                allow_spanning: Some(false),
-                ..Default::default()
-            },
-        },
-        false,
-        false,
-    )
-    .unwrap();
-    for unit in [A0, B0, C0] {
-        h.set_allow_spanning(unit, false);
-    }
-    h.config.defaults.allow_spanning = false;
-    h.write(T0[1], Warn::InSlice(B0, 2));
-
-    for label in &T0[..2] {
+    let label = T0[0];
+    {
         let c = &h.conn;
         let a1 = position_of(c, label, A0, 1);
         let b1 = position_of(c, label, B0, 1);
         assert_eq!(
-            [b1, position_of(c, label, C0, 1)],
-            [a1 + 1, a1 + 4],
-            "{label}: the units in the order staged, none moved"
+            planned_position(c, label, C0, 1),
+            None,
+            "c was planned and not written: its positions went with its row"
         );
         assert_eq!(sealing(c, label), (true, Some(b1 + 1)), "{label}");
+        assert!(b1 > a1);
         assert_eq!(
             writes_of(c, label),
-            rows(&[
-                (A0, "completed", false),
-                (B0, "cut", false),
-                (C0, "cut", false)
-            ]),
+            rows(&[(A0, "completed"), (B0, "range")]),
             "{label}"
         );
-        assert!(write::recorded_ranges(c, label).unwrap().is_empty());
+        assert_eq!(write::recorded_ranges(c, label).unwrap(), [range(B0, 1, 2)]);
         assert!(write::keep_together(c, label).unwrap().is_empty());
         assert_eq!(
             write::recorded_ending(c, label).unwrap(),
             write::RecordedEnding {
                 ended_after: Some(b1 + 1),
-                cut_units: vec![B0.into(), C0.into()],
+                range_units: vec![range(B0, 1, 2)],
+                deferred_units: vec![C0.into()],
                 ..write::RecordedEnding::default()
             },
             "{label}"
@@ -1848,58 +1836,40 @@ fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
             serde_json::json!({
                 "ending": "short",
                 "ended_after": b1 + 1,
-                "cut_units": [B0, C0],
+                "unwritten_units": [C0],
+                "range_units": [{"unit": B0, "first_slice": 1, "last_slice": 2}],
             })
             .to_string(),
             "{label}"
         );
+        assert_eq!(stage_set_status(c, C0), "staged");
+        assert_eq!(snapshot_status(c, B0), "staged", "item 128: not yet");
         let files = h.files(label);
-        assert_eq!(
-            requires_line(files),
-            "requires = [\"short-seal\"]",
-            "{label}"
-        );
-        assert_eq!(
-            seal_requires_line(files),
-            "requires = [\"short-seal\"]",
-            "{label}"
-        );
+        assert_eq!(requires_line(files), "requires = []", "{label}");
+        assert_eq!(seal_requires_line(files), "requires = []", "{label}");
         let members = operator_envelope(&h, label);
         let text = member(&members, "MANIFEST.toml");
-        assert!(!text.contains("may_span"), "{label}: {text}");
-        let manifest = crate::volume::envelope::parse_manifest(&text).unwrap();
-        for unit in &manifest.units {
-            assert!(!unit.may_span);
-            assert!(unit.slices.iter().all(|s| s.tape_position.is_some()));
-        }
-        let recovery = member(&members, "RECOVERY.md");
-        assert!(!recovery.contains("A unit across tapes"), "{label}");
+        assert!(!text.contains(concat!("may", "_span")), "{label}: {text}");
     }
 
-    // The two volumes agree byte for byte on the whole units' slices, their
-    // front index entries and their MANIFEST blocks.
-    let (v1, v2) = (h.files(T0[0]), h.files(T0[1]));
-    let ended_after = sealing(&h.conn, T0[0]).1.unwrap() as usize;
-    let first = position_of(&h.conn, T0[0], A0, 1) as usize;
-    for pos in first..=ended_after {
-        assert_eq!(v1[pos], v2[pos], "data file {pos}");
-    }
-    let slices_of = |files: &[Vec<u8>]| -> Vec<ParsedIndexEntry> {
-        front_index(files)
-            .into_iter()
-            .filter(|e| e.type_label == "data_slice")
-            .collect()
-    };
-    assert_eq!(slices_of(v1), slices_of(v2));
-    let block =
-        |label: &str| manifest_block(&member(&operator_envelope(&h, label), "MANIFEST.toml"), A0);
-    assert_eq!(block(T0[0]), block(T0[1]));
-
-    // The next write writes the cut units whole; a has its two copies.
-    h.write(T0[2], Warn::Never);
+    // The next write: b's owed slice first, then c; b is whole across them.
+    h.write(T0[1], Warn::Never);
+    let c = &h.conn;
     assert_eq!(
-        writes_of(&h.conn, T0[2]),
-        rows(&[(B0, "completed", false), (C0, "completed", false)])
+        writes_of(c, T0[1]),
+        rows(&[(B0, "range"), (C0, "completed")])
     );
-    assert_eq!(requires_line(h.files(T0[2])), "requires = [\"short-seal\"]");
+    assert!(
+        position_of(c, T0[1], B0, 3) < position_of(c, T0[1], C0, 1),
+        "the owed run leads the queue"
+    );
+    assert_eq!(write::keep_together(c, T0[1]).unwrap().len(), 1);
+    assert_eq!(snapshot_status(c, B0), "current");
 }
+
+// T5.3: a range carried by `volume rewrite` and by compaction.
+#[path = "range_carry_proofs.rs"]
+mod range_carry_proofs;
+// T5.7: compression, proven for each algorithm carried.
+#[path = "compression_proofs.rs"]
+mod compression_proofs;

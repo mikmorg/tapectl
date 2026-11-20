@@ -6,7 +6,7 @@
 //! read from any other cartridge whose write holds a slice with that hash:
 //! matched by the hash, never by position or number. From 1.7.0 (#478) a
 //! holder is a `completed` write or a `range` write with the slice
-//! `written` (item 101 sees ranges; `volume-format-v2.md` §4.4 R8), so the
+//! `written` (item 101 sees ranges; `volume-format-v3.md` §5.3 R8), so the
 //! same answer serves a damaged slice and a version read across cartridges.
 //!
 //! "Held" and "live" are `policy::coverage`'s predicates, composed here and
@@ -42,11 +42,9 @@ pub enum Standing {
 /// (#478, item 121). This says so in the query too, so a catalog that broke
 /// that (which `audit` names) sends no read past the seal of the other tape:
 /// tapectl takes `ended_after` from the catalog, which recorded the tape's
-/// seal when it sealed or was rebuilt (`volume-format-v2.md` §4.2 R1 and
-/// R5). A `cut` write's slices are never a source, even those at or before
-/// `ended_after`: §4.2 "Nothing of a cut unit counts on this tape, and no
-/// reader restores it from this tape, even though its slices at or before
-/// `ended_after` are present and hash correctly".
+/// seal when it sealed or was rebuilt (`volume-format-v3.md` §5.1 R1 and
+/// R5). A set the tape was planned to take and did not has no write, so none
+/// of it is a source (ADR-0012 item 288).
 const ON_TAPE: &str = "(v.ended_after IS NULL OR CAST(wp.position AS INTEGER) <= v.ended_after)";
 
 /// The one test of "the volume `v` holds the slice `wp` of the write `w`",
@@ -294,7 +292,7 @@ pub fn shelf_of(conn: &Connection, volume_id: i64, label: &str) -> Shelf {
 }
 
 /// One stage set of a snapshot, and the volumes that hold a completed write
-/// of it.
+/// or a range of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageCopy {
     pub stage_set_id: i64,
@@ -307,18 +305,21 @@ pub struct StageHolder {
     pub volume_id: i64,
     pub label: String,
     pub standing: Standing,
+    /// The volume holds only a range of the stage set (a `range` write): a
+    /// source for the files whose slices it holds whole (item 260), not for
+    /// the version.
+    pub range: bool,
 }
 
 /// The OTHER stage sets of `snapshot_id` (one unit, one version) than
-/// `except_stage_set_id` that a live volume holds a completed write of
-/// (ADR-0012 item 102): the same files, cut into different slices. Newest
-/// stage set first; its volumes in-service first. A stage set no volume
-/// holds is not listed.
+/// `except_stage_set_id` that a live volume holds a completed write or a
+/// range of (ADR-0012 items 102, 260): the same files, cut into different
+/// slices. Newest stage set first; its volumes in-service first. A stage set
+/// no volume holds is not listed.
 ///
-/// Completed writes only, never a `range` (ADR-0012 item 143, #478): a
-/// damaged file is filled only from a copy held whole on one tape. The
-/// ranges this leaves out are [`ranges_of_version`]'s, which the fill names
-/// in its refusal.
+/// **A range is a source** (item 260, which replaces item 143): for the
+/// files whose slices it holds whole, which [`StageHolder::range`] says the
+/// caller must work out from the stage set's file table.
 pub fn other_copies_of_version(
     conn: &Connection,
     snapshot_id: i64,
@@ -326,14 +327,15 @@ pub fn other_copies_of_version(
 ) -> Result<Vec<StageCopy>> {
     let in_service = coverage::in_service("v");
     let mut stmt = conn.prepare(&format!(
-        "SELECT w.stage_set_id, v.id, v.label, {in_service} AS in_service
+        "SELECT w.stage_set_id, v.id, v.label, {in_service} AS in_service,
+                w.status = 'range'
            FROM writes w
            JOIN stage_sets ss ON ss.id = w.stage_set_id
            JOIN volumes v ON v.id = w.volume_id
           WHERE ss.snapshot_id = ?1 AND ss.id <> ?2
-            AND w.status = 'completed'
+            AND w.status IN ('completed', 'range')
             AND ({in_service} OR {bytes})
-          ORDER BY w.stage_set_id DESC, (NOT {in_service}), v.id",
+          ORDER BY w.stage_set_id DESC, (NOT {in_service}), (w.status = 'range'), v.id",
         bytes = coverage::holds_bytes_to_verify("v"),
     ))?;
     let rows = stmt.query_map(params![snapshot_id, except_stage_set_id], |r| {
@@ -342,11 +344,12 @@ pub fn other_copies_of_version(
             r.get::<_, i64>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, bool>(3)?,
+            r.get::<_, bool>(4)?,
         ))
     })?;
     let mut copies: Vec<StageCopy> = Vec::new();
     for row in rows {
-        let (stage_set_id, volume_id, label, in_service) = row?;
+        let (stage_set_id, volume_id, label, in_service, range) = row?;
         let holder = StageHolder {
             volume_id,
             label,
@@ -355,6 +358,7 @@ pub fn other_copies_of_version(
             } else {
                 Standing::Quarantined
             },
+            range,
         };
         match copies.last_mut() {
             Some(c) if c.stage_set_id == stage_set_id => c.holders.push(holder),
@@ -365,53 +369,6 @@ pub fn other_copies_of_version(
         }
     }
     Ok(copies)
-}
-
-/// One `range` write of another stage set of a version: what the fill names
-/// when it cannot use it (ADR-0012 item 143).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RangeCopy {
-    pub stage_set_id: i64,
-    pub label: String,
-    /// The first and last slice the range holds written.
-    pub first: i64,
-    pub last: i64,
-}
-
-/// The `range` writes, on live volumes, of the OTHER stage sets of
-/// `snapshot_id` than `except_stage_set_id`, with the run each holds: the
-/// copies [`other_copies_of_version`] leaves out because a range is never a
-/// fill source (ADR-0012 item 143). Newest stage set first, then volume
-/// order.
-pub fn ranges_of_version(
-    conn: &Connection,
-    snapshot_id: i64,
-    except_stage_set_id: i64,
-) -> Result<Vec<RangeCopy>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT w.stage_set_id, v.label, MIN(sl.slice_number), MAX(sl.slice_number)
-           FROM writes w
-           JOIN stage_sets ss ON ss.id = w.stage_set_id
-           JOIN volumes v ON v.id = w.volume_id
-           JOIN write_positions wp ON wp.write_id = w.id
-           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-          WHERE ss.snapshot_id = ?1 AND ss.id <> ?2
-            AND w.status = 'range' AND {holds}
-          GROUP BY w.id
-          ORDER BY w.stage_set_id DESC, v.id",
-        holds = holds(),
-    ))?;
-    let rows = stmt
-        .query_map(params![snapshot_id, except_stage_set_id], |r| {
-            Ok(RangeCopy {
-                stage_set_id: r.get(0)?,
-                label: r.get(1)?,
-                first: r.get(2)?,
-                last: r.get(3)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
 }
 
 #[cfg(test)]
@@ -584,8 +541,8 @@ mod tests {
                VALUES (3, 1, 2, 10, 20, 'p3', 'cccc');
              INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
                VALUES (4, 'V4', 'lto', 'p', 1000, 'sealed');
-             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, may_span)
-               VALUES (4, 1, 1, 4, 'range', 1);
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status)
+               VALUES (4, 1, 1, 4, 'range');
              INSERT INTO write_positions (write_id, stage_slice_id, position, status)
                VALUES (4, 3, '5', 'written');
              INSERT INTO write_positions (write_id, stage_slice_id, position, status)
@@ -636,8 +593,9 @@ mod tests {
         assert!(!other_copies_exist(&conn, 1, 4).unwrap());
         assert!(other_copies_exist(&conn, 1, 1).unwrap());
         // The positive control: without the range nothing live holds it.
-        conn.execute("UPDATE writes SET status = 'cut' WHERE id = 4", [])
+        conn.execute("DELETE FROM write_positions WHERE write_id = 4", [])
             .unwrap();
+        conn.execute("DELETE FROM writes WHERE id = 4", []).unwrap();
         assert!(!other_copies_exist(&conn, 1, 1).unwrap());
     }
 
@@ -675,29 +633,28 @@ mod tests {
         assert!(holders_of_set(&conn, 99).unwrap().is_empty());
     }
 
-    /// Item 143: the fill's copies are whole writes only, and the ranges it
-    /// leaves out are listed for its refusal.
+    /// Item 260, which replaces item 143: a range is a fill copy, marked as
+    /// one, for the files whose slices it holds whole.
     #[test]
-    fn a_range_is_never_a_fill_copy_and_is_listed_as_a_range() {
+    fn a_range_is_a_fill_copy_and_is_marked_as_a_range() {
         let conn = catalog();
         // Stage set 2's only holder becomes a range of it.
-        conn.execute(
-            "UPDATE writes SET status = 'range', may_span = 1 WHERE id = 3",
-            [],
-        )
-        .unwrap();
-        assert!(other_copies_of_version(&conn, 1, 1).unwrap().is_empty());
-        assert_eq!(
-            ranges_of_version(&conn, 1, 1).unwrap(),
-            vec![RangeCopy {
-                stage_set_id: 2,
-                label: "V3".into(),
-                first: 1,
-                last: 1,
-            }]
-        );
+        conn.execute("UPDATE writes SET status = 'range' WHERE id = 3", [])
+            .unwrap();
+        let copies = other_copies_of_version(&conn, 1, 1).unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].stage_set_id, 2);
+        assert_eq!(copies[0].holders.len(), 1);
+        assert_eq!(copies[0].holders[0].label, "V3");
+        assert!(copies[0].holders[0].range, "marked as a range");
+        // A whole write is not marked.
+        let whole = other_copies_of_version(&conn, 1, 2).unwrap();
+        assert!(whole[0].holders.iter().all(|h| !h.range));
         // Seen from stage set 2 itself, its own range is not "another".
-        assert!(ranges_of_version(&conn, 1, 2).unwrap().is_empty());
+        assert!(other_copies_of_version(&conn, 1, 2)
+            .unwrap()
+            .iter()
+            .all(|c| c.stage_set_id != 2));
     }
 
     /// Where a slice no live volume holds was last seen.

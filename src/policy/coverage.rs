@@ -199,16 +199,12 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 /// pass [`is_write_target`]'s status test alone while already holding a
 /// whole tape's worth of attached content — this closes that gap.
 ///
-/// `'completed'` counts, and so does `'cut'` (#420; ADR-0012 item 112): a cut
-/// write is on a sealed volume whose tape ended early, and its slices that
-/// reached the tape are on it. It is never a copy, but the volume holds bytes
-/// tapectl knows about and is no write target, whatever its status says (a
-/// rebuild or an adoption can leave a short tape's rows on an `initialized`
-/// row exactly as it leaves `completed` ones). So does `'range'` (#478;
-/// ADR-0012 item 121): the run of a spannable set's slices that the early
-/// warning ended on this tape. A range is on the tape, so a volume holding
-/// one holds known bytes and is no write target, for the same reason as a
-/// cut. `session::SealedPending::confirm` moves
+/// `'completed'` counts, and so does `'range'` (#478; ADR-0012 items 121 and
+/// 288): the run of a set's slices that the early warning ended on this
+/// tape. A range is on the tape, so a volume holding one holds known bytes
+/// and is no write target, whatever its status says (a rebuild or an
+/// adoption can leave a short tape's rows on an `initialized` row exactly as
+/// it leaves `completed` ones). `session::SealedPending::confirm` moves
 /// every `writes` row of a session to `completed` in the SAME transaction
 /// that flips `volumes.status` to `sealed`, so in NORMAL operation
 /// `completed` and `initialized` never coexist on one volume — only the
@@ -236,7 +232,7 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 pub fn has_completed_write(conn: &Connection, volume_id: i64) -> crate::error::Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM writes
-                       WHERE volume_id = ?1 AND status IN ('completed', 'cut', 'range'))",
+                       WHERE volume_id = ?1 AND status IN ('completed', 'range'))",
         params![volume_id],
         |row| row.get(0),
     )?)
@@ -580,8 +576,8 @@ impl<'a> CoverageQuery<'a> {
 //   of the set, 1 to N, is on that volume, so the row holds them all by its
 //   status), or with a `range` write whose `write_positions` row for the
 //   slice is `written` (the range is the row's written positions, item 121).
-//   A `cut` write holds nothing that counts (item 112), and no other status
-//   is a finished write on a sealed tape. A recorded warehouse deposit of a
+//   No other status is a finished write on a sealed tape (a set the tape
+//   was planned to take and did not has no row, item 288). A recorded warehouse deposit of a
 //   holder holds what its volume holds (item 127: "a deposit of a range
 //   volume counts for that range"; ADR-0006).
 // - **Item 138's credit.** Each tape, deposit and place counts for ONE stage
@@ -2620,29 +2616,48 @@ pub fn sole_slices(conn: &Connection, volume_id: i64) -> crate::error::Result<Ve
     Ok(rows)
 }
 
-/// A SQL boolean expression: stage set `stage_set_expr` has a copy on an
-/// [`eligible`] volume that was FULLY READ BACK — a `completed` write with
-/// `write_verified = 1`, which only an Integrity confirm or a passing full
-/// `volume verify` sets (ADR-0012 2026-10-06 item 24). It is the fact that
-/// lifts a pending rewrite's hold on a staged set: item 106 releases the
-/// staged slices only after the new volume has passed a full readback, and
-/// asking for the fact rather than the command that produced it makes the
-/// release independent of which command ran the readback.
+/// A SQL boolean expression: every slice of stage set `stage_set_expr` is
+/// held, in a write that was FULLY READ BACK, by an [`eligible`] volume: a
+/// `completed` write with `write_verified = 1` holds all of them, a `range`
+/// write with `write_verified = 1` the slices it has `written` (ADR-0012
+/// items 121, 127 and 288). `write_verified` is set only by an Integrity
+/// confirm or a passing full `volume verify` (ADR-0012 2026-10-06 item 24).
+/// It is the fact that lifts a pending rewrite's hold on a staged set: item
+/// 106 releases the staged slices only after the new volume has passed a
+/// full readback, and asking for the fact rather than the command that
+/// produced it makes the release independent of which command ran the
+/// readback. Slice by slice, because the early warning may end the
+/// destination inside a set (item 288): the rest of its slices are then
+/// held until an ordinary write with a full readback has taken them.
 ///
-/// Embeds `writes`/`volumes` under the aliases `hw`/`hv`; `stage_set_expr`
-/// is the caller's own column or placeholder.
+/// Embeds `writes`/`volumes`/`stage_slices` under the aliases `hw`/`hv`/`hs`
+/// and `write_positions` as `hp`; `stage_set_expr` is the caller's own
+/// column or placeholder.
 pub fn fully_read_back_copy(stage_set_expr: &str) -> String {
     format!(
-        "EXISTS (SELECT 1 FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
-                 WHERE hw.stage_set_id = {stage_set_expr} AND hw.status = 'completed'
-                   AND hw.write_verified = 1 AND {})",
-        eligible("hv")
+        "(EXISTS (SELECT 1 FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
+                  WHERE hw.stage_set_id = {stage_set_expr} AND hw.status = 'completed'
+                    AND hw.write_verified = 1 AND {eligible})
+          OR (EXISTS (SELECT 1 FROM stage_slices hs WHERE hs.stage_set_id = {stage_set_expr})
+              AND NOT EXISTS (
+                  SELECT 1 FROM stage_slices hs WHERE hs.stage_set_id = {stage_set_expr}
+                    AND NOT EXISTS (
+                        SELECT 1 FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
+                         WHERE hw.stage_set_id = hs.stage_set_id AND hw.write_verified = 1
+                           AND {eligible}
+                           AND (hw.status = 'completed'
+                                OR (hw.status = 'range'
+                                    AND EXISTS (SELECT 1 FROM write_positions hp
+                                                 WHERE hp.write_id = hw.id
+                                                   AND hp.stage_slice_id = hs.id
+                                                   AND hp.status = 'written')))))))",
+        eligible = eligible("hv")
     )
 }
 
 // ── The cross-volume index's versions and holders (ADR-0012 items 78-80) ──
 
-/// The volumes the cross-volume index (`volume-format-v2.md` §1.5) names as
+/// The volumes the cross-volume index (`volume-format-v3.md` §1.5) names as
 /// holding a version: sealed, and neither retired nor erased, **whatever
 /// their condition**. A volume has one `status`, so `sealed` alone says
 /// "sealed and unretired"; a verify-quarantined volume (`observed_condition`,
@@ -2699,10 +2714,10 @@ pub struct IndexThisTape<'a> {
 
 /// One stage set a write carries, and the run of its slices this tape's plan
 /// holds: what the `this-tape` row of the index says in `first_slice` and
-/// `last_slice` (`volume-format-v2.md` §1.5; ADR-0012 item 126). A whole set
+/// `last_slice` (`volume-format-v3.md` §1.5; ADR-0012 item 126). A whole set
 /// is the run 1 to its number of slices; a spannable set's range is the one
 /// unbroken run this tape plans (item 122), which the seal's `ended_after`
-/// may end sooner (§4.4).
+/// may end sooner (§5.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexRun {
     pub stage_set_id: i64,
@@ -2782,7 +2797,7 @@ pub fn index_versions(
     index_versions_for_runs(conn, this, &IndexRun::whole_sets(write_stage_sets))
 }
 
-/// **The** cross-volume index query (ADR-0012 item 80, `volume-format-v2.md`
+/// **The** cross-volume index query (ADR-0012 item 80, `volume-format-v3.md`
 /// §1.5): every version the index lists, with each volume that holds it.
 ///
 /// The versions are every CURRENT version with at least one `completed` or
@@ -2795,7 +2810,7 @@ pub fn index_versions(
 /// carries, with the run its plan holds (§1.5 "Ranges", 1.7.0; ADR-0012 items
 /// 121, 126 and 141). A holder of a range is listed with its run and is no
 /// copy on its own (item 127): the index never joins runs, a reader takes a
-/// slice from another tape only by its hash (§4.4 R8). A spanning version is
+/// slice from another tape only by its hash (§5.3 R8). A spanning version is
 /// current only once every slice of a stage set of it is on a sealed volume
 /// (item 128), so until then it is listed only by a write that carries it.
 /// Unsealed, retired and erased volumes hold nothing here, and a reclaimable
@@ -3486,8 +3501,8 @@ pub(crate) mod tests {
 
     /// Every slice with the same copies (one each, on two ranges): every
     /// slice is next, so a range holder at the destination's place is warned
-    /// as a whole copy is, named with its slice run. A `cut` write left
-    /// nothing on its tape and is no holder.
+    /// as a whole copy is, named with its slice run. A set the tape was
+    /// planned to take and did not has no row and is no holder.
     #[test]
     fn a_set_with_equal_copies_on_every_slice_warns_naming_the_range() {
         let c = SpanCatalog::new();
@@ -3513,9 +3528,12 @@ pub(crate) mod tests {
 
         c.conn
             .execute(
-                "UPDATE writes SET status = 'cut' WHERE id = ?1",
+                "DELETE FROM write_positions WHERE write_id = ?1",
                 params![w1],
             )
+            .unwrap();
+        c.conn
+            .execute("DELETE FROM writes WHERE id = ?1", params![w1])
             .unwrap();
         let d = copy_distinctness(&c.conn, dest, &[set]).unwrap();
         assert!(d.shared_location.is_empty(), "{d:?}");
@@ -4634,23 +4652,11 @@ pub(crate) mod tests {
             "a `completed` writes row must disqualify"
         );
 
-        // #420: a `cut` row is on a sealed tape that ended early; the volume
-        // holds bytes tapectl knows about, so it disqualifies too.
-        conn.execute(
-            "UPDATE writes SET status = 'cut' WHERE volume_id = ?1",
-            params![volume_id],
-        )
-        .unwrap();
-        assert!(
-            has_completed_write(&conn, volume_id).unwrap(),
-            "a `cut` writes row must disqualify"
-        );
-
         // #478 (ADR-0012 item 121): a `range` row is the run of a spannable
         // set's slices this tape holds. A volume holding only one holds bytes
         // tapectl knows about and is no write target.
         conn.execute(
-            "UPDATE writes SET status = 'range', may_span = 1 WHERE volume_id = ?1",
+            "UPDATE writes SET status = 'range' WHERE volume_id = ?1",
             params![volume_id],
         )
         .unwrap();
@@ -4660,12 +4666,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// #420 (ADR-0012 item 112), on the shared short-tape fixture: a `cut`
-    /// row is never a copy. The unit whole on the short tape has its copy;
-    /// the two the early end cut have none, though one of them has a slice on
-    /// the tape; a volume holding only cut writes is still no write target.
+    /// #420 (ADR-0012 items 112, 288), on the shared short-tape fixture: a
+    /// range is never a copy on its own. The unit whole on the short tape has
+    /// its copy; the one the early end interrupted has none, though a slice
+    /// of it is on the tape; the one planned and not written has no row; a
+    /// volume holding only a range is still no write target.
     #[test]
-    fn a_cut_row_is_never_a_copy() {
+    fn a_range_row_is_never_a_copy_on_its_own() {
         use crate::volume::restore::short_tape;
         let t = short_tape::short_tape();
         let copies = |unit: &str| -> i64 {
@@ -4690,10 +4697,19 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(in_service_copy_of_version(&t.conn, bravo, 1).unwrap(), None);
         let sole = sole_slices(&t.conn, t.volume_id).unwrap();
-        assert_eq!(sole.len(), 2, "alpha's two slices: {sole:?}");
-        assert!(sole.iter().all(|s| s.unit_name == "alpha"), "{sole:?}");
+        assert_eq!(
+            sole.iter().filter(|s| s.unit_name == "alpha").count(),
+            2,
+            "alpha's two slices: {sole:?}"
+        );
+        assert_eq!(
+            sole.iter().filter(|s| s.unit_name == "bravo").count(),
+            1,
+            "the range's one slice is the only copy of it: {sole:?}"
+        );
+        assert_eq!(sole.len(), 3, "{sole:?}");
 
-        let cut_only = short_tape::cut_only_tape();
+        let cut_only = short_tape::range_only_tape();
         assert!(has_completed_write(&cut_only.conn, cut_only.volume_id).unwrap());
     }
 
@@ -4986,7 +5002,7 @@ pub(crate) mod tests {
         let (conn, unit_id, here) = setup_at_stake(false);
         let set = |status: &str| {
             conn.execute(
-                "UPDATE writes SET status = ?1, may_span = 1 WHERE volume_id = ?2",
+                "UPDATE writes SET status = ?1 WHERE volume_id = ?2",
                 params![status, here],
             )
             .unwrap();
@@ -5224,7 +5240,7 @@ pub(crate) mod tests {
     /// The pin: in every shape of the copy count (a unit's current versions,
     /// one snapshot, a unit's every snapshot), `writes` is searched by
     /// `stage_set_id` and no single-column status index drives any table.
-    /// Before migration 027 the planner started from `idx_snapshots_status`
+    /// With 1.x's status indexes the planner started from `idx_snapshots_status`
     /// and `idx_writes_status`, so each current snapshot's subquery scanned
     /// every completed write in the catalog.
     #[test]
@@ -5265,10 +5281,22 @@ pub(crate) mod tests {
             );
         }
 
-        // Positive control: on the schema before 027 the same check sees the
-        // status indexes drive the current-versions count.
+        // Positive control: give the live schema back the six single-column
+        // status indexes 1.x had until #373 and the same check sees them
+        // drive the current-versions count.
+        let with_status_indexes = crate::db::open_memory().unwrap();
+        with_status_indexes
+            .execute_batch(
+                "CREATE INDEX idx_units_status ON units(status);
+                 CREATE INDEX idx_snapshots_status ON snapshots(status);
+                 CREATE INDEX idx_stage_sets_status ON stage_sets(status);
+                 CREATE INDEX idx_writes_status ON writes(status);
+                 CREATE INDEX idx_volumes_status ON volumes(status);
+                 CREATE INDEX idx_cartridges_status ON cartridges(status);",
+            )
+            .unwrap();
         let old = query_plan_on(
-            &crate::db::open_memory_at_version(26),
+            &with_status_indexes,
             &format!(
                 "SELECT u.id, {} FROM units u",
                 copy_count_expr(&CoverageQuery::current_unit("u.id"))
@@ -5276,7 +5304,7 @@ pub(crate) mod tests {
         );
         assert!(
             old.iter().any(|l| l.contains("idx_writes_status")),
-            "the check must see the pre-027 plan: {old:#?}"
+            "the check must see a status index drive the plan: {old:#?}"
         );
     }
 
@@ -5566,8 +5594,8 @@ pub(crate) mod tests {
         ) {
             self.conn
                 .execute(
-                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                     SELECT id, snapshot_id, ?2, 'range', 1 FROM stage_sets WHERE id = ?1",
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT id, snapshot_id, ?2, 'range' FROM stage_sets WHERE id = ?1",
                     params![stage_set_id, volume_id],
                 )
                 .unwrap();
@@ -5942,9 +5970,9 @@ pub(crate) mod tests {
         ) -> i64 {
             self.conn
                 .execute(
-                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
-                     SELECT id, snapshot_id, ?2, ?3, ?4 FROM stage_sets WHERE id = ?1",
-                    params![set, volume, status, i64::from(status == "range")],
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT id, snapshot_id, ?2, ?3 FROM stage_sets WHERE id = ?1",
+                    params![set, volume, status],
                 )
                 .unwrap();
             let write = self.conn.last_insert_rowid();
@@ -6617,7 +6645,7 @@ pub(crate) mod tests {
     /// §1.5 from 1.7.0 (ADR-0012 items 121, 126, 141): a `range` write is a
     /// holder, listed with the run of slices the catalog records `written`
     /// there; a whole write's run is 1..N; this tape's row carries the run
-    /// its plan holds; a `cut` write holds nothing. A spanning version that is
+    /// its plan holds. A spanning version that is
     /// not yet current is listed only by a write that carries it.
     #[test]
     fn the_index_names_each_holders_run_of_slices() {
@@ -6628,14 +6656,12 @@ pub(crate) mod tests {
         let whole = c.volume("L6-0001", "sealed", "ok", at);
         let head = c.volume("L6-0002", "sealed", "ok", at);
         let tail = c.volume("L6-0003", "sealed", "ok", at);
-        let cut = c.volume("L6-0004", "sealed", "ok", at);
         let unsealed = c.volume("L6-0006", "initialized", "ok", at);
 
         let (_, p1) = c.version(photos, 1, "current", &[10, 10, 10, 10]);
         c.write(p1, whole, "completed");
         c.range(p1, head, 1..=2);
         c.range(p1, tail, 3..=4);
-        c.write(p1, cut, "cut");
         c.range(p1, unsealed, 1..=4);
 
         // docs v1: a span in progress, staged, on one tape so far.

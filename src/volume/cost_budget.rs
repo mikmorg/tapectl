@@ -126,6 +126,7 @@ fn stage_unit(
         )
         .unwrap();
         built.push(BuildSlice {
+            continues: false,
             slice_id,
             slice_number: n,
             size_bytes: content.len() as i64,
@@ -141,9 +142,9 @@ fn stage_unit(
         unit_name: name.to_string(),
         unit_uuid: format!("uuid-{name}"),
         tenant_id,
-        dar_version: Some("2.7.20".to_string()),
-        dar_command: None,
-        catalog_path: None,
+        tar_version: None,
+        stream_bytes: 0,
+        compression: None,
         snapshot_version: 1,
         slices: built,
         span: None,
@@ -182,7 +183,27 @@ fn written() -> Written {
         stage_unit(&conn, slices_dir.path(), tenant_id, "wide", WIDE),
         stage_unit(&conn, slices_dir.path(), tenant_id, "narrow", NARROW),
     ];
+    // What every write's operator envelope carries, made as `volume write`
+    // makes it: the on-tape `catalog.db` and the cross-volume index (a
+    // rebuild refuses a tape without them).
+    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+    let extras_dir = tempfile::tempdir().unwrap();
+    let catalog_db = extras_dir.path().join("catalog.db");
+    db::ontape_catalog::write(&conn, &stage_set_ids, &catalog_db).unwrap();
+    let index = crate::volume::index::generate_files(
+        &conn,
+        &crate::policy::coverage::IndexThisTape {
+            label: LABEL,
+            uuid: VOL_UUID,
+            cartridge_serial: "",
+            generation: "LTO-6",
+        },
+        &stage_set_ids,
+        &extras_dir.path().join("index"),
+    )
+    .unwrap();
     let inputs = BuildInputs {
+        tables: None,
         label: LABEL.to_string(),
         volume_uuid: VOL_UUID.to_string(),
         media_type: "LTO-6".to_string(),
@@ -206,8 +227,8 @@ fn written() -> Written {
         }],
         operator_public_keys: vec![operator.public_key.clone()],
         escrow_public_key: None,
-        catalog_db_path: None,
-        index: None,
+        catalog_db_path: Some(catalog_db),
+        index: Some(index),
     };
     let session_dir = tempfile::tempdir().unwrap();
     let built = build::build(&inputs, session_dir.path()).unwrap();
@@ -524,7 +545,7 @@ fn budget(path: Path) -> (f64, usize) {
         // read pass; no rewind follows.
         Path::Rebuild => (1.05, 0),
         // File 0 and File 3 heads, then out to the seal marker before any
-        // data slice (§4.2 R1: a 1.6.0 tape that may end early says where
+        // data slice (§5.1 R1: a 1.6.0 tape that may end early says where
         // only at its end), one rewind, one forward pass to the seal.
         Path::Raw => (3.05, 1),
         // One envelope, before the slices.

@@ -36,7 +36,7 @@ pub struct IdThunkV2Params<'a> {
     /// chip reported it) or `"operator"` (no serial was readable when this
     /// volume was bound, so the operator named the cartridge with
     /// `volume init --cartridge <barcode>` and `cartridge_serial` carries
-    /// THAT barcode). `docs/design/volume-format-v2.md` §1.1, ADR-0012.
+    /// THAT barcode). `docs/design/volume-format-v3.md` §1.1, ADR-0012.
     ///
     /// `None` OMITS the line entirely, and that is load-bearing: absent means
     /// UNKNOWN and must never read as `"mam"`. Every tape written before this
@@ -54,7 +54,7 @@ pub struct IdThunkV2Params<'a> {
 }
 
 /// Generate the v2 ID thunk (File 0) content. Per sheet §2.3 and
-/// `docs/design/volume-format-v2.md` §1: `[volume]` carries identity
+/// `docs/design/volume-format-v3.md` §1.1: `[volume]` carries identity
 /// (unchanged in spirit from v1, plus a new `uuid` field) and `[layout]`
 /// carries ONLY `front_index = 3`, `seal_marker` (the last file), and
 /// `total_files` — the v1 `data_start`/`data_end`/`first_envelope`/
@@ -69,50 +69,31 @@ pub struct IdThunkV2Params<'a> {
 /// the real `total_files`/`seal_marker` once the layout is built (sheet
 /// §2.3 — resume must not try to preserve init's File 0).
 ///
-/// It states `requires = ["short-seal"]` ([`REQUIRES_WHOLE`]), as every
-/// 1.6.0 tape and every 1.7.0 tape that holds no slice of a spannable set
-/// does. A span tape's File 0 comes from [`generate_id_thunk_v2_requiring`].
+/// It states `requires = []` ([`REQUIRES`]), as every Layout 3 tape does
+/// (D1). [`generate_id_thunk_v2_requiring`] states a list, for a later
+/// feature's fence.
 pub fn generate_id_thunk_v2(params: &IdThunkV2Params) -> String {
-    generate_id_thunk_v2_requiring(params, REQUIRES_WHOLE)
+    generate_id_thunk_v2_requiring(params, REQUIRES)
 }
 
-/// `requires` on a tape whose plan holds no slice of a spannable set: the
-/// tape may end early (`volume-format-v2.md` §1.2; ADR-0012 item 111).
-pub const REQUIRES_WHOLE: &[&str] = &[crate::volume::format::SHORT_SEAL];
+/// `requires` on every Layout 3 tape, in File 0 and in the seal: empty (D1;
+/// ADR-0012 items 258(a), 288; `volume-format-v3.md` §1.2). The short seal
+/// and a unit that continues on another cartridge are part of Layout 3. The
+/// key stays, so that a later feature can fence an older Layout 3 reader.
+pub const REQUIRES: &[&str] = &[];
 
-/// `requires` on a tape whose plan holds a slice of a spannable set
-/// (`volume-format-v2.md` §1.2; ADR-0012 item 124): the two features, in this
-/// order.
-pub const REQUIRES_SPAN: &[&str] = &[
-    crate::volume::format::SHORT_SEAL,
-    crate::volume::format::SPANNING,
-];
-
-/// The features a tape states in File 0 and in its seal, by whether its plan
-/// holds a slice of a spannable set (ADR-0012 item 124). File 0, the seal's
-/// placeholder and the seal written at execute time must all take it from
-/// the same fact, or the real seal will not fit the placeholder.
-pub fn tape_requires(holds_a_span: bool) -> &'static [&'static str] {
-    if holds_a_span {
-        REQUIRES_SPAN
-    } else {
-        REQUIRES_WHOLE
-    }
-}
-
-/// The `requires` value as File 0 and the seal spell it (`volume-format-v2.md`
-/// §1.2, normative): each feature double-quoted, two separated by a comma and
-/// one space, no space inside the brackets. RESTORE.sh's `check_requires`
-/// splits the list at spaces, so `["short-seal","spanning"]` would read as one
-/// unknown feature.
+/// The `requires` value as File 0 and the seal spell it (`volume-format-v3.md`
+/// §1.2, normative for a later feature): each feature double-quoted, two
+/// separated by a comma and one space, no space inside the brackets.
+/// RESTORE.sh's `check_requires` splits the list at spaces, so `["a","b"]`
+/// would read as one unknown feature. An empty list is `[]`.
 fn requires_value(features: &[&str]) -> String {
     let quoted: Vec<String> = features.iter().map(|f| format!("\"{f}\"")).collect();
     format!("[{}]", quoted.join(", "))
 }
 
-/// File 0 stating `features` in `requires` (ADR-0012 item 124): `build` gives
-/// it [`tape_requires`]'s answer. Every other byte is
-/// [`generate_id_thunk_v2`]'s.
+/// File 0 stating `features` in `requires`. Every Layout 3 tape states
+/// [`REQUIRES`]; every other byte is [`generate_id_thunk_v2`]'s.
 pub fn generate_id_thunk_v2_requiring(params: &IdThunkV2Params, features: &[&str]) -> String {
     let requires = requires_value(features);
     let IdThunkV2Params {
@@ -131,15 +112,29 @@ pub fn generate_id_thunk_v2_requiring(params: &IdThunkV2Params, features: &[&str
         cartridge_identity_source,
     } = *params;
     let seal_marker = total_files - 1;
+    let q = crate::volume::format::toml_string;
     // Absent means unknown (§1.1): an unknown provenance emits NO line at
     // all, so a pre-#192 File 0 and a post-#192 one with nothing to say are
     // byte-identical. Rendered as a whole line here (rather than as a value
     // spliced into the template) precisely so `None` can contribute zero
     // bytes — a template with an empty value would still leave the key.
     let identity_source_line = match cartridge_identity_source {
-        Some(src) => format!("cartridge_identity_source = \"{src}\"\n"),
+        Some(src) => format!("cartridge_identity_source = {}\n", q(src)),
         None => String::new(),
     };
+    // Every string in the TOML half is a TOML basic string (#547,
+    // `volume-format-v3.md` §1.1): a hand-typed barcode may hold a quote or
+    // a backslash. The human header above it is not TOML and says them as
+    // they are.
+    let (t_label, t_uuid, t_version, t_media, t_now, t_manufacturer, t_serial) = (
+        q(label),
+        q(uuid),
+        q(tapectl_version),
+        q(media_type),
+        q(now),
+        q(mam_manufacturer),
+        q(mam_serial),
+    );
     format!(
         r#"================================================================
                      TAPECTL ARCHIVAL VOLUME
@@ -185,16 +180,16 @@ It is written so that an AI assistant can follow it to help you.
 ================================================================
 
 [volume]
-magic = "tapectl-volume-v2"
-label = "{label}"
-uuid = "{uuid}"
-layout_version = 2
+magic = "tapectl-volume-v3"
+label = {t_label}
+uuid = {t_uuid}
+layout_version = 3
 requires = {requires}
-tapectl_version = "{tapectl_version}"
-media_type = "{media_type}"
+tapectl_version = {t_version}
+media_type = {t_media}
 nominal_capacity_bytes = {nominal_capacity}
 mam_capacity_bytes = {mam_capacity}
-created_at = "{now}"
+created_at = {t_now}
 
 [layout]
 front_index = 3
@@ -202,8 +197,8 @@ seal_marker = {seal_marker}
 total_files = {total_files}
 
 [media]
-cartridge_manufacturer = "{mam_manufacturer}"
-cartridge_serial = "{mam_serial}"
+cartridge_manufacturer = {t_manufacturer}
+cartridge_serial = {t_serial}
 {identity_source_line}tape_length_meters = {mam_length}
 load_count_at_write = {mam_loads}
 "#
@@ -240,7 +235,9 @@ struct RestoreTool {
 const ALL_MODES: u8 = MODE_READ | MODE_ENVELOPE | MODE_LIST | MODE_PATH | MODE_RESTORE | MODE_INDEX;
 const DECRYPTING: u8 = MODE_ENVELOPE | MODE_LIST | MODE_PATH | MODE_RESTORE | MODE_INDEX;
 
-/// In the order RESTORE.sh's `Requirements:` lines have always listed them.
+/// In the order RESTORE.sh's `Requirements:` lines list them. The
+/// decompressors (`gzip`, `xz`, `zstd`) are not here: the script checks the
+/// one a unit names, and only for such a unit (File 1's "Tools Required").
 const RESTORE_TOOLS: &[RestoreTool] = &[
     RestoreTool {
         name: "dd",
@@ -253,11 +250,6 @@ const RESTORE_TOOLS: &[RestoreTool] = &[
         role: "decryption (age-encryption.org; package age on Debian 11 and later and on Ubuntu 22.04 and later, none on Debian 10, where a release from github.com/FiloSottile/age/releases does). The encrypted files are in the age v1 format, which is stable and which the `age` program and `rage` both read; any age from 1.0.0-rc.1 (March 2021) on opens them, the oldest tried. RESTORE.sh runs a program named `age`, so with only `rage` link it under that name",
     },
     RestoreTool {
-        name: "dar",
-        modes: MODE_LIST | MODE_PATH | MODE_RESTORE,
-        role: "archive extraction (package dar; dar.linux.free.fr)",
-    },
-    RestoreTool {
         name: "sha256sum",
         modes: ALL_MODES,
         role: "integrity verification (coreutils)",
@@ -268,24 +260,14 @@ const RESTORE_TOOLS: &[RestoreTool] = &[
         role: "trimming and hashing exact byte counts (coreutils)",
     },
     RestoreTool {
-        name: "truncate",
-        modes: DECRYPTING,
-        role: "trimming block padding to exact sizes (coreutils)",
-    },
-    RestoreTool {
         name: "tar",
         modes: DECRYPTING,
-        role: "unpacking your decrypted envelope (it is a tar archive; package tar)",
+        role: "unpacking your decrypted envelope, and restoring a unit: the stream a unit is stored as is a tar archive (package tar)",
     },
     RestoreTool {
-        name: "mkfifo",
-        modes: MODE_RESTORE,
-        role: "the named pipes of a restore: one carries a unit's slices to dar, joined back into a single stream, and the other hashes each slice as it passes (coreutils)",
-    },
-    RestoreTool {
-        name: "tee",
-        modes: MODE_PATH | MODE_RESTORE,
-        role: "hashing a slice as it streams, and keeping dar's output (coreutils)",
+        name: "tail",
+        modes: MODE_PATH,
+        role: "cutting one file's bytes out of a slice, for a restore of named paths and for the repair (coreutils)",
     },
 ];
 
@@ -350,8 +332,7 @@ fn guide_read_only_tools() -> String {
 }
 
 /// File 1's "Tools Required" bullets: `mt`, then every tool of
-/// [`RESTORE_TOOLS`] with its role. The file's own `gpg` and dar-version
-/// bullets follow them.
+/// [`RESTORE_TOOLS`] with its role. The file's own bullets follow them.
 fn guide_tools_required() -> String {
     let mut bullets = vec![wrap_words(
         "- `mt` (mt-st package) — tape positioning and setting the block size. \
@@ -529,10 +510,10 @@ fn guide_drive_list(drives: &[crate::media::Generation]) -> String {
 /// cannot disagree.
 fn guide_box_drives() -> String {
     use crate::crypto::escrow_kit::drives_that_read;
-    let mut rows = String::from("    Cartridge       Read by a drive of\n");
+    let mut rows = String::from("  Cartridge       Read by a drive of\n");
     for media in BOX_TABLE_MEDIA {
         rows.push_str(&format!(
-            "    {:<14}  {}\n",
+            "  {:<14}  {}\n",
             guide_generation_name(media),
             guide_drive_list(&drives_that_read(media))
         ));
@@ -680,7 +661,7 @@ fn guide_drive_basics() -> String {
 /// Rewrites v1's Quick Reference to the v2 zone order (front index at File 3,
 /// tenant envelopes from File 4, seal marker last with an embedded copy of
 /// the front index); replaces every "mini-index" reference with File 3 (the
-/// v1 mid-tape mini-index no longer exists — `volume-format-v2.md` §8); adds
+/// v1 mid-tape mini-index no longer exists); adds
 /// the accepted size-disclosure statement (§2 "Accepted disclosure") and the
 /// three-rung degradation ladder with the zero-strip procedure (sheet §3.3,
 /// §3.4).
@@ -715,8 +696,8 @@ This document describes how to recover data from this tape without
 {intro_tools}
 
 Besides those it uses `bash`, `awk` and the basic tools every Linux system
-has (`sed`, `grep`, `tr`, `cut`, `sort`, `stat`, `df`, `wc`, `tail`, `od`,
-`mktemp`), and `gpg` if your dar was built with GPG support ("Tools
+has (`sed`, `grep`, `tr`, `cut`, `sort`, `stat`, `df`, `wc`, `od`, `mktemp`),
+and, for a unit that was compressed, `gzip`, `xz` or `zstd` ("Tools
 Required" says what each is for, and names the few more that only finding
 the drive and checking a key use).
 
@@ -727,25 +708,23 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
 
 1. Check your key: "Which file is your key". A tenant's key opens that
    tenant's units only; the operator key and the escrow key open every
-   tenant's. With `age` installed (step 2), check it against the cover
-   sheet's `age1...` line (`age-keygen -y`); with only a key file, the
+   tenant's. With `age` installed (step 2), check it against the record you
+   hold of its public half (`age-keygen -y`); with only a key file, the
    check is that it opens an envelope (`--find-envelope`, step 5).
 2. Get a drive that reads this tape and a computer it connects to: "The
    tape drive" and "Loading the tape, and a drive that does not show up".
    The programs it needs, with their package names: "Tools Required".
 3. Load the tape, find the drive's device name ("Which device?") and read
-   RESTORE.sh, File 2, off the tape into a file named for the tape,
-   `RESTORE-{label}.sh`: the first commands of "Automated Recovery
-   (recommended)". Set `TAPE_DEVICE` to the same device once, so RESTORE.sh
-   reads the drive your `mt` and `dd` commands read.
-4. Run `--info` on EVERY tape you hold (this tape's script is
-   `./RESTORE-{label}.sh`; this guide writes `./RESTORE.sh` for any tape's).
-   It needs no key and shows each tape's label, when it was sealed and its
-   `Verdict:`; for anything but SEALED see "If the verdict is UNSEALED or
-   DAMAGED". Any tape's script reads the tape in the drive for `--info` and
-   `--find-envelope`, one from a tape written by 1.3.0 or later for
-   `--where`; a restore needs the script of the tape it reads.
-5. Start from the NEWEST tape (the latest "Sealed at"; File 0's
+   RESTORE.sh, File 2, off the tape into a file named `RESTORE.sh`: the first
+   commands of "Automated Recovery (recommended)". It is the same file on
+   every tape of the box, so one copy serves them all. Set `TAPE_DEVICE` to
+   the same device once, so RESTORE.sh reads the drive your `mt` and `dd`
+   commands read.
+4. Run `--info` on EVERY tape you hold. It needs no key and shows each
+   tape's label, when it was sealed and whether it is complete; for a seal
+   that is missing or not trusted see "If the seal is missing or not
+   trusted".
+5. Start from the NEWEST tape (the latest "sealed" date; File 0's
    `created_at` dates an unsealed one). `./RESTORE.sh --where --all --key
    YOUR_KEY.age.key` lists EVERY unit the archive's index names, with its
    newest version and the tapes that hold it, and `./RESTORE.sh --where
@@ -760,18 +739,18 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    newest index is out of reach: get that drive, or say what may be missing
    ("The rest of the box").
 6. Restore. From one tape with the escrow or operator key, `--all` restores
-   every unit on it ("Automated Recovery (recommended)"); check that it did
-   (item 4 of "Did the restore get everything?"). From several tapes,
-   restore each unit's NEWEST version once, from a tape that holds it, into
-   a directory of its own (`/destination/UNIT`), with that tape's own
-   RESTORE.sh, saved as `RESTORE-<label>.sh`, and never an older version
-   first ("The rest of the box" says how to do both). A renamed unit has
-   the name each tape shows. Two units of one name (compare the uuids
-   `--where --all` prints) go in different directories:
-   `/destination/UNIT-` and the first 8 characters of the uuid. A unit
-   across tapes (`--where` shows a tape holding a range of it) restores from
-   a tape that holds it whole, or from the tape that holds its slice 1,
-   which asks for the others: "A unit across tapes".
+   every unit your key opens that is on it ("Automated Recovery
+   (recommended)"); check that it did ("Did the restore get everything?").
+   From several tapes, restore each unit's NEWEST version once, from a tape
+   that holds it, into a directory of its own (`/destination/UNIT`), and
+   never an older version first ("The rest of the box" says how). A renamed
+   unit has the name each tape shows. Two units of one name (compare the
+   uuids `--where --all` prints) go in different directories:
+   `/destination/UNIT-` and the first 8 characters of the uuid, each with
+   only its own tenant's key. A unit that continues on another cartridge
+   (`--where` shows a tape holding a range of it) restores from a tape that
+   holds it whole, or starting on any tape that holds some of it, which asks
+   for the others: "A unit on more than one cartridge".
 7. Check each restore: "Did the restore get everything?". A slice or a file
    that is damaged: "If a slice or a file is damaged".
 8. Know when you are done: every tape you hold opened with your key and
@@ -779,10 +758,9 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    unit `--where --all` names on the newest readable index, and every unit
    the Heir Kit's catalogue lists on a sealed tape, restored or named as
    held only on tapes you do not have; and any tape your key cannot open
-   named, never counted as looked at. No tape names one written after it,
-   and a tape from before 1.3.0 has no index: a kit made later can name
-   such tapes ("The Heir Kit's catalogue"). "The rest of the box" has the
-   whole rule, a damaged unit's place in it, and what a box cannot show.
+   named, never counted as looked at. No tape names one written after it
+   ("The Heir Kit's catalogue"). "The rest of the box" has the whole rule,
+   a damaged unit's place in it, and what a box cannot show.
 
 No RESTORE.sh or tools: "Manual Recovery Steps" does the same job by hand.
 The tape's map is lost: "If All Else Fails". A slice damaged in the middle,
@@ -797,21 +775,10 @@ which RESTORE.sh cannot read around: "tapectl itself".
 - **ID thunk (File 0)**: the first tape file, plain text, that says which
   tape this is: its `label`, `uuid`, `media_type` (the LTO generation),
   `cartridge_serial` and `tapectl_version`, where the front index and the
-  seal marker are (`front_index`, `seal_marker`) and `requires` (below). It
-  also prints the commands that read the next file, this guide: "File 0's
-  commands" in this guide means those.
-- **`requires`**: a line in File 0 and in the seal marker that lists the
-  features a reader must understand to read the tape correctly. A tape
-  written by tapectl 1.6.0 or later states `requires = ["short-seal"]`: the
-  tape may end before the last file the front index plans, and its seal
-  marker says where ("Where the tape ended"). Older tapes state it empty
-  (`requires = []`, from 1.1.0 to 1.5.0) or have no such line, which means
-  nothing special is needed. A tape written by tapectl 1.7.0 or later that
-  holds a slice of a unit allowed to run across tapes states `requires =
-  ["short-seal", "spanning"]`: some slices of that unit may be on other
-  tapes ("A unit across tapes"). A RESTORE.sh that meets a feature it does
-  not know refuses by name and points to the RESTORE.sh stored on that tape,
-  or a newer tapectl.
+  seal marker are (`front_index`, `seal_marker`) and `requires` (a list of
+  features a reader must understand; it is empty on every tape of this
+  layout). It also prints the commands that read the next file, this guide:
+  "File 0's commands" in this guide means those.
 - **Unit**: one archived folder tree, the thing you restore by name (for
   example `photos/2019`). A unit can be stored in several versions, one
   each time it was archived again after its contents had changed. Unless
@@ -823,10 +790,9 @@ which RESTORE.sh cannot read around: "tapectl itself".
   complete it. "Every file" means the files the unit had when that version
   was made: a file deleted before then exists only in an older version, so
   restore an older version (`--version N`, into a directory of its own) only
-  if you want such files ("Files deleted before the newest version", in "The
-  rest of the box", finds them). A version is also called a snapshot:
+  if you want such files. A version is also called a snapshot:
   MANIFEST.toml states it as `snapshot_version`, RECOVERY.md as "snapshot
-  v2" and RESTORE.sh as "snapshot version". Versions are numbered 1, 2, 3 ...
+  v2" and RESTORE.sh as "version". Versions are numbered 1, 2, 3 ...
   for each unit in the order they were made, so the highest number is the
   newest. A unit is
   identified by its `uuid`: it can be renamed, and tapes from different
@@ -857,10 +823,10 @@ which RESTORE.sh cannot read around: "tapectl itself".
   that names the escrow key's public half, where the tapes are kept and
   which drives read them, and `catalog.db.age`, the Heir Kit's catalogue
   (the whole database), encrypted to the escrow key ("The Heir Kit's
-  catalogue" opens it). A kit made by tapectl 1.5.0 or later also holds a
-  copy of the tapectl program that made it, a file named `tapectl-` and its
-  version ("tapectl itself"). It records the archive as of the day it was
-  made, which may be before the newest tape was written. You may have none.
+  catalogue" opens it). The kit also holds a copy of the tapectl program
+  that made it, a file named `tapectl-` and its version ("tapectl itself").
+  It records the archive as of the day it was made, which may be before the
+  newest tape was written. You may have none.
 - **`YOUR_KEY.age.key`**: the one name this guide uses for your key file,
   an age identity file (a text file with a line that starts
   `AGE-SECRET-KEY-`). Replace it with your own file's name, whether it
@@ -872,41 +838,50 @@ which RESTORE.sh cannot read around: "tapectl itself".
   tenant's envelope only; the operator and escrow keys open all of them.
   Inside are `MANIFEST.toml` (each unit's slices and the tape file each is
   in), `RECOVERY.md` (the steps for your units, written out as commands),
-  `catalogs/` (the units' dar catalogues, below), and on a tape written by
-  tapectl 1.3.0 or later `index/` (the index, below).
-- **Slice**: a unit is archived by dar in numbered pieces called slices.
-  Each slice is encrypted on its own and stored as one tape file, and one
-  unit's slices lie together on the tape. Restoring a unit means reading
-  all of its slices, in order. A unit allowed to run across tapes (tapectl
-  1.7.0 or later) can have its slices on more than one tape: a tape then
-  holds a **range** of it, one unbroken run of its slices in order ("A unit
-  across tapes").
+  `index/` (the index, below) and, in a tenant's envelope, `tables/` (each
+  unit's file table and id map, below). The operator's envelope also holds
+  `catalog.db`, a small database that has the same tables' rows.
+- **Slice**: a unit is archived as one tar stream (an ordinary tar
+  archive of its files), cut into numbered pieces called slices. A slice
+  holds WHOLE files: it begins where a file begins. A file larger than a
+  slice is a run of slices of its own, and every slice of the run after the
+  first states `continues = true` in MANIFEST.toml. The slices joined in
+  order are the stream, byte for byte. Each slice is (compressed, if the
+  unit was, then) encrypted on its own and stored as one tape file, and one
+  unit's slices lie together on the tape. Restoring a unit means giving tar
+  its slices in order. A unit can continue on another cartridge: a tape
+  then holds a **range** of it, one unbroken run of its slices in order
+  ("A unit on more than one cartridge").
+- **File table**: for each unit a text file (`tables/NAME.tsv` in your
+  envelope; NAME is the first eight characters of the unit's uuid, `_v` and
+  the version number, `_s` and a number) with one row for each file of the
+  stream, in stream order: its kind (`f` file, `d` folder, `l` symbolic
+  link, `h` hard link, and `p`, `c`, `b` for a FIFO and the two kinds of
+  device), the slice it begins in, where it begins and ends in the stream
+  (`start`, `end`, in bytes), its size, its sha256 and its path. A restore
+  is judged by it: every restored file is hashed and compared with it. A
+  path is written as the index writes it: a backslash as `\\`, a TAB as `\t`,
+  a newline as `\n`, a carriage return as `\r`.
+- **Id map**: for each unit a text file (`tables/NAME.ids.tsv`) that says,
+  for every user and group number the unit's files carry, the name that
+  number had on the computer that wrote the tape, or none. It is shown and
+  never used: "What a restore on another computer does".
 - **Index**: two different things. The FRONT index is File 3 (the seal
   marker, the last file, carries a copy): a plain-text map of THIS tape,
   with every tape file's position, type, size and hash. The index, with no
-  "front", is the directory `index/` in an envelope of a tape written by
-  tapectl 1.3.0 or later: which units, versions and paths the archive had
-  when that tape was written, and which tapes hold them. `--where` and
-  `--find` read it ("The rest of the box").
-- **Catalogue**: this guide never uses the word bare, because it names three
+  "front", is the directory `index/` in an envelope: which units, versions
+  and paths the archive had when that tape was written, and which tapes
+  hold them. `--where` and `--find` read it ("The rest of the box").
+- **Catalogue**: this guide never uses the word bare, because it names two
   different things. The Heir Kit's catalogue is the archive's database, as
   of the day the kit was made, kept as `catalog.db.age` ("The Heir Kit's
   catalogue"); an installation's own catalogue is the live database it was
-  copied from. A dar catalogue (the next entry) is a small file that lists
-  one version of one unit. `catalogs/` is the directory of an envelope that
-  holds the dar catalogues.
-- **dar catalogue**: a small file for each version of a unit, kept in the
-  envelope under `catalogs/`. It lists every file of the unit and which
-  slice holds it, so `dar -l` can list the unit, and one file can be
-  restored, without reading the unit's slices. Its NAME in `catalogs/NAME`
-  is the first eight characters of the unit's uuid, then `_v` and the
-  version number: version 2 of a unit whose uuid starts `11111111-` is
-  `catalogs/11111111_v2.1.dar`, and dar is given the name without `.1.dar`
-  (`dar -l catalogs/11111111_v2 -N -Q`). MANIFEST.toml states each unit's
-  uuid and version. A dar catalogue's listing marks every entry `[InRef]`,
-  dar's word for "the data is in the archive this catalogue was cut from",
-  which here means the unit's slices on the tape. It does not mean the unit
-  is a difference from another version.
+  copied from.
+- **Damaged-file list**: `.tapectl-damaged-files.txt`, a file RESTORE.sh
+  writes in a unit's restored directory when it left a file out or a file
+  failed its check: one path a line, with a header line that names the unit
+  and version. It is the one repair's input ("If a slice or a file is
+  damaged").
 
 ## Which file is your key
 
@@ -919,9 +894,9 @@ not a key. After `AGE-SECRET-KEY-1` the letters B, I, O and the digit 1
 never occur, so a doubtful character on paper is one of the others. If
 you copied a secret by hand, check the copy: type the line
 alone into a file and run `age-keygen -y YOUR_KEY.age.key`; it prints the
-public `age1...` that goes with it, which must equal the one on the cover
-sheet or record you have. A character miscopied is refused with "invalid
-checksum".
+public `age1...` that goes with that one key, which must equal the one on
+the cover sheet or record you have for THAT key. A character miscopied is
+refused with "invalid checksum".
 
 If the key file was itself encrypted with a passphrase (it starts with
 `age-encryption.org/v1`, or `-----BEGIN AGE ENCRYPTED FILE-----`), age
@@ -935,8 +910,9 @@ protected file, or of any key you have only one copy of. Delete the new
 file when you are done.
 
 A key opens a tape only if the tape was written for it. If the escrow key
-opens nothing ("no identity matched any of the recipients" for every
-envelope), check it first as above; then try the operator key and every
+opens nothing (RESTORE.sh ends "no envelope on this tape ... opens with the
+key given"; `age` itself says "no identity matched any of the recipients"
+for every envelope), check it first as above; then try the operator key and every
 tenant key you hold, one after another or together (`--key` may be
 repeated); then ask whether this tape was written by another installation,
 whose escrow is a different key. The keys that opened an envelope are
@@ -976,9 +952,16 @@ and compare with the `age1...` on the cover sheet or in your record:
   the wrong installation's, and nothing on the tapes says which. Try every
   other key you hold, and write down that you could not tell.
 
+**Which key gives which route.** The escrow key and the operator key open
+every envelope and every slice; they give every route in this guide, and
+the only ones that give "tapectl itself". A tenant's key opens that
+tenant's envelope and slices only: it gives RESTORE.sh and the manual steps
+for that tenant's units, and a repair from another copy, and nothing of
+tapectl's own restore ("tapectl itself" says why).
+
 ## Quick Reference
 
-This volume uses layout v2. Tape files are laid out in this fixed order:
+This volume uses layout 3. Tape files are laid out in this fixed order:
 
 - File 0: ID thunk (this tape's identity; says the map is File 3)
 - File 1: This guide
@@ -989,8 +972,8 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
 - Then: Operator envelope, then Operator envelope backup
 - Then: a backup copy of each tenant envelope, in the same order (the
   same bytes: if your envelope will not read, read its backup)
-- Then: Data slices (age-encrypted dar archives) — one unit's slices
-  are stored contiguously
+- Then: Data slices (age-encrypted pieces of each unit's tar stream) — one
+  unit's slices are stored contiguously
 - LAST file (File {last_file} on this tape): SEAL MARKER — asserts the tape
   is complete, and carries a full embedded copy of the front index (used
   if File 3 is damaged). A tape that ended early has its seal marker
@@ -1010,49 +993,17 @@ box has its own: File 0 of that tape gives it (`total_files`, and
   `mktemp`): RESTORE.sh is a bash script, and the manual steps below
   use them. Packages: bash; mawk or gawk (either is `awk`); coreutils;
   sed; grep
-- `gpg` (package gnupg) — only if your `dar` was built with GPG support,
-  as Debian's and Ubuntu's is: such a dar refuses to start without it
-  ("INITIALIZATION FAILED FOR GPGME"). RESTORE.sh checks and says so.
-- dar 2.7.9 or later streams a restore with no disk space for slices;
-  an older one, or a unit without its dar catalogue on a dar before 2.7.21,
-  is restored by decrypting the slices to disk first (RESTORE.sh
-  chooses, and checks the space either way). A unit across tapes is the
-  exception: it is fed to dar only through pipes (only its encrypted slices
-  are ever kept on disk), so it needs dar 2.7.9 or later with the unit's
-  dar catalogue, or 2.7.21 or later, and with an older dar RESTORE.sh
-  refuses it before it reads a slice ("A unit across tapes"). Before it
-  reads a slice RESTORE.sh also checks that this computer's `head` and
-  `dar` can join a unit's slices into the one stream dar reads; when they
-  cannot, it says why, restores a unit on one tape from slices decrypted
-  to disk instead, and refuses a unit across tapes.
-  `dar --version` says which dar you have. A unit's dar catalogue is the
-  small file `catalogs/NAME` in
-  its envelope ("Words this guide uses"); "without its dar catalogue" means
-  the envelope has none for that unit, or dar refuses the one it has
-  because it was cut from another run of the same snapshot. RESTORE.sh
-  says so when that happens.
-- The oldest dar that reads a unit is the one that wrote it, or any newer
-  one: dar reads every archive format that existed when it was released
-  (its own documentation says so), and an older dar may refuse a format it
-  does not know. MANIFEST.toml records the dar that wrote each unit, in its
-  `dar_version` line (unpacked envelope: `grep '^dar_version'
-  env/MANIFEST.toml`). `--find-envelope` with a tenant's key prints the
-  whole MANIFEST.toml, but with an escrow or operator key it prints only a
-  table of units: then unpack the operator envelope by hand (steps 5 and 6
-  of "Manual Recovery Steps") and read `env/MANIFEST.toml` (the unit's uuid
-  alone is in `--where --all`). ("Compressed units", in "Disk space", has
-  the short way to one unit's `dar_command`.) If your dar is older than a unit's
-  `dar_version`, install that version or a newer one before you give the
-  unit up. 2.6 is the oldest dar tapectl writes with, not a promise that
-  every dar from 2.6 on reads every unit. Where to get a newer dar: a newer
-  release of your distribution may package one (`apt-cache policy dar` says
-  which version it offers); otherwise dar's own site, dar.linux.free.fr
-  (release notes and source tarballs), and its project at
-  sourceforge.net/projects/dar (the same releases). A source tarball builds
-  with the commands in its INSTALL and README files (for most releases
-  `./configure`, `make` and `make install`, which name the libraries it
-  needs). These addresses may move over decades: search for "dar" and its
-  author, Denis Corbin, if they are gone.
+- `truncate` (coreutils) — only the manual steps use it, to trim block
+  padding; RESTORE.sh does not
+- `gzip`, `xz` (package xz-utils) or `zstd` — only for a unit that states
+  `compression` in MANIFEST.toml, and only the one it names: the tool that
+  reads each slice after it is decrypted ("Compressed units"). RESTORE.sh
+  checks for it before it reads a slice of such a unit
+- Which `tar`: the one your system has. A GNU tar (any version) or `bsdtar`
+  restores what a tape holds; a BusyBox `tar` restores file CONTENT only and
+  says nothing about what it left out ("What a restore on another computer
+  does"). RESTORE.sh says which tar it used and what that tar does not
+  restore, at the end of every restore
 - Only for finding the drive and checking a key, never for the restore
   itself: `ls`, `lsscsi` (package lsscsi), `lspci` (pciutils), `dmesg`
   (util-linux), `lsmod` and `modprobe` (kmod), `sudo` (sudo) and `usermod`
@@ -1063,15 +1014,14 @@ box has its own: File 0 of that tape gives it (`total_files`, and
 - `sqlite3` (package sqlite3) — optional, only to read the Heir Kit's
   `catalog.db.age` ("The Heir Kit's catalogue"); no restore needs it.
 
-On Debian 11 or later and Ubuntu 22.04 or later one command installs all
-of these (`sg3-utils` is for tapectl itself, "tapectl itself"):
-
-    sudo apt install mt-st coreutils tar age dar gnupg sqlite3 lsscsi pciutils kmod sg3-utils
-
-Debian 10 has every one of those packages but `age`: install the others the
-same way and take age from a release (github.com/FiloSottile/age/releases
-has a Linux build that needs no installation). Package names are Debian's
-and Ubuntu's; other systems name the same programs their own way.
+On Debian 11 or later and Ubuntu 22.04 or later every one of these is a
+package of the same name or one named above (`apt` installs them): mt-st,
+coreutils, tar, age, gzip, xz-utils, zstd, sqlite3, lsscsi, pciutils, kmod
+and, for tapectl itself, sg3-utils ("tapectl itself"). Debian 10 has every
+one of those packages but `age`: install the others the same way and take
+age from a release (github.com/FiloSottile/age/releases has a Linux build
+that needs no installation). Package names are Debian's and Ubuntu's; other
+systems name the same programs their own way.
 
 RESTORE.sh checks for the tools each mode runs, before it reads the tape,
 and names any that is missing: `--info` and `--verify` need only {read_only}.
@@ -1093,88 +1043,41 @@ links as Linux does), so restore to a Linux disk, and copy the result to
 another filesystem afterwards if you must.
 
 **How much room, in one place:** the sum of the sizes of the units you
-restore, as `--find-envelope` and `--where` print them (each unit's slices
-as stored on tape); three times that, and more for mostly text, when you
-cannot tell that a unit was stored uncompressed ("Compressed units",
-below), and watch `df` while it runs; and, for the ways of restoring that
-keep its slices on disk as well (below), one more unit's size, for the
-slices of the unit being restored. The rest of this section says why.
+restore, as `--find-envelope` and `--list` print them ("bytes of stream":
+the size of the unit's files as stored, with a little tar framing; this is
+the size the restored files take, whether or not the unit was compressed);
+and, for the slice RESTORE.sh is working on, twice the largest slice of the
+unit, in its work directory. Doing it by hand ("Manual Recovery Steps") is
+the same, more: the decrypted slices (the unit's stream size) rest on the
+disk beside the restored files (the unit's size again); delete a unit's
+slices once it is restored.
 
 {capacity}
 
-RESTORE.sh streams each slice from the tape through `age` into `dar`, so
-`--to` needs room for about the size of the units you restore: one
-unit's size for one unit, the sum of them with `--all` (each unit's
-slices as stored on tape; a unit that was archived compressed restores
-larger: "Compressed units", below). `--find-envelope` lists each unit with
-its size, and so does `--where`. Nothing else is large: the decrypted
-envelopes (the operator envelope's `catalog.db` and the dar catalogues,
-which grow with the number of files) go to a work directory under
-`$TMPDIR` (default `/tmp`; set `TMPDIR` to move it). `/tmp` is a small RAM
-disk on many systems (`df -h /tmp` says), and no data slice ever goes
-there, but a unit of millions of files has a large dar catalogue: if `/tmp`
-is small, set `TMPDIR` to a directory on a real disk with some GiB free
-(`TMPDIR=/big/disk/tmp ./RESTORE.sh ...`).
-
-Some ways of restoring keep the slices on disk as well, in a scratch
-directory inside `--to` unless `--scratch DIR` names another disk, and
-then need more room, for a unit's slices beside its restored files: the older-dar fallback above (all of the unit's
-slices), `--path` (only the few slices that hold the path), and asking
-for a replacement slice (`--slices-from`, `--swap-tapes`: "If a slice or
-a file is damaged"); and a unit across tapes, by default: all of its
-slices, still encrypted, about the unit's size again beside its restored
-files (the sum of its slices' `encrypted_bytes`; `--stream-tapes` keeps
-none on disk: "A unit across tapes"). Doing it by hand ("Manual Recovery
-Steps") is the
-same: the decrypted slices (the unit's size) beside the restored files
-(the unit's size, more if it was stored compressed); delete a unit's slices
-once it is restored. The script checks the
-space before it reads any slice.
+RESTORE.sh reads one slice at a time from the tape, checks it, decrypts it
+(and decompresses it) into a work directory and gives it to tar, so `--to`
+needs room for about the units you restore and one slice's worth more: one
+unit's size for one unit, the sum of them with `--all`. The work directory
+is a directory named `.tapectl-work.` and some letters INSIDE `--to` (for a
+restore), or under `$TMPDIR` (default `/tmp`; set `TMPDIR` to move it) for
+the modes that only read; `--work DIR` puts it on another disk. It holds the
+decrypted envelopes, the file tables among them: a unit of millions of
+files has a table of hundreds of MiB. `/tmp` is a small RAM disk on many
+systems (`df -h /tmp` says); if `/tmp` is small, set `TMPDIR` to a directory
+on a real disk with some GiB free (`TMPDIR=/big/disk/tmp ./RESTORE.sh ...`).
+RESTORE.sh checks the space before it reads a slice and names a full disk
+when it happens ("Nothing on the tape is wrong"); `--no-space-check` skips
+the check, and `--overwrite` finishes a restore once you have made room.
 
 For a whole box, the destination needs the sum of the sizes of the units
 you restore, whichever tapes they come from; the extra room for slices is
 needed for one unit at a time.
 
-**Compressed units.** A unit restores to more than its slices' size if it
-was stored compressed, by an amount that depends on the files (text
-compresses a lot, photos and video hardly at all). MANIFEST.toml records
-the dar command of each unit, in its `dar_command` line (unpacked
-envelope: `grep '^dar_command' env/MANIFEST.toml`; with an escrow or
-operator key `--find-envelope` prints only a table of units, so unpack the
-operator envelope by hand, as under "Tools Required"). An argument that
-starts `-z`, as in `\"-zgzip\"` or `\"-zzstd\"`, means the unit was
-compressed, and none means it was not. The dar catalogue cannot tell you: `dar -l`
-of the dar catalogue in the envelope shows `-----` in its compression
-column either way.
-
-The short way to the `dar_command` lines, with an escrow or operator key
-and no unpacking of the whole envelope. `--find-envelope` prints "Decrypted
-envelope at file N (tenant: operator)" for the operator envelope, the one
-that lists every unit; call that N POSITION below. Read File 3 into
-`front_index.toml` (step 3 of "Manual Recovery Steps") and run
-`grep -A3 '^position = POSITION$' front_index.toml`: the entry it prints has
-the `size_bytes` that is SIZE below. Then, with the block size set as in "Manual
-Recovery Steps":
-
-    mt -f /dev/nst0 rewind
-    mt -f /dev/nst0 fsf POSITION
-    dd if=/dev/nst0 bs=512k of=envelope.raw
-    truncate -s SIZE envelope.raw
-    age -d -i YOUR_KEY.age.key envelope.raw | tar -xOf - MANIFEST.toml | grep -E '^(name|snapshot_version|dar_command) ='
-
-It prints each unit's name and version with its `dar_command`. Without the
-last `grep` it prints the whole MANIFEST.toml: every unit with its uuid,
-its slices and their tape files, which is what the other places in this
-guide that unpack the operator envelope by hand read. If the envelope will
-not read, use its backup (step 5 of "Manual Recovery Steps").
-
-"Three times" is a rule of thumb for mixed files, not a ceiling: text,
-source code, logs and database dumps compress ten times or more, so a
-compressed unit of mostly such files can need far more than three times its
-slices' size, and nothing on the tape says how much more. With no
-`dar_command` line, or a compressed unit, restore to a disk you can add room
-to and watch `df`. RESTORE.sh names a full disk when it happens, and
-`--overwrite` finishes the restore once you have made room.
+**Compressed units.** A unit that was stored compressed says so
+("Compressed units"), and its slices on the tape are smaller than its
+files. The restored size is the unit's "bytes of stream", which
+`--find-envelope` and `--list` print, so there is nothing to guess: that is
+the room to have.
 
 ## Which device?
 
@@ -1190,14 +1093,13 @@ points at a `/dev/nstN`), not the entry without it (a `/dev/stN`). A
 rewinding device rewinds the tape each time a command finishes, so every
 `mt fsf` is undone and every read starts again at File 0, which looks
 like a damaged tape and is not. The by-id name is the steadiest to use,
-because it does not change when the numbering does:
-
-    /dev/tape/by-id/scsi-XXXXXXXX-nst      (an example: use your own)
+because it does not change when the numbering does: it looks like
+`/dev/tape/by-id/scsi-XXXXXXXX-nst` (an example: use your own).
 
 A wrong device does not always fail loudly: if another tape is loaded in
 it, the commands below will succeed and recover the WRONG volume. File 0
-names the volume this tape carries; RESTORE.sh checks that for you and
-warns.
+names the volume this tape carries, and `./RESTORE.sh --info` prints it
+("Tape: ..."): compare it with the label you meant.
 
 `mt` and `dd` take the device in their own words (`mt -f DEVICE`,
 `dd if=DEVICE`). RESTORE.sh reads it from the environment variable
@@ -1227,15 +1129,12 @@ read `/dev/nst0`, which may be another drive or another tape.
 
     mt -f /dev/nst0 setblk 524288
     mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 2
-    dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE-{label}.sh
-    chmod +x RESTORE-{label}.sh
+    dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE.sh
+    chmod +x RESTORE.sh
 
-The script is saved under this tape's own name, `RESTORE-{label}.sh`, because
-a box has several tapes and each has its own RESTORE.sh: scripts saved under
-one name overwrite each other. Everywhere else this guide writes
-`./RESTORE.sh`, it means the script of the tape that is in the drive: for
-this tape, `./RESTORE-{label}.sh`; for another tape, the file you saved from
-it.
+File 2 is the same file on every tape, so the one copy reads any tape of
+the box. (A tapectl volume of another layout has another File 2 and says
+so: read it with the RESTORE.sh in its own File 2.)
 
 The first line sets the drive to the tape's 512 KiB blocks. Repeating it
 is harmless, and it is not needed if you have just run File 0's commands
@@ -1261,14 +1160,18 @@ works: a full LTO-6 tape reads in about four and a half hours (2.5 TB at
 about 160 MB/s), a full LTO-8 in about nine. `--verify` and `--all` read
 the whole tape; a restore of one unit reads only that unit's slices.
 
+Which tape is in the drive: File 0 says, and so does the first line of
+`./RESTORE.sh --info` ("Tape: LABEL"). By hand:
+
+    mt -f /dev/nst0 rewind
+    dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(label|uuid|media_type|cartridge_serial|created_at|tapectl_version) ='
+
 Then, with `YOUR_KEY.age.key` your own key file:
 
-    # See what's on the tape and its seal verdict
-    # (SEALED / UNSEALED / DAMAGED (ends disagree)); the section
-    # "If the verdict is UNSEALED or DAMAGED" says what to do
+    # See what is on the tape and whether its seal is there ("Seal marker:")
     ./RESTORE.sh --info
 
-    # Keyless integrity check of every file against the front index —
+    # Keyless integrity check of every file against the front index:
     # no key needed, works even without your envelope
     ./RESTORE.sh --verify
 
@@ -1276,67 +1179,193 @@ Then, with `YOUR_KEY.age.key` your own key file:
     # every envelope, and the units of each are listed)
     ./RESTORE.sh --find-envelope --key YOUR_KEY.age.key
 
-    # List a unit's files, from the dar catalogue in the envelope
-    # (no data slice is read)
+    # List a unit's files, from its file table (no data slice is read)
     ./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT
 
     # Which other tapes hold a unit, or a file ("The rest of the box"),
     # and every unit the index names, with no limit
     ./RESTORE.sh --where UNIT --key YOUR_KEY.age.key
-    ./RESTORE.sh --find some/file --key YOUR_KEY.age.key
+    ./RESTORE.sh --find TEXT --key YOUR_KEY.age.key
     ./RESTORE.sh --where --all --key YOUR_KEY.age.key
 
     # Full restore of THIS tape to an EMPTY directory: --all restores
-    # every unit of one envelope (below), each into /destination/UNIT (a
-    # lone unit goes straight into /destination). Each
-    # slice streams from the tape through age into dar, so /destination
-    # needs about those units' size free; the script checks first.
-    # --overwrite finishes a restore that stopped part way, never one over
-    # an older version. With other tapes in the box, read "The rest of the
-    # box" before this: a second --all into the same /destination is refused.
+    # the newest version of every unit your key opens, each into
+    # /destination/UNIT (a lone unit goes straight into /destination).
+    # Each slice is read from the tape, checked, decrypted and given to
+    # tar, so /destination needs about those units' size free; the script
+    # checks first. A restore that stopped part way is finished by
+    # running it again with --overwrite, never over an older version.
     ./RESTORE.sh --restore --key YOUR_KEY.age.key --all --to /destination
+
+    # One unit, into a directory of its own (name it for the unit: two
+    # units must never share a directory)
+    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to /destination/UNIT
 
     # Just one file or folder: reads only the slices that hold it, into the
     # unit's own directory, where a whole-unit restore would put it
     ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT \
-        --path some/file --to /destination/UNIT
+        --path SOME_PATH --to /destination/UNIT
 
-With the ESCROW key or the OPERATOR key, which opens every tenant's
-envelope (`YOUR_KEY.age.key` is then that key's file), list what the tape
-holds first, then restore all of it:
+With the ESCROW key or the OPERATOR key (`YOUR_KEY.age.key` is then that
+key's file), `--find-envelope` and `--list` show what the tape holds, and
+`--all` restores all of it. A single TENANT's key opens only that tenant's
+envelope: it restores that tenant's units and nobody else's.
 
-    ./RESTORE.sh --list --key YOUR_KEY.age.key
-    ./RESTORE.sh --restore --key YOUR_KEY.age.key --all --to /destination
+`--all` restores the newest version of every unit that your key opens, on
+this tape, each into its own directory `/destination/UNIT` (a single unit
+goes straight into `/destination`). With several keys (`--key` repeated) it
+is every unit any of them opens. Two units of one NAME (two tenants may
+name theirs alike) are one name to RESTORE.sh, and it takes the one with the
+higher version: restore each with only its own tenant's key
+(`--key YOUR_KEY.age.key`, that tenant's file), into a directory of its own. Without `--all` or
+`--unit`, `--restore` takes the units your key opens and, if there is one
+unit, restores only it; if there are SEVERAL it will not guess: it prints
+them and stops before it reads a slice, and you name one with `--unit UNIT`
+(repeat `--unit` for several, each into `/destination/UNIT`) or restore
+them all with `--all`. `--restore` takes `--version N` for another version
+than the newest.
 
---all restores every unit of the envelope that lists the most units among
-those your key opens, each in /destination/UNIT (a single unit goes
-straight into /destination): with the escrow or operator key that is the
-operator envelope, which lists every unit on the tape; with a tenant's key
-it is that tenant's envelope. It is always ONE envelope, never the union of
-several. With several keys (`--key` repeated) it is the biggest envelope any
-of them opens, and the first on the tape if two tie: the escrow or operator
-key, alone or with others, therefore restores every unit on the tape, but
-two tenants' keys together restore only the tenant with more units. Restore
-the other tenant in a run of its own, with that tenant's key, into another
-empty directory. Without --all or
---unit, --restore takes the first envelope your key opens and, if that
-lists one unit, restores only that unit (it tells you what else the key
-opened). If that envelope lists SEVERAL units it will not guess: it
-prints them and stops before it reads a slice, and you name one with
-`--unit UNIT` (repeat `--unit` for several, each into /destination/UNIT)
-or restore them all with `--all`. A
-single TENANT's key opens only that tenant's envelope: it restores that
-tenant's units and nobody else's.
-
-If the operator envelope and its backup will not read, the biggest envelope
-that does read may be a tenant's, and --all then restores only that
-tenant's units, with the DAMAGED warnings the script printed as the only
-sign. The script names the file it used ("Decrypted envelope at file N"). Item 4
-of "Did the restore get everything?" is the check, and what to do when
-it fails.
+If the operator envelope and its backup will not read, the envelopes that
+do read may be only some tenants', and `--all` then restores only their
+units, with the warnings the script printed as the only sign. The script
+names each envelope it opened ("The key opens the envelope at file N"). The
+check in "Did the restore get everything?" says how to tell.
 
 The script reads the tape forward from one rewind, and says what it
-needs if it meets a tape newer than itself (`requires` in File 0).
+needs if it meets a tape written by another layout or a newer tapectl
+(`requires` in File 0).
+
+Quitting a restore (Ctrl-C, a closed terminal, `kill`) ends it cleanly: no
+work directory and no partial file is left behind, and the files restored
+and checked so far stay.
+## A unit on more than one cartridge
+
+Every unit may continue on the next cartridge: a tape that reaches the
+drive's early-warning mark finishes the slice it is writing, is sealed, and
+the rest of the unit is written first on the next tape ("Where the tape
+ended"). Nothing is split inside a slice, and a unit that fits on one tape
+is on one tape. A tape that holds only some of a unit's slices holds a
+RANGE of it: one unbroken run of its slices, in slice order. A range is not
+damage, and it is not a copy of the unit on its own.
+
+What one tape shows. Its envelope's MANIFEST.toml lists EVERY slice of the
+unit, 1 to N, each with its `encrypted_bytes` and its `sha256_encrypted`,
+and gives a `tape_position` only to the slices this tape's plan holds. A
+slice with no `tape_position` is on another tape: it is never at tape file
+0. The seal marker's `ended_after` can end the run sooner, as it ends any
+tape ("Where the tape ended"), and a slice after it is on another tape
+too. `--info` and `--verify` need no key and see the range as data slices
+like any other. `--find-envelope` marks such a unit `PART:` and `--list`
+says which slices of the unit this tape holds. `--where` and `--find` print
+the run of slices each tape holds when it is not the whole version, marked
+"a range".
+
+What a tape read alone gives. Because a slice holds whole files, a range
+read alone restores every file whose slices are all on it: those files are
+restored and checked, and the files that lie across the cartridge boundary
+or in slices on another tape are listed in the damaged-file list, with the
+tapes the index names for them. A hard-linked name whose first name is on
+another tape is listed for the repair. So a restore may START ON ANY TAPE of
+a unit that your key opens: the first command below, with the cartridge you
+have in the drive.
+
+Prefer a whole copy: if any tape holds the version whole (`--where` prints
+no "a range" beside it), restore from that tape alone, as any unit, with no
+change of cartridge.
+
+To read a unit across its cartridges, with the tape that holds its first
+slice in the drive (a tape never names a tape written after it, so
+`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` on the NEWEST tape
+names the tapes and the slices each holds; write them down before you
+start, so that you can find each cartridge when it is asked for):
+
+    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to /destination/UNIT
+
+When the tape in the drive does not hold the next slice, RESTORE.sh says
+which slice it needs, names the tapes the index in your envelope gives for
+it, tells you to eject the cartridge now in the drive (its eject button, or
+`mt -f /dev/nst0 offline` from another terminal: nothing holds the device
+open while it waits), and asks for the next cartridge at a prompt. It waits
+for as long as you take, and reads your answer from its input, one line:
+
+- ENTER (an empty line), after you have loaded the cartridge that holds the
+  slice and waited for the drive to be ready: it reads that cartridge. It
+  takes a cartridge only when that tape's front index lists the next
+  slice's `sha256_encrypted`, at a position its own seal marker covers; a
+  label or an index never stands in for the hash. A blank, unreadable or
+  foreign cartridge, or the one already in the drive, is named and the
+  prompt asks again.
+- `done` and ENTER, or the end of the input (Ctrl-D): "I do not have it".
+  The restore goes on with what it has: the files whose slices it read are
+  restored and checked, and the files that lie in slices it could not read
+  are written to the damaged-file list with the cartridges an index names
+  for them. It does not ask again for that unit.
+- `quit` and ENTER: stop. The files restored and checked so far stay, a
+  file tar had begun is removed, and what was left out is on the
+  damaged-file list. RESTORE.sh ends `RESTORE STOPPED`.
+
+The restore across cartridges is one tar run: nothing is kept on disk between
+cartridges but the one slice being read. Ctrl-C, a closed terminal or a lost
+connection to the computer, and `kill` end it too, and leave no work
+directory behind: a restore across tapes can take hours of cartridge
+changes, so run it inside `screen` or `tmux`.
+
+A LATER RUN into the same destination, from another tape of the same unit,
+adds to the earlier run. Give the same command with the next tape in the
+drive and the same `--to`: where `--to` holds the damaged-file list of the
+same unit and version, RESTORE.sh restores only the files that tape holds
+whole and that do not already pass their sha256 in the unit's file table.
+A file that passes is never written again, and the list is rewritten with
+what is still missing, or removed. Two limits, both measured: a folder's
+modification time is the one it got in the last run that touched it, and a
+hard-linked name whose first name was not read in the same run is not made
+by that run (the repair, "If a slice or a file is damaged", makes it once
+the tape that holds the first name has been read). One run across the
+cartridges is the way to read a unit whole.
+
+By hand, across tapes: read each tape's slices of the unit into one
+directory, each taken from the tape whose front index lists its
+`sha256_encrypted` ("Manual Recovery Steps", step 7, for each tape), and
+join them in order before tar sees them.
+
+## What a restore on another computer does
+
+A tape stores the owner and group of every file by NUMBER only: no user or
+group name is in the tar stream, and no name is on the tape in the clear.
+So a restore never looks a name up, and never maps one. What that means
+where the tape is restored:
+
+- Run as an ordinary user, tar restores every file as yours (owner and
+  group are set only by root). Run as root, tar sets each file's owner and
+  group to the numbers the tape records. On another computer those numbers
+  are other accounts, or none: a file then belongs to whoever has that
+  number there. Nothing is remapped. If the files should belong to someone
+  else, change that after the restore (`chown`), once you know who the
+  numbers were.
+- An ACL entry (a permission granted to one more user or group than the
+  file's own) is stored by number the same way, and tar restores it by
+  number, as `--acls` does: the entry follows the number, and on another
+  computer it names whoever has that number, or nobody. An ACL, or an
+  extended attribute, that the destination file system will not take is
+  reported by tar and not restored; BusyBox's tar restores neither the
+  owner, the ACL nor any extended attribute, and does not say so.
+- The ID MAP says who the numbers were: for each unit, the names the
+  computer that wrote the tape gave each user and group number its files
+  carry (or none). RESTORE.sh prints it after each unit it restores,
+  headed "Who the ids were", and it is the file `tables/NAME.ids.tsv` in
+  your envelope. It is information: a restore shows it and never acts on it.
+- A tar restores a file's contents, its times and its permission bits as
+  an ordinary user, whatever the tar; which tar restores what else:
+
+  GNU tar, any version: content, permission bits, times (a folder's too
+  when the unit is read in one run), owner and group by number as root,
+  extended attributes and ACLs. `bsdtar` the same. BusyBox `tar`: content
+  only.
+
+The extra things a restore may lose are named at its end: "The tar used"
+and "What it does not restore". A restore is judged by the per-file check
+against the file table (the sha256 of every file), never by tar's exit
+status, which is 0 for a BusyBox tar that left files out.
 
 ## The rest of the box: other tapes, copies and the index
 
@@ -1346,32 +1375,28 @@ cartridge, so that one can be lost), or hold OTHER units, or hold other
 VERSIONS of a unit this tape holds: a unit's older versions need not be
 on the same tape as its newest one.
 
-A tape written by tapectl 1.3.0 or later carries an index inside its
-envelopes that answers this: the directory `index/`, whose file
-`units.tsv` is a table with a row for each version of each unit and each
-tape that holds it. For each unit it lists every version and the tapes that
-hold it (label, uuid, cartridge serial, generation, state and when it
-sealed), and a tenant's envelope also has `paths.tsv`, which lists every
-file path. RESTORE.sh reads it:
-
-    # EVERY unit the index names (no limit): its newest version, whether
-    # the tape in the drive holds it, and every tape that holds each version
-    ./RESTORE.sh --where --all --key YOUR_KEY.age.key
-
-    # every version of UNIT, and every tape that holds each
-    ./RESTORE.sh --where UNIT --key YOUR_KEY.age.key
-
-    # which unit, version and tape hold a path containing some text
-    ./RESTORE.sh --find report --key YOUR_KEY.age.key
+Every tape carries an index inside its envelopes that answers this: the
+directory `index/`, whose file `units.tsv` is a table with a row for each
+version of each unit and each tape that holds it. For each unit it lists
+every version and the tapes that hold it (label, uuid, cartridge serial,
+generation, state and when it sealed), and a tenant's envelope also has
+`paths.tsv`, which lists every file path. RESTORE.sh reads it:
+`./RESTORE.sh --where --all --key YOUR_KEY.age.key` lists EVERY unit the
+index names (no limit): its newest version, whether the tape in the drive
+holds it, and every tape that holds each version;
+`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` prints every version of
+UNIT and every tape that holds each; `./RESTORE.sh --find TEXT --key
+YOUR_KEY.age.key` prints which unit, version and tape hold a path
+containing some text (the commands of "Automated Recovery
+(recommended)").
 
 An index is as of the moment its own tape was written. It never names a
 tape written after it, and a tape it names may since have been retired or
 erased. So the NEWEST tape's index is the most complete: start with the
-newest tape you have (`./RESTORE.sh --info` prints "Sealed at"), and
-expect an older tape to know less. A tape written before 1.3.0 has no
-index and says so. The index is plain text in the envelope (`index/` in
-the unpacked envelope; RECOVERY.md shows how to read it with `awk`), so it
-needs no tapectl either.
+newest tape you have (`./RESTORE.sh --info` prints when it was sealed), and
+expect an older tape to know less. The index is plain text in the envelope
+(`index/` in the unpacked envelope; RECOVERY.md shows how to read it with
+`awk`), so it needs no tapectl either.
 
 **Is the box complete?** Nothing on a tape can name tapes written after
 it, so the newest tape you hold may not be the newest ever written, and no
@@ -1400,16 +1425,15 @@ your newest tape was written may name tapes this box lacks.
 The whole box, in short:
 
 1. Name every cartridge. Load each in turn and run `./RESTORE.sh --info`
-   (any copy of RESTORE.sh will do for this: see "The modes that only read
-   the tape", after this list):
-   its label is "Tape identifies as" (File 0's label is the authority; a
-   sticker on the case can have been replaced) and its sealed date is
-   "Sealed at" (`unknown (tape not sealed)` there means the tape is
-   unsealed: File 0's `created_at`, from the `grep` below, says when it
-   was written). The generation is printed on the cartridge (L6 is LTO-6)
-   and stated in File 0 as `media_type`; tapes of different generations
-   need different drives ("The tape drive" has a table, so that you can
-   choose one drive for the box).
+   (any copy of RESTORE.sh will do: it is the same file on every tape):
+   its label is "Tape:" (File 0's label is the authority; a sticker on
+   the case can have been replaced) and its sealed date is on the "Seal
+   marker:" line (a tape with "NOT FOUND" there is unsealed: File 0's
+   `created_at`, which the `grep` in "Automated Recovery (recommended)"
+   prints, says when it was written). The generation is printed on the
+   cartridge (L6 is LTO-6) and stated in File 0 as `media_type`; tapes of
+   different generations need different drives ("The tape drive" has a
+   table, so that you can choose one drive for the box).
 2. Start from the newest tape. `./RESTORE.sh --where --all --key
    YOUR_KEY.age.key` lists every unit its index names, each with its newest
    version and the tapes that hold it; `./RESTORE.sh --find-envelope --key
@@ -1424,11 +1448,11 @@ The whole box, in short:
    each unit into a directory of its own so that tapes never overwrite one
    another: `./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT
    --to /destination/UNIT`. `--to` must be empty or new (a directory that
-   is not empty is refused), which is why each unit has its own directory
-   under /destination and not /destination itself. A tape that holds the
-   newest version needs no `--version`: a restore takes the newest version
-   on the tape. Use THAT tape's own RESTORE.sh, File 2 of the tape in the
-   drive, which reads that tape's format.
+   is not empty is refused, unless it holds the damaged-file list of this
+   unit: "A unit on more than one cartridge"), which is why each unit has
+   its own directory under /destination and not /destination itself. A tape
+   that holds the newest version needs no `--version`: a restore takes the
+   newest version on the tape.
 4. Do not restore an older version first and then a newer one into the
    same directory: it is refused as not empty, and `--overwrite` would keep
    the files that only the older version had. If a directory already holds
@@ -1442,124 +1466,77 @@ The whole box, in short:
    cannot be restored from this box.
 6. You are done only when ALL of these hold; fewer is not done:
    - Every tape in the box has had its envelopes opened with your key
-     (`./RESTORE.sh --find-envelope --key YOUR_KEY.age.key`), and the newest
-     version of every unit any of them lists is restored: the highest
-     version number among the versions with that unit's `uuid`.
+   (`./RESTORE.sh --find-envelope --key YOUR_KEY.age.key`), and the newest
+   version of every unit any of them lists is restored: the highest
+   version number among the versions with that unit's `uuid`.
    - Every unit the newest readable index names (`--where --all`) is
-     restored at its newest version, or you have written down that it is
-     held only on tapes you do not have.
+   restored at its newest version, or you have written down that it is
+   held only on tapes you do not have.
    - With a Heir Kit: every unit the Heir Kit's catalogue lists on a tape
-     whose status is `sealed` ("Which tapes hold which units", in "The
-     Heir Kit's catalogue") is restored at the newest version the kit
-     names, or you have written down that it is held only on tapes you do
-     not have. A kit made after your newest tape is the one thing you hold
-     that can name a tape written after it, so the two checks above do not
-     cover this one.
+   whose status is `sealed` ("Which tapes hold which units", in "The
+   Heir Kit's catalogue") is restored at the newest version the kit
+   names, or you have written down that it is held only on tapes you do
+   not have. A kit made after your newest tape is the one thing you hold
+   that can name a tape written after it, so the two checks above do not
+   cover this one.
    - A unit whose every copy in the box is damaged counts once it is
-     restored as far as its copies allow ("If a slice or a file is
-     damaged": RESTORE.sh, then tapectl's own restore, which saves more of
-     a damaged slice), its `.tapectl-damaged-files.txt` is kept beside it,
-     and you have written down that the files on that list are lost. An
-     older version, restored into a directory of its own, may hold older
-     copies of them.
+   restored as far as its copies allow ("If a slice or a file is
+   damaged": RESTORE.sh's one repair, then tapectl's own restore if your
+   key allows it), its `.tapectl-damaged-files.txt` is kept beside it,
+   and you have written down that the files on that list are lost. An
+   older version, restored into a directory of its own, may hold older
+   copies of them.
    - A tape your key cannot open is NOT done. `./RESTORE.sh` ends with "no
-     envelope matched the key provided" (or "any of the N keys provided"), and
-     `--info`, which needs no key, shows only the tape's label, dates and
-     map, never what it holds. Do not count that tape as looked at: name it
-     (a tape of another installation, or a key you do not have) and try
-     every other key you hold on it. If none opens it, the box is not done,
-     and you say so, by that tape's name.
-   - A tape written before 1.3.0 has no index. It counts by its own
-     envelopes alone, and nothing on it names a tape or a unit but its own.
-   - An unsealed tape (no "Sealed at") is ordered by File 0's `created_at`.
-     If the newest tape in the box will not read, the older tapes' indexes
-     cannot see what was written after them: say that some units may be
-     unknown.
+   envelope on this tape ... opens with the key given", and `--info`,
+   which needs no key, shows only the tape's label, dates and map, never
+   what it holds. Do not count that tape as looked at: name it (a tape of
+   another installation, or a key you do not have) and try every other
+   key you hold on it. If none opens it, the box is not done, and you say
+   so, by that tape's name.
+   - An unsealed tape (no seal marker) is ordered by File 0's
+   `created_at`. If the newest tape in the box will not read, the older
+   tapes' indexes cannot see what was written after them: say that some
+   units may be unknown.
    That is the most a box can show about itself: "Is the box complete?"
    above says what it cannot.
 
    The newest version of a unit holds the files that version had. A file
-   deleted before it was made exists only in an older version, so restore an
-   older version (`--version N`, into a directory of its own) only if you
-   want such files.
-
-**Files deleted before the newest version.** Nothing says which files exist
-only in an older version, but you can see: list the paths of two versions
-and print those the older one has and the newer one lacks. `--list` takes
-`--version`, and needs both versions on the tape in the drive and their dar
-catalogues in its envelope (a version without one prints "no dar
-catalogue"). If the two versions are on different tapes (`--where UNIT`
-says which), run each `--list` with its own tape loaded. With versions 3
-(the newest) and 2 of UNIT, the last command prints the paths of version 2
-that version 3 does not have:
-
-    ./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT --version 3 | grep -E '^\[.{{5}}\]\[.\] ' | awk -F'\t' '{{ print $NF }}' > newer.paths
-    ./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT --version 2 | grep -E '^\[.{{5}}\]\[.\] ' | awk -F'\t' '{{ print $NF }}' > older.paths
-    awk 'NR == FNR {{ seen[$0]; next }} !($0 in seen)' newer.paths older.paths
-
-Each entry line of dar's listing ends with the path, after its last TAB (a
-path with a TAB in it is cut at the TAB). Nothing printed means version 3
-has every path version 2 had. To restore one that is printed, from version
-2, into a directory of its own:
-
-    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --version 2 \
-        --path PATH --to /destination/UNIT-v2
+   deleted before it was made exists only in an older version: `--list
+   --version N` of two versions prints each one's files, and a file only the
+   older one lists is the file to restore from it (`--version N`, into a
+   directory of its own, with `--path`).
 
 **A renamed unit.** A unit is the same unit by its `uuid`, but every
 command takes its NAME, and a tape's envelope knows a unit by the name it
 had when THAT tape was written. If the unit was renamed after an older tape
 was written, the newest index lists it under the new name (with the older
 tape as a holder of an earlier version), and the older tape's envelope still
-says the old name. `--unit NEWNAME` finds nothing there: RESTORE.sh says an
-envelope "decrypts but does not list" the name, then ends "no envelope for
-unit 'NEWNAME' matched the key provided". That reads like a wrong key and
-is not one. Take the unit's uuid from the newest index (`--where --all`
-prints it as "unit uuid", beside the name), and on the older tape type the
-name THAT tape shows for the same uuid:
-
-    # the names this tape knows, each with the first eight characters of its
-    # uuid (catalogs/UUID8_vN); it lists every file too, so it can take a while
-    ./RESTORE.sh --list --key YOUR_KEY.age.key | grep '^==='
-    # a tape written by 1.3.0 or later: the names with the full uuids
-    ./RESTORE.sh --where --all --key YOUR_KEY.age.key
-
-A unit stored without its dar catalogue has no `catalogs/` name to read:
-`--find-envelope` with a tenant's key prints the whole MANIFEST.toml, and
-"Manual Recovery Steps" (step 6) reads it from an unpacked envelope, each
-unit's `name` beside its `uuid`; with an escrow or operator key
-`--find-envelope` prints only a table of units (see "Tools Required"), so
-take the uuid from `--where --all`, or print the operator envelope's
-MANIFEST.toml ("The short way", in "Compressed units").
+says the old name. `--unit NEWNAME` finds nothing there: RESTORE.sh says
+"unit 'NEWNAME' ... is not in the envelope(s) your key opened" and lists
+the units there. That reads like a wrong key and is not one. Take the
+unit's uuid from the newest index (`--where --all` prints it as "unit
+uuid", beside the name), and on the older tape type the name THAT tape shows
+for the same uuid: `./RESTORE.sh --where --all --key YOUR_KEY.age.key` on
+that tape prints each name with its full uuid, and the first eight
+characters of the uuid are in the name of the unit's file table
+(`tables/UUID8_vN_sN.tsv`).
 
 **Two units of one name.** A name is unique inside one installation's
 catalogue, but it can recur across tapes: a unit renamed and its old name
-used again, or tapes of two installations. They are different units when their uuids differ
-(`--where --all` prints each as an entry of its own, with its uuid). The
-box procedure puts each unit in `/destination/UNIT`, and two such units
-would meet there. RESTORE.sh refuses a `--to` that is not empty, but the
-manual dar path keeps what is already there and exits 0, so it merges them
-without a word. Restore each into a directory of its own,
+used again, or tapes of two installations. They are different units when
+their uuids differ (`--where --all` prints each as an entry of its own,
+with its uuid). The box procedure puts each unit in `/destination/UNIT`,
+and two such units would meet there. RESTORE.sh refuses a `--to` that is not
+empty, but restoring by hand into a directory that already holds files
+mixes them without a word. Restore each into a directory of its own,
 `/destination/UNIT-` followed by the first 8 characters of its uuid, and
-with the manual path always into a new, empty directory.
+with the manual path always into a new, empty directory. (RESTORE.sh takes
+a unit by name: for two of one name that are in different tenants' envelopes,
+give each restore only its own tenant's key.)
 
 The modes that only read the tape (`--info`, `--verify`, `--find-envelope`,
-`--list`, `--where`, `--find`) describe the tape that is in the drive,
-whichever tape's RESTORE.sh runs them (`--where` and `--find` need the
-script of a tape written by tapectl 1.3.0 or later; an older one answers
-`Unknown mode`). A RESTORE.sh written for another
-tape prints a "WRONG TAPE?" box first, and for these modes it is only a
-reminder that the script was written for another volume: what follows is
-about the tape in the drive (the `Tape identifies as:` line, which every mode
-prints, is that tape's own label; the heading `--verify` prints names the
-script's volume, but it checks the tape in the drive). For a
-restore use the loaded tape's own RESTORE.sh, which was written for that
-tape's format, and take "WRONG TAPE?" during a restore as a sign that the
-script or the tape is the wrong one. To get a tape's own script, load that
-tape and run the four commands at the start of "Automated Recovery
-(recommended)"; they read File 2 of whatever tape is in the drive. In the
-last two put THAT tape's label (the `Tape identifies as:` line of `--info`)
-in place of this tape's, so that each tape's script is kept under its own
-name, `RESTORE-<label>.sh`.
+`--list`, `--where`, `--find`) describe the tape that is in the drive, with
+any copy of RESTORE.sh: it is the same file on every tape.
 
 In the index's `state` column, `sealed` is a tape whose write finished and
 was sealed, `quarantined` is a sealed tape whose medium a verify proved bad
@@ -1570,30 +1547,25 @@ retired or erased since. A cartridge that was erased and written again
 carries a NEW volume: File 0 then shows another label and another `uuid`
 on the same `cartridge_serial`, and the index row for the old volume names
 data that is gone. So match a tape to an index row by its label AND its
-uuid (`--where` prints the uuid; File 0 shows it):
-
-    mt -f /dev/nst0 rewind
-    dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(label|uuid|media_type|cartridge_serial|created_at|tapectl_version) ='
+uuid (`--where` prints the uuid; File 0 shows it, as the `grep` of "Automated
+Recovery (recommended)" prints).
 
 To take stock of a box without relying on the index, load each tape in
-turn, run `./RESTORE.sh --info` (its label and when it was sealed) and
+turn, run `./RESTORE.sh --info` (its label and whether it was sealed) and
 `./RESTORE.sh --find-envelope --key YOUR_KEY.age.key` (its units, their
 versions, slices and sizes), and write them down. A unit that appears at
 the same version AND with the same unit uuid on two tapes has two copies
 only when each of the two tapes holds that version WHOLE: then they are the
 same content, and either restores it alone. A tape that holds only part of
-a unit across tapes ("A unit across tapes") is not a copy: two tapes that
-each hold part of a unit are ONE copy, and restore it only together. To
-tell, run `./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT` on the
-tape: it says "HELD ACROSS TAPES" when the tape holds only part of that
-version, and `--where UNIT` marks such a tape "a range". The table of
-`--find-envelope` marks such a unit `PART:` from the tape's plan alone; a
-tape that ended early ("Where the tape ended") can hold less than its plan,
-and `--list` and `--where` know it. A name and a version
-number alone prove nothing; the uuid is in MANIFEST.toml (`--find-envelope`
-with a tenant's key prints it) and, on a tape with an index, in `--where`.
-Cartridges are found by their label; the cartridge's chip serial is in
-File 0 (`cartridge_serial`) and in the index, and a sticker can have been
+a unit across tapes ("A unit on more than one cartridge") is not a copy:
+two tapes that each hold part of a unit are ONE copy, and restore it only
+together. To tell, run `./RESTORE.sh --list --key YOUR_KEY.age.key --unit
+UNIT` on the tape: it says "PART:" when the tape holds only part of that
+version, and `--where UNIT` marks such a tape "a range". A name and a
+version number alone prove nothing; the uuid is in MANIFEST.toml
+(`--find-envelope` does not print it; `--where --all` does). Cartridges are
+found by their label; the cartridge's chip serial is in File 0
+(`cartridge_serial`) and in the index, and a sticker can have been
 replaced.
 
 ## The Heir Kit's catalogue (catalog.db.age)
@@ -1649,11 +1621,10 @@ BY`; for one tape, add `AND v.label = 'TAPE'`:
 
 `holds` is `completed` for a tape that holds that version whole and `range`
 for one that holds only the run `slices` names, of the version's
-`of_slices` (a unit across tapes, from tapectl 1.7.0: "A unit across
-tapes"). A `range` tape is not a copy on its own: the version restores only
+`of_slices` (a unit on more than one cartridge:
+"A unit on more than one cartridge"). A `range` tape is not a copy on its own: the version restores only
 with every slice, 1 to `of_slices`, from the tapes that hold them, and its
-rows together say which tapes those are. A kit made before 1.7.0 has no
-`range` rows.
+rows together say which tapes those are.
 
 A tape holds a good copy when its `status` is `sealed` and its `condition`
 is `ok`. `erased` is a wiped tape and `retired` one taken out of service:
@@ -1668,96 +1639,71 @@ which `--where --all` prints as "unit uuid": match a unit by its uuid. If a quer
 because a table or column is missing, the kit came from another tapectl
 release: `sqlite3 catalog.db .schema` shows the tables it has.
 
-## If the verdict is UNSEALED or DAMAGED
 
-`./RESTORE.sh --info` prints a `Verdict:` line, a verdict on the tape as a
-whole:
+## If the seal is missing or not trusted
 
-- SEALED: the seal marker (the last file) is there and agrees with the
-  front index. The write finished and the two ends of the tape match.
-  Carry on. A SEALED tape may still have ended early, and `--info` then
-  says after which file: "Where the tape ended".
-- UNSEALED: there is no valid seal marker. The write never finished: it
+`./RESTORE.sh --info` prints a "Seal marker:" line, a statement about the
+tape as a whole:
+
+- "present ... the tape is complete, every planned file is on it": the seal
+  marker (the last file) is there and agrees with the front index. The
+  write finished and the two ends of the tape match. Carry on.
+- "present ... this tape ended EARLY, after file N": a SEALED tape that ended
+  early, which every tape may do. A unit with a slice after file N is on
+  this tape in part only: "Where the tape ended".
+- "NOT FOUND": there is no valid seal marker. The write never finished: it
   was interrupted or aborted, or the tape ran out of room. Envelopes are
   written before slices, and the front index before both, so the front
   index lists EVERY file the write planned, slices that were never written
-  included: such a slice shows as FAIL ("unreadable") below, and what is
-  missing is normally the last data slices. What was written before the
-  break is intact and checks against the index.
-- DAMAGED (ends disagree): a seal marker is there, but it does not match
-  the front index, or the front index will not read. One of the two text
-  files was damaged or replaced since the write, and neither can vouch for
-  the other. What you can check yourself is each file against the hash the
-  front index lists for it, which is what follows.
+  included: such a slice cannot be read, and what is missing is normally the
+  last data slices. What was written before the break is intact and checks
+  against the index.
+- "present but NOT TRUSTED": a seal marker is there, but it does not match
+  the front index (or counts more files than File 0's plan), or the front
+  index will not read. One of the plain-text files was damaged or replaced
+  since the write, and neither can vouch for the other. The tape is read as
+  unsealed, and what you can check yourself is each file against the hash
+  the front index lists for it, which is what follows.
 
 In both cases go file by file, because each file is checked against its
-own recorded hash:
-
-    ./RESTORE.sh --verify
-
-It prints PASS or FAIL for every tape file, by number; a file that is
-missing or will not read is a FAIL. To find which slices are incomplete,
-take the tape file numbers of a unit's slices from its MANIFEST.toml
-(`--find-envelope` with a tenant's key prints it, and RECOVERY.md's table
-of "Tape files") and look them up in that list. The operator and escrow
-keys open several envelopes, and `--find-envelope` then prints only a table
-of units: for the slices of every unit, decrypt the operator envelope by
-hand (steps 5 and 6 of "Manual Recovery Steps") and read `env/MANIFEST.toml`,
-which lists each unit with its slices and their tape files. RESTORE.sh
-itself reads the front index from File 3 and, if that fails, from the seal
-marker's copy of it, with a warning (rung 2 of "If All Else Fails").
+own recorded hash: `./RESTORE.sh --verify` prints PASS or FAIL for every
+tape file, by number; a file that is missing or will not read is a FAIL, and
+it ends `VERIFY PASSED` only for a sealed tape every file of which passed.
+To find which slices are incomplete, take the tape file numbers of a unit's
+slices from its MANIFEST.toml (RECOVERY.md's table of "Tape files" lists
+them too) and look them up in that list. RESTORE.sh itself reads the front
+index from File 3 and, if that fails, from the seal marker's copy of it, with
+a warning (rung 2 of "If All Else Fails").
 
 - A unit whose slices all PASS is complete: restore it as usual. RESTORE.sh
   does not need the seal, and checks every slice again as it restores.
-  That holds for the tape in the drive when the restore starts. Every LATER
-  cartridge, of a unit across tapes, and every cartridge `--swap-tapes`
-  reads for a replacement slice, is refused without a readable seal marker:
-  a slice is taken from another tape only at a position its own seal says
-  that tape holds ("A unit across tapes"). With such a tape as a later part
-  of a unit across tapes, read its slices by hand (step 7 of "Manual
-  Recovery Steps"), each checked against the `sha256_encrypted` the
-  manifest gives, into one directory with the other tapes' slices of the
-  unit, and run dar there once every slice is in it. For a slice of a whole
-  unit, copy it off with `dd` and give it to `--slices-from DIR` ("If a
-  slice or a file is damaged"), which matches by sha256 alone.
 - If every file PASSes against the front index and only the seal
   disagrees, the data is exactly what that index describes (each file
   matches its recorded hash): the fault is in the seal marker or the
   index, it does not matter which for restoring, and restoring is sound.
 - A unit with a FAIL slice cannot be restored whole from this tape.
-  RESTORE.sh stops at the first slice that fails its check and says which.
-  `--all` restores the units in their order on the tape, so it stops there
-  too: the units before that one are restored, that unit and every unit
-  after it are not. Restore each unit after it in a run of its own,
-  `--unit UNIT --to /destination/UNIT` (as in item 4 of "Did the restore
-  get everything?"), and the damaged one as below.
-  Look for another copy first ("The rest of the box"; "If a slice or a
-  file is damaged" says how RESTORE.sh takes the failed slice from it); a
+  RESTORE.sh leaves the failed slice out, restores every file whose slices
+  are all good, lists the others and ends `RESTORE INCOMPLETE`. Look for
+  another copy first ("The rest of the box"; "If a slice or a file is
+  damaged" says how the one repair takes the listed files from it); a
   cartridge that failed here may read in another drive. With no other copy,
-  the slices that did PASS are intact, and the files that lie wholly
-  inside them can still be restored: RESTORE.sh does it (`--swap-tapes`,
-  then type `done`), and "No other copy", in "If a slice or a file is
-  damaged", has that and the commands by hand. The files in the failed
-  slices are lost. Not so for a unit across tapes when no tape you hold has
-  that version whole ("A unit across tapes"): RESTORE.sh refuses
-  `--swap-tapes` for it, `done` at its prompt stops the restore, and it
-  restores nothing of the unit without every slice. "No other copy" names
-  the ways that do work for it.
+  the files that lie wholly inside the good slices are restored, and the
+  files in the failed slices are lost.
 
 ## Where the tape ended
 
-A tape written by tapectl 1.6.0 or later states `requires = ["short-seal"]`
-in File 0 and in its seal marker. It means the tape may end before the last
-file the front index plans: when the drive reported that its medium was
-nearly full while it wrote a data slice that was not the last, the write
-finished that slice and sealed the tape right after it. File 0, the front
-index and the envelopes were written before that, so they describe the
-plan, and only the seal marker, the last file on the tape, says where the
-tape really ended. Its `ended_after` is the last tape file before the seal
-marker, and its `file_count` is `ended_after` plus 2. Every tape file the
-front index lists after `ended_after` is not on this tape. A tape that
-sealed where the plan said states it too: there it is the file before the
-planned last.
+Every tape of this layout may end before the last file the front index
+plans: when the drive reported that its medium was nearly full while it
+wrote a data slice that was not the last, the write finished that slice and
+sealed the tape right after it, and the rest of what it planned is written
+first on the next tape ("A unit on more than one cartridge"). File 0, the
+front index and the envelopes were written before that, so they describe the
+plan (they state `may_end_early = true`, on every tape), and only the seal
+marker, the last file on the tape, says where the tape really ended. Its
+`ended_after` is the last tape file before the seal marker, and its
+`file_count` is `ended_after` plus 2. Every tape file the front index lists
+after `ended_after` is not on this tape. A tape that sealed where the plan
+said states it too: there it is the file before the planned last.
 
 To read it by hand, with no key (`/dev/nst0` is an example: "Which
 device?"):
@@ -1767,119 +1713,25 @@ device?"):
     mt -f /dev/nst0 bsfm 2
     dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(file_count|ended_after) ='
 
-A unit whose slices run past `ended_after` (the `tape_position` of its last
-slice in MANIFEST.toml, the last of its "Tape files" in RECOVERY.md, is
-after it) is not on this tape whole: do not start reading its slices. Its
-first slices are there and hash correctly, the rest are not, and it is
-restored only from another tape that holds it whole. The index names that
-tape: `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` ("The rest of the
-box"). Every unit wholly at or before `ended_after` is on this tape whole
-and restores as usual. A unit allowed to run across tapes (its block in
-MANIFEST.toml states `may_span = true`) with a slice at or before
-`ended_after` is not cut: this tape holds a range of it, and its other
-slices are on other tapes by design ("A unit across tapes").
+A unit whose slices run past `ended_after` (the `tape_position` of a slice
+in MANIFEST.toml, or of the last of its "Tape files" in RECOVERY.md, is
+after it) is on this tape in part only: its slices up to `ended_after` are
+there and hash correctly, and the rest are on other tapes by design. The
+index names those tapes: `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key`
+("The rest of the box"). Every unit wholly at or before `ended_after` is on
+this tape whole and restores as usual.
 
 RESTORE.sh does all of this by itself, reading the seal marker before any
 slice (one wind to the end of the tape and a rewind). `--info` says where
-the tape ended (the verdict stays SEALED), and `--info` and `--verify` print
-one `NOT ON TAPE` line for the planned files after `ended_after`, naming
-the first and the last of them, which is not a failure:
+the tape ended, and `--info` and `--verify` print one `NOT ON TAPE` line for
+the planned files after `ended_after`, naming the first and the last of
+them, which is not a failure:
 
-    NOT ON TAPE  files 12 to 15  (planned; the tape ended after file 11, and its seal marker is file 12)
+  NOT ON TAPE  files 12 to 15  (planned; the tape ended after file 11, and its seal marker is file 12)
 
-`--restore` refuses a unit the end of the tape cut, by name (`--all`
-restores the others and names it), `--list` says so, and `--where` marks
-this tape `CUT` for that version.
-
-## A unit across tapes
-
-From tapectl 1.7.0 a unit that was allowed to run across tapes can have its
-slices on more than one tape. A tape that holds only some of them holds a
-RANGE: one unbroken run of the unit's slices, in slice order. Such a tape
-states `requires = ["short-seal", "spanning"]` in File 0 and its seal
-marker, and so does a tape that holds the whole of such a unit, which
-restores from that one tape as any unit does. A range is not damage, and it
-is not a copy of the unit on its own.
-
-What one tape shows. Its envelope's MANIFEST.toml lists EVERY slice of the
-unit, 1 to N, each with its `encrypted_bytes` and its `sha256_encrypted`,
-and gives a `tape_position` only to the slices this tape's plan holds. A
-slice with no `tape_position` is on another tape: it is never at tape file
-0. The seal marker's `ended_after` can end the run sooner, as it ends any
-tape ("Where the tape ended"), and a slice after it is on another tape too.
-`--info` and `--verify` need no key and see the range as data slices like
-any other. `--list` says which slices of the unit this tape holds.
-`--restore --all` restores the units this tape holds whole and names each
-one it holds only a range of. `--where` and `--find` print the run of
-slices each tape holds when it is not the whole version, marked "a range".
-
-What a restore needs: every slice, 1 to N, in slice order, from the tapes
-that hold them. dar never runs over one tape's slices alone.
-
-Prefer a whole copy: if any tape holds the version whole (`--where` prints
-no "a range" beside it), restore from that tape alone, as any unit, with
-no change of cartridge and no scratch. A whole copy written from another
-staging run of the same version has slices of other sha256 values: the
-prompt below refuses it by hash, though `--where` names it, and it still
-restores alone.
-
-If none does, read the version across tapes. Start from the
-tape that holds slice 1: `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key`
-on the NEWEST tape names the tapes and the slices each holds (a tape never
-names a tape written after it, so the first tape of a unit across tapes
-cannot name the rest). Before you start, write down every tape it names
-and the slices each holds: the restore asks for the next slice by number,
-the tape then in the drive can name only tapes written before it, and to
-run `--where` on the newest tape again you would have to change cartridges
-in the middle of the restore. Load the tape that holds slice 1 and run
-THAT tape's RESTORE.sh (saved as `RESTORE-<label>.sh`, as for any tape):
-
-    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to /destination/UNIT
-
-When the tape's run ends before slice N, it names the slice it needs
-next and the tapes an index names for it, and waits for you to load another
-cartridge and press ENTER. It takes a cartridge only when that tape's front
-index lists the next slice's `sha256_encrypted`, at a position its own seal
-marker covers; a label or an index never stands in for the hash. Otherwise
-it says why and asks again.
-
-By default it keeps each tape's slices, still encrypted, in a scratch
-directory inside `--to` (or `--scratch DIR`), so that disk needs room for
-the whole unit's encrypted slices (the sum of their `encrypted_bytes`)
-besides the restored files; it checks before it reads a slice, and when the
-room is not there it refuses and names `--stream-tapes`. `--stream-tapes`
-keeps no slice on disk: it feeds dar from each tape in turn, so it needs
-every cartridge at hand, loaded when asked.
-
-Either way it waits at each change of cartridge for as long as you take,
-reading your answer from its input, and `quit` stops it. So does `done`:
-here it does not go on without the slice, as it does after `--swap-tapes`
-("If a slice or a file is damaged"); either one ends the restore and
-discards the slices read so far (with `--stream-tapes`, the files dar has
-written are only part of the unit). A slice that fails
-its hash or will not read is asked for again, by default, from another
-cartridge that holds it; with `--stream-tapes` it ends the run.
-
-Ctrl-C, a closed terminal or a lost connection to the computer, and `kill`
-end the run too, and REMOVE its scratch directory with every slice read so
-far: a restore across tapes can take hours of cartridge changes, so run it
-inside `screen` or `tmux`, where a closed window or a lost connection does
-not end it. Only a run that had no chance to clean up (`kill -9`, a crash, a
-power cut) leaves its scratch directory inside `--to` (or `--scratch DIR`),
-named `.tapectl-restore.` and some letters and holding encrypted slices
-only: remove it by hand before you run the restore again, which starts
-from the beginning. A dar older than
-2.7.9 (or than 2.7.21, when the envelope holds no dar catalogue of the unit)
-cannot read slices this way, and RESTORE.sh says so before it reads one. It
-says so too on a computer whose `head` or `dar` cannot join the slices into
-the one stream dar reads, and names which.
-
-`--restore --unit UNIT --path PATH` reads across tapes too, and needs only
-the slices that hold the path and the last one. It can start on any tape of
-the unit that your key opens: it takes the slices that tape holds first,
-then asks for each further cartridge in slice order, taken by hash in the
-same way. They wait, still encrypted, in the scratch directory until all
-are read, and only then are they decrypted for dar.
+A slice after `ended_after` is never read from this tape and never reported
+as damage. `--list` and `--find-envelope` say which units this tape holds
+only part of ("A unit on more than one cartridge").
 
 ## Did the restore get everything?
 
@@ -1891,310 +1743,205 @@ to its end.
 A restore went right only if all of these hold:
 
 1. RESTORE.sh ended with `RESTORE COMPLETE` and exit status 0 (`echo $?`
-   straight after it). It prints that only after dar ended with status 0,
-   every slice printed "checksum verified against front index", and dar
-   skipped no file. `RESTORE INCOMPLETE` (exit status 1) means dar named
-   files it could not restore: they are listed, and "If a slice or a file
-   is damaged" says how to fill them. Any other ending: read its message,
-   and do not trust what was written.
-2. dar's own summary, printed at the end, shows nothing failed or skipped:
+   straight after it). It prints that only when no file was left out and
+   every restored file passed its check. `RESTORE INCOMPLETE` (exit status
+   1) means some files were left out or failed the check: they are listed,
+   and "If a slice or a file is damaged" says how to fill them.
+   `RESTORE STOPPED` is a restore you stopped at the prompt. Any other
+   ending: read its message, and do not trust what was written.
+2. For each unit, its "File check" line says all of its regular files match
+   the sha256 in the unit's file table ("File check: all N regular file(s)
+   match..."). That check is the verdict, and tar's exit status is not: a
+   tar can exit 0 with files missing (BusyBox's does), so RESTORE.sh notes
+   what tar said and decides by the hashes. A restore with `--no-file-check`
+   has no verdict.
+3. The count matches the file table. The regular files a unit's table lists
+   are the lines of `--list` whose kind is `f`; that number should equal the
+   N of "File check: all N". For a few files, compare sizes and a checksum
+   with any record of your own.
+4. After `--all`, every unit your key opens was restored: "RESTORE COMPLETE:
+   N unit(s) restored" names N, and every unit that `./RESTORE.sh
+   --find-envelope --key YOUR_KEY.age.key` lists must be a directory of the
+   `--all` destination (a tape of one unit puts that unit's files in the
+   destination itself, and that is the unit's directory). Restore each one
+   that is not in a run of its own, `./RESTORE.sh --restore --key
+   YOUR_KEY.age.key --unit UNIT --to /destination/UNIT`, and check that run
+   the same way.
 
-       150 inode(s) restored
-       0 inode(s) not restored (not saved in archive)
-       0 inode(s) not restored (overwriting policy decision)
-       0 inode(s) ignored (excluded by filters)
-       0 inode(s) failed to restore (filesystem error)
-
-   Every line but the first must be 0. "Overwriting policy decision" means
-   dar left a file that was already there: the destination was not empty.
-   "Ignored (excluded by filters)" above 0 in a whole-unit restore means dar
-   skipped files, as it does for a slice that was left out ("No other
-   copy" in "If a slice or a file is damaged").
-3. The count matches the dar catalogue. The inodes (files and directories)
-   a unit's dar catalogue lists are the lines of `--list` that begin with a
-   status such as `[Saved]` or `[InRef]`:
-
-       ./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT \
-           | grep -c -E '^\[.{{5}}\]\[.\] '
-
-   That number should equal the "inode(s) restored" figure of a whole-unit
-   restore. For a few files, compare their sizes and a checksum with any
-   record of your own. A unit stored without its dar catalogue has no
-   listing (`--list` says "no dar catalogue"): for it, items 1 and 2 are
-   the check, with RESTORE.sh's sha256 check of every file on a tape
-   written since 1.3.0 ("A file fails its hash").
-4. After `--all`, every unit of the tape was restored, not only one
-   envelope's. `--all` restores the units of ONE envelope, the one that
-   lists the most: with the escrow or operator key that is the operator
-   envelope, which lists every unit on the tape, but when the operator
-   envelope and its backup will not read it is a tenant's, and only that
-   tenant's units are restored, while items 1 to 3 still pass. Every unit
-   that `./RESTORE.sh --find-envelope --key YOUR_KEY.age.key` lists, under
-   any envelope, must be a directory of the `--all` destination (a tape of
-   one unit puts that unit's files in the destination itself, and that is
-   the unit's directory). Restore each one that is not in a run of its
-   own, `./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to
-   /destination/UNIT` (the script finds the envelope that lists it), and
-   check that run the same way.
-
-Two restores print a different summary. With `--all`, or `--unit` given
-more than once, dar runs once for each unit and prints one summary for
-each: check every one, and compare each against that unit's `--list`. With
-`--path`, dar restores only what you asked for, plus the directories above
-it (a file `a/b/c.txt` brings `a` and `a/b` with it, so 3 inodes), or
-everything under a directory you asked for; "inode(s) ignored (excluded by
-filters)" then counts every other inode of the unit, which is expected and
-not a failure. What to check there is that "failed to restore" and "not
-restored" are 0, and that "restored" is the number of inodes you asked
-for, the path and the directories above it. `--fill-from` restores only
-the files on its list, and a `--swap-tapes` restore where you typed `done`
-leaves out the files of the missing slices, so lines after the first are
-above 0 there by design: check instead that every file it did not restore
-is on `.tapectl-damaged-files.txt` (item 1).
+With `--path`, only the files you asked for are restored, plus the folders
+above them as tar makes them, and the check covers the files you named.
+After a repair, the check covers the files it was asked for and the list is
+rewritten with what is still damaged ("If a slice or a file is damaged").
 
 ## If a slice or a file is damaged
 
-Two things can go wrong with a unit that has a good copy somewhere else,
-and RESTORE.sh mends both from that copy. A COPY here means the same unit at
-the same version written to another tape: its slices are the same bytes as
-this tape's, and its front index lists the same sha256 for each.
+RESTORE.sh checks every slice four ways before tar sees it: its hash
+against the front index, that age decrypts it, its length after decrypting
+(and decompressing) against the manifest, and the hash of its plain cut
+against the manifest. It never fills a lost slice with zeros. A slice that
+fails any check, or is not on this tape, is LEFT OUT: the files that lie in
+it are not restored but written to `.tapectl-damaged-files.txt`, one path a
+line, in the unit's directory (`--to` itself when the restore had one unit,
+`--to/UNIT` when it had several), and RESTORE.sh restores every other file.
+A path is written as the index writes one: a backslash as `\\`, a TAB as
+`\t`, a newline as `\n`, a carriage return as `\r`. The first line records
+the unit, its uuid and its version. A long file whose run has a bad slice is
+left out whole, and the part tar began is removed. After the restore each
+regular file is hashed against the file table: a file that does not match,
+or is missing, goes on the same list, however tar ended.
 
-**A slice fails.** `./RESTORE.sh --verify` says FAIL for it, or a restore
-stops with "checksum MISMATCH" or "did not decrypt". Give RESTORE.sh the
-slice from another tape. Matching is by that sha256 and nothing else, never
-by the number or position of a slice or by a file name:
+**The one repair.** Load another tape that holds the same unit at the same
+version, and its slices of the files on the list (a tape that holds only a
+range of the unit gives the files whose slices it holds: "A unit on more
+than one cartridge"), and give the list to `--paths-from`, with the `--to`
+directory of that unit:
 
-    # A directory of slice files copied off the other tape, under any names.
-    # A copy made with dd as it is, block padding and all, will do.
-    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT \
-        --slices-from DIR --to /destination/UNIT
+    ./RESTORE.sh --restore --key YOUR_KEY.age.key --paths-from /destination/UNIT/.tapectl-damaged-files.txt --to /destination/UNIT
 
-    # Or let the script ask for the other cartridge once it has read this
-    # one (it says which slices it needs, by number and sha256, and waits
-    # for ENTER; type done to go without)
-    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT \
-        --swap-tapes --to /destination/UNIT
+It reads only the slices that hold the listed files, restores exactly them,
+over their damaged copies, and nothing else in the directory, and checks each
+against the file table. The list is then rewritten with whatever is still
+damaged (from yet another copy, run it again) and removed when nothing is. A
+hard-linked name whose first name is on the list is made from its first name
+once that is restored. Only a tape whose envelope lists the same unit, with
+the same uuid, at the same version is used; any other is refused by name,
+because another version can differ in the very files that are damaged. A
+slice is taken from another tape by its hash, never by a label.
 
-`--verify` takes the same two options and says whether a copy of each failed
-slice was found. `--swap-tapes` reads the other cartridge's seal marker
-first, and takes a slice from it only at a position the seal says the tape
-holds ("Where the tape ended"): a cartridge whose seal marker cannot be read
-gives none. The other cartridge may hold only part of a unit held across
-tapes ("A unit across tapes"); it gives the slices it holds. To copy a slice
-off the other tape by hand, find its tape file in THAT tape's front index
-(File 3) by its sha256 (the entry's `position` is POSITION), then:
+**No other copy.** If a slice fails and no other tape has a copy of it, the
+slices that passed are intact, and the files that lie wholly inside them
+are restored; the files that touch a failed slice are lost.
 
-    mt -f /dev/nst0 rewind
-    mt -f /dev/nst0 fsf POSITION
-    dd if=/dev/nst0 bs=512k of=slice-copy.bin
+By hand, without RESTORE.sh, do the steps of "Manual Recovery Steps" for
+the unit, but leave the failed slice out: do not decrypt it, do not put an
+empty file in its place, and remove its `slice.N.tar`. If the failed slice
+is part of a long file's run (it, or a slice just before it, states
+`continues = true`: the slices of one run), leave out the WHOLE run, the
+slice that begins the file and every slice after it that continues it, so
+that tar is never given the head of a file without its tail. The slices
+that are left, joined in order, are a tar stream of whole files, and tar
+restores every one of them; the file table's `slice` column says which
+files were in the slices you left out.
 
-Either option restores slice by slice onto disk, as with an older dar, so
-`--to` needs room for the unit's slices beside its restored files ("How much
-room, in one place", in "Disk space"; `--scratch DIR` puts the slices on
-another disk). Each tape is read forward from one rewind. A slice RESTORE.sh
-cannot replace is left out: the files in it are not restored but listed,
-below. RESTORE.sh runs the `age` program, which stops at the first damaged
-part of a slice, so it cannot save the good parts of a slice; tapectl's own
-restore can ("No other copy", below).
-
-**A file fails.** When dar names files it could not restore (a checksum that
-failed, a slice that was not there), RESTORE.sh restores the rest, ends
-`RESTORE INCOMPLETE` with exit status 1, and writes the paths of those files,
-one per line, to `.tapectl-damaged-files.txt` in the unit's directory: `--to`
-itself when the restore had one unit (a lone unit goes straight into `--to`,
-`--all` included), `--to/UNIT` when it had several. A path is written as
-the index writes one: a backslash as `\\`, a TAB as `\t`, a newline as
-`\n`, a carriage return as `\r`. The first line records the unit, its uuid
-and its version. The box procedure restores each unit with `--to /destination/UNIT`, so its
-list is `/destination/UNIT/.tapectl-damaged-files.txt`. A tape that holds ONE
-unit, restored with `--all --to /destination`, puts the files straight into
-`/destination`: its list is `/destination/.tapectl-damaged-files.txt`, and
-that directory is the `--to` below. Load a tape that holds
-the same unit at the same version WHOLE (a tape that holds only part of a
-unit across tapes is refused: "A unit across tapes") and run ITS
-RESTORE.sh, with the list and `--to` of that same unit directory:
-
-    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT \
-        --fill-from /destination/UNIT/.tapectl-damaged-files.txt \
-        --to /destination/UNIT
-
-It reads only the slices that hold those files, restores exactly them, over
-their damaged copies, and nothing else in the directory, and dar checks each
-file it restores. The list is then rewritten with whatever is still damaged
-(from yet another copy, run it again) and removed when nothing is. Only a
-tape whose envelope lists the same unit, with the same uuid, at the same
-version is used; any other is refused by name, because another version can
-differ in the very files that are damaged.
-
-When the slice that holds a folder's own entry is lost, dar names the
-folder and restores nothing in it. On a tape written since 1.3.0 the list
-names the files the index records under that folder instead, and the fill
-restores them like any other. A tape written before 1.3.0 has no index, so
-the list names the folder itself, and the fill restores what is missing in
-it and overwrites nothing that is there.
-
-**A file fails its hash.** dar checks each file it restores with a short
-checksum, not a hash, and two equal flips in a file can cancel: a damaged file
-can come back with no error from dar. A tape written since 1.3.0 records the
-sha256 of every regular file in the index of its tenant envelope, and after
-each restore and each fill RESTORE.sh reads the restored files back from
-`--to` and checks them against it with `sha256sum`. A file that does not match,
-or is missing, goes on the same list as a file dar named, and the run ends
-`RESTORE INCOMPLETE`: fill it from another copy the same way. The check costs
-one read of the restored files from disk and none of the tape; with `--path`
-only the paths restored are checked. A file with no sha256 recorded is not
-checked, and a tape written before 1.3.0 has no index and is not checked at
-all; RESTORE.sh says both. `--no-file-check` skips the check.
-
-**No other copy.** If a slice fails and no other tape or directory has a
-copy of it, the slices that passed are intact, and the files that lie wholly
-inside them can still be restored; the files that touch a failed slice are
-lost.
-
-RESTORE.sh does this for you: run the `--swap-tapes` restore above and type
-`done` when it asks for another cartridge. It restores the files it can,
-lists the others in `.tapectl-damaged-files.txt` ("A file fails", above) and
-ends `RESTORE INCOMPLETE`. It needs the room of a replacement-slice restore
-("Disk space").
-
-Not for a unit across tapes when no tape you hold has that version whole
-("A unit across tapes"): RESTORE.sh takes no `--swap-tapes` or
-`--slices-from` for it, and `done` at its prompt stops the restore with
-nothing of the unit restored. What does work for such a unit:
-
-- `--restore --unit UNIT --path PATH` restores a folder or a file whose
-  slices all avoid the failed one. It reads only the slices that hold the
-  path, and the last slice, which must therefore be good; the `dar -l` line
-  below shows which slices hold each file.
-- tapectl's own restore reads a unit across tapes, asking for each
-  cartridge, and reads around a damaged 64 KiB piece of a slice, losing
-  only the files in that piece ("tapectl itself").
-- By hand, as below: step 7 of "Manual Recovery Steps" reads each tape's
-  slices of the unit into the one directory, matched by their
-  `sha256_encrypted`, and the failed slice is left out.
-
-By hand, without RESTORE.sh, do the steps of "Manual Recovery Steps" for the
-unit, but leave the failed slices out: do not decrypt them, and do not put
-empty files in their place. The decrypted slices keep their own numbers
-(`restore.1.dar`, `restore.2.dar`, `restore.4.dar` ..., a gap where the
-failed slice was); this is the one time a gap in the numbering is right.
-Then, into an empty directory:
-
-    dar -x restore -R /destination -O -Q -N > dar.log 2>&1
-    echo $?
-    grep 'not restored (user choice)' dar.log
-
-dar does not stop at the gap. It restores every file whose slices are all
-there. For each of the others it prints `PATH not restored (user choice)`
-(the last command lists them) and leaves a file of that name that is EMPTY
-or short: that is not the real file, so delete it, or fill it from another
-copy later. The exit status is 0 and the summary counts those files under
-"ignored (excluded by filters)", so a status of 0 does not mean the unit is
-whole. If a directory's own entry lies in a lost slice, dar skips
-everything under it ("No file in this directory will be restored"). On a
-tape with an index, the `sha256sum` line in RECOVERY.md ("If a slice or a
-file is damaged" there) names every restored file that does not match,
-the empty leftovers included. `dar -l env/catalogs/NAME -T slice -N -Q`
-(NAME as under "Words this guide uses") shows which slices hold each file,
-so you can see beforehand what a lost slice costs. If the failed slice is
-the LAST one, dar stops at once ("The last file of the set is not present",
-exit status 4) and restores nothing; add `-0` (sequential read) and it
-restores the files in order up to the first missing slice, then stops with
-status 4. The file it was in the middle of is left short and named, and
-those after it are not named at all, so compare with the dar catalogue's list.
-
-Neither way can read around a damaged part of a slice: the `age` program
-stops at the first damaged piece. tapectl can. tapectl is the program that
-wrote this tape (File 0 names its release in `tapectl_version`); it is
-open-source software, and its own restore reads around a damaged 64 KiB
-piece of a slice, loses only the files in that piece and names them, and
-fills files from another copy of the same version. "tapectl itself", next,
-says where to get it and what to run; nothing else in this guide needs it.
+**A damaged piece inside a slice.** `age` stops at the first damaged 64 KiB
+piece of a slice, so RESTORE.sh, and the manual steps, lose the whole
+slice. tapectl's own restore reads around a damaged piece and loses only
+the files that touch it (in a compressed slice, the files from the damaged
+piece to the end of that slice): "tapectl itself", for the operator or
+escrow key.
 
 ## tapectl itself
 
-Look in the Heir Kit first. A kit made by tapectl 1.5.0 or later holds a
-copy of the program that made it, in the folder with `catalog.db.age`: a
-file named `tapectl-` and its version, `tapectl-X.Y.Z` below (such as
-`tapectl-1.5.0`). The cover sheet names it with its size and sha256 (check
-the file against the sheet with `sha256sum`) and says it is for Linux on
-one machine type (`uname -m` says yours). It needs no building: run it as
-`./tapectl-X.Y.Z` wherever this section says `tapectl`, after
-`./tapectl-X.Y.Z --version` has shown it starts. Copy it to a Linux disk
-first and run `chmod +x` on it: from a USB stick formatted FAT or exFAT,
-or mounted `noexec`, it answers "Permission denied". Its release must be
-File 0's `tapectl_version` or newer (the `grep` of File 0 in "The rest of
-the box" prints it); a kit made before the tape was written can hold an
-older one. With no kit, a copy that
-is too old, or one that will not run on your machine, read on.
+Look in the Heir Kit first. The kit holds a copy of the program that made
+it, in the folder with `catalog.db.age`: a file named `tapectl-` and its
+version, `tapectl-X.Y.Z` below (X.Y.Z such as 2.0.0). The cover sheet
+names it with its size and sha256 (check the file against the sheet with
+`sha256sum`) and says it is for Linux on one machine type (`uname -m` says
+yours). It needs no building: run it as `./tapectl-X.Y.Z` wherever this
+section says `tapectl`, after `./tapectl-X.Y.Z --version` has shown it
+starts. Copy it to a Linux disk first and run `chmod +x` on it: from a USB
+stick formatted FAT or exFAT, or mounted `noexec`, it answers "Permission
+denied". Its release must be File 0's `tapectl_version` or newer (File 0
+prints it: "Automated Recovery (recommended)"). With no kit, a copy that is
+too old, or one that will not run on your machine, read on.
 
 tapectl is open-source software, and its source is at
 https://github.com/mikmorg/tapectl: one place to look, and a web address
 may move over decades, so search for the name if it is gone. File 0's
 `tapectl_version` names the release that wrote this tape; the repository
-tags each release `v` followed by that number (such as `v1.5.0`); use that release
-or a newer one. It is built from source. It needs the Rust toolchain the
-repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs,
-installs it on the first `cargo` run, or when you run `rustup toolchain
-install` in the checkout; a distribution's own cargo may be too old), a
-network connection to download its libraries, and `dar`, `mt-st` and
-`sg3-utils` installed ("Tools Required"):
+tags each release `v` followed by that number (such as `v` and 2.0.0); use that
+release or a newer one. It is built from source with the Rust toolchain
+the repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs,
+installs it), a network connection to download its libraries, and `mt-st`
+and `sg3-utils` installed ("Tools Required"); the repository's own
+documentation (`docs/keys-and-recovery.md`, runbook C) gives the commands.
 
-    git clone https://github.com/mikmorg/tapectl
-    cd tapectl && git checkout vX.Y.Z      # X.Y.Z: the tapectl_version
-    cargo build --release                  # the program: target/release/tapectl
+**Which key it needs.** tapectl's own restore starts from `tapectl catalog
+rebuild --from-volume`, which reads the tape's operator envelope: it needs
+the OPERATOR key or the ESCROW secret. With a tenant's key it is refused ("cannot
+open the operator envelope"), and no tapectl restore runs without the
+rebuilt catalogue. A holder of only a tenant's key has RESTORE.sh, the
+manual steps and the one repair from another copy of the tape, and
+nothing else; they do not read around a damaged piece of a slice, and
+nothing here pretends they do.
 
-Then use it in a new home made for this recovery: set the environment
-variable `TAPECTL_HOME` to an empty directory once (`export
-TAPECTL_HOME=/recovery/tapectl-home`), or give `--home DIR` right after
-`tapectl` on each command; under `sudo`, which drops the variable, give
-`--home DIR`. ESCROW_PUBLIC is the `age1...` line of the cover sheet, the
-escrow key's public half (with only the key file, `age-keygen -y
-YOUR_KEY.age.key` prints it), and YOUR_KEY.age.key is your key file, the
-escrow key's included:
+The route with the operator or escrow key, in order. ESCROW_PUBLIC is the
+`age1...` line of the cover sheet, the ESCROW key's public half
+(`age-keygen -y` of the ESCROW secret prints it, and of any other key prints
+a different one, which `init` would register as the escrow identity, so use
+it only on the escrow secret). OPERATOR_NAME is the operator's name where you
+know it (the Heir Kit's catalogue has it); otherwise give any name, your
+own say, because the rebuild takes the tenants' names from the tape. Use
+your own device ("Which device?"):
 
     tapectl init --operator OPERATOR_NAME --escrow-public-key ESCROW_PUBLIC
     tapectl catalog rebuild --from-volume --device /dev/nst0 --key YOUR_KEY.age.key
     tapectl restore unit --unit UNIT --device /dev/nst0 --to /destination/UNIT --key YOUR_KEY.age.key
 
-`init` makes the home and registers the escrow PUBLIC key, which decrypts
-nothing; run it once. OPERATOR_NAME is the operator's name where you know it
-(the Heir Kit's catalogue has it: `sqlite3 catalog.db "SELECT name FROM
-tenants WHERE is_operator = 1;"`); otherwise give any name, your own say,
-because the rebuild takes the tenants' names from the tape. (Run as an
-ordinary user, `init` without `--operator` names the operator after your
-login; run as root, under `sudo`, it refuses without one.) `catalog rebuild` reads the loaded tape and
-puts what it says into tapectl's own catalogue (its database, in the new
-home); run it once for each tape. `restore unit`
-restores the newest version of a unit on the loaded tape into an empty
-directory (`--version N` for another). Use your own device ("Which
-device?"). The repository's `docs/keys-and-recovery.md` (runbook C) is the
-long form.
+`init` makes a new home for the recovery and registers the escrow PUBLIC
+key, which decrypts nothing; run it once. (Run as an ordinary user, `init`
+without `--operator` names the operator after your login; run as root,
+under `sudo`, it refuses without one.) `catalog rebuild` reads the loaded
+tape and puts what it says into tapectl's own catalogue; run it once for
+each tape. `restore unit` restores the newest version of a unit
+(`--version N` for another) into an empty directory, asks for the cartridges
+of a unit on more than one, shows the id map, and reads around a damaged
+64 KiB piece of a slice, listing the files it lost.
 
 `--key` names a key file for that one command and nothing more: tapectl
 does not copy it into its home or register it, and the escrow secret is
-never stored on the machine. Give it on each command, and once for each key
-file if the units need more than one (`--key` repeats). With the escrow key
-this route does what RESTORE.sh cannot: it reads around a damaged 64 KiB
-piece of a slice, loses only the files in that piece and names them.
-
-The alternative, with the operator's key file: adopt it at `init` with
+never stored on the machine. Give it on each command; it may be repeated.
+The alternative with the operator's key file: adopt it at `init` with
 `--operator-key OPERATOR.age.key` beside `--escrow-public-key`, and leave
-`--key` off the restore, which then reads the key from its home's `keys/`.
-`init` refuses the escrow secret as `--operator-key` (that secret is kept
-on paper, apart from every machine); `--key` is how the escrow key is used.
+`--key` off the restore, which then reads the key from its home's `keys/`;
+`init` refuses the escrow secret as `--operator-key` (that secret is kept on
+paper, apart from every machine). Give `--home DIR` right after `tapectl` (or
+set `TAPECTL_HOME`) to name the recovery's home; under `sudo`, which drops
+the variable, give `--home DIR`.
+
+## Compressed units
+
+A unit may be stored compressed, whatever else it is. How to tell: the
+unit's block in MANIFEST.toml states `compression = "gzip"` (or `"xz"` or
+`"zstd"`) and a unit stored uncompressed has no `compression` line;
+`--find-envelope` and `--list` print "compressed with" and the name; the
+front index, File 0 and the seal say nothing about it. (With the operator or
+escrow key, a manual look at MANIFEST.toml takes the envelope of the tenant
+that owns the unit: step 5 of "Manual Recovery Steps".)
+
+Each slice is compressed on its own, after the cut and before it is
+encrypted, so a lost slice loses only the files in it, and a slice
+decrypted and decompressed is exactly the plain cut an uncompressed unit
+would have in that place. The tool that reads each algorithm, and the
+package that has it: `gzip` (package gzip), `xz` (package xz-utils), `zstd`
+(package zstd). Only the one the unit names is needed. The tool's exit
+status is never the verdict (a BusyBox `unxz` exits 0 after writing wrong
+bytes): the plain cut's length is the slice's `size_bytes` in MANIFEST.toml
+and its hash the slice's `sha256_plain`, and the last line below checks
+both. By hand, the slice line of "Manual Recovery Steps" (step 7) becomes,
+with DECOMPRESS `gzip -dc`, `xz -dc` or `zstd -dc`:
+
+    dd if=/dev/nst0 bs=512k of=slice.NUMBER.age
+    truncate -s ENCRYPTED_BYTES slice.NUMBER.age
+    echo "SHA256_ENCRYPTED  slice.NUMBER.age" | sha256sum -c - && age -d -i YOUR_KEY.age.key slice.NUMBER.age | DECOMPRESS > slice.NUMBER.tar && rm slice.NUMBER.age
+    test $(wc -c < slice.NUMBER.tar) -eq SIZE_BYTES && echo "SHA256_PLAIN  slice.NUMBER.tar" | sha256sum -c -
+
+and everything after it (the join, the check against the file table) is
+the same. The room the restore needs is the unit's "bytes of stream", not
+its slices' size ("Disk space").
 
 ## Manual Recovery Steps
 
 If RESTORE.sh is not available, follow these steps with `mt`, `dd`,
-`truncate`, `age`, `tar`, `sha256sum` and `dar`. They use the non-rewinding
-device ("Which device?"; `/dev/nst0` is an example). Each `dd` that finishes
-leaves the head at the start of the next file, so `mt fsf N` moves forward N
-files from where you are, and `mt rewind` then `mt fsf N` reaches File N from
-anywhere. A `dd` that stops with an error ("Input/output error") leaves the
-head INSIDE that file, not at the start of the next: after any failed read,
-`mt rewind` and `mt fsf` to the file you want next, whatever the counting
-below says. Read the tape forward where you can; rewinding is slow.
+`truncate`, `age`, `tar`, `sha256sum` and the standard tools. They use the
+non-rewinding device ("Which device?"; `/dev/nst0` is an example). Each
+`dd` that finishes leaves the head at the start of the next file, so `mt
+fsf N` moves forward N files from where you are, and `mt rewind` then `mt
+fsf N` reaches File N from anywhere. A `dd` that stops with an error
+("Input/output error") leaves the head INSIDE that file, not at the start
+of the next: after any failed read, `mt rewind` and `mt fsf` to the file
+you want next, whatever the counting below says. Read the tape forward
+where you can; rewinding is slow.
 
 Deleting the padding zeros with `tr -d '\0'` is for the plain text files
 only (Files 0 to 3 and the last). An envelope or a slice is trimmed to its
@@ -2232,15 +1979,14 @@ exact size with `truncate` instead, never with `tr`.
    that filemark and the one before it and then steps forward over that
    one, which leaves the head at the START of the last file. (Without
    `eod`, `mt -f /dev/nst0 rewind` then `mt -f /dev/nst0 fsf {last_file}`
-   reaches the same place on this tape, if it did not end early.) Check that `front_index_sha256` in seal.toml
-   equals the sha256sum printed in step 3, and that its `file_count` is
-   the number of entries in the front index. On a tape that ended early
-   (File 0 and the seal say `requires = ["short-seal"]`, and `file_count`
-   is smaller), the seal marker's `ended_after` is the last file before it,
-   and every entry of the front index after that is not on the tape:
-   "Where the tape ended". If the seal marker is
-   missing, or the two hashes disagree, treat the tape as unsealed or
-   damaged: see "If the verdict is UNSEALED or DAMAGED". An unsealed tape
+   reaches the same place on this tape, if it did not end early.) Check that
+   `front_index_sha256` in seal.toml equals the sha256sum printed in step 3,
+   and that its `file_count` is the number of entries in the front index. On
+   a tape that ended early, `file_count` is smaller, the seal marker's
+   `ended_after` is the last file before it, and every entry of the front
+   index after that is not on the tape: "Where the tape ended". If the seal
+   marker is missing, or the two hashes disagree, treat the tape as unsealed
+   or damaged: see "If the seal is missing or not trusted". An unsealed tape
    may lack its last data slices (the front index still lists them), and
    every file that is there can be checked against the index.
 5. Find and open an envelope. Its entries in the front index have type
@@ -2250,10 +1996,10 @@ exact size with `truncate` instead, never with `tr`.
    `tenant_envelope` and no other, so the first that decrypts is yours. The
    operator key and the escrow key open EVERY envelope, and the tenant
    envelopes come first: the first that decrypts is then one tenant's, and
-   its MANIFEST.toml lists that tenant's units and no one else's. For all
-   the units on the tape open the `operator_envelope` instead, whose
-   MANIFEST.toml lists every unit (or open each `tenant_envelope` and
-   restore the units of each). For each envelope you try, with POSITION
+   its MANIFEST.toml lists that tenant's units and no one else's, with their
+   file tables. The `operator_envelope` lists every unit, but holds the file
+   tables only as rows of its `catalog.db`, so open each `tenant_envelope`
+   and restore the units of each. For each envelope you try, with POSITION
    (the entry's `position`) and SIZE (its `size_bytes`):
 
        mt -f /dev/nst0 rewind
@@ -2263,68 +2009,70 @@ exact size with `truncate` instead, never with `tr`.
        sha256sum envelope.raw
        age -d -i YOUR_KEY.age.key envelope.raw > envelope.tar
 
-   The sha256sum must equal that entry's `sha256_encrypted`. age says
-   "no identity matched any of the recipients" for an envelope your key
-   was not made for: go on to the next. With a tenant's key the first that
-   decrypts is yours; with the operator or escrow key you choose, as above.
-   If it is damaged or will not read, use its backup, the `_backup` entry
-   with the same `sha256_encrypted`. Unpack it:
+   The sha256sum must equal that entry's `sha256_encrypted`. age says "no
+   identity matched" for an envelope your key was not made for: go on to the
+   next. With a tenant's key the first that decrypts is yours. If it is
+   damaged or will not read (age says anything else after a key matched), use
+   its backup, the `_backup` entry with the same `sha256_encrypted`. Unpack
+   it:
 
        mkdir env && tar xf envelope.tar -C env
-       ls env env/catalogs env/index
+       ls env env/tables env/index
 
    (If neither the envelope nor its backup reads: "If All Else Fails", at
    its end.)
 
 6. `env/MANIFEST.toml` describes the units of the envelope you opened: a
-   `[[units]]` block for each (`name`, `uuid`, `snapshot_version`), and
-   under it one `[[units.slices]]` block for each slice, with its `number`,
-   `tape_position`, `encrypted_bytes` (its exact size) and
-   `sha256_encrypted`. A unit stored in several versions has a `[[units]]`
-   block, with its own slices, for each version. This line lists the units
-   and versions:
+   `[[units]]` block for each (`name`, `uuid`, `snapshot_version`,
+   `stream_bytes`, `file_table` and `id_map`, and `compression` when the unit
+   was compressed), and under it one `[[units.slices]]` block for each slice,
+   with its `number`, `tape_position`, `size_bytes` (the length of the slice's
+   PLAIN cut), `encrypted_bytes` (its exact size on the tape),
+   `sha256_plain`, `sha256_encrypted` and, for a slice that continues a long
+   file, `continues = true`. A unit stored in several versions has a
+   `[[units]]` block, with its own slices, for each version. This line lists
+   the units and versions:
 
-       grep -E '^(name|uuid|snapshot_version) =' env/MANIFEST.toml
+       grep -E '^(name|uuid|snapshot_version|stream_bytes|file_table|compression) =' env/MANIFEST.toml
 
    `env/RECOVERY.md` writes the commands of step 7 out for each unit.
-   `env/catalogs/` holds each unit's dar catalogue
-   (`dar -l env/catalogs/NAME -N -Q` lists the files without the tape,
-   NAME as under "Words this guide uses"), and `env/index/` the index of
-   "The rest of the box".
+   `env/tables/` holds each unit's file table and id map, and `env/index/`
+   the index of "The rest of the box".
 7. Restore ONE version of ONE unit at a time, each in a directory of its
-   own: the slices of every unit are named `restore.N.dar`, so two units in
-   one directory would overwrite each other. If the manifest lists the unit
-   more than once, take the block with the highest `snapshot_version`, the
-   newest, unless you want an older one. On a tape that ended early (step
-   4), check first that the `tape_position` of the unit's last slice is at
-   or before the seal marker's `ended_after`: if it is after, the tape does
-   not hold the unit whole, so do not start ("Where the tape ended"). A
-   block that states `may_span = true` is a unit across tapes: a slice with
-   no `tape_position` is on another tape, so read each tape's slices of it
-   this way, matching each by its `sha256_encrypted`, all into the one
-   directory, and run dar only once every slice, 1 to the last, is there ("A
-   unit across tapes"). Put the tape at the first slice,
-   once. `fsf N` moves forward N files from where the head is, so from the
-   start of the tape it reaches File N: the `tape_position` of the first
-   slice, from the manifest (FIRST_TAPE_POSITION below).
+   own: the slices of every unit are named `slice.N.tar`, so two units in
+   one directory would be mixed. If the manifest lists the unit more than
+   once, take the block with the highest `snapshot_version`, the newest,
+   unless you want an older one. On a tape that ended early (step 4), check
+   first that the `tape_position` of the slices you read is at or before the
+   seal marker's `ended_after`; a slice with no `tape_position` is on
+   another tape ("A unit on more than one cartridge"): read each tape's
+   slices of it this way, matching each by its `sha256_encrypted`, all into
+   the one directory. Put the tape at the first slice, once. `fsf N` moves
+   forward N files from where the head is, so from the start of the tape it
+   reaches File N: the `tape_position` of the first slice, from the
+   manifest (FIRST_TAPE_POSITION below).
 
        mt -f /dev/nst0 rewind
        mt -f /dev/nst0 fsf FIRST_TAPE_POSITION
 
    Then, for each slice of the unit in order of its number, with
-   ENCRYPTED_BYTES, SHA256_ENCRYPTED and NUMBER from the manifest (each read
-   that finishes leaves the tape at the start of the next file, so the next
-   slice needs no spacing unless there is a gap or a read failed):
+   ENCRYPTED_BYTES, SHA256_ENCRYPTED, SHA256_PLAIN, SIZE_BYTES and NUMBER from
+   the manifest (each read that finishes leaves the tape at the start of the
+   next file, so the next slice needs no spacing unless there is a gap or a
+   read failed). For a unit that states `compression`, use the slice line of
+   "Compressed units" instead:
 
-       dd if=/dev/nst0 bs=512k of=restore.NUMBER.dar.age
-       truncate -s ENCRYPTED_BYTES restore.NUMBER.dar.age
-       echo "SHA256_ENCRYPTED  restore.NUMBER.dar.age" | sha256sum -c - && age -d -i YOUR_KEY.age.key restore.NUMBER.dar.age > restore.NUMBER.dar && rm restore.NUMBER.dar.age
+       dd if=/dev/nst0 bs=512k of=slice.NUMBER.age
+       truncate -s ENCRYPTED_BYTES slice.NUMBER.age
+       echo "SHA256_ENCRYPTED  slice.NUMBER.age" | sha256sum -c - && age -d -i YOUR_KEY.age.key slice.NUMBER.age > slice.NUMBER.tar && rm slice.NUMBER.age
+       test $(wc -c < slice.NUMBER.tar) -eq SIZE_BYTES && echo "SHA256_PLAIN  slice.NUMBER.tar" | sha256sum -c -
 
-   The last line is one command on purpose: each `&&` stops it at the first
+   The third line is one command on purpose: each `&&` stops it at the first
    step that fails, so a slice whose hash is wrong is never decrypted, and
    its encrypted copy is deleted only after it decrypted. If it stops, the
-   slice is damaged (below); if `age` was what failed, delete the partial
-   `restore.NUMBER.dar` before going on.
+   slice is damaged ("If a slice or a file is damaged"); if `age` was what
+   failed, delete the partial `slice.NUMBER.tar` before going on. The last
+   line checks the decrypted slice: its length and its hash.
 
    If a gap lies between two of the unit's slices (another unit's slices,
    say), space over it first. `fsf` takes the number of files to skip, not a
@@ -2343,43 +2091,87 @@ exact size with `truncate` instead, never with `tr`.
    the tape. The copy lists it in its own front index under the same
    `sha256_encrypted`, at whatever File that tape puts it, so find it by
    that hash and by nothing else. With no other copy, leave that slice out
-   and go on: "If a slice or a file is damaged" ("No other copy") says what
-   dar then does.
+   and go on: "If a slice or a file is damaged" says what the rest gives.
 
    Block padding must be trimmed (`truncate`) before the hash is checked
    and before age sees the file: the padding zeros make age reject the
-   ciphertext. The decrypted files must be named `restore.1.dar`,
-   `restore.2.dar`, ... with the slice's number in the manifest as the
-   number, and no gaps (but for a slice you must leave out: "No other copy"
-   in "If a slice or a file is damaged"): that is the naming dar requires of
-   a sliced archive (base name `restore`). Work on a disk with room for all of the
-   unit's decrypted slices at once (about the unit's size) and for step 8's
-   restored files beside them (the unit's size again, more if it was stored
-   compressed: "How much room, in one place", in "Disk space"), on a real disk and not in /tmp, which is a small RAM disk on many systems
-   ("Disk space"). RESTORE.sh keeps only the envelopes there, never a slice.
-8. Reassemble dar slices into an EMPTY directory, which dar needs to exist
-   (`mkdir /destination`): `dar -x restore -R /destination -O -Q -N`. With
-   several units, give each its own directory (`/destination/UNIT`); two
-   units of one name (different uuids) take `/destination/UNIT-` and the
-   first 8 characters of the uuid, each a new directory, or dar would merge
-   them without a word. dar keeps any file already there and still reports
-   success, so to finish an earlier restore of the same unit that stopped
-   part way, add `-w` (overwrite); never use it to restore a newer version
-   over an older one.
-   `-N` keeps a `~/.darrc` on your machine from changing what is restored.
-   Delete the unit's `restore.N.dar` files once it is restored and checked.
+   ciphertext. Work on a disk with room for all of the unit's decrypted
+   slices at once (the unit's "bytes of stream") and for step 8's restored
+   files beside them (the same again), on a real disk and not in /tmp, which
+   is a small RAM disk on many systems ("Disk space"). RESTORE.sh keeps only
+   the envelopes and one slice there.
+8. Join the slices in order into ONE tar run, into an empty directory of
+   its own (each slice begins where a file begins, and the slices joined are
+   the tar stream, so tar needs nothing more). `LC_ALL=C` keeps file names as
+   they are, and a `TAR_OPTIONS` in your environment must be empty. With GNU
+   tar the flags are these (numbers, not names, for owner and group; with
+   another tar, drop the flags it refuses: "What a restore on another
+   computer does"):
 
-Then check the result as under "Did the restore get everything?": dar's
-exit status (`echo $?`) is 0 and its summary shows nothing failed, and
-the count matches `dar -l env/catalogs/NAME -N -Q`.
+       mkdir -p /destination
+       cat $(ls slice.*.tar | sort -t. -k2,2n) | LC_ALL=C tar -x --numeric-owner -p --xattrs --acls -f - -C /destination
+
+   With several units, give each its own directory (`/destination/UNIT`);
+   two units of one name (different uuids) take `/destination/UNIT-` and the
+   first 8 characters of the uuid, each a new directory, or their files
+   would be mixed without a word. tar keeps nothing of an earlier run and
+   restores over what is there, so restore into an empty directory; never
+   restore a newer version over an older one. Delete the unit's
+   `slice.N.tar` files once it is restored and checked.
+9. Check the result against the unit's file table (the check is the
+   sha256 of every file; tar's exit status is not a check). NAME is the
+   table's name without `.tsv`, as step 5's `ls` shows it (`env/tables/NAME.tsv`,
+   TABLE below). It prints nothing when every file passes, and `FAILED` for
+   each that does not. A file whose name holds a backslash, a TAB, a newline
+   or a carriage return is written escaped in the table and is left out of this
+   line: compare it by hand against its row (RESTORE.sh checks it).
+
+       awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && index($7, "\\") == 0 {{ print $6 "  ./" $7 }}' env/tables/TABLE.tsv | (cd /destination && sha256sum -c --quiet)
+
+   Who the user and group numbers were, for the unit (the id map; it is
+   shown and never used):
+
+       cat env/tables/TABLE.ids.tsv
+
+**One file, not the whole unit.** Find its row in the unit's file table (the
+columns are `kind`, `slice`, `start`, `end`, `size`, `sha256` and `path`, the
+path as the table writes it, with `./` left off):
+
+    awk -F'\t' '$7 == "SOME_PATH"' env/tables/TABLE.tsv
+
+then the stream offset where its slice begins, which is the `start` of the
+first row whose `slice` is that slice's number (SLICE is the row's `slice`):
+
+    awk -F'\t' -v s=SLICE '!/^#/ && $2 == s {{ print $3; exit }}' env/tables/TABLE.tsv     # SLICE_START
+
+Read that slice into `slice.SLICE.tar` as in step 7, then cut the file's bytes
+out of it and give them to tar (START and END are the row's, and SLICE_START
+is the second command's answer). Each cut is its own pipeline:
+
+    tail -c +$((START - SLICE_START + 1)) slice.SLICE.tar | head -c $((END - START)) | LC_ALL=C tar -x --numeric-owner -p -f - -C /destination
+
+A file that runs on past the end of its slice (a long file: its `end` is
+beyond the end of its slice, which is its `start` plus the `size_bytes` of the
+slices from there) is a run of slices: read each slice of the run, and cut from
+them joined, FIRST_SLICE_TO_LAST being their names in order:
+
+    cat FIRST_SLICE_TO_LAST | tail -c +$((START - SLICE_START + 1)) | head -c $((END - START)) | LC_ALL=C tar -x --numeric-owner -p -f - -C /destination
+
+A hard link (kind `h`) needs the file it is a name for restored first (its
+row's last column names it): restore that file the same way, then the link.
 
 ## Important: Block Padding
 
 This tape uses 512KB (524288 byte) fixed block mode. Every file is
 padded with zeros to the next block boundary. Encrypted files (data
 slices, envelopes) MUST be trimmed to their exact byte size before
-decryption — the padding zeros will cause age to reject the ciphertext.
-Exact sizes are in File 3, the front index (`size_bytes` field).
+decryption — the padding zeros will cause age to reject the ciphertext
+("failed to decrypt and authenticate payload chunk" is what age prints for
+an untrimmed file). Exact sizes are in File 3, the front index (`size_bytes`
+field), and in MANIFEST.toml's `encrypted_bytes` for a slice. A slice's
+`size_bytes` in MANIFEST.toml is something else: the length of its PLAIN cut,
+after it is decrypted (and decompressed). Never trim an encrypted slice to
+that.
 
 ## What the unencrypted parts of this tape reveal
 
@@ -2396,19 +2188,23 @@ physical tape can therefore learn a limited set of *structural* facts
   trim block padding without a key).
 
 They CANNOT learn filenames, unit or tenant names, plaintext-content
-checksums, ownership, or any file content — all of that lives only
-inside the age-encrypted envelopes and slices. That includes the index
-of other tapes and of every path, which is inside the envelopes.
+checksums, ownership (no user or group name or number is in any plain
+file), or any file content — all of that lives only inside the
+age-encrypted envelopes and slices. That includes the index of other tapes
+and of every path, the file tables and the id maps, which are inside the
+envelopes.
 
 **Accepted size disclosure.** Encryption overhead is deterministic and
 tapectl archives without compression unless its operator chose it, so an
-on-tape size approximates the content size it encloses. If your units are archived one
-folder per slice — the common case — the size of each data slice
-effectively discloses that unit's approximate content size and
-reveals unit boundaries: someone holding this tape could in principle
-correlate slice sizes against publicly known media sizes. This is a
-known, accepted trade-off: sizes and ciphertext hashes are structural
-facts needed for keyless navigation and integrity checking, and
+on-tape size approximates the content size it encloses. A slice holds whole
+files and a file larger than a slice is a run of slices of its own, so a
+slice's size follows the files in it: a file alone in its slice, or in a run
+of its own, shows its size, and if your units are archived one folder per
+slice, the size of each data slice effectively discloses that unit's
+approximate content size and reveals unit boundaries: someone holding this
+tape could in principle correlate slice sizes against publicly known media
+sizes. This is a known, accepted trade-off: sizes and ciphertext hashes are
+structural facts needed for keyless navigation and integrity checking, and
 neither is tied to any tenant or unit name in plaintext.
 
 ## If All Else Fails
@@ -2453,7 +2249,7 @@ piece of a unit's archive (often hundreds of MiB to GiB; a unit's last
 slice can be small), so size is a hint, not proof. By trying your key and
 unpacking what comes out: your key opens your slices as well as your
 envelope, so a file that decrypts is not yet an envelope, but an
-envelope's decrypted bytes are a tar archive and a slice's are not. With a
+envelope's decrypted bytes are a tar archive that lists MANIFEST.toml, and a slice's are not. With a
 tenant's key, stop at the first file that decrypts to a tar archive listing
 MANIFEST.toml: that is your envelope. With the operator or escrow key do
 not stop there: the tenants' envelopes come first and each lists only one
@@ -2498,12 +2294,14 @@ the tape was written, and the operator and escrow keys open every one.
    trillion that more zeros were lost, so an error after four means the
    wrong key or real damage, not the stripping.)
 4. Run `tar tf candidate.dec`. A list that begins with MANIFEST.toml is an
-   envelope; an error that it is not a tar archive means a data slice.
+   envelope; anything else (a list of a unit's files, or an error that it is
+   not a tar archive) is a data slice.
    Once the envelope you want decrypts, unpack it (`mkdir env && tar xf
    candidate.dec -C env`): its MANIFEST.toml gives the exact tape
-   position and byte size for every slice belonging to the units it lists.
-   Apply the same read/trim/decrypt procedure to each slice using
-   those exact sizes, then reassemble with dar as above.
+   position and `encrypted_bytes` for every slice belonging to the units it
+   lists. Apply the same read/trim/decrypt procedure to each slice using
+   those exact sizes, then join the slices and give them to tar as step 8 of
+   "Manual Recovery Steps" does.
 
 **When no envelope reads.** If every copy of every envelope (each one and
 its backup) is damaged, the data slices may be intact, but nothing else on
@@ -2516,5522 +2314,18 @@ copy of this tape (its envelopes carry it), or the Heir Kit's catalogue
 was made after this tape was written. With a map, read the slices as step 7
 of "Manual Recovery Steps" does.
 
+
 ## Total files on this tape: {total_files}
 
 The files of THIS tape are numbered 0 to {last_file}. File {last_file}, the
 last, is the seal marker. Another tape of the box has its own count: File 0
 of that tape gives it. That is the plan: a tape that ended early holds
 fewer, and its seal marker says where it ended ("Where the tape ended").
+
 "#
     )
 }
 
-/// Generate RESTORE.sh v2 (File 2) — self-contained emergency restore +
-/// verify script for layout v2. Four modes per sheet §10:
-/// - `--info`: read File 0 + File 3 (front index) + the last file (seal
-///   marker); print the layout table and the exact §2.5 verdict (SEALED /
-///   UNSEALED / DAMAGED (ends disagree)) — never trusts the seal marker's
-///   mere presence (§2.6): the verdict always re-derives from the hash chain.
-/// - `--verify`: keyless integrity walk — every file's on-tape bytes (after
-///   trimming to File 3's `size_bytes`) hashed and compared to File 3's
-///   `sha256_encrypted`; File 3 itself checked against the seal binding.
-///   Per-file PASS/FAIL lines, nonzero exit on any FAIL.
-/// - `--find-envelope --key K [--key K2 ...]`: trial-decrypt envelope
-///   positions (found by type in the file map), as v1.
-/// - `--restore --key K [--key K2 ...] --to DIR [--unit U] [--version N]`: slice positions/sizes come from
-///   the decrypted MANIFEST, cross-checked against the file map's
-///   `size_bytes`/`sha256_encrypted` before each slice is trusted/decrypted.
-///
-/// Every mode that needs a file map applies the degradation ladder (sheet
-/// §3.4): rung 1 is File 3 itself; rung 2 (if File 3 fails to parse or fails
-/// its self-consistency check, §2.5) falls back to the seal marker's
-/// embedded `[[files]]` copy, loudly warned; rung 3 (both gone) prints the
-/// manual zero-strip procedure (§3.3) and exits — there is nothing left to
-/// automate. Parsing stays line-oriented (`grep`/`awk`/`sed` over
-/// `key = value` lines, the §3.1 grammar contract); every value read from a
-/// plaintext tape metadata zone goes through `require_uint` before it
-/// reaches arithmetic, `fsf`, or `seq` (S2 hardening, carried over from v1).
-/// Tools used: mt, and the ones in `RESTORE_TOOLS` (each mode checks only
-/// those it runs), plus standard coreutils (awk/sed/grep/tr) — no TOML
-/// collection, per the grammar contract.
-/// **`--key` is repeatable (issue #288, CTO ruling 2026-09-22).** A volume's
-/// tenant envelope is sealed at WRITE time to the tenant's then-current public
-/// keys (`build.rs`), while its data slices were sealed at STAGE time
-/// (`staging/mod.rs`). A `key rotate` landing between the two puts envelope
-/// and slices on different key generations, and then NO single key opens both
-/// — measured on a real tape. tapectl itself is unaffected because it
-/// trial-decrypts with every tenant and operator key, independently for the
-/// envelope and for the slices; RESTORE.sh took one `--key`, so the heir path
-/// was the only one that failed. It now mirrors tapectl: repeated `--key`,
-/// each tried on its own for the envelope and for each slice (remembering the
-/// key that opened the previous slice, since a wrong key costs a re-read of
-/// tape-sized ciphertext). Every key path is checked for existence BEFORE the
-/// first tape read — `age -d -i good -i missing` fails outright rather than
-/// skipping the bad one.
-///
-/// **CARRIED FIX — issue #218, CTO ruling 2026-09-17: done, 2026-09-22.** The
-/// decrypted-slice progress line read `MB` for a 1048576-divided figure, which
-/// ADR-0012 forbids (capacities decimal, data sizes binary, the two named
-/// apart). #204 fixed the class across ~40 CLI sites and deliberately left
-/// this one, because RESTORE.sh is on-tape content pinned by
-/// `RESTORE_SH_SHA256` in `tests/on_tape_golden.rs` and the ruling was to
-/// batch it onto the next substantive change rather than spend a re-pin on a
-/// label. #288 is that change, so the line now reads `MiB`.
-///
-/// **A quoting defect went with it (issue #291).** Two of the three
-/// "no envelope opened" exits quoted the tape label as `'\''VOL-A'\''` — the
-/// idiom for embedding a quote inside a SINGLE-quoted string, in a string
-/// that is double-quoted, where a bare `'` is already literal. Bash printed
-/// the backslashes verbatim, so the one line telling a reader in a disaster
-/// whether they hold the wrong cartridge rendered as garbage. The third exit
-/// (the `--unit` one, which is the ordinary way to reach it) carried no
-/// context at all. All three now route through one `die_no_envelope` helper
-/// so they cannot drift apart again.
-///
-/// This note lives on the FUNCTION, not inside the template: a comment added
-/// within the string becomes shell comment lines in the generated script and
-/// changes its hash. I did exactly that first, and the golden test caught it —
-/// which is the test working as designed.
-pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
-    use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAMAGED_DIRS, AWK_DAR_DAMAGED, AWK_DAR_HEADER,
-        AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
-        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
-        AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
-        AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
-    };
-
-    let script = r#"#!/usr/bin/env bash
-# RESTORE.sh — Emergency restore script for tapectl volume __LABEL__ (layout v2)
-# This script restores data from this tape WITHOUT tapectl installed.
-# It reads the tape's front index (File 3), the seal marker (last file),
-# finds your encrypted envelope, decrypts each data slice, and extracts
-# the dar archive to a directory.
-#
-# Usage:
-#   ./RESTORE.sh --info                                       Show tape layout + seal verdict
-#   ./RESTORE.sh --verify                                     Keyless integrity check (no key needed)
-#   ./RESTORE.sh --find-envelope --key KEYFILE [--key K2 ...] Decrypt your envelope
-#   ./RESTORE.sh --restore --key KEYFILE [--key K2 ...] --to DIR
-#                [--unit U [--unit U2 ...] | --all] [--version N]
-#                [--no-space-check] [--overwrite] [--no-file-check] [--scratch DIR]
-#   ./RESTORE.sh --restore --key KEYFILE --to DIR --unit U --path P [--path P2 ...]
-#                [--version N] [--scratch DIR]                One file or folder
-#   ./RESTORE.sh --list --key KEYFILE [--unit U] [--version N]  A unit's files
-#   ./RESTORE.sh --restore ... [--slices-from DIR ...] [--swap-tapes]   A bad slice from another copy
-#   ./RESTORE.sh --restore --key KEYFILE --to DIR --unit U [--stream-tapes]   A unit across tapes
-#   ./RESTORE.sh --restore --key KEYFILE --to DIR --unit U --fill-from LIST   Files a restore could not restore
-#   ./RESTORE.sh --verify [--slices-from DIR ...] [--swap-tapes]
-#   ./RESTORE.sh --where UNIT --key KEYFILE [--key K2 ...]       Which tapes hold UNIT
-#   ./RESTORE.sh --where --all --key KEYFILE [--key K2 ...]      Every unit the index names, no limit
-#   ./RESTORE.sh --find TEXT --key KEYFILE [--key K2 ...]        Which unit and tape hold a path
-#
-# --list and --path read the dar catalogue each envelope carries
-# (catalogs/<uuid8>_v<version>.1.dar): --list reads no data slice at all, and
-# --path reads only the slices that hold what it asks for, plus the last.
-# --to must be empty or new: dar keeps a file that is already there and
-# reports success, so a restore over an earlier one cannot be trusted.
-# --overwrite replaces such files instead, to finish a restore that stopped.
-# With more than one unit (--all, or --unit repeated) each unit goes to its
-# own directory, --to/UNIT.
-#
-# --where and --find read the cross-volume index that a tape written since
-# version 1.3.0 carries in its envelopes (index/units.tsv, and index/paths.tsv
-# in each tenant envelope): --where lists every version of a unit and the tapes
-# holding it, --where --all lists EVERY unit the index names (no limit) with its
-# newest version, whether this tape holds it, and every version's holders,
-# --find lists the paths that contain a piece of text and the tapes holding
-# them. An index is as of the moment its own tape was written, so the newest
-# tape you hold has the most complete one. They read this tape only, forward
-# from one rewind, like every other mode.
-#
-# --key may be repeated. An envelope and the slices it describes can need
-# different keys after a key rotation, so every key is tried independently.
-#
-# A tape written since version 1.6.0 may end early: when the drive reported
-# the end of its medium in a data slice before the last, the write sealed the
-# tape after that slice, with a short seal. Everything before the slices is
-# the plan (File 0, the front index, the envelopes); the seal marker, the last
-# file, says where the tape really ended (ended_after), and a planned file
-# after that is not on the tape. A unit with a slice there is cut: not on this
-# tape whole, named and never restored from it (another tape holds it). So on
-# such a tape every mode that reads slices or says which units it holds reads
-# the seal first, right after the front index: one wind to the end of the data
-# and a rewind. --info says where the tape ended, and --info and --verify print
-# one NOT ON TAPE line for the planned files after it.
-#
-# A tape written since version 1.7.0 may hold part of a unit held across tapes:
-# a range, one unbroken run of its slices in slice order (File 0 then requires
-# spanning). The envelopes list every slice of such a unit and give a tape
-# position only to the slices this tape holds: a slice with none is on another
-# tape. --list says which slices of it this tape holds, and --where and --find
-# print a tape's run of slices when it is not the whole version. dar never runs
-# over part of such a unit: --restore --unit U restores it from the tape that
-# holds its slice 1 (on another tape it refuses before reading a slice, and
-# names the tapes that hold slice 1 when an index says), then asks for each
-# further cartridge, which it takes only when that tape's front index lists the
-# next slice's sha256 at a position its seal marker covers. By default each
-# tape's slices are kept, still encrypted, in a scratch directory inside --to
-# (or --scratch DIR) until all are read, and dar then runs once over them: room
-# for the whole unit's encrypted slices as well as its files, checked first.
-# --stream-tapes feeds one dar run from each tape in turn instead, keeping no
-# slice on disk. Either way the run waits at each cartridge change for as long
-# as it takes, reading its answer from the input. --path reads only the slices
-# it needs (those that hold the paths, and the last) from whichever tapes hold
-# them, starting on any tape the key opens: the ones that tape holds first,
-# then each further cartridge, taken the same way; they wait, still encrypted,
-# in the scratch directory until all are read. --all restores the units this
-# tape holds whole and names the others.
-#
-# A slice that fails its hash, or will not read, can be taken from another copy
-# of the unit (ADR-0012 item 101). The copy's slice has the same sha256 in its
-# front index, and that is the only way one is matched: --slices-from DIR names
-# a directory of slice files copied off another tape (any names), and
-# --swap-tapes asks for another cartridge after this one has been read, and
-# takes a slice from it only at a position its seal marker covers (a tape that
-# holds part of a unit held across tapes gives the slices it holds). Either
-# one restores the way an older dar does, slice by slice onto disk (about twice
-# the unit's size), because a stream cannot take a slice back from dar.
-#
-# A restore whose dar run names files it could not restore (a failed CRC, a
-# damaged slice) writes their paths to .tapectl-damaged-files.txt in the unit's
-# directory (ADR-0012 item 102) and ends RESTORE INCOMPLETE. Another tape that
-# holds the same unit at the same version fills exactly those files:
-#   ./RESTORE.sh --restore --key KEYFILE --unit U --fill-from LIST --to DIR
-#
-# dar checks each file it restores with a short checksum, not a hash, so a
-# damaged file can come back with no error. A tape written since version 1.3.0
-# records the sha256 of every regular file in its index, and after each restore
-# and each fill this script reads the restored files back and checks them
-# against it with sha256sum (ADR-0012 item 103). A file that does not match, or
-# is missing, goes on the damaged-file list like one dar named, and the run ends
-# RESTORE INCOMPLETE. That costs one read of the restored files from disk, not
-# a tape read; --no-file-check skips it. A tape written before 1.3.0 has no
-# index to check against, and the script says so.
-#
-# Disk space: --restore streams each slice from the tape through age into dar,
-# so nothing decrypted is written to disk but the restored files themselves:
-# --to needs about the unit's size free (counted from the slices' encrypted
-# size on tape: a compressed unit may need more). The envelopes are the other
-# thing on disk: they go to the work directory in ${TMPDIR:-/tmp}, decrypted,
-# and TMPDIR moves it. dar is given the unit's catalogue from the envelope
-# (dar 2.7.13 loses a file's tail streaming without one).
-# Where streaming is not safe (no usable catalogue and a dar before 2.7.21,
-# or a dar before 2.7.9) the slices are decrypted to disk first, as 1.0.x
-# did, in a scratch directory inside --to or --scratch DIR. The script
-# measures the space before it reads any slice.
-#
-# Requirements: mt (mt-st), __TOOLS_ALL__
-# Each mode checks only the tools it runs (see the prerequisite check below).
-# Total files on tape: __TOTAL_FILES__
-#
-# Degradation ladder (see the system guide, File 1, "If All Else Fails"):
-#   rung 1 — File 3, the front index (normal path)
-#   rung 2 — the seal marker's embedded front-index copy (if File 3 fails)
-#   rung 3 — manual zero-strip recovery (if both fail; this script cannot
-#            automate it, but prints the procedure)
-
-set -euo pipefail
-
-# This script matches the words of dar and of other tools (dar's skip line,
-# the GPG start-up failure, a full disk). dar and coreutils ship translations,
-# and a translated message would not match: ask for English in any locale.
-export LC_ALL=C
-
-DEVICE="${TAPE_DEVICE:-/dev/nst0}"
-LABEL="__LABEL__"
-BLOCK=524288 # 512 KB — tapectl fixed block size
-
-# Every --key given on the command line, in order. A volume's envelope and the
-# data slices it describes can be sealed to DIFFERENT key generations: the
-# envelope is built when the volume is written, each slice when it was staged.
-# A key rotation between the two leaves no single key that opens both, so each
-# key here is tried independently for the envelope and for every slice.
-KEYS=()
-
-# WORK is the work directory, made in ${TMPDIR:-/tmp}: TMPDIR moves it. It
-# holds the tape's text zones, the FIFOs a restore streams slices through, and
-# the ENVELOPES: each is read whole into it, and each one a key opens is kept
-# there decrypted (its MANIFEST.toml, the dar catalogues of its units and, in
-# the operator's, catalog.db) until the run ends; --all keeps every one it
-# opens. These grow with the number of files on the tape. A data slice never
-# lands here — a slice is up to 10 GiB and /tmp is RAM on many systems.
-# SCRATCH is for the modes that keep slices on disk (--path, which reads only
-# a few; a unit held across tapes, its slices still encrypted; a replacement
-# slice), a directory created inside --to or --scratch once its size is known.
-SCRATCH=""
-SCRATCH_PARENT=""
-SKIP_SPACE_CHECK=0
-OVERWRITE=0
-# --slices-from DIR (repeatable), --swap-tapes and --fill-from LIST (1.3.0).
-# SALVAGE is 1 when either of the first two was given.
-SLICES_FROM=()
-SWAP_TAPES=0
-SALVAGE=0
-FILL_FROM=""
-# A unit held across tapes (1.7.0) is restored from the tape that holds its
-# slice 1, asking for each further cartridge. SPAN_RESTORE is scratch (the
-# default: each tape's slices are kept, still encrypted, in SCRATCH until all
-# are read, and dar runs once over them) or stream (--stream-tapes: one dar
-# run fed across the swaps, no slice on disk) while such a restore runs, and
-# path while --path reads the slices it needs of such a unit (into SCRATCH,
-# still encrypted, as by default).
-STREAM_TAPES=0
-SPAN_RESTORE=""
-
-umask 077 # decrypted plaintext and temp files must not be world-readable
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/tapectl-restore.XXXXXX")" ||
-  {
-    echo "FATAL: cannot create temporary directory" >&2
-    exit 1
-  }
-# Background jobs of a streaming restore (dar, and a slice's hash) are
-# killed on any way out: a dar left waiting on a FIFO would wait forever.
-BG_PIDS=()
-cleanup() {
-  local p
-  for p in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do
-    disown "$p" 2>/dev/null || true
-    kill -KILL "$p" 2>/dev/null || true
-  done
-  rm -rf "$WORK"
-  [ -z "$SCRATCH" ] || rm -rf "$SCRATCH"
-}
-trap cleanup EXIT
-
-die() {
-  echo "FATAL: $*" >&2
-  exit 1
-}
-info() { echo ">>> $*"; }
-
-# The provided keys as one line, so a failure names every key that was tried.
-keys_list() {
-  local k out=""
-  for k in ${KEYS[@]+"${KEYS[@]}"}; do
-    out="$out $k"
-  done
-  echo "${out# }"
-}
-
-# "the key provided" / "any of the 3 keys provided" — the count is what tells a
-# reader whether they forgot to pass one.
-keys_phrase() {
-  if [ "${#KEYS[@]}" -eq 1 ]; then
-    echo "the key provided"
-  else
-    echo "any of the ${#KEYS[@]} keys provided"
-  fi
-}
-
-# The keys back as command-line arguments, for the hints this script prints.
-keys_args() {
-  local k out=""
-  for k in ${KEYS[@]+"${KEYS[@]}"}; do
-    out="$out --key $k"
-  done
-  echo "${out# }"
-}
-
-# Check every key path BEFORE the first tape read. `age -d -i good -i missing`
-# fails outright rather than skipping the bad one, so a mistyped path must be
-# caught here and not discovered minutes into a restore.
-require_key_files() {
-  local k
-  for k in ${KEYS[@]+"${KEYS[@]}"}; do
-    [ -n "$k" ] || die "--key needs a value"
-    [ -f "$k" ] || die "key file not found: $k"
-  done
-}
-
-# Reject a value read from a plaintext tape metadata zone (ID thunk, front
-# index, seal marker) that is not a plain non-negative integer, BEFORE it is
-# used in `$(( ))` arithmetic, `fsf`, or `seq`. Those zones are unauthenticated
-# — anyone holding the tape can rewrite them without any key — so a crafted
-# value such as 'a[$(cmd)]' would otherwise execute inside arithmetic
-# expansion. Called in the current shell (not a subshell) so `die` halts the
-# whole script. (MANIFEST.toml values are NOT re-checked here: they come from
-# an age-authenticated envelope, a different trust tier — tampering there
-# breaks decryption itself.)
-require_uint() {
-  local name=$1 val=$2
-  case "$val" in
-  "" | *[!0-9]*)
-    die "tape layout value '$name' is not a non-negative integer: '$val' — the tape may be damaged or tampered"
-    ;;
-  esac
-}
-
-# Make a string read from an unauthenticated plaintext tape zone safe to ECHO.
-# Same trust tier as require_uint's callers: anyone holding the tape can write
-# these bytes. This one is never used in arithmetic — the danger is terminal
-# control sequences (a crafted label could hide or forge output). Keep only
-# printable ASCII, cap the length, and mark it if anything was dropped.
-safe_str() {
-  local raw=$1 clean
-  clean=$(printf '%s' "$raw" | LC_ALL=C tr -cd '[:alnum:] ._:@/+-' | cut -c1-64)
-  [ "$clean" = "$raw" ] || clean="$clean (sanitized)"
-  printf '%s' "$clean"
-}
-
-# Non-fatal cousin of require_uint: true/false, never exits. Used in soft
-# parse/consistency checks where a bad value should degrade the reader to the
-# next rung of the ladder (or to an UNSEALED/DAMAGED verdict) instead of
-# crashing the whole script.
-is_uint() {
-  case "$1" in
-  "" | *[!0-9]*) return 1 ;;
-  *) return 0 ;;
-  esac
-}
-
-# A byte count for messages: GiB, MiB or KiB with one decimal, so a small unit
-# does not read as "needs 0.0 GiB, 0.0 GiB free".
-size_str() {
-  awk -v b="$1" 'BEGIN {
-    if (b >= 1073741824) printf "%.1f GiB", b / 1073741824
-    else if (b >= 1048576) printf "%.1f MiB", b / 1048576
-    else printf "%.1f KiB", b / 1024
-  }'
-}
-
-# A failed write must say why. Out of disk space is the likely cause on a
-# restore, and it must never read as a tape fault or a wrong key: the loop that
-# tries each key used to report a full disk as "key did not decrypt".
-die_io() { # <what failed> <file holding the tool's stderr> <directory written to>
-  local what=$1 errf=$2 where=$3 detail
-  detail=$(grep -v -e 'records in$' -e 'records out$' -e 'bytes.*copied' "$errf" 2>/dev/null | tail -n 3 || true)
-  if grep -qi 'no space left' "$errf" 2>/dev/null; then
-    die "$what: OUT OF DISK SPACE in $where
-       ${detail}
-       This is not a tape or key problem. Free space there and run the same
-       command again, with --overwrite if --to now holds part of the unit.
-       --restore writes only the restored files to --to (--path also keeps
-       the few slices it reads in a scratch directory, inside --to unless
-       --scratch names another disk); everything else goes to the work
-       directory in ${TMPDIR:-/tmp}: the decrypted envelopes, which grow with
-       the number of files on the tape. If that is what filled, set TMPDIR to
-       a directory on a larger disk."
-  fi
-  die "$what
-       ${detail:-(no error text)}"
-}
-
-# Free space in bytes on the filesystem holding directory $1; empty if df
-# cannot say.
-free_bytes() {
-  df -Pk -- "$1" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { printf "%.0f\n", $4 * 1024 }'
-}
-
-die_space() { # <directory> <bytes needed> <bytes free>
-  if [ "$SPAN_RESTORE" = scratch ]; then
-    die "not enough disk space in $1 to restore this unit across tapes:
-       it needs about $(size_str "$2"), and $(size_str "$3") is free.
-       No slice has been read yet. By default a unit held across tapes is
-       restored from its slices kept, still encrypted, in a scratch directory
-       (inside --to, or --scratch DIR) until every tape has been read, and dar
-       then runs once over all of them: room for the whole unit's encrypted
-       slices (the sum of their encrypted_bytes in the manifest) as well as
-       the restored files, which that figure also counts (a compressed unit
-       may need more).
-       Free space there, put the scratch directory on another disk with
-       --scratch DIR, or run the same command with --stream-tapes, which keeps
-       no slice on disk and feeds dar from each tape in turn (every cartridge
-       must then be at hand, loaded when asked).
-       (--no-space-check skips this check, for a filesystem that holds more than
-       df reports, such as a compressed or thin-provisioned one.)"
-  fi
-  die "not enough disk space in $1 to restore:
-       it needs about $(size_str "$2"), and $(size_str "$3") is free.
-       No slice has been read yet. A restore streams each slice from the tape
-       through age into dar, so it needs room for the restored files only,
-       about the size of the unit's slices. That figure is the slices' size
-       on tape, encrypted: a unit that was stored compressed restores larger,
-       and a compressed unit may need more than this. --path also keeps the
-       slices it reads on disk until dar has taken the files from them
-       (--scratch DIR puts those on another disk).
-       Free space there, or choose a larger disk with --to.
-       (--no-space-check skips this check, for a filesystem that holds more than
-       df reports, such as a compressed or thin-provisioned one.)"
-}
-
-# What the figures above count. dar does not say how large a unit restores
-# before it runs, so the check counts the slices as they sit on tape.
-space_note() {
-  info "            (counted from the slices' encrypted size on tape; a compressed unit may need more)"
-}
-
-# Refuse BEFORE the first slice is read when the restore cannot fit. Running
-# out of space mid-restore used to kill the script hours in, silently or as a
-# key error. A streamed restore asks only for the files (scratch 0); --path
-# asks for the slices it keeps in scratch as well. With both on one
-# filesystem (unless stat proves otherwise) the two needs add up.
-check_space() { # <destination> <scratch dir> <bytes of files> <bytes of scratch>
-  local dest=$1 scr=$2 need_dest=$3 need_scr=$4
-  if [ "$SKIP_SPACE_CHECK" = 1 ]; then
-    info "Disk space not checked (--no-space-check)"
-    return 0
-  fi
-  local scr_free dest_free
-  dest_free=$(free_bytes "$dest")
-  if ! is_uint "$dest_free"; then
-    echo "WARNING: cannot measure free disk space (df failed); continuing without the check." >&2
-    return 0
-  fi
-  if [ "$need_scr" -eq 0 ]; then
-    info "Disk space: needs about $(size_str "$need_dest") in $dest (the files); $(size_str "$dest_free") free"
-    space_note
-    [ "$dest_free" -ge "$need_dest" ] || die_space "$dest" "$need_dest" "$dest_free"
-    return 0
-  fi
-  scr_free=$(free_bytes "$scr")
-  if ! is_uint "$scr_free"; then
-    echo "WARNING: cannot measure free disk space (df failed); continuing without the check." >&2
-    return 0
-  fi
-  local scr_dev dest_dev
-  scr_dev=$(stat -c %d -- "$scr" 2>/dev/null || true)
-  dest_dev=$(stat -c %d -- "$dest" 2>/dev/null || true)
-  if [ -z "$scr_dev" ] || [ "$scr_dev" = "$dest_dev" ]; then
-    local need=$((need_scr + need_dest))
-    info "Disk space: needs about $(size_str "$need") in $dest (slices read, then the files); $(size_str "$dest_free") free"
-    space_note
-    [ "$dest_free" -ge "$need" ] || die_space "$dest" "$need" "$dest_free"
-  else
-    info "Disk space: needs about $(size_str "$need_scr") in $scr (slices read); $(size_str "$scr_free") free"
-    info "            and about $(size_str "$need_dest") in $dest (the files); $(size_str "$dest_free") free"
-    space_note
-    [ "$scr_free" -ge "$need_scr" ] || die_space "$scr" "$need_scr" "$scr_free"
-    [ "$dest_free" -ge "$need_dest" ] || die_space "$dest" "$need_dest" "$dest_free"
-  fi
-}
-
-# Refuse, BEFORE the first tape read, a destination this restore could not
-# be trusted to fill (#405). dar under -Q answers "no" to every overwrite
-# question and exits 0, so a re-run over a restore that stopped part way (a
-# full disk, a power cut, Ctrl-C) used to report RESTORE COMPLETE over the
-# truncated files it left. And a scratch directory left by a killed restore
-# may hold decrypted data, so it is named and never silently reused.
-check_stale_scratch() { # <directory>...
-  local d stale
-  for d in "$@"; do
-    [ -d "$d" ] || continue
-    for stale in "$d"/.tapectl-restore.*; do
-      [ -e "$stale" ] || continue
-      die "refusing to restore: $stale is the scratch directory of an earlier
-       restore that was killed or lost power. It may hold DECRYPTED archive
-       data, or the still encrypted slices of a unit held across tapes. Remove
-       it (rm -rf \"$stale\") and run the same command again.
-       Nothing has been read from tape."
-    done
-  done
-}
-
-check_destination() { # <destination> <scratch parent>
-  local dest=$1 scr=$2
-  if [ -e "$dest" ] && [ ! -d "$dest" ]; then
-    die "--to $dest exists and is not a directory. Nothing has been read from tape."
-  fi
-  check_stale_scratch "$dest" "$scr"
-  [ -d "$dest" ] || return 0
-  [ -n "$(ls -A "$dest")" ] || return 0
-  if [ "$OVERWRITE" = 1 ]; then
-    info "--to $dest is not empty; --overwrite replaces every file this unit restores"
-    return 0
-  fi
-  die "--to $dest is not empty.
-       dar keeps a file that is already there and still reports success, so a
-       restore into a directory that holds files cannot be trusted: after an
-       earlier restore that stopped part way, the truncated files would stay.
-       Restore into an empty or new directory, or, to finish an earlier restore
-       of the same unit, run the same command again with --overwrite, which
-       replaces every file the unit restores.
-       Nothing has been read from tape."
-}
-
-# The backstop behind check_destination: a file that appeared in --to while
-# the restore ran is still kept by dar, which says so only in this line on
-# its stdout, and exits 0.
-die_if_dar_skipped() { # <dar output> <destination>
-  local skipped
-  skipped=$(grep 'not restored (user choice)$' "$1" 2>/dev/null |
-    sed 's/ not restored (user choice)$//' | head -n 20 || true)
-  [ -z "$skipped" ] && return 0
-  die "the restore into $2 is INCOMPLETE: dar declined to overwrite file(s)
-       that already existed there, and reported success anyway. The old copies
-       are still in place, so they are NOT what is on tape. Skipped:
-$skipped
-       Restore into an empty directory, or run again with --overwrite."
-}
-
-# The dar on this machine: its version, and whether it can start at all.
-# A dar built with GPG support asks, at startup, whether to carry on when
-# the gpg program is missing; under -Q it answers no and aborts. `dar -V`
-# meets the same question, so asking it first names the problem before the
-# tape is read rather than after every slice has been.
-DAR_VERSION=""
-dar_check() {
-  local out
-  out=$(dar -V -Q -N 2>&1 </dev/null || true)
-  if printf '%s\n' "$out" | grep -i 'INITIALIZATION FAILED FOR GPGME' >/dev/null; then
-    die "dar cannot start here: it was built with GPG support and needs the gpg
-       program on PATH (package gnupg; on Debian/Ubuntu: apt install gnupg).
-       dar's own words: $(printf '%s\n' "$out" | grep -i 'INITIALIZATION FAILED FOR GPGME' | head -n 1)
-       Nothing has been read from tape."
-  fi
-  DAR_VERSION=$(printf '%s\n' "$out" | sed -n 's/.*dar version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1)
-  if [ -z "$DAR_VERSION" ]; then
-    echo "WARNING: cannot tell which dar this is (dar -V said nothing usable); restoring the" >&2
-    echo "         safe way, decrypting each unit's slices to disk before dar reads them." >&2
-  fi
-}
-
-# Is this dar at least version $1 (X.Y.Z)? False when the version is unknown.
-dar_at_least() {
-  [ -n "$DAR_VERSION" ] || return 1
-  awk -v have="$DAR_VERSION" -v want="$1" 'BEGIN {
-    split(have, a, "."); split(want, b, ".")
-    for (i = 1; i <= 3; i++) {
-      if (a[i] + 0 > b[i] + 0) exit 0
-      if (a[i] + 0 < b[i] + 0) exit 1
-    }
-    exit 0
-  }'
-}
-
-# ---- prerequisite check ----
-
-# What each mode runs, besides mt (every mode that reads the tape). A mode
-# checks its own tools when it starts, before the first tape read, so a host
-# that can only read and hash a tape is not refused for tools a restore needs.
-# --info, --verify:
-TOOLS_READ=(__TOOLS_READ__)
-# --find-envelope:
-TOOLS_ENVELOPE=(__TOOLS_ENVELOPE__)
-# --list:
-TOOLS_LIST=(__TOOLS_LIST__)
-# --restore --path:
-TOOLS_PATH=(__TOOLS_PATH__)
-# --restore, whole units (every tool any mode may run):
-TOOLS_RESTORE=(__TOOLS_RESTORE__)
-# --where, --find (the envelopes' index, read as plain text):
-TOOLS_INDEX=(__TOOLS_INDEX__)
-
-require_tools() { # <tool>...
-  local tool
-  command -v mt >/dev/null 2>&1 || command -v mt-st >/dev/null 2>&1 ||
-    die "missing required tool: mt (package mt-st)"
-  for tool in "$@"; do
-    command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
-  done
-}
-
-# ---- tape helpers ----
-
-# The mt this script drives. mt-st is the one that can set the block size;
-# stock Debian and Ubuntu install GNU cpio's mt as plain `mt` when mt-st is
-# absent, and that one has no setblk. tape_init chooses.
-MT=mt
-
-tape_init() {
-  if command -v mt-st >/dev/null 2>&1; then
-    MT=mt-st
-  fi
-  local ver
-  ver=$("$MT" --version 2>&1 | head -n 1 || true)
-  if "$MT" -f "$DEVICE" setblk "$BLOCK" 2>"$WORK/mt.err"; then
-    return 0
-  fi
-  local why
-  why=$(head -n 1 "$WORK/mt.err" 2>/dev/null || true)
-  case "$ver $why" in
-  *mt-st*)
-    die "cannot set the block size on $DEVICE: ${why:-mt failed}
-       mt-st itself refused, so the device is the problem: is $DEVICE a tape
-       drive, with a cartridge loaded? List the drives: ls -l /dev/tape/by-id/"
-    ;;
-  *"GNU cpio"* | *"invalid argument"* | *setblk*)
-    echo "WARNING: '$MT' is not mt-st (${ver:-unknown version}) and cannot set the block size." >&2
-    echo "         Reading $DEVICE in whatever mode the drive is in. In variable-block mode, the" >&2
-    echo "         st driver's default, dd bs=512k reads each 512 KiB tape block whole and this" >&2
-    echo "         works. If a read fails, install mt-st (apt install mt-st) and run again." >&2
-    ;;
-  *)
-    die "cannot set the block size on $DEVICE with '$MT' (${ver:-unknown version}): ${why:-mt failed}
-       This script needs mt-st (package mt-st). If $MT is mt-st, check that
-       $DEVICE is a tape drive with a cartridge loaded: ls -l /dev/tape/by-id/"
-    ;;
-  esac
-}
-
-# CUR is the tape file the head sits at the START of, or empty when that is
-# not known for certain (#396). It is 0 after a rewind and pos+1 after a read
-# that took file pos through its filemark; a failed mt or dd, or a read that
-# stopped inside a file, empties it. seek_to moves only forward from a known
-# CUR and rewinds whenever it is unknown or behind the target, so any doubt
-# costs a rewind and never a read of the wrong file. Before 1.1.0 every read
-# rewound to the start of the tape, which on LTO costs about two minutes.
-CUR=""
-MT_STATUS_WARNED=0
-
-# Where the drive says the head is, as "FILE BLOCK", or nothing when mt
-# status cannot be read or parsed (mt-st and GNU mt word it differently).
-mt_position() {
-  "$MT" -f "$DEVICE" status 2>/dev/null | awk '__AWK_MT_POSITION__' || true
-}
-
-# Put the head at the start of tape file $1. Returns 1 if mt fails.
-seek_to() {
-  local pos=$1 from=$CUR here
-  CUR=""
-  if [ -n "$from" ]; then
-    # Trust CUR only if the drive agrees, as tapectl checks MTIOCGET.
-    here=$(mt_position)
-    if [ -z "$here" ]; then
-      if [ "$MT_STATUS_WARNED" = 0 ]; then
-        echo "NOTE: '$MT status' gave no file number this script can read; rewinding before every read (slower, still correct)." >&2
-        MT_STATUS_WARNED=1
-      fi
-      from=""
-    elif [ "$here" != "$from 0" ]; then
-      echo "NOTE: the drive reports file/block $here, not the start of file $from; rewinding to be sure." >&2
-      from=""
-    fi
-  fi
-  if [ -n "$from" ] && [ "$pos" -eq "$from" ]; then
-    :
-  elif [ -n "$from" ] && [ "$pos" -gt "$from" ]; then
-    "$MT" -f "$DEVICE" fsf $((pos - from)) 2>/dev/null || return 1
-  else
-    "$MT" -f "$DEVICE" rewind 2>/dev/null || return 1
-    if [ "$pos" -gt 0 ]; then
-      "$MT" -f "$DEVICE" fsf "$pos" 2>/dev/null || return 1
-    fi
-  fi
-  CUR=$pos
-}
-
-# dd's own complaint, for a NOTE: not its record counts.
-dd_detail() {
-  grep -v -e 'records in$' -e 'records out$' -e 'bytes.*copied' "$1" 2>/dev/null | tail -n 2 || true
-}
-
-# Read tape file at position $1 into file $2 (raw bytes, block-padded). Dies
-# on failure, naming the cause — used once a source is already trusted
-# (post-ladder). dd's stderr used to go to /dev/null, so a full disk here ended
-# the script with no message at all.
-read_tape_raw() {
-  local pos=$1 out=$2
-  seek_to "$pos" || die "cannot position the tape at file $pos ($MT failed)"
-  if ! dd if="$DEVICE" of="$out" bs="$BLOCK" 2>"$WORK/dd.err"; then
-    CUR=""
-    die_io "reading tape file $pos failed" "$WORK/dd.err" "$(dirname "$out")"
-  fi
-  if [ -s "$out" ]; then CUR=$((pos + 1)); else CUR=""; fi
-}
-
-# Same, but never exits: returns 1 on any failure (missing position, I/O
-# error, or an empty read). Used wherever "absent" must be distinguished from
-# "present but wrong" — the ladder's rung selection relies on this instead of
-# letting `set -e` kill the script. dd's complaint is kept as a NOTE.
-try_read_tape_raw() {
-  local pos=$1 out=$2
-  seek_to "$pos" || return 1
-  if ! dd if="$DEVICE" of="$out" bs="$BLOCK" 2>"$WORK/dd.err"; then
-    CUR=""
-    echo "NOTE: reading tape file $pos failed: $(dd_detail "$WORK/dd.err")" >&2
-    return 1
-  fi
-  if [ -s "$out" ]; then
-    CUR=$((pos + 1))
-  else
-    CUR=""
-    return 1
-  fi
-}
-
-# sha256 of tape file $1, first $2 bytes (all of it when $2 is empty), hashed
-# as it streams off the tape: --verify used to copy each file into WORK first,
-# twice, and a 10 GiB slice in a RAM-backed /tmp made a good tape FAIL as
-# "unreadable". Returns 1 when the file cannot be reached or read, or yields no
-# bytes at all. The hash is left in TAPE_SHA, not printed: called as
-# $(hash_tape_file ...) it would run in a subshell, and the cursor it moves
-# would be lost with it.
-EMPTY_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-TAPE_SHA=""
-hash_tape_file() {
-  local pos=$1 size=$2 sum
-  TAPE_SHA=""
-  seek_to "$pos" || return 1
-  CUR=""
-  if [ -n "$size" ]; then
-    # head stops at the exact size; cat drains the block padding after it,
-    # so dd never takes a SIGPIPE that pipefail would read as a tape fault,
-    # and the head ends past the filemark.
-    sum=$(dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | {
-      head -c "$size" | sha256sum
-      cat >/dev/null
-    }) || return 1
-  else
-    sum=$(dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | sha256sum) || return 1
-  fi
-  sum=${sum%% *}
-  [ -n "$sum" ] && [ "$sum" != "$EMPTY_SHA256" ] || return 1
-  CUR=$((pos + 1))
-  TAPE_SHA=$sum
-}
-
-# Keep a copy of tape file $1 (at most $3 bytes of it) in file $2 while
-# passing it: --verify reads Files 1 and 2 on its way to File 3 and checks
-# them once File 3 says what they should be, instead of rewinding for them.
-# Returns 1 if the file cannot be read.
-stash_tape_file() {
-  local pos=$1 out=$2 max=$3
-  seek_to "$pos" || return 1
-  CUR=""
-  dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | {
-    head -c "$max" >"$out"
-    cat >/dev/null
-  } || return 1
-  [ -s "$out" ] || return 1
-  CUR=$((pos + 1))
-}
-
-# The most of a file before the front index that --verify keeps while passing
-# it (Files 0-2 are a few KiB each; this only bounds a damaged tape).
-STASH_MAX=$((64 * BLOCK))
-
-# sha256 of the first $2 bytes (all, when $2 is empty) of tape file $1 from
-# what --verify kept of it while passing; returns 1 when nothing was kept, or
-# too little, so the caller reads the tape instead.
-stashed_sha() {
-  local f="$WORK/stash.$1" size=$2 have
-  [ -f "$f" ] || return 1
-  have=$(wc -c <"$f")
-  if [ -n "$size" ]; then
-    [ "$have" -ge "$size" ] || return 1
-    head -c "$size" "$f" | sha256sum | awk '{print $1}'
-  else
-    [ "$have" -lt "$STASH_MAX" ] || return 1
-    sha256sum "$f" | awk '{print $1}'
-  fi
-}
-
-# ---- TOML helpers (flat key = value parsing; sec 3.1 grammar contract) ----
-
-# Print the value for a TOML key on a "key = value" line. Strips quotes.
-toml_val() {
-  local file=$1 key=$2
-  awk -v k="$key" '
-    $1 == k && $2 == "=" {
-      v = $3
-      for (i = 4; i <= NF; i++) v = v " " $i
-      gsub(/^"/, "", v); gsub(/"$/, "", v)
-      print v; exit
-    }
-  ' "$file"
-}
-
-# Parse [[files]] blocks (front index or the seal marker's embedded copy)
-# into lines: position|type|size_bytes|sha256_encrypted. Either field may be
-# empty (front index's own entry has neither; the seal marker's own entry
-# has neither; everything else has both).
-parse_front_index_entries() {
-  local file=$1
-  awk '__AWK_PARSE_FILE_LIST__' "$file"
-}
-
-# Front-index self-consistency check (sec 2.5): positions strictly
-# increasing from 0 (a total index has no gaps), exactly one front_index
-# entry and it is at position 3, exactly one seal_marker entry and it is
-# last. Optional $2 = the expected total file count; when given, the entry
-# count must match it too. A subtly wrong map fails loudly (nonzero exit)
-# rather than silently misleading recovery. No `exit` appears in the main
-# per-record block (awk runs END even after a mid-block `exit`) — flags are
-# accumulated and only checked in END, where `exit` really does terminate.
-check_file_list_consistency() {
-  local list=$1 expected_total=${2:-}
-  awk -F'|' -v expected="$expected_total" '__AWK_CHECK_FILE_LIST__' "$list"
-}
-
-# Look up size_bytes / sha256_encrypted for a given tape file position.
-file_size_at() { awk -F'|' -v p="$1" '$1 == p { print $3; exit }' "$2"; }
-file_hash_at() { awk -F'|' -v p="$1" '$1 == p { print $4; exit }' "$2"; }
-file_type_at() { awk -F'|' -v p="$1" '$1 == p { print $2; exit }' "$2"; }
-
-# List envelope positions in on-tape order (the file list is already
-# position-sorted, and the format's fixed zone order puts the tenant
-# envelope(s), then the operator envelope and its backup, then each tenant
-# envelope's backup: every primary before every backup).
-envelope_positions() {
-  awk -F'|' '__AWK_FIND_ENVELOPE__' "$1"
-}
-
-# ---- bootstrap (File 0 — identity + pointers only in layout v2) ----
-
-bootstrap_thunk() {
-  tape_init
-  info "Reading ID thunk (file 0)..."
-  # Kept raw as well: --verify checks File 0's bytes against the front index
-  # without going back for them. The text is plaintext TOML with no NULs of
-  # its own, so deleting every NUL removes exactly the block padding.
-  read_tape_raw 0 "$WORK/stash.0"
-  tr -d '\0' <"$WORK/stash.0" >"$WORK/id_thunk.txt"
-  sed -n '/^\[volume\]/,$p' "$WORK/id_thunk.txt" >"$WORK/thunk.toml"
-
-  check_layout_version "$(toml_val "$WORK/thunk.toml" layout_version)"
-  check_magic "$(toml_val "$WORK/thunk.toml" magic)"
-  check_requires "File 0" "$WORK/thunk.toml"
-  # A tape that requires short-seal may end before the last file its plan
-  # lists: its seal says where, and is read before any data slice (R1).
-  TAPE_SHORT_SEAL=0
-  if requires_feature "$WORK/thunk.toml" short-seal; then
-    TAPE_SHORT_SEAL=1
-  fi
-
-  FRONT_INDEX=$(toml_val "$WORK/thunk.toml" front_index)
-  SEAL_MARKER=$(toml_val "$WORK/thunk.toml" seal_marker)
-  TOTAL_FILES=$(toml_val "$WORK/thunk.toml" total_files)
-  CREATED=$(toml_val "$WORK/thunk.toml" created_at)
-
-  require_uint front_index "$FRONT_INDEX"
-  require_uint seal_marker "$SEAL_MARKER"
-  require_uint total_files "$TOTAL_FILES"
-
-  # Which volume is ACTUALLY in the drive. $LABEL is baked into this script at
-  # write time; it says which tape the script was made for, and is printed even
-  # when a different tape is loaded. Only the thunk says what is really there.
-  TAPE_LABEL=$(safe_str "$(toml_val "$WORK/thunk.toml" label)")
-  check_tape_identity
-}
-
-# This script reads layout v2 only. Every tape carries the script that reads
-# it at file 2, so a tape of another layout is refused with the way to that
-# script, before anything of it is interpreted. A missing value (a damaged
-# thunk) warns and reads on as v2: a damaged thunk, the case where an heir
-# needs this script most, must never become a hard stop.
-check_layout_version() { # <layout_version as File 0 states it>
-  local v=$1
-  if [ -z "$v" ]; then
-    echo "WARNING: File 0 states no layout_version (damaged?); reading this tape as layout v2." >&2
-    return 0
-  fi
-  [ "$v" != 2 ] || return 0
-  if [ "$SPAN_OFFERED" = 1 ]; then
-    die "this tape is layout_version $(safe_str "$v"); this script reads layout v2 only, so nothing
-       is taken from it, and the restore goes on: load another that holds the slice. To read
-       that cartridge on its own, use the RESTORE.sh stored on it, at file 2."
-  fi
-  die "this tape is layout_version $(safe_str "$v"); this script reads layout v2 only.
-       Use the RESTORE.sh stored on THIS tape — every tape carries the script
-       that reads it, at file 2:
-         mt -f $DEVICE rewind && mt -f $DEVICE fsf 2
-         dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE.sh"
-}
-
-# The features this script knows how to read (volume-format-v2.md, "How v2
-# extends"). A tape whose File 0 or seal marker names anything else under
-# `requires` is refused by name: a later tapectl that changes something a
-# reader must understand says so there, and this script must stop rather than
-# misread it. An absent `requires` (every tape before 1.1.0) requires nothing,
-# and any key a table carries that this script does not know is ignored
-# unless `requires` names it. short-seal (every tape written since version
-# 1.6.0): the tape may end before the last file its plan lists, and its seal
-# marker, the last file, says where (volume-format-v2.md 4.1, 4.2). spanning
-# (a tape written since version 1.7.0 whose plan holds a slice of a unit that
-# may run across tapes): an envelope block that states may_span = true lists
-# every slice of the unit, and a slice with no tape_position is on another
-# tape (volume-format-v2.md 4.4).
-KNOWN_FEATURES="short-seal spanning"
-
-# 1 while span_accept reads a cartridge offered for a unit held across tapes,
-# in a subshell: a refusal there is relayed as a NOTE and the restore goes on
-# with another cartridge, so it does not send the heir to that one's script.
-SPAN_OFFERED=0
-
-die_newer_needed() { # <what> <detail>
-  if [ "$SPAN_OFFERED" = 1 ]; then
-    die "$2
-       This script cannot read that cartridge safely and will not guess, so nothing
-       is taken from it, and the restore goes on: load another that holds the slice.
-       To read that cartridge on its own, use the RESTORE.sh stored on it, at file 2,
-       or a newer tapectl ($1 names what it needs)."
-  fi
-  die "$2
-       This RESTORE.sh (layout v2, tapectl 1.7.0) cannot read it safely, and
-       will not guess. Use the RESTORE.sh stored on THIS tape — every tape
-       carries the script that reads it, at file 2:
-         mt -f $DEVICE rewind && mt -f $DEVICE fsf 2
-         dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE.sh
-       or a newer tapectl ($1 names what it needs)."
-}
-
-check_magic() { # <magic as File 0 states it>
-  local m=$1
-  [ -z "$m" ] && return 0
-  [ "$m" = "tapectl-volume-v2" ] && return 0
-  die_newer_needed "File 0" "this tape's File 0 says magic = $(safe_str "$m"), not tapectl-volume-v2."
-}
-
-check_requires() { # <what> <toml file>
-  local what=$1 file=$2 raw list f unknown=""
-  raw=$(toml_val "$file" requires)
-  [ -z "$raw" ] && return 0
-  case "$raw" in
-  \[*\]) ;;
-  *) die_newer_needed "$what" "$what states requires = $(safe_str "$raw"), which this script cannot parse." ;;
-  esac
-  list=$(printf '%s' "$raw" | tr -d '[]",' | tr -s ' ' ' ')
-  for f in $list; do
-    case " $KNOWN_FEATURES " in
-    *" $f "*) ;;
-    *) unknown="$unknown $(safe_str "$f")" ;;
-    esac
-  done
-  [ -z "$unknown" ] && return 0
-  die_newer_needed "$what" "this tape requires feature(s)${unknown}, which this script does not know
-       ($what states requires = $(safe_str "$raw")). It was written by a newer
-       tapectl (File 0: tapectl_version $(safe_str "$(toml_val "$WORK/thunk.toml" tapectl_version)"))."
-}
-
-# Does the requires line of a TOML file name feature $2? Matched as a whole
-# name in the list check_requires reads, never as a pattern.
-requires_feature() { # <toml file> <feature>
-  local list
-  list=$(toml_val "$1" requires | tr -d '[]",' | tr -s ' ' ' ')
-  case " $list " in
-  *" $2 "*) return 0 ;;
-  esac
-  return 1
-}
-
-# Always say which device was read and what was found there. A silent default
-# device is how a wrong-tape read disguises itself as a key or data problem:
-# with the wrong cartridge loaded, --info happily describes it while
-# --find-envelope reports that no envelope matched any key given, which reads
-# as "your key is wrong" or "your archive is gone" when it means neither.
-#
-# This WARNS and continues rather than exiting. Everything here except $LABEL is
-# generic, so running this script against a sibling tape is legitimate recovery
-# — and a damaged thunk (the case where an heir needs this script most) must
-# never be turned into a hard stop.
-check_tape_identity() {
-  info "Tape device:      $DEVICE${TAPE_DEVICE:+ (from TAPE_DEVICE)}"
-  info "Tape identifies as: ${TAPE_LABEL:-<unreadable>}"
-  # The second cartridge of --swap-tapes is a different tape on purpose.
-  [ "${OTHER_TAPE:-0}" = 0 ] || return 0
-  if [ -n "$TAPE_LABEL" ] && [ "$TAPE_LABEL" != "$LABEL" ]; then
-    echo "" >&2
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
-    echo "  WRONG TAPE? This script was written for volume '$LABEL'," >&2
-    echo "  but the tape in $DEVICE identifies itself as '$TAPE_LABEL'." >&2
-    echo "" >&2
-    echo "  Reading continues, but keys and units from '$LABEL' will NOT" >&2
-    echo "  be found on this tape. If that is not what you intended:" >&2
-    echo "    - load the '$LABEL' cartridge, or" >&2
-    echo "    - point this script at the right drive:" >&2
-    echo "        TAPE_DEVICE=/dev/nstN $0 ..." >&2
-    echo "  Drives on this machine: ls -l /dev/tape/by-id/" >&2
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
-    echo "" >&2
-  fi
-}
-
-# ---- rung 1: the front index (File 3) ----
-
-# On success sets FRONT_INDEX_HASH and leaves the parsed, validated entry
-# list at $WORK/files_from_index.txt. Never exits — callers test it with `if`
-# or `&&`.
-try_front_index() {
-  try_read_tape_raw "$FRONT_INDEX" "$WORK/front_index.raw" || return 1
-  tr -d '\0' <"$WORK/front_index.raw" >"$WORK/front_index.stripped"
-  grep -q '^\[index\]' "$WORK/front_index.stripped" || return 1
-  sed -n '/^\[index\]/,$p' "$WORK/front_index.stripped" >"$WORK/index.toml"
-  parse_front_index_entries "$WORK/index.toml" >"$WORK/files_from_index.txt"
-  [ -s "$WORK/files_from_index.txt" ] || return 1
-  check_file_list_consistency "$WORK/files_from_index.txt" "$TOTAL_FILES" || return 1
-  FRONT_INDEX_HASH=$(sha256sum "$WORK/front_index.stripped" | awk '{print $1}')
-  return 0
-}
-
-# ---- rung 2: the seal marker's embedded front-index copy ----
-
-# On success sets SEAL_FRONT_INDEX_SHA256, SEAL_FILE_COUNT, SEAL_SEALED_AT,
-# SEAL_LAST (the last file before the seal) and leaves the parsed, validated
-# embedded copy at $WORK/files_from_seal.txt. Returns 1 when there is no usable
-# seal; exits only for a seal that requires a feature this script does not
-# know, which must never read as unsealed.
-try_seal_copy() {
-  local at="" n
-  if read_last_file "$WORK/seal.raw" && seal_parses "$WORK/seal.raw"; then
-    at=$((SEAL_FILE_COUNT - 1))
-    if [ "$SEAL_MARKER" != "$at" ] && ! short_ending "$at"; then
-      echo "WARNING: File 0 says the seal marker is file $SEAL_MARKER, but the last file on the tape is" >&2
-      echo "         a seal marker for $SEAL_FILE_COUNT files (file $at). Using the last file." >&2
-    fi
-  else
-    # No end-of-data route (an mt without eod, or the last file is not a
-    # seal): File 0's pointer, read with the same bound.
-    seek_to "$SEAL_MARKER" || return 1
-    read_bounded "$WORK/seal.raw" || return 1
-    seal_parses "$WORK/seal.raw" || return 1
-  fi
-  check_requires "the seal marker" "$WORK/seal.toml"
-  seal_keeps_rules || return 1
-  parse_front_index_entries "$WORK/seal.toml" >"$WORK/files_from_seal.txt"
-  [ -s "$WORK/files_from_seal.txt" ] || return 1
-  check_file_list_consistency "$WORK/files_from_seal.txt" "$SEAL_FILE_COUNT" || return 1
-  seal_ends_on_a_slice || return 1
-  return 0
-}
-
-# A seal before File 0's pointer is the normal short ending of a tape that
-# requires short-seal, when the seal requires it too (volume-format-v2.md 1.2
-# rule 6): it draws no warning. Any other seal at another place does.
-short_ending() { # <the seal's own position>
-  [ "$TAPE_SHORT_SEAL" = 1 ] && [ "$SEAL_SHORT" = 1 ] && is_uint "$1" &&
-    [ "${#1}" -le 15 ] && [ "$((10#$1))" -lt "$((10#$SEAL_MARKER))" ]
-}
-
-# The seal's parse rules (volume-format-v2.md 4.1) for a seal that states
-# ended_after or requires short-seal, as every seal since version 1.6.0 does.
-# S1: ended_after is file_count - 2, so the seal is the file after it. S2: a
-# seal that requires short-seal states ended_after. A seal that states neither
-# (every seal before 1.6.0) is a full seal that ended after file_count - 2
-# (S3). S4 is check_file_list_consistency, for every seal, and S5 below. A seal
-# that breaks one is not a seal (S6): the tape reads as unsealed. Sets
-# SEAL_LAST.
-SEAL_LAST=""
-seal_keeps_rules() {
-  SEAL_LAST=""
-  if [ -z "$SEAL_ENDED_AFTER" ]; then
-    if [ "$SEAL_SHORT" = 1 ]; then
-      echo "NOTE: the seal marker requires short-seal but states no ended_after: it is not a valid seal" >&2
-      echo "      (volume-format-v2.md 4.1, rule S2), and the tape is read as unsealed." >&2
-      return 1
-    fi
-    [ "${#SEAL_FILE_COUNT}" -le 15 ] && SEAL_LAST=$((10#$SEAL_FILE_COUNT - 2))
-    return 0
-  fi
-  if ! is_uint "$SEAL_ENDED_AFTER" || [ "${#SEAL_ENDED_AFTER}" -gt 15 ] ||
-    [ "${#SEAL_FILE_COUNT}" -gt 15 ] ||
-    [ "$((10#$SEAL_ENDED_AFTER + 2))" -ne "$((10#$SEAL_FILE_COUNT))" ]; then
-    echo "NOTE: the seal marker states ended_after = $(safe_str "$SEAL_ENDED_AFTER") and file_count = $(safe_str "$SEAL_FILE_COUNT"):" >&2
-    echo "      ended_after must be file_count - 2 (volume-format-v2.md 4.1, rule S1). It is not a valid" >&2
-    echo "      seal, and the tape is read as unsealed." >&2
-    return 1
-  fi
-  SEAL_LAST=$((10#$SEAL_ENDED_AFTER))
-}
-
-# S5: the last file before a seal that states ended_after is a data slice (a
-# write never ends inside the metadata). Checked against the seal's own copy.
-seal_ends_on_a_slice() {
-  [ -n "$SEAL_ENDED_AFTER" ] || return 0
-  local t
-  t=$(file_type_at "$SEAL_LAST" "$WORK/files_from_seal.txt")
-  [ "$t" = data_slice ] && return 0
-  echo "NOTE: the seal marker says the tape ended after file $SEAL_LAST, which its copy of the front index" >&2
-  echo "      lists as $(safe_str "${t:-nothing}"), not a data slice (volume-format-v2.md 4.1, rule S5). It is not" >&2
-  echo "      a valid seal, and the tape is read as unsealed." >&2
-  return 1
-}
-
-# Read at most STASH_MAX bytes of the file under the head into $1: enough
-# for any seal marker, and it never copies a 10 GiB data slice into /tmp.
-# The head is left unknown (it may stop inside the file). Returns 1 if
-# nothing was read.
-read_bounded() { # <out>
-  CUR=""
-  dd if="$DEVICE" of="$1" bs="$BLOCK" count=$((STASH_MAX / BLOCK)) 2>"$WORK/dd.err" || {
-    echo "NOTE: reading the last file failed: $(dd_detail "$WORK/dd.err")" >&2
-    return 1
-  }
-  [ -s "$1" ]
-}
-
-# The last file on the tape, found the way the seal marker is defined — the
-# last file — rather than by File 0's pointer alone (#384): space to the end
-# of data, then back over two filemarks to the start of the file before
-# them. mt-st calls end of data `eod`, GNU mt `eom`. Returns 1 if mt cannot.
-read_last_file() { # <out>
-  CUR=""
-  "$MT" -f "$DEVICE" eod 2>/dev/null || "$MT" -f "$DEVICE" eom 2>/dev/null || return 1
-  "$MT" -f "$DEVICE" bsfm 2 2>/dev/null || return 1
-  read_bounded "$1"
-}
-
-# Does $1 hold a seal marker this script can use? Sets SEAL_FRONT_INDEX_SHA256,
-# SEAL_FILE_COUNT, SEAL_SEALED_AT, SEAL_ENDED_AFTER (as the seal states it;
-# empty on a seal before 1.6.0), SEAL_SHORT (1 when the seal requires
-# short-seal) and $WORK/seal.toml.
-SEAL_ENDED_AFTER=""
-SEAL_SHORT=0
-seal_parses() { # <raw file>
-  tr -d '\0' <"$1" >"$WORK/seal.stripped"
-  grep '^\[seal\]' "$WORK/seal.stripped" >/dev/null 2>&1 || return 1
-  sed -n '/^\[seal\]/,$p' "$WORK/seal.stripped" >"$WORK/seal.toml"
-  SEAL_FRONT_INDEX_SHA256=$(toml_val "$WORK/seal.toml" front_index_sha256)
-  SEAL_FILE_COUNT=$(toml_val "$WORK/seal.toml" file_count)
-  SEAL_SEALED_AT=$(toml_val "$WORK/seal.toml" sealed_at)
-  SEAL_ENDED_AFTER=$(toml_val "$WORK/seal.toml" ended_after)
-  SEAL_SHORT=0
-  if requires_feature "$WORK/seal.toml" short-seal; then
-    SEAL_SHORT=1
-  fi
-  [ -n "$SEAL_FRONT_INDEX_SHA256" ] || return 1
-  is_uint "$SEAL_FILE_COUNT" || return 1
-  [ "$SEAL_FILE_COUNT" -gt 0 ]
-}
-
-# ---- rung 3: nothing left to parse ----
-
-zero_strip_instructions() {
-  cat <<'ZSEOF'
-FATAL: both the front index (File 3) and the seal marker's embedded copy
-are unreadable or fail their self-consistency check. The navigation map is
-lost at both ends of the tape (degradation ladder rung 3).
-
-Manual "zero-strip" recovery is still possible: envelopes are among the
-first files after the front index, and block padding can be defeated
-without knowing exact sizes:
-
-  1. mt -f "$DEVICE" setblk 524288
-     mt -f "$DEVICE" rewind && mt -f "$DEVICE" fsf 4
-  2. Read one candidate file. Each read leaves the tape at the start of the
-     next file, so repeat this step for each file in turn, moving forward:
-       dd if="$DEVICE" bs=524288 of=candidate.raw
-  3. Strip only the TRAILING zero bytes, which are block padding. Zero bytes
-     inside the ciphertext are part of it: deleting every zero byte (as
-     tr -d does) destroys the file. These four lines keep everything up to
-     the last non-zero byte:
-       size=$(stat -c %s candidate.raw)
-       tail_len=$(tail -c 524288 candidate.raw | wc -c)
-       keep=$(tail -c 524288 candidate.raw | od -An -v -tu1 | awk '{ for (i = 1; i <= NF; i++) { n++; if ($i != 0) last = n } } END { print last + 0 }')
-       head -c $((size - tail_len + keep)) candidate.raw > candidate.stripped
-  4. Try: age -d -i YOUR_KEY.age.key candidate.stripped > candidate.dec
-     "no identity matched" means this file is not sealed to your key: go
-     back to step 2 for the next file. Any other error: real ciphertext can
-     end in a zero byte, so put one back and retry, up to four times:
-       printf '\0' >> candidate.stripped
-  5. Once a candidate decrypts, it is your tenant (or operator) envelope:
-     untar it and read MANIFEST.toml for the exact tape position and byte
-     size of every slice belonging to your unit(s); read each slice (steps
-     1-2, with fsf to its position), trim it to that exact size with
-     truncate -s SIZE instead of zero-stripping, decrypt it to restore.N.dar,
-     then, in an empty directory: dar -x restore -R /destination -O -Q -N
-
-See the system guide (File 1), "If All Else Fails", for the full narrative.
-ZSEOF
-}
-
-# ---- where a tape that requires short-seal ended (volume-format-v2.md 4.1, 4.2) ----
-
-# Everything a tape holds before its first data slice is the plan: File 0,
-# the front index and the envelopes are written before the writer can know
-# whether the drive will report the end of its medium. A tape written since
-# version 1.6.0 requires short-seal: when that warning came in a data slice
-# before the last, the write sealed the tape after it, with a short seal whose
-# ended_after is the last file before it. Every planned file after that is not
-# on the tape, and a unit with a slice there is cut: not on this tape whole.
-#
-# TAPE_SHORT_SEAL is 1 when File 0 requires short-seal. ENDED_AFTER is then
-# the last file before the seal, once the seal has been read; it is empty on
-# every other tape, and on one whose seal cannot be read (R2: that tape reads
-# as unsealed, and the end of its data is the end of it).
-TAPE_SHORT_SEAL=0
-ENDED_AFTER=""
-
-# Read the seal of a tape that requires short-seal, before any data slice
-# (R1). It is the last file on the tape, found by spacing to the end of the
-# data and back over two filemarks (volume-format-v2.md 1.2 rule 6), which
-# costs one wind of the tape and a rewind after it. With 1, the seal was read
-# already (the file map came from its copy) and is used as it is.
-learn_end() { # [1: the seal has been read]
-  ENDED_AFTER=""
-  [ "$TAPE_SHORT_SEAL" = 1 ] || return 0
-  if [ "${1:-0}" = 1 ] || try_seal_copy; then
-    ENDED_AFTER=$SEAL_LAST
-    return 0
-  fi
-  echo "WARNING: this tape requires short-seal, and no valid seal marker was found as its last file:" >&2
-  echo "         it is read as an unsealed tape, and a planned file past the end of its data is not on it." >&2
-}
-
-# Did the tape end before the last data slice of its plan (File 0's
-# seal_marker is the planned seal, so its last slice is the file before)?
-tape_is_short() {
-  [ -n "$ENDED_AFTER" ] && [ "$ENDED_AFTER" -lt "$((10#$SEAL_MARKER - 1))" ]
-}
-
-# On a short tape, the file map becomes the plan's files up to ENDED_AFTER
-# and the seal marker after them, as the seal's own copy lists them: a planned
-# file after the end is not in it, so no read can be sent there (R3).
-trim_to_end() {
-  tape_is_short || return 0
-  awk -F'|' -v k="$ENDED_AFTER" '$1 + 0 <= k + 0' "$FILES_TXT" >"$WORK/files_on_tape.txt"
-  echo "$((ENDED_AFTER + 1))|seal_marker||" >>"$WORK/files_on_tape.txt"
-  FILES_TXT="$WORK/files_on_tape.txt"
-  info "This tape ended early, after file $ENDED_AFTER: its seal marker is file $((ENDED_AFTER + 1)), and files"
-  info "  $((ENDED_AFTER + 1)) to $((10#$SEAL_MARKER - 1)) of the plan are not on it. A unit with a slice among them is not on it whole."
-}
-
-# ---- establish the trusted file map (rung 1 -> rung 2 -> rung 3) ----
-
-# Sets FILES_TXT and FILES_SOURCE on success; on total failure prints the
-# zero-strip procedure and exits (used by modes that cannot proceed at all
-# without a map: --find-envelope, --restore; --info and --verify apply the
-# same ladder but handle a total failure themselves so they can still report
-# a verdict). On a tape that requires short-seal it then reads the seal and
-# keeps the map to the files on the tape, unless told --no-seal: --find-envelope
-# reads only envelopes, which are always before the first data slice.
-establish_files() { # [--no-seal]
-  local seal=1
-  [ "${1:-}" != --no-seal ] || seal=0
-  bootstrap_thunk
-
-  if try_front_index; then
-    FILES_TXT="$WORK/files_from_index.txt"
-    FILES_SOURCE="front_index"
-    if [ "$seal" = 1 ]; then
-      learn_end
-      trim_to_end
-    fi
-    return 0
-  fi
-
-  echo "WARNING: front index (file $FRONT_INDEX) is unreadable or failed its self-consistency check — falling back to the seal marker's embedded copy (degradation ladder RUNG-2, volume-format-v2.md sec 4)." >&2
-
-  if try_seal_copy; then
-    FILES_TXT="$WORK/files_from_seal.txt"
-    FILES_SOURCE="seal_embedded_copy(RUNG-2)"
-    echo "WARNING: using the seal marker's embedded copy as the file map — the front of the tape may be damaged; treat this recovery as degraded." >&2
-    if [ "$seal" = 1 ]; then
-      learn_end 1
-      trim_to_end
-    fi
-    return 0
-  fi
-
-  zero_strip_instructions >&2
-  exit 1
-}
-
-# The one line for the planned files after the end of a short tape (ADR-0012
-# item 140, volume-format-v2.md 4.2): the first and the last planned position
-# after ended_after (the last is the planned seal), and where the seal really
-# is. It is not a failure. --info indents it as its file map; --verify does not.
-not_on_tape_line() { # <indent> <first planned file after the end> <last>
-  printf "%sNOT ON TAPE  files %d to %d  (planned; the tape ended after file %d, and its seal marker is file %d)\n" "$1" "$2" "$3" "$ENDED_AFTER" "$((ENDED_AFTER + 1))"
-}
-
-# ---- --info ----
-
-do_info() {
-  bootstrap_thunk
-
-  local fi_ok=0 seal_ok=0
-  try_front_index && fi_ok=1
-  try_seal_copy && seal_ok=1
-  # On a tape that requires short-seal the seal says where the tape ended;
-  # a short seal is still SEALED (volume-format-v2.md 4.2).
-  ENDED_AFTER=""
-  if [ "$seal_ok" -eq 1 ] && [ "$TAPE_SHORT_SEAL" = 1 ]; then
-    ENDED_AFTER=$SEAL_LAST
-  fi
-
-  local verdict
-  if [ "$seal_ok" -ne 1 ]; then
-    verdict="UNSEALED"
-  elif [ "$fi_ok" -ne 1 ] || [ "$FRONT_INDEX_HASH" != "$SEAL_FRONT_INDEX_SHA256" ]; then
-    verdict="DAMAGED (ends disagree)"
-  else
-    verdict="SEALED"
-  fi
-
-  local table_file="" table_source=""
-  if [ "$fi_ok" -eq 1 ]; then
-    table_file="$WORK/files_from_index.txt"
-    table_source="front index (file $FRONT_INDEX)"
-  elif [ "$seal_ok" -eq 1 ]; then
-    table_file="$WORK/files_from_seal.txt"
-    table_source="seal marker's embedded copy (RUNG-2 — front index unreadable)"
-  fi
-
-  echo ""
-  # The tape's own label, not this script's — the map below describes what is
-  # actually loaded. Identical in the normal case; honest in the wrong-tape one.
-  echo "=== tapectl volume: ${TAPE_LABEL:-$LABEL} ==="
-  echo ""
-  echo "Verdict: $verdict"
-  case "$verdict" in
-  SEALED)
-    echo "  Front index (file $FRONT_INDEX) hash matches the seal marker's binding."
-    ;;
-  UNSEALED)
-    echo "  No valid seal marker was found — this tape was never sealed, or the"
-    echo "  write was interrupted or aborted. Trailing data slices may be missing."
-    ;;
-  "DAMAGED (ends disagree)")
-    echo "  The seal marker is present but the front index does not match it (or"
-    echo "  is unreadable). Never trust the seal marker's presence alone — see"
-    echo "  the system guide."
-    ;;
-  esac
-  if tape_is_short; then
-    echo "  The tape ended early, after file $ENDED_AFTER: its seal marker, the last file, is"
-    echo "  file $((ENDED_AFTER + 1)) (a short seal). Files $((ENDED_AFTER + 1)) to $((10#$SEAL_MARKER - 1)) of the plan are not on it,"
-    echo "  and a unit with a slice among them is not on this tape whole (another tape holds it)."
-  fi
-  echo ""
-
-  if [ -n "$table_file" ]; then
-    echo "File map (source: $table_source):"
-    local gone=0 gone_first="" gone_last=""
-    [ "$table_file" != "$WORK/files_from_index.txt" ] || ! tape_is_short || gone=1
-    while IFS='|' read -r pos type size hash; do
-      if [ "$gone" = 1 ] && [ "$pos" -gt "$ENDED_AFTER" ]; then
-        [ -n "$gone_first" ] || gone_first=$pos
-        gone_last=$pos
-        continue
-      fi
-      printf "  %3d  %-24s  %8s bytes  %s\n" "$pos" "$type" "${size:--}" "${hash:+${hash:0:16}...}"
-    done <"$table_file"
-    # The planned files after the end of a short tape are one line, on every
-    # short tape, a span tape or not (ADR-0012 item 140).
-    if [ -n "$gone_first" ]; then
-      not_on_tape_line "  " "$gone_first" "$gone_last"
-    fi
-  else
-    echo "No usable file map: both the front index and the seal marker's"
-    echo "embedded copy are unreadable."
-    echo ""
-    zero_strip_instructions
-  fi
-
-  echo ""
-  echo "Sealed at: ${SEAL_SEALED_AT:-unknown (tape not sealed)}"
-  echo ""
-  echo "To decrypt your envelope:"
-  echo "  $0 --find-envelope --key YOUR_KEY.age.key"
-  echo "To check tape integrity without any key:"
-  echo "  $0 --verify"
-  echo "To find the other tapes that hold a unit, or the tape that holds a file:"
-  echo "  $0 --where UNIT --key YOUR_KEY.age.key"
-  echo "  $0 --where --all --key YOUR_KEY.age.key     (every unit the index names)"
-  echo "  $0 --find TEXT --key YOUR_KEY.age.key"
-}
-
-# ---- --verify ----
-
-# A file that failed the walk. A data slice also says whether a copy of it is
-# in a --slices-from directory (matched by its sha256 alone); one that is not
-# is remembered for the second cartridge --swap-tapes asks for.
-VERIFY_BAD=()
-VERIFY_COVERED=0
-VERIFY_OTHER=0
-verify_failed() { # <position> <type> <bytes> <sha256> <what>
-  local pos=$1 type=$2 size=$3 hash=$4 what=$5 extra=""
-  if [ "$type" = data_slice ] && [ -n "$size" ]; then
-    if dir_find "$pos" "$size" "$hash"; then
-      extra="; a copy whose sha256 matches is $DIR_HIT"
-      VERIFY_COVERED=$((VERIFY_COVERED + 1))
-    else
-      VERIFY_BAD+=("$pos|$size|$hash")
-    fi
-  else
-    VERIFY_OTHER=$((VERIFY_OTHER + 1))
-  fi
-  printf "FAIL  file %3d  %-24s  (%s%s)\n" "$pos" "$type" "$what" "$extra"
-}
-
-verify_needed() { # job|number|bytes|sha256|label, for each failed slice with no copy yet
-  local e pos size hash
-  for e in ${VERIFY_BAD[@]+"${VERIFY_BAD[@]}"}; do
-    IFS='|' read -r pos size hash <<<"$e"
-    echo "v|$pos|$size|$hash|tape file $pos"
-  done
-}
-
-do_verify() {
-  bootstrap_thunk
-  [ "$SALVAGE" = 0 ] || salvage_init
-
-  # One pass, ascending, from a single rewind (#396). Files 1 and 2 lie
-  # between File 0 and the front index, so their bytes are kept as the head
-  # passes them and checked once the front index says what they should be.
-  # The seal marker is the last file on the tape, so it is read last (#412),
-  # after the walk, with the same verdict as before. Only when the front index
-  # cannot be used is the seal read first, for its copy of the map. On a tape
-  # that requires short-seal (since version 1.6.0) the seal is read right after
-  # the front index, before any data slice (R1): it says where the tape ended,
-  # and a planned file after that is NOT ON TAPE, which is not a failure.
-  local p
-  for p in 1 2; do
-    stash_tape_file "$p" "$WORK/stash.$p" "$STASH_MAX" || rm -f "$WORK/stash.$p"
-  done
-
-  local fi_ok=0 seal_ok=0 seal_tried=0 files_file=""
-  if try_front_index; then
-    fi_ok=1
-    files_file="$WORK/files_from_index.txt"
-  elif try_seal_copy; then
-    seal_ok=1
-    seal_tried=1
-    echo "WARNING: front index unreadable — verifying against the seal marker's embedded copy (degradation ladder RUNG-2)." >&2
-    files_file="$WORK/files_from_seal.txt"
-  else
-    zero_strip_instructions >&2
-    exit 1
-  fi
-  FILES_TXT=$files_file
-  FILES_SOURCE=verify
-  if [ "$TAPE_SHORT_SEAL" = 1 ]; then
-    if [ "$seal_tried" = 0 ]; then
-      seal_tried=1
-      try_seal_copy && seal_ok=1
-    fi
-    [ "$seal_ok" -ne 1 ] || ENDED_AFTER=$SEAL_LAST
-  fi
-
-  echo "=== keyless integrity walk: $LABEL ==="
-  echo ""
-
-  local overall_ok=1 not_on_tape=0 gone_first="" gone_last=""
-
-  while IFS='|' read -r pos type size hash; do
-    # A planned file after the end of a short tape is not on it (R3): it is
-    # never read, and the planned files after the end are named in one line
-    # below the walk (ADR-0012 item 140). Only the front index lists one.
-    if [ "$fi_ok" -eq 1 ] && tape_is_short && is_uint "$pos" &&
-      [ "$pos" -gt "$ENDED_AFTER" ]; then
-      [ -n "$gone_first" ] || gone_first=$pos
-      gone_last=$pos
-      not_on_tape=$((not_on_tape + 1))
-      continue
-    fi
-    # Entries with no hash are self-referential (front_index's own entry in
-    # the front-index-sourced list, and the seal marker's own entry always)
-    # — nothing on the tape hashes them, so there is nothing to compare.
-    [ -z "$hash" ] && continue
-
-    require_uint "position(@$type)" "$pos"
-    [ -z "$size" ] || require_uint "size_bytes(@$pos)" "$size"
-
-    local actual=""
-    if ! actual=$(stashed_sha "$pos" "$size"); then
-      if hash_tape_file "$pos" "$size"; then
-        actual=$TAPE_SHA
-      else
-        verify_failed "$pos" "$type" "$size" "$hash" "unreadable"
-        overall_ok=0
-        continue
-      fi
-    fi
-
-    if [ "$actual" = "$hash" ]; then
-      printf "PASS  file %3d  %-24s\n" "$pos" "$type"
-    else
-      verify_failed "$pos" "$type" "$size" "$hash" "hash mismatch"
-      overall_ok=0
-    fi
-  done <"$files_file"
-  [ "$not_on_tape" = 0 ] || not_on_tape_line "" "$gone_first" "$gone_last"
-
-  # The seal marker, last. File 3 vs the seal binding is the one entry the
-  # per-file loop above cannot check when the list came from the front index
-  # itself (its own entry carries no hash there — self-reference).
-  if [ "$fi_ok" -eq 1 ] && [ "$seal_tried" = 0 ] && try_seal_copy; then
-    seal_ok=1
-  fi
-  if [ "$seal_ok" -eq 1 ] && [ "$fi_ok" -eq 1 ]; then
-    if [ "$FRONT_INDEX_HASH" = "$SEAL_FRONT_INDEX_SHA256" ]; then
-      printf "PASS  file %3d  %-24s  (matches seal binding)\n" "$FRONT_INDEX" "front_index"
-    else
-      printf "FAIL  file %3d  %-24s  (seal binding mismatch)\n" "$FRONT_INDEX" "front_index"
-      overall_ok=0
-    fi
-  elif [ "$seal_ok" -eq 1 ]; then
-    printf "FAIL  file %3d  %-24s  (unreadable/unparseable)\n" "$FRONT_INDEX" "front_index"
-    overall_ok=0
-  else
-    echo "WARNING: no valid seal marker — this tape is UNSEALED; completeness cannot be confirmed. Only the files above were checked." >&2
-  fi
-
-  echo ""
-  if [ "$overall_ok" -eq 1 ] && [ "$not_on_tape" -gt 0 ]; then
-    echo "VERIFY: PASS — every file on this tape matches the front index. The tape ended early, after"
-    echo "        file $ENDED_AFTER (its seal marker is file $((ENDED_AFTER + 1))): the $not_on_tape planned file(s) marked NOT ON TAPE"
-    echo "        are not on it, which is not a failure. A unit with a slice among them is on another tape."
-  elif [ "$overall_ok" -eq 1 ]; then
-    echo "VERIFY: PASS — every file matches the front index."
-  else
-    if [ "$SWAP_TAPES" = 1 ] && [ ${#VERIFY_BAD[@]} -gt 0 ]; then
-      VERIFY_ONLY=1
-      swap_loop
-    fi
-    echo "VERIFY: FAIL — one or more files do not match. See FAIL lines above." >&2
-    if [ "$SALVAGE" = 1 ]; then
-      if [ "$VERIFY_OTHER" -eq 0 ] && [ ${#VERIFY_BAD[@]} -eq 0 ]; then
-        echo "        Every file that failed is a data slice, and a copy of each was found (in a --slices-from" >&2
-        echo "        directory or on a cartridge you loaded): --restore with the same options takes them from there." >&2
-      else
-        echo "        $VERIFY_OTHER failed file(s) are not data slices, and ${#VERIFY_BAD[@]} failed data slice(s) have no copy yet." >&2
-      fi
-    fi
-    exit 1
-  fi
-}
-
-# ---- envelopes ----
-
-# The three "no envelope opened" exits share one shape (issues #288, #291):
-# which keys were tried, what tape is actually in the drive, and the rotation
-# fact that makes a correct-looking key fail on a correct tape. They live here,
-# in one function, because the --unit exit — the one an heir is most likely to
-# hit — had already drifted into a bare one-liner with none of it. When an
-# envelope a key DID match turned out damaged (#412), that is said instead of
-# the rotation hint: it is not a key problem.
-die_no_envelope() { # [unit]
-  local headline="no envelope matched $(keys_phrase)"
-  if [ -n "${1:-}" ]; then
-    headline="no envelope for unit '$1' matched $(keys_phrase)"
-  fi
-  if [ "$MATCHED_DAMAGED" -gt 0 ]; then
-    die "$headline that could be opened.
-       $DAMAGED_ENVELOPES envelope(s) on this tape are DAMAGED (see the WARNING
-       lines above): a key matched, so this is not a wrong key. Another copy of
-       this volume, or the operator or escrow key (which open the operator
-       envelope and its backup), can still recover the data.
-       Keys tried: $(keys_list)"
-  fi
-  if [ "$DAMAGED_ENVELOPES" -gt 0 ]; then
-    die "$headline that could be opened.
-       $DAMAGED_ENVELOPES envelope(s) on this tape are DAMAGED (see the WARNING
-       lines above), but no key opened any of them: they could not be read or
-       failed their hash, so this is damage, a key that is not a recipient, or
-       both. Another copy of this volume, or the operator or escrow key (which
-       open the operator envelope and its backup), can still recover the data.
-       Tape in $DEVICE identifies as '${TAPE_LABEL:-<unreadable>}'; this script is for '$LABEL'.
-       If you hold other keys, try them: an envelope is sealed with the key
-       that was active when THIS tape was written.
-       Keys tried: $(keys_list)"
-  fi
-  die "$headline
-       Tape in $DEVICE identifies as '${TAPE_LABEL:-<unreadable>}'; this script is for '$LABEL'.
-       If those differ, you have the wrong cartridge or the wrong drive
-       (set TAPE_DEVICE=/dev/nstN) — not necessarily the wrong key.
-       If they match, try your OTHER keys: an envelope is sealed with the key
-       that was active when THIS tape was written, so a key issued after it
-       will not open it. --find-envelope reports which keys do.
-       Keys tried: $(keys_list)"
-}
-
-# Read the envelope at tape file $1 and try each key on it, on its own
-# (#288). Returns 0 when a key opened it (ENV_KEY names the key; the files
-# are in $WORK/env), 1 when no key matched it, 2 when it is DAMAGED: a key
-# matched but the payload would not decrypt or unpack (#412). age names the
-# difference — "no identity matched" is a key that is not a recipient — and
-# the front index's keyless hash says so before any key is tried.
-ENV_KEY=""
-DAMAGED_ENVELOPES=0
-# How many of those a key MATCHED (age got past the header, the payload would
-# not decrypt). Only then is "not a wrong key" true; an envelope that would not
-# read, or failed its hash with no key opening it, says nothing about the keys.
-MATCHED_DAMAGED=0
-try_envelope() { # <position>
-  local pos=$1 esize ehash actual keyfile mismatch=0
-  ENV_KEY=""
-  # A file that will not read is damaged too, not the end of the run: its
-  # backup further on holds the same bytes. A full disk here is not the
-  # tape's fault, and no backup would fare better, so that still stops.
-  : >"$WORK/dd.err"
-  if ! try_read_tape_raw "$pos" "$WORK/envelope.enc"; then
-    if grep -i 'no space left' "$WORK/dd.err" >/dev/null 2>&1; then
-      die_io "reading tape file $pos failed" "$WORK/dd.err" "$WORK"
-    fi
-    DAMAGED_ENVELOPES=$((DAMAGED_ENVELOPES + 1))
-    echo "WARNING: the envelope at file $pos could not be read from the tape: it is DAMAGED" >&2
-    return 2
-  fi
-  esize=$(file_size_at "$pos" "$FILES_TXT")
-  ehash=$(file_hash_at "$pos" "$FILES_TXT")
-  if [ -n "$esize" ]; then
-    require_uint "size_bytes(@$pos)" "$esize"
-    [ "$esize" -gt 0 ] && truncate -s "$esize" "$WORK/envelope.enc"
-  fi
-  if [ -n "$ehash" ]; then
-    actual=$(sha256sum "$WORK/envelope.enc" | awk '{print $1}')
-    if [ "$actual" != "$ehash" ]; then
-      mismatch=1
-      echo "WARNING: the envelope at file $pos does not match the front index: it is DAMAGED" >&2
-      echo "         (sha256 ${actual:0:16}..., the front index says ${ehash:0:16}...). Trying it anyway." >&2
-    fi
-  fi
-  for keyfile in ${KEYS[@]+"${KEYS[@]}"}; do
-    rm -rf "$WORK/env" && mkdir -p "$WORK/env"
-    if age -d -i "$keyfile" <"$WORK/envelope.enc" 2>"$WORK/age.err" |
-      tar xf - -C "$WORK/env/" 2>"$WORK/tar.err"; then
-      ENV_KEY=$keyfile
-      return 0
-    fi
-    if grep 'no identity matched' "$WORK/age.err" >/dev/null 2>&1; then
-      info "  key $keyfile did not open the envelope at file $pos"
-      continue
-    fi
-    # The key matched (age got past the header), so no other key can do
-    # better: these bytes are damaged.
-    DAMAGED_ENVELOPES=$((DAMAGED_ENVELOPES + 1))
-    MATCHED_DAMAGED=$((MATCHED_DAMAGED + 1))
-    echo "WARNING: key $keyfile matched the envelope at file $pos, but the envelope is DAMAGED:" >&2
-    cat "$WORK/age.err" "$WORK/tar.err" 2>/dev/null | sed 's/^/         /' >&2 || true
-    return 2
-  done
-  if [ "$mismatch" = 1 ]; then
-    DAMAGED_ENVELOPES=$((DAMAGED_ENVELOPES + 1))
-    return 2
-  fi
-  return 1
-}
-
-# The work directory's own need, as far as the front index tells it: every
-# envelope is read whole into $WORK (block padded), and each one a key opens
-# is kept there decrypted, about its size again, until the run ends. Which
-# envelopes a key opens is not known before it tries, so this is an upper
-# bound (the largest, read whole, plus every envelope kept) and only a
-# WARNING; a full disk is named when it happens (die_io), and TMPDIR moves
-# the work directory. The sizes come from a plaintext zone, so the sum is
-# done in awk, where a crafted figure cannot overflow shell arithmetic.
-check_work_space() {
-  [ "$SKIP_SPACE_CHECK" = 0 ] || return 0
-  local need free
-  need=$(awk -F'|' -v blk="$BLOCK" '
-    ($2 == "tenant_envelope" || $2 == "operator_envelope") && $3 ~ /^[0-9]+$/ {
-      sum += $3
-      if ($3 + 0 > max) max = $3 + 0
-    }
-    END { if (sum > 0) printf "%.0f\n", sum + max + blk }
-  ' "$FILES_TXT")
-  [ -n "$need" ] || return 0
-  free=$(free_bytes "$WORK")
-  is_uint "$free" || return 0
-  if ! awk -v have="$free" -v want="$need" 'BEGIN { exit (have + 0 >= want + 0) ? 0 : 1 }'; then
-    echo "WARNING: the work directory $WORK has $(size_str "$free") free, and reading the" >&2
-    echo "         envelopes on this tape may need up to $(size_str "$need") there: each envelope is read whole," >&2
-    echo "         and each one a key opens stays decrypted until the run ends. If it fills, the run" >&2
-    echo "         stops and says so; set TMPDIR to a directory on a larger disk to move the work" >&2
-    echo "         directory (a key that opens one small envelope needs far less than this)." >&2
-  fi
-}
-
-# Walk the envelopes in tape order — forward only — trying the keys on each,
-# and call "$1 <position>" for each that opens; it returns 1 to stop the
-# walk. A file whose bytes equal one already tried (an envelope's backup, by
-# its front-index hash) is skipped unless that one was damaged or would not
-# read: then the backup is what is read instead. With a second argument the
-# walk RESUMES after that position (a walk a callback stopped), remembering
-# what the first one tried.
-WALK_SEEN=" "
-walk_envelopes() { # <on-open callback> [<resume after this position>]
-  local cb=$1 after=${2:-} pos h rc ty
-  if [ -z "$after" ]; then
-    WALK_SEEN=" "
-    check_work_space
-  fi
-  while IFS= read -r pos; do
-    require_uint envelope_position "$pos"
-    if [ -n "$after" ] && [ "$pos" -le "$after" ]; then
-      continue
-    fi
-    h=$(file_hash_at "$pos" "$FILES_TXT")
-    case "$WALK_SEEN" in
-    *" $h "*)
-      [ -z "$h" ] || {
-        info "File $pos holds the same bytes as an envelope already tried (its backup): skipped"
-        continue
-      }
-      ;;
-    esac
-    info "Trying envelope at file $pos..."
-    rc=0
-    try_envelope "$pos" || rc=$?
-    [ "$rc" = 2 ] || [ -z "$h" ] || WALK_SEEN="$WALK_SEEN$h "
-    if [ "$rc" = 0 ]; then
-      ty=$(file_type_at "$pos" "$FILES_TXT")
-      case "$ty" in
-      *_backup) info "File $pos is a backup copy, read because the envelope it copies could not be used" ;;
-      esac
-      rm -rf "$WORK/opened.$pos"
-      mv "$WORK/env" "$WORK/opened.$pos"
-      "$cb" "$pos" || break
-    fi
-  done < <(envelope_positions "$FILES_TXT")
-}
-
-# One line per unit an envelope lists: unit, versions, slices, size. A unit
-# held across tapes of which this tape's plan holds only some slices (those
-# given a tape_position, volume-format-v2.md 4.4) is marked PART, with the run
-# its plan holds: such a tape is not a copy of it on its own. This reads no
-# seal, so a tape that ended early may hold less; --list --unit says.
-units_table() { # <MANIFEST.toml>
-  local rows name versions nslices bytes part parted=0
-  rows=$(awk '__AWK_UNITS_TABLE__' "$1")
-  printf "    %-32s  %-10s  %6s  %10s\n" "Unit" "Versions" "Slices" "Size"
-  while IFS='|' read -r name versions nslices bytes part; do
-    [ -n "$name" ] || continue
-    if [ -z "$part" ]; then
-      printf "    %-32s  %-10s  %6s  %10s\n" "$name" "$versions" "$nslices" "$(size_str "$bytes")"
-      continue
-    fi
-    printf "    %-32s  %-10s  %6s  %10s  PART: %s\n" "$name" "$versions" "$nslices" "$(size_str "$bytes")" "$part"
-    parted=1
-  done <<<"$rows"
-  [ "$parted" = 1 ] || return 0
-  echo "    PART: a unit held across tapes, of which this tape's plan holds only the slices named (Slices"
-  echo "      and Size count the whole version). It is not a copy on its own: --list --unit UNIT says which"
-  echo "      slices this tape holds, and --where UNIT which tapes hold the others."
-}
-
-# ---- --find-envelope ----
-
-FOUND_ENVELOPES=()
-found_envelope() { # <position>
-  local pos=$1 m="$WORK/opened.$1/MANIFEST.toml" who
-  FOUND_ENVELOPES+=("$pos")
-  who=$(safe_str "$(toml_val "$m" tenant 2>/dev/null)")
-  echo ""
-  info "Decrypted envelope at file $pos${who:+ (tenant: $who)}"
-  info "  opened with key $ENV_KEY"
-  if [ -f "$m" ]; then
-    units_table "$m"
-  fi
-  return 0
-}
-
-do_find_envelope() {
-  # Every envelope lies before the first data slice, so this mode never needs
-  # to know where a tape that requires short-seal ended: it reads no seal.
-  establish_files --no-seal
-
-  # Every envelope, not just the first that opens (#412): an operator or
-  # escrow key opens them all, and the operator envelope lists every unit.
-  walk_envelopes found_envelope
-  [ "${#FOUND_ENVELOPES[@]}" -gt 0 ] || die_no_envelope
-
-  if [ "${#FOUND_ENVELOPES[@]}" -eq 1 ]; then
-    local d="$WORK/opened.${FOUND_ENVELOPES[0]}"
-    if [ -f "$d/MANIFEST.toml" ]; then
-      echo ""
-      echo "--- MANIFEST.toml ---"
-      cat "$d/MANIFEST.toml"
-    fi
-    if [ -f "$d/RECOVERY.md" ]; then
-      echo ""
-      echo "--- RECOVERY.md ---"
-      cat "$d/RECOVERY.md"
-    fi
-  else
-    echo ""
-    echo "${#FOUND_ENVELOPES[@]} envelopes opened. The operator envelope (an operator or escrow"
-    echo "key opens it) lists every unit on this tape; --restore --unit NAME finds the"
-    echo "envelope that holds NAME, and --all restores every unit of the largest one."
-  fi
-  echo ""
-  echo "To restore, run:"
-  echo "  $0 --restore $(keys_args) --to /your/destination"
-}
-
-# ---- --restore ----
-
-# Does an envelope MANIFEST.toml list a given unit under [[units]]? Exit 0 if
-# so. Used by --restore to pick the right envelope for a universal key (#127).
-manifest_has_unit() { # <manifest_path> <unit_name>
-  awk -v u="$2" '__AWK_MANIFEST_HAS_UNIT__' "$1"
-}
-
-# A failed slice must say whether the keys or the bytes are to blame (#288).
-die_slice_keys() { # <slice number>
-  die "cannot decrypt slice $1 — none of the ${#KEYS[@]} key(s) decrypted it
-       Keys tried: $(keys_list)
-       The key that opened the envelope need not be the key that opens the
-       slices: the envelope is sealed when the volume is written, each slice
-       when it was staged, so a key rotation between the two puts them on
-       different key generations. Supply the older key as well — repeat
-       --key once per key.
-       If this is the right key, the slice itself may be damaged (a damaged
-       header reads this way too): --verify checks it without a key, and
-       --slices-from DIR or --swap-tapes take it from another copy."
-}
-
-# Every --key as age identities. A slice is decrypted ONCE, with all of them:
-# age tries each against the slice's recipients itself. Streamed from tape,
-# a slice cannot be re-read for a second key, so the per-key retry of 1.0.x
-# (which re-read a decrypted-to-disk slice per key) is gone; age's own
-# "no identity matched any of the recipients" still names a missing key.
-AGE_IDS=()
-set_age_ids() {
-  local k
-  AGE_IDS=()
-  for k in ${KEYS[@]+"${KEYS[@]}"}; do
-    AGE_IDS+=(-i "$k")
-  done
-}
-
-# Decrypt one slice file to another (--path, which keeps the few slices it
-# needs on disk). A full disk is named as one, never as a key problem. With a
-# size, only the first that many bytes of the file are the slice (a copy made
-# with dd carries the tape's block padding after them).
-decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number> [bytes]
-  local in=$1 out=$2 num=$3 size=${4:-}
-  if [ -z "$size" ]; then
-    if age -d "${AGE_IDS[@]}" <"$in" >"$out" 2>"$WORK/age.err"; then
-      return 0
-    fi
-  else
-    if head -c "$size" -- "$in" | age -d "${AGE_IDS[@]}" >"$out" 2>"$WORK/age.err"; then
-      return 0
-    fi
-  fi
-  cat "$WORK/age.err" >&2 || true
-  if grep -i 'no space left' "$WORK/age.err" >/dev/null 2>&1; then
-    rm -f "$out"
-    die_io "decrypting slice $num failed" "$WORK/age.err" "$(dirname "$out")"
-  fi
-  rm -f "$out"
-  if grep 'no identity matched' "$WORK/age.err" >/dev/null 2>&1; then
-    die_slice_keys "$num"
-  fi
-  die "slice $num did not decrypt: a key matched it, so its bytes are damaged."
-}
-
-# Whether dar ($DAR_PID) is still running. Once it has ended, its exit status
-# is DAR_RC: wait gives a status once, so it is taken once (dar_reap) and read
-# from there by every later question about dar.
-DAR_RC=""
-dar_reap() {
-  [ -z "$DAR_RC" ] || return 0
-  DAR_RC=0
-  wait "$DAR_PID" 2>/dev/null || DAR_RC=$?
-}
-dar_running() {
-  [ -z "$DAR_RC" ] || return 1
-  if kill -0 "$DAR_PID" 2>/dev/null; then
-    return 0
-  fi
-  dar_reap
-  return 1
-}
-
-# dar is gone: say why, with its own words. One exit is not an error: dar
-# refusing the envelope's catalogue as not this archive's (a re-staged
-# snapshot, #419), which it does before writing anything. That sets
-# STREAM_REFUSED and returns, and the caller restores another way. Either way
-# the stream dar read (stream_unit) is closed first.
-STREAM_REFUSED=0
-die_dar() { # <destination>
-  local rc
-  stream_close
-  dar_reap
-  rc=$DAR_RC
-  DAR_PID=""
-  CUR=""
-  if grep 'do not correspond to the same data' "$WORK/extract.log" >/dev/null 2>&1; then
-    STREAM_REFUSED=1
-    return 0
-  fi
-  cat "$WORK/extract.log" >&2 2>/dev/null || true
-  if grep -i 'no space left' "$WORK/extract.log" >/dev/null 2>&1; then
-    die_io "dar extraction failed" "$WORK/extract.log" "$1"
-  fi
-  die "dar extraction failed (exit $rc) — dar's own message is above."
-}
-
-# A slice with no tape position here is on another tape (volume-format-v2.md
-# 4.4, R6): it is never read from this tape, and never taken for file 0.
-slice_here() { # <slice number> <its tape file here, or empty>
-  [ -z "$2" ] || return 0
-  die "slice $1 has no tape position on this tape: it is on another tape, and is never read from this
-       one (volume-format-v2.md 4.4)."
-}
-
-# The ciphertext of slice $1, for stream_unit: the tape file under the head,
-# or, with STREAM_FROM, the copy in that directory that a restore across tapes
-# read off its tape (still encrypted, and checked as it was read).
-STREAM_FROM=""
-slice_bytes() { # <slice number>
-  if [ -n "$STREAM_FROM" ]; then
-    cat -- "$STREAM_FROM/slice.$1.enc" 2>"$WORK/dd.err" </dev/null
-  else
-    dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" </dev/null
-  fi
-}
-
-# ---- the slices joined back into one stream for dar (#498; ADR-0012 item 181) ----
-#
-# dar given a sliced archive one named pipe per slice (as this script did up
-# to 1.7) can take a slice's one-byte trailer for archive data: where one of
-# its reads ends on the last byte of a slice, the trailer comes back as data,
-# and the unit fails "Bad CRC", exit 5, the same way every time (every dar
-# from 2.7.7 to 2.8.6). So a streamed restore gives dar ONE stream on its
-# standard input (dar -x -), which dar reads without that fault: the slices
-# joined back into the dar -c - stream tapectl cut them from. Its header is
-# this host's dar's own (dar -c - over an empty directory) with the two
-# labels of slice 1 put in; then each slice's payload, with its header and its
-# trailer taken off and checked; then the stream's own trailer, T. A slice
-# that is not what tapectl cut is refused, never guessed at.
-
-# The dar header at the start of file $1: prints its length, its flag (T, N
-# or E), the slice size it records (- for none) and where its data name sits;
-# or what is wrong with it, and fails.
-dar_header() { # <file>
-  od -An -v -tu1 "$1" | awk '__AWK_DAR_HEADER__'
-}
-
-# Whether this host can join a unit's slices into the one stream dar reads,
-# checked once a run, before any slice is read. The join takes each slice apart
-# with head in a group, the next command reading on where head stopped, so head
-# must read no further than it is asked (busybox's reads ahead, through stdio);
-# and its header is the one this host's dar writes on its standard output (dar
-# -c - over an empty directory), which this script must know:
-# $WORK/stream.tmpl, JOIN_H0 bytes long, its data name at JOIN_DN0. When it
-# cannot, STREAM_WHY says why (and STREAM_WHY_MORE what was seen), and the
-# caller restores another way: a unit on one tape from slices decrypted to
-# disk, as for a dar too old to stream.
-JOIN_OK=""
-JOIN_H0=""
-JOIN_DN0=""
-STREAM_WHY=""
-STREAM_WHY_MORE=""
-stream_check() {
-  local got out flag size rc=0
-  [ -z "$JOIN_OK" ] || {
-    [ "$JOIN_OK" = 1 ]
-    return
-  }
-  JOIN_OK=0
-  got=$(printf abcdef | { head -c 2 >/dev/null; head -c 1; } 2>/dev/null) || true
-  if [ "$got" != c ]; then
-    STREAM_WHY="this host's head reads past what it is asked for"
-    STREAM_WHY_MORE="(printf abcdef | { head -c 2 >/dev/null; head -c 1; } printed '$(visible_text "$got")', not 'c')"
-    return 1
-  fi
-  mkdir -p "$WORK/empty"
-  dar -N -c - -R "$WORK/empty" -an -D -Q >"$WORK/stream.tmpl" 2>"$WORK/tmpl.err" </dev/null || rc=$?
-  if [ "$rc" != 0 ]; then
-    STREAM_WHY="dar could not write its standard-output header (dar -c - over an empty directory, exit $rc)"
-    STREAM_WHY_MORE="dar said: $(visible_text "$(head -n 1 "$WORK/tmpl.err" 2>/dev/null)")"
-    return 1
-  fi
-  if ! out=$(dar_header "$WORK/stream.tmpl"); then
-    STREAM_WHY="this dar's standard-output header is not one this script knows"
-    STREAM_WHY_MORE="($out)"
-    return 1
-  fi
-  read -r JOIN_H0 flag size JOIN_DN0 <<<"$out"
-  if [ "$flag" != T ] || [ "$size" != - ]; then
-    STREAM_WHY="this dar's standard-output header is not a single-slice archive's (flag T, no slice size)"
-    STREAM_WHY_MORE=""
-    return 1
-  fi
-  JOIN_OK=1
-}
-
-# Why stream_check failed, indented by $1, one line or two.
-stream_why() { # <indent>
-  printf '%s%s.\n' "$1" "$STREAM_WHY"
-  [ -z "$STREAM_WHY_MORE" ] || printf '%s%s\n' "$1" "$STREAM_WHY_MORE"
-}
-
-# Why the join refuses the slice being fed, for stream_unit to say.
-join_refuse() { # <what>
-  printf '%s\n' "$1" >"$WORK/join.why"
-}
-
-# Whether files $1 and $2 hold the same bytes (a header: a few dozen).
-same_bytes() { # <file> <file>
-  [ "$(od -An -v -tu1 "$1")" = "$(od -An -v -tu1 "$2")" ]
-}
-
-# The rest of slice $4 after its header (standard input), cut exactly at the
-# plaintext size the manifest gives it ($5): its payload into the stream (fd
-# 3), its trailer taken off and checked, and nothing may be left. Every slice
-# but the last is the slice size its header records, the last no longer. Each
-# piece is a head -c, which reads no further than it is asked (stream_check):
-# no byte is held back by a tool and read off a copy (#498: uutils tail -c 1 on
-# a FIFO that carries under 64 KiB never returns). A write the stream refuses is
-# dar having closed it: join.closed, and nothing more is checked or written.
-join_rest() { # <header bytes> <slice size> <1 for the last slice> <slice number> <plaintext bytes>
-  local h=$1 size=$2 last=$3 num=$4 plain=$5 j="$WORK/join" trl extra want=78 wantc=N
-  [ "$last" != 1 ] || want=84 wantc=T
-  if [ "$last" != 1 ] && [ "$plain" != "$size" ]; then
-    join_refuse "slice $num is $plain bytes by the manifest, where its header's slice size is $size and it is not the last"
-    return 0
-  fi
-  if [ "$plain" -gt "$size" ]; then
-    join_refuse "slice $num is $plain bytes by the manifest, more than its header's slice size ($size)"
-    return 0
-  fi
-  if [ "$plain" -le "$h" ]; then
-    join_refuse "slice $num is $plain bytes by the manifest, which ends it inside its $h-byte header"
-    return 0
-  fi
-  : >"$j.trl"
-  if ! head -c $((plain - h - 1)) 2>/dev/null >&3; then
-    : >"$j.closed"
-    return 0
-  fi
-  head -c 1 >"$j.trl"
-  extra=$(wc -c)
-  trl=$(od -An -v -tu1 "$j.trl" | awk '{ printf "%s", $1 }')
-  if [ "$extra" -gt 0 ]; then
-    join_refuse "slice $num is longer than the manifest says ($plain bytes)"
-  elif [ -z "$trl" ]; then
-    join_refuse "slice $num is shorter than the manifest says ($plain bytes)"
-  elif [ "$trl" != "$want" ]; then
-    join_refuse "slice $num ends with the byte $trl, not $wantc"
-  fi
-}
-
-# Slice $1 (standard input: its plaintext, from age) into the stream on fd 3.
-# Runs in the slice's feed, never in this script itself: a write to a stream
-# dar has closed raises SIGPIPE, which must end the feed's writer, never the
-# restore. What it finds is left in $WORK: join.why (a refusal), join.closed
-# (dar closed the stream). Slice 1's header, and its length and slice size,
-# are kept (join.hdr, join.frame) for the slices after it, which must carry
-# that header byte for byte. Slice 1 also writes the stream's header.
-join_slice() { # <slice number> <1 for the first slice> <1 for the last> <plaintext bytes>
-  local num=$1 first=$2 last=$3 plain=$4 j="$WORK/join" out h flag size dn
-  if [ "$first" = 1 ]; then
-    head -c 4096 >"$j.head"
-    if ! out=$(dar_header "$j.head"); then
-      join_refuse "slice $num: $out"
-      return 0
-    fi
-    read -r h flag size dn <<<"$out"
-    if [ "$flag" != E ] || [ "$size" = - ]; then
-      join_refuse "slice $num has the header of an archive that is not sliced (flag $flag, slice size $size)"
-      return 0
-    fi
-    if [ "$size" -le $((h + 1)) ]; then
-      join_refuse "a slice size of $size bytes leaves no room for data after a $h-byte header"
-      return 0
-    fi
-    head -c "$h" "$j.head" >"$j.hdr"
-    printf '%s %s\n' "$h" "$size" >"$j.frame"
-    # The stream's header: this dar's, with slice 1's internal name (bytes 4
-    # to 13 of every dar header) and its data name put in. Bytes A to B of a
-    # file are its first B, less all but the last B - A.
-    {
-      head -c 4 "$WORK/stream.tmpl"
-      head -c 14 "$j.head" | tail -c 10
-      head -c "$JOIN_DN0" "$WORK/stream.tmpl" | tail -c $((JOIN_DN0 - 14))
-      head -c $((dn + 10)) "$j.head" | tail -c 10
-      head -c "$JOIN_H0" "$WORK/stream.tmpl" | tail -c $((JOIN_H0 - JOIN_DN0 - 10))
-    } >"$j.stream" 2>/dev/null
-    if [ "$(dar_header "$j.stream" 2>/dev/null)" != "$JOIN_H0 T - $JOIN_DN0" ] ||
-      [ "$(wc -c <"$j.stream")" != "$JOIN_H0" ]; then
-      join_refuse "the stream header made from slice $num's does not read back as one"
-      return 0
-    fi
-    if ! cat "$j.stream" 2>/dev/null >&3; then
-      : >"$j.closed"
-      return 0
-    fi
-    { tail -c +$((h + 1)) "$j.head"; cat; } | join_rest "$h" "$size" "$last" "$num" "$plain"
-    return 0
-  fi
-  read -r h size <"$j.frame"
-  head -c "$h" >"$j.this"
-  if ! same_bytes "$j.this" "$j.hdr"; then
-    join_refuse "slice $num's header is not slice 1's"
-    return 0
-  fi
-  join_rest "$h" "$size" "$last" "$num" "$plain"
-}
-
-# The stream (fd 3) closed, once: dar reads its end.
-STREAM_OPEN=0
-stream_close() {
-  [ "$STREAM_OPEN" = 1 ] || return 0
-  exec 3>&-
-  STREAM_OPEN=0
-}
-
-# ---- damage only in what dar never needed (ADR-0012 item 182) ----
-#
-# Given the catalogue, dar stops reading where the file data ends and exits 0
-# (#497); what it leaves is still read, hashed and authenticated. Damage found
-# there is in bytes dar never needed: it is said, once for the slice, the
-# restore goes on, and the restored files are checked against the index as
-# ever. Which it is, dar's exit status says: damage found while dar may still
-# be reading closes dar's stream at that point and waits for dar (stream_unit),
-# and dar ending well then needed nothing past it. A dar that ends any other
-# way, or a file that fails the check, fails the restore as it always has.
-
-# The tape slice $1 came from, for a message: the cartridge in the drive (tape
-# file $2), or the one it was read from into the scratch directory.
-CART_LABEL=""
-slice_where() { # <slice number> <tape file, or empty>
-  local lab="" pos=""
-  if [ -n "$STREAM_FROM" ]; then
-    IFS='|' read -r _ lab pos < <(awk -F'|' -v n="$1" '$1 == n { print; exit }' "$WORK/span.from" 2>/dev/null) || true
-    printf 'read into the scratch directory from tape file %s of %s' "${pos:-?}" "${lab:-<unreadable>}"
-  else
-    printf 'tape file %s of %s' "$2" "${CART_LABEL:-${TAPE_LABEL:-$LABEL}}"
-  fi
-}
-
-# What was found is age (a chunk it cannot authenticate, so the sha256 cannot
-# match either) or sha (the sha256 alone). The note is said here, once for the
-# slice, and again at the end of the run (late_notes), each line of it within
-# about 100 columns but the first, which names the unit and the tape.
-LATE_NOTES=()
-late_damage() { # <slice number> <tape file, or empty> age|sha [<sha256 expected> <sha256 got>]
-  local line short="Replace this tape."
-  line="slice $1 of '$(visible_text "$UNIT_NAME")' ($(slice_where "$1" "$2")) is damaged after the point this restore needed"
-  {
-    echo "NOTE: $line:"
-    if [ "$3" = age ]; then
-      echo "      age cannot authenticate it there (its own words are above), so its sha256 cannot"
-      echo "      match the front index either."
-    else
-      echo "      its sha256 does not match the front index"
-      echo "      (expected ${4:0:16}…, got ${5:0:16}…)."
-    fi
-    echo "      dar had already restored what it needed of the unit, and ended well. The restore goes"
-    echo "      on: the slices after it are still read and checked, and every restored file is checked"
-    echo "      against the sha256 the index records for it."
-    if [ -n "$STREAM_FROM" ]; then
-      echo "      It matched the front index of its tape when it was read, so its copy in the scratch"
-      echo "      directory changed since, or every copy of the slice holds the same damage."
-    else
-      echo "      Replace this tape: it no longer holds this slice as written, though this restore did"
-      echo "      not need the damaged part."
-    fi
-  } >&2
-  [ -z "$STREAM_FROM" ] || short="Every copy of it may hold the same damage: see the note on it above."
-  LATE_NOTES+=("NOTE: $line." "      $short")
-}
-
-# Stream one unit's slices off the tape, through age, into dar (#412 item 1),
-# as the one stream above (#498): nothing decrypted is written to disk except
-# the restored files (the 1.0.x restore decrypted every slice to disk first
-# and needed about twice the unit's size free). Each slice's ciphertext is
-# hashed as it passes and checked against the front index, and age
-# authenticates every 64 KiB as it decrypts, so damaged bytes stop the restore
-# rather than reach dar. Whatever fails first is named: the tape read (dd's
-# words), age (a missing key, or damage), dar (its own output), or the join (a
-# slice that is not what tapectl cut).
-#
-# Given the catalogue (-A), dar stops reading where the file data ends and
-# exits 0: it never reads the archive's own catalogue, the tail of the last
-# slice, and with small slices not the last few slices at all (#497). That is
-# dar done, not dar failed. What it leaves of a slice is still read to its end,
-# hashed and decrypted, into nothing, and so is every slice after it; dar's
-# exit status then decides, as for any restore (and damage found there is
-# late_damage's).
-#
-# The stream is one named pipe, opened for writing once, as fd 3, after dar
-# has started (it is not dar's to hold), and kept open across the slices and
-# across a cartridge change. Only a slice's feed, a child, ever writes to it.
-stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalogue]
-  local list=$1 destdir=$2 cat=${3:-} fifos="$WORK/stream" i n
-  STREAM_REFUSED=0
-  local -a nums=() poss=() sizes=() shas=()
-  local num tpos size sha
-  while IFS='|' read -r num tpos size sha; do
-    nums+=("$num")
-    poss+=("$tpos")
-    sizes+=("$size")
-    shas+=("$sha")
-  done <"$list"
-  n=${#nums[@]}
-  # Each slice's plaintext size, from the manifest (pick_slices), in the same
-  # order: the join cuts each slice there.
-  local -a plains=() pnums=()
-  local pn pv
-  if [ -f "$list.plain" ]; then
-    while IFS='|' read -r pn pv; do
-      pnums+=("$pn")
-      plains+=("$pv")
-    done <"$list.plain"
-  fi
-  # The join takes slices 1 to N, in order, none skipped, each of a known size.
-  for ((i = 0; i < n; i++)); do
-    [ "${nums[$i]}" = "$((i + 1))" ] ||
-      die "the slices of '$(visible_text "$UNIT_NAME")' are not listed as 1 to $n in order (slice ${nums[$i]} where
-       slice $((i + 1)) was due), so they cannot be joined for dar. No slice of it has been read."
-    { [ "${pnums[$i]:-}" = "${nums[$i]}" ] && is_uint "${plains[$i]:-}"; } ||
-      die "the envelope's manifest gives no plaintext size (size_bytes) for slice ${nums[$i]} of
-       '$(visible_text "$UNIT_NAME")', so its slices cannot be joined for dar. No slice of it has been read."
-  done
-  # The caller asked stream_check before any slice was read.
-  stream_check || die "the slices of '$(visible_text "$UNIT_NAME")' cannot be joined into the one stream dar reads, on this host:
-$(stream_why "       ")"
-  rm -rf "$fifos" && mkdir -p "$fifos"
-  mkfifo "$fifos/stream" "$fifos/cipher"
-
-  local -a dar_opts=(-O -Q -N --sequential-read)
-  [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
-  # The isolated catalogue, when there is one: dar 2.7.13 (Debian's and
-  # Ubuntu's) reading sliced FIFOs sequentially without it cuts short a file
-  # that runs into the last slice, for most slice sizes; with it the restore
-  # is exact (measured with #411; fixed in dar 2.7.21).
-  [ -z "$cat" ] || dar_opts+=(-A "$cat")
-  dar -x - -R "$(abs_dir "$destdir")" "${dar_opts[@]}" <"$fifos/stream" >"$WORK/extract.log" 2>&1 &
-  DAR_PID=$!
-  DAR_RC=""
-  BG_PIDS+=("$DAR_PID")
-  exec 3>"$fifos/stream"
-  STREAM_OPEN=1
-
-  local hpid wpid got from sink late
-  local -a st
-  for ((i = 0; i < n; i++)); do
-    num=${nums[$i]} tpos=${poss[$i]} size=${sizes[$i]} sha=${shas[$i]}
-    if [ "$SPAN_RESTORE" = stream ]; then
-      # A unit held across tapes, with --stream-tapes: each slice from the
-      # cartridge in the drive while its front index lists it, then the next
-      # cartridge, asked for while dar waits on the stream for as long as that
-      # takes (volume-format-v2.md 4.4, R8). A dar that has ended well needs no
-      # more, and the slice is still asked for, to be checked.
-      tpos=$(span_pos "$num")
-      if [ -z "$tpos" ] && ! dar_running && [ "$DAR_RC" = 0 ]; then
-        span_swap "$num"
-        tpos=$(span_pos "$num")
-      elif [ -z "$tpos" ]; then
-        # A dar already gone (its catalogue refused, #419, or worse) is said
-        # before a cartridge is asked for that it would never read.
-        if ! kill -0 "$DAR_PID" 2>/dev/null; then
-          die_dar "$destdir"
-          return 0
-        fi
-        span_swap "$num"
-        tpos=$(span_pos "$num")
-      fi
-    fi
-    if [ -n "$STREAM_FROM" ]; then
-      from="the copy of slice $num in $STREAM_FROM"
-      info "Slice $((i + 1))/$n — from the scratch directory"
-    else
-      slice_here "$num" "$tpos"
-      from="tape file $tpos"
-      info "Slice $((i + 1))/$n — tape file $tpos"
-    fi
-    # The slice is joined into dar's stream while dar runs. A dar that ended
-    # well wants no more: the slice goes to /dev/null, still read, hashed and
-    # decrypted. One that failed is said now.
-    sink=stream
-    if ! dar_running; then
-      if [ "$DAR_RC" != 0 ]; then
-        die_dar "$destdir"
-        return 0
-      fi
-      sink=/dev/null
-    fi
-    if [ -z "$STREAM_FROM" ]; then
-      seek_to "$tpos" || die "cannot position the tape at file $tpos ($MT failed)"
-      CUR=""
-    fi
-    rm -f "$WORK/join.why" "$WORK/join.closed"
-    sha256sum <"$fifos/cipher" >"$WORK/slice.sha" 2>/dev/null 3>&- &
-    hpid=$!
-    BG_PIDS+=("$hpid")
-    : >"$WORK/feed.status"
-    (
-      # Not -e here: the pipeline's statuses are the result, written below.
-      set +e
-      # What dar does not take of the slice is drained after age: the join
-      # stops writing when dar closes the stream, and what is left is read
-      # into nothing, so age still authenticates every chunk, the hash is of
-      # the whole slice and the tape file is read to its end.
-      slice_bytes "$num" |
-        {
-          head -c "$size"
-          cat >/dev/null
-        } | tee "$fifos/cipher" |
-        age -d "${AGE_IDS[@]}" 2>"$WORK/age.err" |
-        {
-          [ "$sink" = /dev/null ] || join_slice "$num" "$((i == 0))" "$((i + 1 == n))" "${plains[$i]}"
-          cat >/dev/null
-        }
-      echo "${PIPESTATUS[*]}" >"$WORK/feed.status"
-    ) </dev/null &
-    wpid=$!
-    wait "$wpid" 2>/dev/null || true
-    wait "$hpid" 2>/dev/null || true
-    if [ -f "$WORK/join.closed" ]; then
-      # dar closed the stream part way through this slice: it has ended, or
-      # is ending, and takes nothing more. Its status is waited for, and a
-      # dar that failed is said now, as it ended while the slice was fed.
-      stream_close
-      dar_reap
-      if [ "$DAR_RC" != 0 ]; then
-        die_dar "$destdir"
-        return 0
-      fi
-    fi
-    read -r -a st <"$WORK/feed.status" || true
-    # st: dd (or cat, from scratch), the head/drain group, tee, age, and the
-    # group that joins the slice into dar's stream and drains what dar leaves.
-    if [ "${st[0]:-1}" != 0 ]; then
-      if [ "$SPAN_RESTORE" = stream ]; then
-        echo "NOTE: without --stream-tapes a slice that will not read is asked for from another cartridge that holds it." >&2
-      elif [ -z "$STREAM_FROM" ]; then
-        echo "NOTE: a slice that will not read can come from another copy of the unit: see --slices-from and --swap-tapes in --help." >&2
-      fi
-      die_io "reading $from failed" "$WORK/dd.err" "$WORK"
-    fi
-    got=$(awk '{print $1}' "$WORK/slice.sha")
-    # A slice found damaged (a chunk age cannot authenticate, a sha256 that is
-    # not the front index's) or not passed whole, while dar may still be
-    # reading: dar's stream is closed there, with no final T, and dar is waited
-    # for. dar ending well then needed nothing past the damage, and any other
-    # end is the damage stopping the restore as it always has (item 182). A dar
-    # seen running at one instant may be about to end either way, so it is
-    # never asked whether it runs, only how it ended.
-    if [ "$STREAM_OPEN" = 1 ] && { [ "${st[3]:-1}" != 0 ] || [ "$got" != "$sha" ] ||
-      [ "${st[1]:-1}" != 0 ] || [ "${st[2]:-1}" != 0 ] || [ "${st[4]:-1}" != 0 ]; }; then
-      stream_close
-      dar_reap
-    fi
-    # Damage cannot have reached what dar needed when dar ended well: the slice
-    # went to /dev/null, dar closed the stream while it was fed, or dar ended
-    # well once the stream was closed at the damage (late_damage).
-    late=0
-    if [ -n "$DAR_RC" ] && [ "$DAR_RC" = 0 ]; then
-      late=1
-    fi
-    if [ "${st[3]:-1}" != 0 ]; then
-      # age's own complaint about the slice (a damaged chunk, a header no key
-      # opens) is what the heir needs to read. Only an age that failed some
-      # other way, with dar failed too, hands the word to dar.
-      if ! grep -E 'decrypt|authenticat|no identity matched|header|MAC' "$WORK/age.err" >/dev/null 2>&1 &&
-        ! dar_running && [ "$DAR_RC" != 0 ]; then
-        die_dar "$destdir"
-        return 0
-      fi
-      cat "$WORK/age.err" >&2 || true
-      if grep 'no identity matched' "$WORK/age.err" >/dev/null 2>&1; then
-        die_slice_keys "$num"
-      fi
-      if [ "$late" = 1 ]; then
-        late_damage "$num" "$tpos" age
-        [ -n "$STREAM_FROM" ] || CUR=$((tpos + 1))
-        continue
-      fi
-      die "slice $num ($from) did not decrypt: a key matched it, so its bytes are
-       damaged. Files already restored to $destdir from this unit may be incomplete.
-$(replace_hint)"
-    fi
-    if [ -s "$WORK/join.why" ]; then
-      die "slice $num ($from) is not a slice of this unit as tapectl cut it: $(cat "$WORK/join.why").
-       Refusing to join the slices for dar rather than guess (a dar whose slice header this
-       script does not know would land here). Files already restored to $destdir from this
-       unit may be incomplete."
-    fi
-    if [ "${st[1]:-1}" != 0 ] || [ "${st[2]:-1}" != 0 ] || [ "${st[4]:-1}" != 0 ]; then
-      if ! dar_running && [ "$DAR_RC" != 0 ]; then
-        die_dar "$destdir"
-        return 0
-      fi
-      die "slice $num ($from) could not be passed to dar (status ${st[*]})"
-    fi
-    [ -n "$STREAM_FROM" ] || CUR=$((tpos + 1))
-    if [ "$got" != "$sha" ]; then
-      if [ "$late" = 1 ]; then
-        late_damage "$num" "$tpos" sha "$sha" "$got"
-        continue
-      fi
-      die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${got:0:16}…)
-       The slice does not match the front index. dar has already taken what
-       decrypted of it: do not trust the files restored to $destdir.
-$(replace_hint)"
-    fi
-    info "  checksum verified against front index"
-  done
-  # The stream's own trailer, written by a child (see above), once every
-  # slice is joined; then the stream is closed, and dar reads its end.
-  if [ "$STREAM_OPEN" = 1 ] && dar_running; then
-    (printf T >&3) 2>/dev/null || true
-  fi
-  stream_close
-
-  dar_reap
-  local rc=$DAR_RC
-  DAR_PID=""
-  if [ "$rc" != 0 ] && grep 'do not correspond to the same data' "$WORK/extract.log" >/dev/null 2>&1; then
-    STREAM_REFUSED=1
-    return 0
-  fi
-  dar_result "$WORK/extract.log" "$rc" "$destdir"
-}
-
-# Read, check and decrypt the slices listed in $1 as restore.N.dar, one
-# encrypted slice on disk at a time, into directory $2 (default SCRATCH). A
-# slice that fails stops the run, unless a replacement was asked for
-# (SALVAGE): then it is looked for, by its sha256, in the --slices-from
-# directories, and one not found is written to the file $3 (number | tape file
-# | bytes | sha256) for the second tape, and the rest are read on.
-spool_slices() { # <slices file> [<directory> [<file for the slices not found>]]
-  local list=$1 into=${2:-$SCRATCH} missing=${3:-} num tpos size sha actual i=0 n
-  [ -z "$missing" ] || : >"$missing"
-  n=$(wc -l <"$list")
-  while IFS='|' read -r num tpos size sha; do
-    i=$((i + 1))
-    slice_here "$num" "$tpos"
-    info "Slice $num ($i/$n) — tape file $tpos"
-    if [ "$SALVAGE" = 1 ]; then
-      if read_slice_checked "$tpos" "$size" "$sha" "$SCRATCH/slice.enc"; then
-        info "  checksum verified against front index"
-        decrypt_slice "$SCRATCH/slice.enc" "$into/restore.$num.dar" "$num"
-        rm -f "$SCRATCH/slice.enc"
-      else
-        info "  slice $num (tape file $tpos) $SLICE_WHY"
-        if dir_find "$num" "$size" "$sha"; then
-          info "  taking slice $num from $DIR_HIT (its sha256 is the one the front index lists)"
-          decrypt_slice "$DIR_HIT" "$into/restore.$num.dar" "$num" "$size"
-        else
-          echo "$num|$tpos|$size|$sha" >>"$missing"
-          info "  no copy of slice $num in the --slices-from directories"
-        fi
-      fi
-      continue
-    fi
-    read_tape_raw "$tpos" "$SCRATCH/slice.enc"
-    truncate -s "$size" "$SCRATCH/slice.enc"
-    actual=$(sha256sum "$SCRATCH/slice.enc" | awk '{print $1}')
-    [ "$actual" = "$sha" ] ||
-      die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${actual:0:16}…)
-$(replace_hint)"
-    info "  checksum verified against front index"
-    decrypt_slice "$SCRATCH/slice.enc" "$into/restore.$num.dar" "$num"
-    rm -f "$SCRATCH/slice.enc"
-  done <"$list"
-}
-
-# The way 1.0.x restored, for a dar that cannot stream a unit safely: every
-# slice decrypted to disk first, then dar reads them directly (not
-# sequentially), which needs no catalogue. Needs room for the slices as well
-# as the files, checked before the first slice is read.
-spool_unit() { # <slices file> <destination>
-  local list=$1 destdir=$2 bytes=0 num tpos size sha
-  while IFS='|' read -r num tpos size sha; do
-    bytes=$((bytes + size))
-  done <"$list"
-  check_space "$destdir" "$SCRATCH_PARENT" "$bytes" "$((bytes + BLOCK))"
-  SCRATCH="$(mktemp -d "$SCRATCH_PARENT/.tapectl-restore.XXXXXX")" ||
-    die "cannot create a scratch directory in $SCRATCH_PARENT"
-  spool_slices "$list"
-  local -a dar_opts=(-O -Q -N)
-  local rc=0
-  [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
-  dar -x "$SCRATCH/restore" -R "$(abs_dir "$destdir")" "${dar_opts[@]}" >"$WORK/extract.log" 2>&1 </dev/null || rc=$?
-  rm -rf "$SCRATCH"
-  SCRATCH=""
-  dar_result "$WORK/extract.log" "$rc" "$destdir"
-}
-
-# Restore one unit the best way this dar allows. Streaming needs the unit's
-# isolated catalogue from the envelope with dar 2.7.9 or later (sliced
-# sequential reading with a catalogue works from there), or no catalogue with
-# dar 2.7.21 or later (which fixed reading without one). A catalogue dar
-# refuses (#419) is dropped, and anything else is restored from slices
-# decrypted to disk first.
-restore_unit_plain() { # <slices file> <destination> <unit> <version>
-  local list=$1 destdir=$2 unit=$3 ver=$4 cat
-  cat=$(catalogue_path "$CHOSEN_ENV" "$unit" "$ver")
-  # A dar that could stream it, on a host that cannot join the slices into the
-  # one stream dar reads (stream_check): the unit is restored from slices
-  # decrypted to disk first, as for a dar too old to stream. A unit held
-  # across tapes never comes here so: restore_across_tapes refused it.
-  if { { [ -n "$cat" ] && dar_at_least 2.7.9; } || dar_at_least 2.7.21; } && ! stream_check; then
-    [ -z "$SPAN_RESTORE" ] || die "the slices of '$unit' cannot be joined into the one stream dar reads, on this host:
-$(stream_why "       ")"
-    {
-      echo "NOTE: the slices of '$(visible_text "$unit")' cannot be joined into the one stream dar reads, on this host:"
-      stream_why "      "
-      echo "      They are decrypted to disk first instead, and dar reads them from there, as for a dar"
-      echo "      too old to stream: that needs room for the slices as well as the files."
-    } >&2
-    spool_unit "$list" "$destdir"
-    return 0
-  fi
-  if [ -n "$cat" ] && dar_at_least 2.7.9; then
-    stream_unit "$list" "$destdir" "$cat"
-    [ "$STREAM_REFUSED" = 1 ] || return 0
-    # With --stream-tapes, once a cartridge has changed, a restore without the
-    # catalogue would start again from slice 1, on a cartridge already taken
-    # out: the run ends instead (#419), and says how to restore the unit.
-    if [ "$SPAN_RESTORE" = stream ] && [ "$SPAN_SWAPPED" = 1 ]; then
-      die "dar refused the envelope's catalogue for '$unit': it belongs to another
-       staging run of the same snapshot (#419). Nothing was written. Restoring '$unit'
-       without it would start again from slice 1, on a cartridge this run has taken out
-       of the drive, so the run ends here. Run the same command again without
-       --stream-tapes: the slices then wait, still encrypted, in scratch space, and a
-       dar 2.7.21 or later restores '$unit' from them without the catalogue."
-    fi
-    echo "NOTE: dar refused the envelope's catalogue for '$unit': it belongs to another" >&2
-    echo "      staging run of the same snapshot (#419). Nothing was written; restoring" >&2
-    echo "      '$unit' without it." >&2
-  fi
-  if dar_at_least 2.7.21; then
-    stream_unit "$list" "$destdir" ""
-    [ "$STREAM_REFUSED" = 0 ] || die "dar refused to read '$unit' — see its message above"
-    return 0
-  fi
-  # A unit held across tapes keeps only ciphertext on disk: restore_across_tapes
-  # refused, before any slice was read, a dar that would end here, and only a
-  # catalogue dar refused (#419) can still bring it here.
-  [ -z "$SPAN_RESTORE" ] || die "dar ${DAR_VERSION:-(of an unknown version)} cannot read '$unit' across tapes without its
-       catalogue, which it refused (see above): dar 2.7.21 or later can. Nothing was restored."
-  info "dar ${DAR_VERSION:-(unknown version)} cannot stream '$unit' safely without its catalogue;"
-  info "  decrypting the slices to disk first (dar 2.7.21 or later would stream it)"
-  spool_unit "$list" "$destdir"
-}
-
-# One unit, whichever way: streamed, from slices on disk, or (when a
-# replacement slice was asked for) from slices on disk with the bad ones
-# replaced. UNIT_OK says whether dar named files it could not restore.
-restore_unit() { # <slices file> <destination> <unit> <version>
-  local list=$1 destdir=$2 unit=$3 ver=$4
-  UNIT_NAME=$unit
-  UNIT_VER=$ver
-  UNIT_OK=1
-  UNIT_UUID=$(unit_uuid_of "$CHOSEN_ENV" "$unit" "$ver")
-  if [ "$SALVAGE" = 1 ]; then
-    salvage_unit "$list" "$destdir" "$unit" "$ver"
-    return 0
-  fi
-  restore_unit_plain "$list" "$destdir" "$unit" "$ver"
-  if [ "$UNIT_OK" = 1 ]; then
-    DONE_LINES+=("Unit '$unit' restored to: $destdir")
-  fi
-}
-
-# The envelope --restore uses (walk_envelopes calls this for each that
-# opens): the first that lists every unit asked for (#127: an escrow key opens
-# them all, and the first may be another tenant's), or with --all the one
-# that lists the most units — for an operator or escrow key, the operator
-# envelope, which lists every unit on the tape.
-RESTORE_UNITS=()
-RESTORE_ALL=0
-CHOSEN_ENV=""
-CHOSEN_COUNT=0
-CHOSEN_KEY=""
-CHOSEN_POS=""
-pick_for_restore() { # <position>
-  local pos=$1 m="$WORK/opened.$1/MANIFEST.toml" u count
-  [ -f "$m" ] || return 0
-  if [ "$RESTORE_ALL" = 1 ]; then
-    count=$(awk '__AWK_UNIT_LIST__' "$m" | wc -l)
-    if [ -z "$CHOSEN_ENV" ] || [ "$count" -gt "$CHOSEN_COUNT" ]; then
-      CHOSEN_ENV="$WORK/opened.$pos" CHOSEN_COUNT=$count CHOSEN_KEY=$ENV_KEY CHOSEN_POS=$pos
-    fi
-    return 0
-  fi
-  for u in ${RESTORE_UNITS[@]+"${RESTORE_UNITS[@]}"}; do
-    if ! manifest_has_unit "$m" "$u"; then
-      info "Envelope at file $pos decrypts but does not list '$u'; continuing..."
-      return 0
-    fi
-  done
-  CHOSEN_ENV="$WORK/opened.$pos" CHOSEN_KEY=$ENV_KEY CHOSEN_POS=$pos
-  return 1
-}
-
-# A restore that names no unit and no --all restores the one unit the first
-# envelope its key opens lists, when it lists exactly one (the default is
-# deliberate). The same key may open more envelopes that list more units, and
-# an heir who sees RESTORE COMPLETE would take the tape for that one unit. So,
-# before a single slice is read, the envelopes after the one used are looked
-# at, only to count what they list besides it. They all come before every
-# slice, so this moves the tape forward only; each is dropped once counted.
-LONE_UNIT=""
-OTHER_ENVELOPES=0
-OTHER_UNITS=0
-OTHER_BIGGEST=0
-count_other_envelope() { # <position>
-  local pos=$1 m="$WORK/opened.$1/MANIFEST.toml" n
-  if [ -f "$m" ]; then
-    OTHER_ENVELOPES=$((OTHER_ENVELOPES + 1))
-    awk '__AWK_UNIT_LIST__' "$m" >"$WORK/listed.txt"
-    cat "$WORK/listed.txt" >>"$WORK/other_units.txt"
-    n=$(wc -l <"$WORK/listed.txt")
-    [ "$n" -le "$OTHER_BIGGEST" ] || OTHER_BIGGEST=$n
-  fi
-  rm -rf "$WORK/opened.$pos"
-  return 0
-}
-
-survey_other_envelopes() { # <the unit being restored>
-  local unit=$1 need free
-  # The survey reads envelopes the restore itself would not have read, so it
-  # must not be what fills a small work directory: the largest one after the
-  # envelope in use is read whole and, if a key opens it, decrypted. Without
-  # room for that the survey is skipped, whatever --no-space-check says.
-  need=$(awk -F'|' -v after="$CHOSEN_POS" -v blk="$BLOCK" '
-    ($2 == "tenant_envelope" || $2 == "operator_envelope") && $1 + 0 > after + 0 && $3 ~ /^[0-9]+$/ {
-      if ($3 + 0 > max) max = $3 + 0
-    }
-    END { if (max > 0) printf "%.0f\n", 2 * max + blk }
-  ' "$FILES_TXT")
-  [ -n "$need" ] || return 0
-  free=$(free_bytes "$WORK")
-  if is_uint "$free" && ! awk -v have="$free" -v want="$need" 'BEGIN { exit (have + 0 >= want + 0) ? 0 : 1 }'; then
-    info "Not looking at the other envelopes: the work directory has $(size_str "$free") free and the"
-    info "  largest needs about $(size_str "$need") (set TMPDIR to a larger disk to see what else this key opens)."
-    return 0
-  fi
-  LONE_UNIT=$unit
-  : >"$WORK/other_units.txt"
-  info "Looking at the other envelopes this key opens, to tell you at the end what else is on this tape..."
-  walk_envelopes count_other_envelope "$CHOSEN_POS"
-  OTHER_UNITS=$(U="$unit" awk '$0 != ENVIRON["U"] && !seen[$0]++' "$WORK/other_units.txt" | wc -l)
-}
-
-# Said just before RESTORE COMPLETE, and only when the survey found units the
-# restore did not cover.
-note_other_units() {
-  if [ -z "$LONE_UNIT" ] || [ "$OTHER_UNITS" -eq 0 ]; then
-    return 0
-  fi
-  echo ""
-  info "NOTE: only '$LONE_UNIT' was restored: no --unit or --all said what to restore, so the"
-  info "      first envelope this key opened decided. This key opened $OTHER_ENVELOPES other envelope(s)"
-  info "      on this tape, which list $OTHER_UNITS other unit(s) besides it."
-  info "      See what each lists:   $0 --list $(keys_args)"
-  info "      Restore every unit of the envelope that lists the most ($OTHER_BIGGEST units here), each into"
-  info "      --to/UNIT (use another, empty directory):"
-  info "        $0 --restore $(keys_args) --all --to /another/destination"
-}
-
-# Pick the slices of one unit (one version) from the manifest into $3, checked
-# against the file map before any slice is read. Sets PICKED_VERSION,
-# PICKED_SPAN (1 when the block states may_span = true) and PICKED_BYTES.
-# Which of its slices this tape holds decides what the version is here
-# (volume-format-v2.md 4.2, 4.4): a slice with no tape_position is on another
-# tape (R6), never at file 0, and one planned after ENDED_AFTER is not on this
-# tape (R3). A version every slice of which is here is whole. One that states
-# may_span = true (a unit that may run across tapes) and has some slices here
-# is a RANGE: PICKED_RANGE is 1, PICKED_COUNT is how many slices it has,
-# PICKED_RUN_FIRST and PICKED_RUN_LAST the first and the last slice here, and
-# PICKED_FILE_FIRST and PICKED_FILE_LAST their tape files. Any other version
-# not here whole is cut: PICKED_CUT is 1 and PICKED_LAST its last slice's
-# planned tape file. For a range or a cut version $3 is left empty, and the
-# caller names it (R4, R7).
-PICKED_VERSION=""
-PICKED_SPAN=0
-PICKED_BYTES=0
-PICKED_CUT=0
-PICKED_LAST=""
-PICKED_RANGE=0
-PICKED_COUNT=0
-PICKED_RUN_FIRST=""
-PICKED_RUN_LAST=""
-PICKED_FILE_FIRST=""
-PICKED_FILE_LAST=""
-pick_slices() { # <manifest> <unit> <out> [version]
-  local manifest=$1 unit=$2 out=$3 want=${4:-} num tpos meb msha isize ihash k="" class n last a b fa fb
-  # A volume can carry the SAME unit more than once — two snapshot versions,
-  # two stage sets. Collecting every matching [[units]] block concatenated
-  # both versions' slices and handed the mix to dar (issue #131). So: buffer
-  # per block and emit exactly one version's slices.
-  rm -f "$WORK/picked.plain"
-  awk -v unit="$unit" -v want="$want" -v plain_out="$WORK/picked.plain" '__AWK_SELECT_VERSION__' "$manifest" >"$WORK/picked.txt" 2>"$WORK/picked_version.txt"
-  PICKED_VERSION=""
-  PICKED_SPAN=0
-  read -r PICKED_VERSION PICKED_SPAN _ <"$WORK/picked_version.txt" 2>/dev/null || true
-  [ "$PICKED_SPAN" = 1 ] || PICKED_SPAN=0
-  if [ ! -s "$WORK/picked.txt" ]; then
-    if [ -n "$want" ]; then
-      die "unit '$unit' has no version $want on this volume
-       --find-envelope --key KEYFILE lists the versions here; --info is
-       keyless and cannot see them. Omit --version for the newest."
-    fi
-    die "no slices found for unit '$unit'"
-  fi
-  : >"$out"
-  PICKED_BYTES=0
-  PICKED_CUT=0
-  PICKED_LAST=""
-  PICKED_RANGE=0
-  PICKED_COUNT=0
-  PICKED_RUN_FIRST=""
-  PICKED_RUN_LAST=""
-  PICKED_FILE_FIRST=""
-  PICKED_FILE_LAST=""
-  ! tape_is_short || k=$ENDED_AFTER
-  # One line: what the version is here, its slices, its last planned tape
-  # file, and the first and last slice here with their tape files ("-" for
-  # none). An empty tape_position is never read as a number.
-  read -r class n last a b fa fb < <(awk -F'|' -v k="$k" -v span="$PICKED_SPAN" '
-    { n++ }
-    $2 == "" { away++; next }
-    $2 + 0 > last + 0 { last = $2 + 0 }
-    k != "" && $2 + 0 > k + 0 { past++; next }
-    { here++; if (here == 1) { a = $1; fa = $2 } b = $1; fb = $2 }
-    END {
-      if (away + past == 0) c = "whole"
-      else if (here > 0 && (span == 1 || away > 0)) c = "range"
-      else c = "cut"
-      print c, n + 0, (last == "" ? "-" : last), (a == "" ? "-" : a), (b == "" ? "-" : b), (fa == "" ? "-" : fa), (fb == "" ? "-" : fb)
-    }
-  ' "$WORK/picked.txt")
-  case "$class" in
-  cut)
-    PICKED_CUT=1
-    PICKED_LAST=$last
-    return 0
-    ;;
-  range)
-    PICKED_RANGE=1
-    PICKED_COUNT=$n
-    PICKED_RUN_FIRST=$a
-    PICKED_RUN_LAST=$b
-    PICKED_FILE_FIRST=$fa
-    PICKED_FILE_LAST=$fb
-    # The run this tape holds, for the index programs (range_holders).
-    printf '%s\t%s\t%s\t%s\t%s\n' "$(awk -v unit="$unit" -v want="$PICKED_VERSION" '__AWK_UNIT_UUID__' "$manifest")" \
-      "$PICKED_VERSION" "$a" "$b" "$n" >"$WORK/range.here"
-    return 0
-    ;;
-  esac
-  while IFS='|' read -r num tpos meb msha; do
-    slice_here "$num" "$tpos"
-    isize=$(file_size_at "$tpos" "$FILES_TXT")
-    ihash=$(file_hash_at "$tpos" "$FILES_TXT")
-    if [ -z "$isize" ] || [ -z "$ihash" ]; then
-      die "slice $num of '$unit' (tape file $tpos) has no data_slice entry in the file map — refusing to trust the envelope manifest alone"
-    fi
-    require_uint "front_index_size(@$tpos)" "$isize"
-    if [ -n "$meb" ] && [ "$meb" != "$isize" ]; then
-      die "slice $num of '$unit' size mismatch: envelope manifest says $meb bytes, file map says $isize bytes — tape may be tampered or damaged"
-    fi
-    if [ -n "$msha" ] && [ "$msha" != "$ihash" ]; then
-      die "slice $num of '$unit' hash mismatch: envelope manifest and file map disagree — tape may be tampered or damaged"
-    fi
-    echo "$num|$tpos|$isize|$ihash" >>"$out"
-    PICKED_BYTES=$((PICKED_BYTES + isize))
-  done <"$WORK/picked.txt"
-  # Each slice's plaintext size, from the manifest, beside the list: the
-  # streamed restore cuts each slice there (stream_unit).
-  cp "$WORK/picked.plain" "$out.plain" 2>/dev/null || : >"$out.plain"
-}
-
-# A unit cut by the early end of the tape: its slices run past the last file
-# before the seal, so this tape does not hold it whole, and nothing of it is
-# restored from here (R4), though the slices before the end are on the tape
-# and hash right. Another tape holds it whole, and --where says which.
-cut_text() { # <unit> <version> <its last slice's tape file>
-  if [ "$PICKED_SPAN" = 1 ]; then
-    # A unit that may run across tapes, none of whose slices is on this tape
-    # (volume-format-v2.md 4.4): its slices are on other tapes, whole or as runs.
-    echo "unit '$1' (version ${2:-unknown}) has no slice on this tape: the tape ended early,
-       after tape file $ENDED_AFTER (its seal marker, the last file, says so), before
-       the first slice of it this tape was to hold. It may run across tapes, and is
-       restorable only from the tapes that hold its slices, starting from one that
-       holds slice 1. Find them:
-         $0 --where '$1' $(keys_args)"
-    return 0
-  fi
-  echo "unit '$1' (version ${2:-unknown}) is not on this tape whole: the tape ended early,
-       after tape file $ENDED_AFTER (its seal marker, the last file, says so), and the
-       slices of this version run to tape file $3. It was cut by the end of the
-       tape and is restorable only from another tape that holds it whole. Find the
-       tapes that do:
-         $0 --where '$1' $(keys_args)"
-}
-
-die_cut() { # <unit> <version> <its last slice's tape file>
-  die "$(cut_text "$@")
-       No slice has been read."
-}
-
-# The units --all left out because they are cut, as unit|version|last file.
-CUT_UNITS=()
-
-# Said before RESTORE COMPLETE when --all left a unit out because it is cut.
-note_cut_units() {
-  [ ${#CUT_UNITS[@]} -gt 0 ] || return 0
-  local line u v last
-  echo ""
-  info "NOT ON THIS TAPE WHOLE: the tape ended early, after file $ENDED_AFTER, before the last slice of"
-  info "  these unit(s), so they were not restored from it. Each is restorable only from another tape:"
-  for line in "${CUT_UNITS[@]}"; do
-    IFS='|' read -r u v last <<<"$line"
-    info "    '$u' (version $v), slices to tape file $last"
-  done
-  info "  The tapes that hold one: $0 --where UNIT $(keys_args)"
-}
-
-# A unit held across tapes, of which this tape holds a range (volume-format-v2.md
-# 4.4): the run of its slices that is here, from pick_slices. A restore needs
-# every slice, 1 to the last, in slice order, from the tapes that hold them
-# (R7): dar is never run over one tape's slices alone.
-range_text() { # <unit> <version>
-  echo "unit '$1' (version ${2:-unknown}) is held across tapes, and this tape holds only part of it:
-       slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of its $PICKED_COUNT, at tape files $PICKED_FILE_FIRST to $PICKED_FILE_LAST. The
-       other slices are on other tapes. A unit held across tapes is restored only with
-       every slice, 1 to $PICKED_COUNT, in slice order, never from one tape's slices alone."
-}
-
-# The tapes an index this run opened names for one version of a unit, with the
-# slices each holds, as --where prints them (this tape among them, with the run
-# it holds). With HOLDER_SLICE set, only the tapes whose run holds that slice.
-# Returns 1 when no open envelope's index names one.
-HOLDER_SLICE=""
-range_holders() { # <unit> <version>
-  local d uuid
-  uuid=$(cut -f1 "$WORK/range.here" 2>/dev/null || true)
-  for d in "$CHOSEN_ENV" "$WORK"/opened.*; do
-    [ -f "$d/index/units.tsv" ] || continue
-    if CHK_UNIT="$1" CHK_VER="$2" CHK_UUID="$uuid" CHK_SLICE="$HOLDER_SLICE" INDEX_RANGE="$WORK/range.here" \
-      awk '__AWK_INDEX_COMMON__ __AWK_INDEX_HOLDERS__' "$d/index/units.tsv" >"$WORK/range.holders" 2>/dev/null; then
-      cat "$WORK/range.holders"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# Where a restore starts (volume-format-v2.md 4.4): refuse a unit this tape
-# holds a range of that does not start at slice 1, before any slice is read,
-# naming the run that is here and the tapes that hold slice 1, as far as an
-# index this key opened says (an index never names a tape written after its
-# own).
-die_range() { # <unit> <version>
-  local holders where
-  HOLDER_SLICE=1
-  if holders=$(range_holders "$1" "$2") && [ -n "$holders" ]; then
-    where="The index this key opened names these tapes as holding slice 1, each with the
-       slices it holds (a tape never names one written after it):
-$holders"
-  else
-    where="No index this key opened names a tape that holds slice 1 (a tape never names
-       one written after it): --where on the newest tape you hold names the tapes,
-       and the slices each holds."
-  fi
-  HOLDER_SLICE=""
-  die "$(range_text "$1" "$2")
-       A restore of it starts from a tape that holds its slice 1 and reads the tapes in
-       slice order, and the run on this tape starts at slice $PICKED_RUN_FIRST. Load a tape that
-       holds slice 1 and run the restore again: it asks for each further cartridge.
-       $where
-       The tapes that hold it:
-         $0 --where '$1' $(keys_args)
-       No slice has been read."
-}
-
-# --path into a unit this tape holds only a range of reads the slices it needs
-# across tapes (span_path_spool), each by its sha256, and asks again for one
-# that fails: it takes no replacement slice. (--stream-tapes and --fill-from
-# take no --path at all, and are refused before the tape is read.)
-die_range_path() { # <unit> <version>
-  die "unit '$1' (version ${2:-unknown}) is held across tapes: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST
-       of its $PICKED_COUNT. --path reads the slices it needs of it from this tape and from each
-       cartridge it asks for, taking each by its sha256, and asks again for one that fails,
-       so it takes no --slices-from or --swap-tapes. Run the same command without them.
-       No slice has been read."
-}
-
-# The units --all left out because this tape holds only a range of them, as
-# unit|version|first slice here|last slice here|slices.
-RANGE_UNITS=()
-
-# Said before RESTORE COMPLETE when --all left a unit out because this tape
-# holds only part of it.
-note_range_units() {
-  [ ${#RANGE_UNITS[@]} -gt 0 ] || return 0
-  local line u v a b n
-  echo ""
-  info "HELD ACROSS TAPES: this tape holds only some of the slices of these unit(s), so they were not"
-  info "  restored from it. Each restores with every slice, in slice order, from the tapes that hold them:"
-  for line in "${RANGE_UNITS[@]}"; do
-    IFS='|' read -r u v a b n <<<"$line"
-    info "    '$u' (version $v): slices $a to $b of $n are on this tape"
-    info "      $0 --restore $(keys_args) --unit '$u' --to /your/destination/$u"
-  done
-  info "  Run it with a tape that holds slice 1 loaded: it asks for each further cartridge, and keeps"
-  info "  the slices encrypted in scratch space until it has them all (--stream-tapes keeps none on"
-  info "  disk). The tapes that hold each slice:"
-  info "    $0 --where UNIT $(keys_args)"
-}
-
-# ---- a unit held across tapes, from the tape that holds its slice 1
-# (volume-format-v2.md 4.4; ADR-0012 items 88, 132) ----
-
-# A restore of a unit held across tapes reads its slices, 1 to N, in slice
-# order: from the tape in the drive while its front index lists them, then
-# from each cartridge the heir loads when asked, taken only by the slices'
-# sha256 (R8). These hold its state. $WORK/span.all is the version's every
-# slice as the manifest lists it (number|tape file here, or empty|
-# encrypted_bytes|sha256_encrypted); $WORK/span.take is what the tape in the
-# drive gives, from the slice still needed on (number|tape file|bytes|sha256,
-# each listed in that tape's front index with the manifest's sha256 and size,
-# at a position its seal marker covers).
-SPAN_UNIT=""
-SPAN_VER=""
-SPAN_N=0
-SPAN_NEED=""
-# 1 once a cartridge other than the first has been taken.
-SPAN_SWAPPED=0
-
-# The tape file of slice $1 on the cartridge in the drive, or nothing when it
-# does not give that slice.
-span_pos() { # <slice number>
-  awk -F'|' -v n="$1" '$1 == n { print $2; exit }' "$WORK/span.take"
-}
-
-# Said at each prompt for another cartridge, before "Load ...": the one in the
-# drive comes out first. No tape device is open while a prompt waits, so mt
-# offline from another terminal is safe then.
-eject_first() {
-  info "First eject the cartridge now in the drive: its eject button, or mt -f $DEVICE offline in another"
-  info "terminal, which is safe while this waits (no tape device is held open)."
-}
-
-# What the prompt for the next cartridge says: the slice needed, the tapes an
-# index this run opened names for it, and how a cartridge is taken.
-span_ask() {
-  local eb sha holders
-  IFS='|' read -r _ _ eb sha < <(awk -F'|' -v n="$SPAN_NEED" '$1 == n' "$WORK/span.all")
-  echo ""
-  info "'$SPAN_UNIT' (version $SPAN_VER) needs slice $SPAN_NEED of $SPAN_N next: $eb bytes, sha256 $sha"
-  HOLDER_SLICE=$SPAN_NEED
-  if holders=$(range_holders "$SPAN_UNIT" "$SPAN_VER") && [ -n "$holders" ]; then
-    info "The index this key opened names these tapes as holding slice $SPAN_NEED, each with the slices it holds:"
-    printf '%s\n' "$holders"
-  else
-    info "No index this key opened names a tape that holds slice $SPAN_NEED (a tape never names one written"
-    info "after it): --where on the newest tape you hold names the tapes, and the slices each holds."
-  fi
-  HOLDER_SLICE=""
-  eject_first
-  info "Load the cartridge that holds slice $SPAN_NEED into $DEVICE, wait until the drive is ready, then press ENTER."
-  info "A cartridge is taken only when its front index lists that sha256 at a position its seal marker covers:"
-  info "its label is never taken for it. This waits for as long as you take. Type quit and ENTER (or end the"
-  if [ "$SPAN_RESTORE" = path ]; then
-    info "input) to stop: nothing is restored without every slice --path needs."
-  else
-    info "input) to stop: nothing of the unit is restored without every slice."
-  fi
-  # done, here, is quit: a restore across tapes cannot go on without a slice
-  # (swap_loop, span_stop), unlike --swap-tapes, where done goes on.
-  if [ "$SPAN_RESTORE" = stream ]; then
-    info "done or quit STOPS this restore: it does not go on without the slice, and the files dar has"
-    info "written so far are only part of the unit."
-  else
-    info "done or quit STOPS this restore and discards the slices read so far, with the scratch directory:"
-    info "it does not go on without the slice."
-  fi
-}
-
-# The heir stopped at a prompt.
-span_stop() {
-  if [ "$SPAN_RESTORE" = path ]; then
-    die "stopped before slice $SPAN_NEED of '$SPAN_UNIT' (version $SPAN_VER), of $SPAN_N. --path restores
-       only from every slice it needs (those that hold the paths, and the last), so nothing was restored,
-       and the encrypted slices read so far are removed with the scratch directory. Run the same command
-       again, with the cartridges that hold those slices at hand: --where names them."
-  fi
-  if [ "$SPAN_RESTORE" = stream ]; then
-    die "stopped before slice $SPAN_NEED of '$SPAN_UNIT' (version $SPAN_VER), of $SPAN_N. dar has already
-       restored to $RESTORE_TO what the slices before it hold: those files are part of the unit only,
-       and the last of them may be cut short. Run the same command again, with --overwrite, to restore
-       it whole."
-  fi
-  die "stopped before slice $SPAN_NEED of '$SPAN_UNIT' (version $SPAN_VER), of $SPAN_N. A unit held across tapes is
-       restored only with every slice, so nothing of it was restored, and the encrypted slices read so
-       far are removed with the scratch directory. Run the same command again to restore it."
-}
-
-# Does the cartridge now in the drive give slice SPAN_NEED (R8)? Its seal is
-# read first (R5), and nothing after its ended_after is taken. It gives the
-# slice only when its front index lists a data slice with that slice's sha256
-# and size, and then every next slice for as long as it lists that one too.
-# Its label, File 0 and index are never taken for the hash. A cartridge this
-# script cannot read at all is said so, and the prompt asks again. On success
-# the slices it gives are in $WORK/span.take; otherwise it says why.
-span_accept() {
-  local eb sha pos rc=0 have num what
-  if ! (tape_init) 2>"$WORK/swap.err"; then
-    echo "NOTE: the drive is not ready: $(head -n 1 "$WORK/swap.err" 2>/dev/null)" >&2
-    echo "      Wait until the cartridge is loaded, then press ENTER again." >&2
-    return 1
-  fi
-  # In a subshell: a cartridge that is not a tape this script reads (another
-  # layout, a feature it does not know, a File 0 that will not read) stops
-  # the subshell, not this restore. The head is unknown after it.
-  rm -f "$WORK/other.vars"
-  SPAN_OFFERED=1
-  (other_tape_map && printf '%s|%s\n' "$OTHER_END" "$OTHER_LABEL" >"$WORK/other.vars") 2>"$WORK/other.err" || rc=$?
-  SPAN_OFFERED=0
-  CUR=""
-  # A subshell stopped part way has not put back the first tape's file map.
-  [ ! -f "$WORK/tape1.files" ] || cp "$WORK/tape1.files" "$FILES_TXT"
-  sed 's/^FATAL: /NOTE: /' "$WORK/other.err" >&2 || true
-  if [ "$rc" != 0 ] || [ ! -s "$WORK/other.vars" ]; then
-    info "Nothing is taken from this cartridge: its file map cannot be used (see above)."
-    return 1
-  fi
-  IFS='|' read -r OTHER_END OTHER_LABEL <"$WORK/other.vars"
-  info "This cartridge identifies as: ${OTHER_LABEL:-<unreadable>}"
-  IFS='|' read -r _ _ eb sha < <(awk -F'|' -v n="$SPAN_NEED" '$1 == n' "$WORK/span.all")
-  sealed_other || return 1
-  # The slices still needed, from SPAN_NEED on, in the order span.all lists
-  # them (every slice for --restore; for --path, the ones it needs): those
-  # already in the scratch directory are not asked of this cartridge again.
-  have=" "
-  if [ -n "$SCRATCH" ]; then
-    while IFS='|' read -r num _; do
-      [ ! -f "$SCRATCH/slice.$num.enc" ] || have="$have$num "
-    done <"$WORK/span.all"
-  fi
-  awk -F'|' -v from="$SPAN_NEED" -v end="$OTHER_END" -v have="$have" '
-    FILENAME == ARGV[1] {
-      if ($1 + 0 >= from + 0 && index(have, " " $1 " ") == 0) { n++; num[n] = $1 + 0; sz[n] = $3; sh[n] = $4 }
-      next
-    }
-    $2 == "data_slice" && $1 ~ /^[0-9]+$/ && $1 + 0 <= end + 0 && !(($4 "|" $3) in at) { at[$4 "|" $3] = $1 }
-    END {
-      for (i = 1; i <= n; i++) {
-        k = sh[i] "|" sz[i]
-        if (!(k in at)) break
-        print num[i] "|" at[k] "|" sz[i] "|" sh[i]
-      }
-    }
-  ' "$WORK/span.all" "$WORK/other.files" >"$WORK/span.offer"
-  if [ ! -s "$WORK/span.offer" ]; then
-    pos=$(awk -F'|' -v h="$sha" '$2 == "data_slice" && $4 == h { print $1; exit }' "$WORK/other.plan" 2>/dev/null || true)
-    if [ -n "$pos" ] && is_uint "$pos"; then
-      info "Its front index lists slice $SPAN_NEED (sha256 ${sha:0:16}...) at tape file $pos, but the tape ended after"
-      info "file $OTHER_END (its seal marker says so): that slice is not on it. Nothing is taken from it."
-    else
-      info "Its front index lists no data slice with the sha256 of slice $SPAN_NEED (${sha:0:16}...), so it does"
-      info "not hold that slice. Nothing is taken from it."
-    fi
-    return 1
-  fi
-  cp "$WORK/span.offer" "$WORK/span.take"
-  what=$(awk -F'|' '{ n[++k] = $1 } END {
-    if (n[k] - n[1] == k - 1) { print n[1] " to " n[k]; exit }
-    for (i = 1; i <= k; i++) printf "%s%s", (i == 1 ? "" : (i == k ? " and " : ", ")), n[i]
-    print ""
-  }' "$WORK/span.take")
-  info "It gives slice(s) $what of '$SPAN_UNIT': its front index lists each one's sha256, at"
-  info "positions its seal marker covers."
-  return 0
-}
-
-# A cartridge gives a slice only at a position its seal marker covers (R5,
-# R8): one whose seal cannot be read (OTHER_END is empty) gives nothing, and
-# says so. span_accept and swap_fetch both ask.
-sealed_other() {
-  [ -z "$OTHER_END" ] || return 0
-  info "Its seal marker cannot be read, so nothing is taken from it: a cartridge gives a slice only at a"
-  info "position its seal marker says the tape holds (volume-format-v2.md 4.4, R8)."
-  return 1
-}
-
-# Ask for the cartridge that gives slice $1, until one does (R8) or the heir
-# stops: swap_loop prompts, span_accept judges each cartridge offered.
-span_swap() { # <slice number>
-  SPAN_NEED=$1
-  swap_loop
-  SPAN_NEED=""
-  CART_LABEL=${OTHER_LABEL:-<unreadable>}
-  SPAN_SWAPPED=1
-}
-
-# The default way (item 132), and --path's: every slice $WORK/span.all lists
-# into SCRATCH, still encrypted, in slice order. The tape in the drive gives
-# every one of them it holds first; then the lowest slice not yet read comes
-# from the cartridge span_swap asks for, and so on. For --restore the tape in
-# the drive holds slice 1, so that is slice order from 1 to N. A slice that
-# fails its hash or will not read is asked for the same way, from another
-# cartridge that holds it. The tape is opened by each mt and dd only, so
-# nothing holds the drive while the prompt waits.
-span_spool() {
-  local need num pos size sha line
-  local -a take=()
-  while true; do
-    take=()
-    while IFS= read -r line; do take+=("$line"); done <"$WORK/span.take"
-    for line in ${take[@]+"${take[@]}"}; do
-      IFS='|' read -r num pos size sha <<<"$line"
-      [ ! -f "$SCRATCH/slice.$num.enc" ] || continue
-      info "Slice $num of $SPAN_N — tape file $pos"
-      if read_slice_checked "$pos" "$size" "$sha" "$SCRATCH/slice.$num.enc"; then
-        info "  checksum verified against front index; kept, still encrypted, in the scratch directory"
-        echo "$num|${CART_LABEL:-${TAPE_LABEL:-$LABEL}}|$pos" >>"$WORK/span.from"
-      else
-        info "  slice $num (tape file $pos) $SLICE_WHY: another cartridge that holds it is asked for"
-        break
-      fi
-    done
-    need=""
-    while IFS='|' read -r num _; do
-      [ -f "$SCRATCH/slice.$num.enc" ] || {
-        need=$num
-        break
-      }
-    done <"$WORK/span.all"
-    [ -n "$need" ] || break
-    span_swap "$need"
-  done
-}
-
-# The slices of $WORK/span.all that the tape in the drive gives, into
-# $WORK/span.take (number|tape file|bytes|sha256): each with a tape position
-# here (R6), at or before the end of the tape (R3), and listed in its file map
-# as a data slice of the size and sha256 the manifest gives (R9).
-span_take_here() { # <unit>
-  local k="" num tpos eb sha ty isize ihash
-  ! tape_is_short || k=$ENDED_AFTER
-  : >"$WORK/span.take"
-  while IFS='|' read -r num tpos eb sha; do
-    [ -n "$tpos" ] || continue
-    [ -z "$k" ] || [ "$tpos" -le "$k" ] || continue
-    ty=$(file_type_at "$tpos" "$FILES_TXT")
-    isize=$(file_size_at "$tpos" "$FILES_TXT")
-    ihash=$(file_hash_at "$tpos" "$FILES_TXT")
-    if [ "$ty" != data_slice ] || [ "$isize" != "$eb" ] || [ "$ihash" != "$sha" ]; then
-      die "slice $num of '$1' (tape file $tpos): the envelope manifest and the file map disagree on it
-       (a ${ty:-missing} entry, $isize bytes) — refusing to trust either. The tape may be tampered or
-       damaged. No slice has been read."
-    fi
-    echo "$num|$tpos|$eb|$sha" >>"$WORK/span.take"
-  done <"$WORK/span.all"
-}
-
-# A unit held across tapes is read by the manifest's list of its slices,
-# $WORK/picked.txt from pick_slices: 1 to N in order, each with the
-# encrypted_bytes and sha256_encrypted a cartridge is taken by (R8). Sets
-# SPAN_N.
-span_list() { # <unit>
-  SPAN_N=$(wc -l <"$WORK/picked.txt")
-  awk -F'|' '$1 != NR || $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9a-f]+$/ { bad = 1 } END { exit bad }' "$WORK/picked.txt" ||
-    die "the envelope's manifest does not list the slices of '$1' as 1 to $SPAN_N, each with its
-       encrypted_bytes and sha256_encrypted, so it cannot be read across tapes. No slice has been read."
-}
-
-# --path into a unit held across tapes (volume-format-v2.md 4.4): the slices
-# it needs ($WORK/path.slices: those its catalogue names for the paths, and
-# the last) are read from whichever tapes hold them, the tape in the drive
-# first, then each cartridge span_swap asks for (R8). Each goes into SCRATCH
-# still encrypted, checked against the front index of its own tape (R9). Only
-# once every one is there are they decrypted, for dar: nothing decrypted is on
-# disk across a cartridge change. --path has no start rule: it starts on any
-# tape whose envelope the key opens.
-span_path_spool() { # <unit> <version> <slices of the version>
-  local num
-  cp "$WORK/path.slices" "$WORK/span.all"
-  SPAN_UNIT=$1
-  SPAN_VER=$2
-  SPAN_N=$3
-  span_take_here "$1"
-  info "'$1' (version $2) is held across tapes: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of $3."
-  info "  The slices --path needs are read from this tape, then from each cartridge you are asked for, and"
-  info "  wait, still encrypted, in $SCRATCH until all are read."
-  SPAN_RESTORE=path
-  span_spool
-  SPAN_RESTORE=""
-  info "Every slice --path needs is in the scratch directory; each is decrypted there for dar"
-  while IFS='|' read -r num _; do
-    decrypt_slice "$SCRATCH/slice.$num.enc" "$SCRATCH/restore.$num.dar" "$num"
-    rm -f "$SCRATCH/slice.$num.enc"
-  done <"$WORK/span.all"
-}
-
-# Restore one version of a unit that this tape holds a range of, starting at
-# slice 1 (the caller has checked that it does): by default through SCRATCH,
-# with --stream-tapes through pipes. Both modes refuse, before any slice is
-# read, what they cannot finish: a dar that cannot read slices through pipes
-# (only ciphertext is ever kept on disk, so there is no decrypted fallback),
-# and, by default, a disk without room for the whole unit's ciphertext.
-restore_across_tapes() { # <manifest> <unit> <version> <destination>
-  local manifest=$1 unit=$2 ver=$3 destdir=$4 cat bytes last
-  if [ "$SALVAGE" = 1 ]; then
-    die "'$unit' is held across tapes: its restore takes every slice by its sha256 from
-       the cartridges it asks for, and asks again for one that fails, so it takes no
-       --slices-from or --swap-tapes. Run the same command without them.
-       No slice has been read."
-  fi
-  span_list "$unit"
-  cp "$WORK/picked.txt" "$WORK/span.all"
-  # Every slice's plaintext size: the first tape's manifest lists them all.
-  cp "$WORK/picked.plain" "$WORK/span.all.plain" 2>/dev/null || : >"$WORK/span.all.plain"
-  # The run this tape gives, each slice checked against the file map (R9).
-  span_take_here "$unit"
-  last=$(tail -n 1 "$WORK/span.take" | cut -d'|' -f1)
-  cat=$(catalogue_path "$CHOSEN_ENV" "$unit" "$ver")
-  if ! { [ -n "$cat" ] && dar_at_least 2.7.9; } && ! dar_at_least 2.7.21; then
-    local held="holds none"
-    [ -z "$cat" ] || held="holds it"
-    die "dar ${DAR_VERSION:-(of an unknown version)} cannot restore '$unit' across tapes. A unit held
-       across tapes is fed to one dar run through pipes, so that only encrypted slices
-       are ever kept on disk, and this dar cannot read slices that way safely: it needs
-       dar 2.7.9 or later with the unit's catalogue (the envelope $held), or dar 2.7.21
-       or later. Install a newer dar and run the same command again.
-       No slice has been read."
-  fi
-  # The same dar, on a host that cannot join the slices into the one stream
-  # dar reads (stream_check): no slice is kept decrypted on disk across tapes,
-  # so there is no other way here.
-  if ! stream_check; then
-    die "'$unit' is held across tapes, and its slices cannot be joined into the one stream
-       dar reads, on this host:
-$(stream_why "       ")
-       A unit held across tapes keeps only encrypted slices on disk, so they are not decrypted
-       to disk for dar instead. Restore it as File 1's \"Manual Recovery Steps\" say for a unit
-       across tapes (each tape's slices read off it and decrypted, then dar over them), or run
-       the same command on a computer where this check passes. No slice has been read."
-  fi
-  bytes=$(awk -F'|' '{ s += $3 } END { printf "%.0f\n", s }' "$WORK/span.all")
-  if [ "$STREAM_TAPES" = 1 ]; then
-    SPAN_RESTORE=stream
-    check_space "$destdir" "$SCRATCH_PARENT" "$bytes" 0
-  else
-    SPAN_RESTORE=scratch
-    check_space "$destdir" "$SCRATCH_PARENT" "$bytes" "$((bytes + BLOCK))"
-  fi
-  SPAN_UNIT=$unit
-  SPAN_VER=$ver
-  CART_LABEL=${TAPE_LABEL:-$LABEL}
-  : >"$WORK/span.from"
-  info "'$unit' (version $ver) is held across tapes: this tape holds slices 1 to $last of $SPAN_N."
-  info "  It is restored from this tape, then from each cartridge you are asked for, in slice order."
-  if [ "$SPAN_RESTORE" = scratch ]; then
-    SCRATCH="$(mktemp -d "$SCRATCH_PARENT/.tapectl-restore.XXXXXX")" ||
-      die "cannot create a scratch directory in $SCRATCH_PARENT"
-    info "  Its slices wait, still encrypted, in $SCRATCH until every one is read; then dar runs"
-    info "  once over all of them. Ctrl-C, a closed terminal or kill, like done or quit at a prompt, ends"
-    info "  this run and removes that directory with the slices read: run it in screen or tmux. A run"
-    info "  stopped with no chance to clean up (kill -9, a crash) leaves that directory: remove it by hand"
-    info "  (rm -rf \"$SCRATCH\") before running again."
-    span_spool
-    info "Every slice of '$unit' is in the scratch directory; dar extracts it to $destdir ..."
-    STREAM_FROM=$SCRATCH
-  else
-    info "  --stream-tapes: one dar run, fed from each tape in turn; no slice is kept on disk."
-  fi
-  restore_unit "$WORK/span.all" "$destdir" "$unit" "$ver"
-  STREAM_FROM=""
-  CART_LABEL=""
-  if [ "$SPAN_RESTORE" = scratch ]; then
-    rm -rf "$SCRATCH"
-    SCRATCH=""
-  fi
-}
-
-do_restore() {
-  local destdir=$1 want_version=${2:-} scratch_parent=${3:-}
-
-  [ -n "$scratch_parent" ] || scratch_parent=$destdir
-  check_destination "$destdir" "$scratch_parent"
-  dar_check
-  mkdir -p "$destdir" "$scratch_parent"
-  SCRATCH_PARENT=$scratch_parent
-  RESTORE_TO=$destdir
-  set_age_ids
-
-  establish_files
-  [ "$SALVAGE" = 0 ] || salvage_init
-
-  # Step 1: the envelope (see pick_for_restore). Each key is tried on its own
-  # at each position (#288).
-  walk_envelopes pick_for_restore
-  local wanted="${RESTORE_UNITS[*]-}"
-  [ -n "$CHOSEN_ENV" ] || die_no_envelope "${wanted// /, }"
-  info "Decrypted envelope at file $CHOSEN_POS"
-  info "  opened with key $CHOSEN_KEY"
-  local manifest="$CHOSEN_ENV/MANIFEST.toml"
-  [ -f "$manifest" ] || die "envelope missing MANIFEST.toml"
-
-  # Step 2: which units.
-  local -a unit_names=() targets=()
-  local uname
-  while IFS= read -r uname; do
-    unit_names+=("$uname")
-  done < <(awk '__AWK_UNIT_LIST__' "$manifest")
-  [ ${#unit_names[@]} -gt 0 ] || die "no units in manifest"
-
-  if [ "$RESTORE_ALL" = 1 ]; then
-    targets=("${unit_names[@]}")
-  elif [ ${#RESTORE_UNITS[@]} -gt 0 ]; then
-    targets=("${RESTORE_UNITS[@]}")
-  elif [ ${#unit_names[@]} -eq 1 ]; then
-    targets=("${unit_names[0]}")
-    survey_other_envelopes "${unit_names[0]}"
-  else
-    echo "Units in this envelope:"
-    for uname in "${unit_names[@]}"; do echo "  - $uname"; done
-    die "multiple units found — specify one with --unit NAME (repeat it for several), or --all"
-  fi
-  if [ -n "$want_version" ] && [ ${#targets[@]} -gt 1 ]; then
-    die "--version applies to one unit; give a single --unit with it"
-  fi
-  if [ ${#RESTORE_PATHS[@]} -gt 0 ]; then
-    [ ${#targets[@]} -eq 1 ] || die "--path needs exactly one unit: give one --unit with it"
-    info "Parsing slices for unit: ${targets[0]}"
-    pick_slices "$manifest" "${targets[0]}" "$WORK/slices.0" "$want_version"
-    [ "$PICKED_CUT" = 0 ] || die_cut "${targets[0]}" "$PICKED_VERSION" "$PICKED_LAST"
-    if [ "$PICKED_RANGE" = 1 ]; then
-      # One this tape holds a range of (volume-format-v2.md 4.4): --path
-      # reads the slices it needs from whichever tapes hold them, starting
-      # here, whatever slice this tape's run starts at.
-      [ "$SALVAGE" = 0 ] || die_range_path "${targets[0]}" "$PICKED_VERSION"
-      span_list "${targets[0]}"
-      cp "$WORK/picked.txt" "$WORK/slices.0"
-    fi
-    info "Restoring from '${targets[0]}' snapshot version ${PICKED_VERSION:-unknown}"
-    restore_paths "$WORK/slices.0" "$CHOSEN_ENV" "${targets[0]}" "$PICKED_VERSION" "$destdir" "$scratch_parent"
-    restore_end
-    return 0
-  fi
-
-  # Step 3: each unit's slices, checked against the file map, before any is
-  # read. Always say which version: a volume can hold several, and silently
-  # picking one is how an heir restores the wrong data believing it current.
-  local i total=0 first
-  local -a order_lines=() versions=()
-  for ((i = 0; i < ${#targets[@]}; i++)); do
-    info "Parsing slices for unit: ${targets[$i]}"
-    pick_slices "$manifest" "${targets[$i]}" "$WORK/slices.$i" "$want_version"
-    if [ "$PICKED_CUT" = 1 ]; then
-      # --all restores every unit the tape holds whole and names the cut
-      # ones; a unit asked for by name is refused by name.
-      [ "$RESTORE_ALL" = 1 ] || die_cut "${targets[$i]}" "$PICKED_VERSION" "$PICKED_LAST"
-      info "  '${targets[$i]}' (version $PICKED_VERSION) is not on this tape whole: the tape ended before its last slice"
-      CUT_UNITS+=("${targets[$i]}|$PICKED_VERSION|$PICKED_LAST")
-      continue
-    fi
-    if [ "$PICKED_RANGE" = 1 ] && [ "$RESTORE_ALL" = 0 ]; then
-      # One asked for that this tape holds a range of (volume-format-v2.md
-      # 4.4) is restored across tapes, on its own, starting here only if this
-      # tape holds its slice 1.
-      [ "$PICKED_RUN_FIRST" = 1 ] || die_range "${targets[$i]}" "$PICKED_VERSION"
-      [ ${#targets[@]} -eq 1 ] || die "'${targets[$i]}' is held across tapes: restore it on its own, with --unit
-       '${targets[$i]}' given once (the other units take a run of their own). No slice has been read."
-      restore_across_tapes "$manifest" "${targets[$i]}" "$PICKED_VERSION" "$destdir"
-      restore_end
-      return 0
-    fi
-    if [ "$PICKED_RANGE" = 1 ]; then
-      # --all restores the units this tape holds whole and names the ones it
-      # holds a range of (volume-format-v2.md 4.4).
-      info "  '${targets[$i]}' (version $PICKED_VERSION) is held across tapes: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of $PICKED_COUNT"
-      RANGE_UNITS+=("${targets[$i]}|$PICKED_VERSION|$PICKED_RUN_FIRST|$PICKED_RUN_LAST|$PICKED_COUNT")
-      continue
-    fi
-    versions[$i]=$PICKED_VERSION
-    info "Restoring '${targets[$i]}' snapshot version ${PICKED_VERSION:-unknown} ($(wc -l <"$WORK/slices.$i") slice(s))"
-    total=$((total + PICKED_BYTES))
-    first=$(head -n 1 "$WORK/slices.$i" | cut -d'|' -f2)
-    order_lines+=("$first|$i")
-  done
-
-  if [ ${#order_lines[@]} -eq 0 ]; then
-    note_cut_units
-    note_range_units
-    if [ ${#RANGE_UNITS[@]} -gt 0 ]; then
-      die "no unit this envelope lists is on this tape whole: each is cut by the end of the
-       tape or held across tapes (see above). Nothing was restored."
-    fi
-    die "no unit this envelope lists is on this tape whole: the tape ended early, after
-       file $ENDED_AFTER, and every one is cut (see above). Nothing was restored."
-  fi
-
-  # Step 4: room for all of it, measured once, before any slice is read.
-  check_space "$destdir" "$destdir" "$total" 0
-
-  # Step 5: the units in tape order, one forward pass. One unit goes straight
-  # into --to; several go to --to/UNIT each.
-  local line dest_i
-  while IFS= read -r line; do
-    i=${line#*|}
-    if [ ${#targets[@]} -eq 1 ]; then
-      dest_i=$destdir
-    else
-      dest_i="$destdir/${targets[$i]}"
-      mkdir -p "$dest_i"
-    fi
-    info "Extracting '${targets[$i]}' to $dest_i ..."
-    restore_unit "$WORK/slices.$i" "$dest_i" "${targets[$i]}" "${versions[$i]}"
-  done < <(printf '%s\n' "${order_lines[@]}" | sort -t'|' -k1,1n)
-
-  finish_pending
-  restore_end
-}
-
-# ---- the envelope's dar catalogues (--list, --path; #418) ----
-
-# Every envelope carries, under catalogs/, the isolated dar catalogue of each
-# unit it lists, named <first 8 of the unit uuid>_v<snapshot version>. With
-# it dar lists a unit's files, and says which slice holds each, without
-# reading the tape. Prints the catalogue's base path, or dies.
-catalogue_path() { # <envelope dir> <unit> <version>: the base path, or nothing
-  local env=$1 unit=$2 ver=$3 uuid
-  uuid=$(awk -v unit="$unit" -v want="$ver" '__AWK_UNIT_UUID__' "$env/MANIFEST.toml")
-  [ -n "$uuid" ] || return 0
-  [ -f "$env/catalogs/${uuid:0:8}_v$ver.1.dar" ] || return 0
-  echo "$env/catalogs/${uuid:0:8}_v$ver"
-}
-
-catalogue_for() { # <envelope dir> <unit> <version>
-  local env=$1 unit=$2 ver=$3 uuid base
-  uuid=$(awk -v unit="$unit" -v want="$ver" '__AWK_UNIT_UUID__' "$env/MANIFEST.toml")
-  [ -n "$uuid" ] || die "the envelope lists no uuid for unit '$unit' version $ver"
-  base="$env/catalogs/${uuid:0:8}_v$ver"
-  [ -f "$base.1.dar" ] || die "the envelope carries no dar catalogue for '$unit' version $ver
-       (expected catalogs/${uuid:0:8}_v$ver.1.dar). --restore without --path
-       restores the whole unit, which needs no catalogue."
-  echo "$base"
-}
-
-# The units --list and --path work on: those named, else the envelope's only
-# one, else (for --list) every unit in it.
-units_of_envelope() { # <manifest>
-  awk '__AWK_UNIT_LIST__' "$1"
-}
-
-# --list still lists a cut unit's files (its dar catalogue is in the envelope,
-# and no slice is read), and says the tape does not hold it whole.
-list_cut_note() { # <unit>
-  echo "    NOT ON THIS TAPE WHOLE: the tape ended early, after file $ENDED_AFTER, and this version's"
-  if [ "$PICKED_SPAN" = 1 ]; then
-    echo "    slices run to file $PICKED_LAST; none is on this tape. Restore it from the tapes that"
-    echo "    hold its slices, starting from one that holds slice 1:"
-  else
-    echo "    slices run to file $PICKED_LAST. Restore it from another tape that holds it:"
-  fi
-  echo "      $0 --where '$1' $(keys_args)"
-}
-
-# --list says which slices of a unit held across tapes this tape holds.
-list_range_note() { # <unit>
-  echo "    HELD ACROSS TAPES: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of this version's $PICKED_COUNT"
-  echo "    (tape files $PICKED_FILE_FIRST to $PICKED_FILE_LAST); the others are on other tapes. Restoring it needs every"
-  echo "    slice, in slice order, from the tapes that hold them:"
-  echo "      $0 --where '$1' $(keys_args)"
-}
-
-do_list() {
-  local want_version=${1:-} manifest u base
-  set_age_ids
-  dar_check
-  establish_files
-  # No unit named: the envelope listing the most units, as --all chooses
-  # (with an operator or escrow key, the operator envelope: every unit).
-  [ ${#RESTORE_UNITS[@]} -gt 0 ] || RESTORE_ALL=1
-  walk_envelopes pick_for_restore
-  local wanted="${RESTORE_UNITS[*]-}"
-  [ -n "$CHOSEN_ENV" ] || die_no_envelope "${wanted// /, }"
-  info "Decrypted envelope at file $CHOSEN_POS"
-  info "  opened with key $CHOSEN_KEY"
-  manifest="$CHOSEN_ENV/MANIFEST.toml"
-  [ -f "$manifest" ] || die "envelope missing MANIFEST.toml"
-  local -a targets=()
-  if [ ${#RESTORE_UNITS[@]} -gt 0 ]; then
-    targets=("${RESTORE_UNITS[@]}")
-  else
-    while IFS= read -r u; do targets+=("$u"); done < <(units_of_envelope "$manifest")
-  fi
-  for u in "${targets[@]}"; do
-    pick_slices "$manifest" "$u" "$WORK/list.slices" "$want_version"
-    base=$(catalogue_path "$CHOSEN_ENV" "$u" "$PICKED_VERSION")
-    echo ""
-    if [ -z "$base" ]; then
-      echo "=== $u, snapshot version $PICKED_VERSION — no dar catalogue in this envelope ==="
-      if [ "$PICKED_CUT" = 1 ]; then
-        list_cut_note "$u"
-      elif [ "$PICKED_RANGE" = 1 ]; then
-        list_range_note "$u"
-      else
-        echo "    (it can still be restored whole; --list and --path need the catalogue)"
-      fi
-      continue
-    fi
-    echo "=== $u, snapshot version $PICKED_VERSION — catalogs/${base##*/} ==="
-    [ "$PICKED_CUT" = 0 ] || list_cut_note "$u"
-    [ "$PICKED_RANGE" = 0 ] || list_range_note "$u"
-    dar -l "$base" -N -Q || die "dar could not list the catalogue of '$u'"
-  done
-  echo ""
-  echo "To restore one of these, give its path as listed:"
-  echo "  $0 --restore $(keys_args) --unit UNIT --path PATH --to /your/destination"
-}
-
-# --restore --path: dar's catalogue says which slices hold each path and the
-# directories above it (dar -l -T slice); those, and the last slice, which
-# carries the archive's own catalogue, are read from the tape, checked,
-# decrypted into scratch, and dar extracts just the paths from them. Of a unit
-# held across tapes they are read from whichever tapes hold them, still
-# encrypted, and decrypted once all are in scratch (span_path_spool).
-RESTORE_PATHS=()
-restore_paths() { # <slices file> <envelope dir> <unit> <version> <destination> <scratch parent>
-  local list=$1 env=$2 unit=$3 ver=$4 destdir=$5 scr=$6 base p range lo hi last
-  local -a g=()
-  for p in "${RESTORE_PATHS[@]}"; do
-    p=${p#/}
-    p=${p#./}
-    g+=(-g "$p")
-  done
-  base=$(catalogue_for "$env" "$unit" "$ver")
-  dar -l "$base" -N -Q -Tslice "${g[@]}" >"$WORK/slicing.txt" 2>&1 ||
-    die "dar could not read the catalogue of '$unit': $(tail -n 3 "$WORK/slicing.txt")"
-  range=$(sed -n 's/.*slice range \[\([0-9-]*\)\].*/\1/p' "$WORK/slicing.txt" | head -n 1)
-  if [ -z "$range" ]; then
-    die "'$unit' version $ver holds nothing at: ${RESTORE_PATHS[*]}
-       A path is relative to the unit's root, exactly as --list prints it:
-         $0 --list $(keys_args) --unit '$unit'
-       No slice has been read."
-  fi
-  lo=${range%-*}
-  hi=${range#*-}
-  require_uint slice_range "$lo"
-  require_uint slice_range "$hi"
-  last=$(tail -n 1 "$list" | cut -d'|' -f1)
-  awk -F'|' -v lo="$lo" -v hi="$hi" -v last="$last" \
-    '($1 + 0 >= lo + 0 && $1 + 0 <= hi + 0) || $1 == last' "$list" >"$WORK/path.slices"
-  local total=0 n num tpos size sha
-  n=$(wc -l <"$WORK/path.slices")
-  while IFS='|' read -r num tpos size sha; do
-    total=$((total + size))
-  done <"$WORK/path.slices"
-  info "'${RESTORE_PATHS[*]}' is in slice(s) $lo-$hi of $last; reading $n of them"
-  check_space "$destdir" "$scr" "$total" "$total"
-  UNIT_NAME=$unit
-  UNIT_VER=$ver
-  UNIT_OK=1
-  UNIT_UUID=$(unit_uuid_of "$env" "$unit" "$ver")
-  if [ "$SALVAGE" = 1 ]; then
-    # The same slices, in a job of their own, with a bad one replaced.
-    ensure_scratch
-    local j=$JOB_N
-    JOB_N=$((JOB_N + 1))
-    JOB_KIND[$j]=unit
-    JOB_DEST[$j]=$destdir
-    JOB_UNIT[$j]=$unit
-    JOB_VER[$j]=$ver
-    JOB_UUID[$j]=$UNIT_UUID
-    EXTRACT_G=("${g[@]}")
-    mkdir -p "$SCRATCH/job.$j"
-    spool_slices "$WORK/path.slices" "$SCRATCH/job.$j" "$WORK/job.$j.missing"
-    if [ -s "$WORK/job.$j.missing" ] && [ "$SWAP_TAPES" = 1 ]; then
-      PENDING+=("$j")
-      finish_pending
-    else
-      job_run "$j"
-    fi
-    return 0
-  fi
-  SCRATCH="$(mktemp -d "$scr/.tapectl-restore.XXXXXX")" ||
-    die "cannot create a scratch directory in $scr"
-  if [ "$PICKED_RANGE" = 1 ]; then
-    span_path_spool "$unit" "$ver" "$last"
-  else
-    spool_slices "$WORK/path.slices"
-  fi
-  local -a dar_opts=(-O -Q -N)
-  local rc=0
-  [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
-  info "Extracting ${RESTORE_PATHS[*]} to $destdir ..."
-  dar -x "$SCRATCH/restore" -R "$(abs_dir "$destdir")" "${g[@]}" "${dar_opts[@]}" >"$WORK/extract.log" 2>&1 </dev/null || rc=$?
-  rm -rf "$SCRATCH"
-  SCRATCH=""
-  dar_result "$WORK/extract.log" "$rc" "$destdir"
-  if [ "$UNIT_OK" = 1 ]; then
-    DONE_LINES+=("${RESTORE_PATHS[*]} of '$unit' restored to: $destdir")
-  fi
-}
-
-# ---- replacement slices and the damaged-file list (1.3.0; ADR-0012 items 101, 102) ----
-
-# A slice that fails its ciphertext hash, or will not read, can be taken from
-# another copy of the same unit. Copies are written from one staging, so the
-# copy's slice has the same sha256_encrypted in its own front index, and that
-# hash is the only thing a replacement is matched by: not its position, not its
-# file name. --slices-from DIR offers slice files copied off another tape;
-# --swap-tapes asks for another cartridge once this one has been read. Either
-# one makes the restore keep each slice on disk in the scratch area, decrypted
-# (as the older-dar fallback does), because a stream cannot take back a slice
-# dar has already consumed.
-
-# The absolute form of directory $1, with no trailing slash. dar prints the -R
-# it was given word for word in its messages, so the damaged-file list is cut
-# from an absolute root this script chose.
-abs_dir() { # <directory>
-  local d=$1
-  case "$d" in
-  /*) ;;
-  *) d="$PWD/$d" ;;
-  esac
-  while [ "${#d}" -gt 1 ] && [ "${d%/}" != "$d" ]; do
-    d=${d%/}
-  done
-  printf '%s' "$d"
-}
-
-# A text as sec 1.5 of the format escapes a path: a backslash is written as
-# two, a TAB as \t, a newline as \n, a carriage return as \r, and nothing else
-# changes. Character by character, so no escape is escaped twice.
-escape_text() { # <text>
-  local s=$1 out="" c
-  while [ -n "$s" ]; do
-    c=${s:0:1}
-    s=${s:1}
-    case "$c" in
-    "\\") out="$out\\\\" ;;
-    $'\t') out="$out\\t" ;;
-    $'\n') out="$out\\n" ;;
-    $'\r') out="$out\\r" ;;
-    *) out="$out$c" ;;
-    esac
-  done
-  printf '%s' "$out"
-}
-
-# The reverse, in one left-to-right scan (chained substitutions would turn the
-# text of a backslash followed by t into a TAB). The result is in UNESC, not
-# printed, because a path may end in a newline that $(...) would drop.
-UNESC=""
-unesc_line() { # <escaped text>
-  local s=$1 out="" d
-  while [[ $s == *\\* ]]; do
-    out="$out${s%%\\*}"
-    s=${s#*\\}
-    d=${s:0:1}
-    s=${s:1}
-    case "$d" in
-    t) out="$out"$'\t' ;;
-    n) out="$out"$'\n' ;;
-    r) out="$out"$'\r' ;;
-    "\\") out="$out\\" ;;
-    *) out="$out\\$d" ;;
-    esac
-  done
-  UNESC="$out$s"
-}
-
-# The directories named by --slices-from must exist before any tape is read;
-# asking for a replacement turns SALVAGE on.
-check_slices_from() {
-  local d
-  for d in ${SLICES_FROM[@]+"${SLICES_FROM[@]}"}; do
-    [ -d "$d" ] || die "--slices-from $d: not a directory. Nothing has been read from tape."
-  done
-  if [ ${#SLICES_FROM[@]} -gt 0 ] || [ "$SWAP_TAPES" = 1 ]; then
-    SALVAGE=1
-  fi
-}
-
-# What a failure of a slice says when no replacement was offered.
-replace_hint() {
-  if [ "$SPAN_RESTORE" = stream ]; then
-    cat <<'HINTEOF'
-       Another copy of this unit holds the same slice, byte for byte: the front
-       index of its tape lists the same sha256 for it. Run the same command
-       again, with --overwrite if --to now holds part of the unit, and without
-       --stream-tapes: then a slice that fails is asked for from the next
-       cartridge you load, taken only if that tape's front index lists it.
-HINTEOF
-    return 0
-  fi
-  if [ "$SPAN_RESTORE" = scratch ]; then
-    cat <<'HINTEOF'
-       Each slice was checked against the front index of its tape when it was
-       read, so this copy changed in the scratch directory since, or the slice
-       was staged damaged and every copy of it holds the same bytes. Run the
-       same command again, with --overwrite if --to now holds part of the unit.
-HINTEOF
-    return 0
-  fi
-  cat <<'HINTEOF'
-       Another copy of this unit holds the same slice, byte for byte: the front
-       index of its tape lists the same sha256 for it. Run the same command
-       again, with --overwrite if --to now holds part of the unit, and
-         --slices-from DIR   a directory of slice files copied off another tape
-                             (any names: a file is used only if its sha256 is the
-                             one the front index here lists), or
-         --swap-tapes        this script asks for another cartridge, once it has
-                             read this one, and reads just the slices it needs.
-       --help and File 1 say more.
-HINTEOF
-}
-
-# The sha256 of the first $2 bytes of file $1, remembered for the run: the
-# slices of one unit share a size, so every file in a directory is a candidate
-# for each of them and is hashed once, not once per slice.
-dir_sum() { # <file> <bytes>
-  local key="$1|$2" sum
-  sum=$(K="$key" awk -F'\t' '$1 == ENVIRON["K"] { print $2; exit }' "$WORK/dir.sums" 2>/dev/null || true)
-  if [ -z "$sum" ]; then
-    sum=$(head -c "$2" -- "$1" | sha256sum | awk '{print $1}')
-    printf '%s\t%s\n' "$key" "$sum" >>"$WORK/dir.sums"
-  fi
-  printf '%s' "$sum"
-}
-
-# Is a slice with this sha256 in one of the --slices-from directories? A file
-# is a candidate by its size alone (the slice's exact size, or that rounded up
-# to the tape block as dd copies it off a tape) and is USED only if the sha256
-# of its first <bytes> bytes is the one wanted. The file is left in DIR_HIT.
-# --slices-from reads files, not tapes: there is no seal to read first (R5 is
-# for a tape), so the hash alone decides, whatever tape, range or whole, the
-# file was copied off.
-DIR_HIT=""
-DIR_NOTED=""
-dir_find() { # <slice number> <bytes> <sha256>
-  local num=$1 size=$2 sha=$3 padded d f fsz
-  DIR_HIT=""
-  [ ${#SLICES_FROM[@]} -gt 0 ] || return 1
-  padded=$(((size + BLOCK - 1) / BLOCK * BLOCK))
-  for d in "${SLICES_FROM[@]}"; do
-    for f in "$d"/* "$d"/.[!.]*; do
-      [ -f "$f" ] || continue
-      fsz=$(stat -c %s -- "$f" 2>/dev/null || true)
-      [ "$fsz" = "$size" ] || [ "$fsz" = "$padded" ] || continue
-      if [ "$(dir_sum "$f" "$size")" = "$sha" ]; then
-        DIR_HIT=$f
-        return 0
-      fi
-      case "$DIR_NOTED" in
-      *"|$f|"*) ;;
-      *)
-        DIR_NOTED="$DIR_NOTED|$f|"
-        echo "NOTE: $f has the size of slice $num but not its sha256: it is not used." >&2
-        ;;
-      esac
-    done
-  done
-  return 1
-}
-
-# Read the slice at tape file $1 into $4, trimmed to its $2 bytes, and check it
-# against the sha256 $3 the front index states. Never exits on a bad slice:
-# returns 1 and says why in SLICE_WHY (a full disk still stops the run).
-SLICE_WHY=""
-read_slice_checked() { # <tape file> <bytes> <sha256> <out>
-  local pos=$1 size=$2 sha=$3 out=$4 actual
-  SLICE_WHY=""
-  : >"$WORK/dd.err"
-  if ! try_read_tape_raw "$pos" "$out"; then
-    if grep -i 'no space left' "$WORK/dd.err" >/dev/null 2>&1; then
-      die_io "reading tape file $pos failed" "$WORK/dd.err" "$(dirname "$out")"
-    fi
-    rm -f "$out"
-    SLICE_WHY="would not read"
-    return 1
-  fi
-  truncate -s "$size" "$out"
-  actual=$(sha256sum "$out" | awk '{print $1}')
-  if [ "$actual" != "$sha" ]; then
-    rm -f "$out"
-    SLICE_WHY="does not match the front index (sha256 ${actual:0:16}..., the index says ${sha:0:16}...)"
-    return 1
-  fi
-}
-
-# ---- the unit being restored, and what became of it ----
-
-UNIT_NAME=""
-UNIT_VER=""
-UNIT_UUID=""
-UNIT_OK=1
-INCOMPLETE=()
-DONE_LINES=()
-RESTORE_TO=""
-DAMAGED_NAME=.tapectl-damaged-files.txt
-
-# The uuid of one version of a unit, from its envelope's manifest.
-unit_uuid_of() { # <envelope dir> <unit> <version>
-  awk -v unit="$2" -v want="$3" '__AWK_UNIT_UUID__' "$1/MANIFEST.toml"
-}
-
-# The first line of a damaged-file list: its magic, its format (1), then the
-# unit's name (escaped as a path is), its uuid and its version, TAB-separated.
-# A fill run uses a tape only if it lists the same unit uuid AND version.
-damaged_header() { # <unit> <uuid> <version>
-  printf '%s\t%s\tunit=%s\tuuid=%s\tversion=%s\n' '#tapectl-damaged-files' 1 "$(escape_text "$1")" "$2" "$3"
-}
-
-# One unit's note for the end of a run that did not get everything: how many
-# files, where the list is, and the command that fills them from another copy.
-damage_note() { # <count> <list file> <slices not available, or empty> [folders on the list]
-  local n=$1 list=$2 gone=${3:-} dirs=${4:-0} to=${RESTORE_TO:-DIR}
-  if [ "${CHECK_ADDED:-0}" -eq 0 ]; then
-    echo "Unit '$UNIT_NAME' (version $UNIT_VER): $n file(s) were not restored."
-  elif [ "$CHECK_ADDED" -eq "$n" ]; then
-    echo "Unit '$UNIT_NAME' (version $UNIT_VER): $n file(s) do not match the sha256 the index records for them, or are missing."
-    echo "  dar named none of them: it checks a file with a short checksum, and this script checks it with a hash."
-  else
-    echo "Unit '$UNIT_NAME' (version $UNIT_VER): $n file(s) were not restored intact."
-    echo "  $CHECK_ADDED of them were written without a dar error but do not match the sha256 the index records"
-    echo "  for them, or are missing: dar checks a file with a short checksum, and this script checks it with a hash."
-  fi
-  if [ -n "$gone" ]; then
-    echo "  Slice(s) not available: $gone. The files in them are among those listed."
-  fi
-  if [ "$dirs" -gt 0 ]; then
-    echo "  $dirs of them are folder(s) dar restored nothing in (the slice that holds a folder's own entry"
-    echo "  was not there). A fill restores what is missing in each folder, and overwrites nothing there."
-  fi
-  echo "  They are listed, one path per line, in"
-  echo "    $list"
-  echo "  Another copy of this same unit and version holds them. Load that tape and run ITS"
-  echo "  RESTORE.sh (File 2 of that tape), which restores only those files and overwrites only them:"
-  echo "    ./RESTORE.sh --restore $(keys_args) --unit $(printf '%q' "$UNIT_NAME") --fill-from $(printf '%q' "$list") --to $(printf '%q' "$to")"
-  echo "  A tape that does not hold this unit at this version is refused: no other version is used."
-  echo "  It must hold this version WHOLE: a tape that holds only part of a unit held across tapes is"
-  echo "  refused too (--list --unit on that tape says which it is)."
-}
-
-# Write the list of files dar could not restore into the unit's directory and
-# note the unit as incomplete.
-record_damage() { # <destination> <file of escaped paths> <slices not available, or empty>
-  local destdir=$1 paths=$2 gone=${3:-} n list line dirs=0
-  list="$destdir/$DAMAGED_NAME"
-  n=$(wc -l <"$paths")
-  {
-    damaged_header "$UNIT_NAME" "$UNIT_UUID" "$UNIT_VER"
-    cat "$paths"
-  } >"$list"
-  while IFS= read -r line; do
-    unesc_line "$line"
-    if [ -d "$destdir/$UNESC" ] && [ ! -L "$destdir/$UNESC" ]; then
-      dirs=$((dirs + 1))
-    fi
-  done <"$paths"
-  UNIT_OK=0
-  INCOMPLETE+=("$(damage_note "$n" "$list" "$gone" "$dirs")")
-}
-
-# A list left by an earlier run of this very unit and version is out of date
-# once the unit restores whole: drop it, so a clean directory has no list.
-clear_stale_list() { # <destination>
-  local list="$1/$DAMAGED_NAME" first=""
-  [ -f "$list" ] || return 0
-  IFS= read -r first <"$list" || true
-  case "$first" in
-  *$'\t'"uuid=$UNIT_UUID"$'\t'"version=$UNIT_VER")
-    rm -f "$list"
-    info "Removed $list: this restore of '$UNIT_NAME' left nothing damaged"
-    ;;
-  esac
-}
-
-# ---- the restored files against their recorded sha256 (1.3.0; ADR-0012 item 103) ----
-
-# dar checks each file it restores with a short checksum, not a hash: two equal
-# byte flips can cancel, and a damaged file comes back with no error. A tape
-# written since 1.3.0 records the sha256 of every regular file in its tenant
-# envelope's index/paths.tsv, and once a unit is extracted each file is read
-# back from --to and checked against it with sha256sum. The envelope is on disk
-# already and the files are the ones just restored: the tape is not touched. A
-# file that does not match, or a listed file that is not there, goes on the
-# damaged-file list, so --fill-from can take it from another copy. A file with
-# no recorded hash is not checked, and a tape with no index (written before
-# 1.3.0) is not checked at all; both are said. --no-file-check skips it.
-FILE_CHECK=1
-CHECK_NOTED=" "
-CHECK_INDEX=""
-CHECK_ANY_INDEX=0
-CHECK_BAD="$WORK/check.bad"
-CHECK_FAILED=0
-CHECK_ADDED=0
-
-# True when $1 was said before in this run; else remembers it and is false.
-said_before() { # <key>
-  case "$CHECK_NOTED" in
-  *" $1 "*) return 0 ;;
-  esac
-  CHECK_NOTED="$CHECK_NOTED$1 "
-  return 1
-}
-
-# A path as the lists print it: one line, with no control character a
-# terminal would act on (the lists already hold a TAB, newline or carriage
-# return as \t, \n and \r).
-printable_path() { # <escaped path>
-  printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
-}
-
-# The paths.tsv, among the envelopes this run has open, that lists this
-# version of this unit: the envelope in use first, then the others the walk
-# opened (an escrow or operator key restores from the operator envelope, which
-# has no paths.tsv; the tenant envelope that lists the unit was opened before
-# it and is still on disk). Sets CHECK_INDEX ("" when there is none) and
-# CHECK_ANY_INDEX (1 when any open envelope carries an index member at all).
-index_for_unit() { # <unit> <version> <unit uuid>
-  local d
-  CHECK_INDEX=""
-  CHECK_ANY_INDEX=0
-  for d in "$CHOSEN_ENV" "$WORK"/opened.*; do
-    [ -d "$d" ] || continue
-    if [ -f "$d/index/units.tsv" ] || [ -f "$d/index/paths.tsv" ]; then
-      CHECK_ANY_INDEX=1
-    fi
-    [ -z "$CHECK_INDEX" ] || continue
-    [ -f "$d/index/paths.tsv" ] && [ -f "$d/index/units.tsv" ] || continue
-    if CHK_UNIT="$1" CHK_VER="$2" CHK_UUID="$3" awk '__AWK_INDEX_COMMON__ __AWK_FILE_CHECK_LISTED__' "$d/index/units.tsv"; then
-      CHECK_INDEX="$d/index/paths.tsv"
-    fi
-  done
-}
-
-# The paths a --path restore asked for, escaped, one per line, in
-# $WORK/check.only: SCOPE_ONLY names that file, and is empty for a whole unit
-# (no --path, or a --path of the unit's root). dar restored those paths and,
-# for a directory, what is under it.
-SCOPE_ONLY=""
-restored_scope() {
-  local p
-  SCOPE_ONLY=""
-  [ ${#RESTORE_PATHS[@]} -gt 0 ] || return 0
-  : >"$WORK/check.only"
-  for p in "${RESTORE_PATHS[@]}"; do
-    p=${p#/}
-    p=${p#./}
-    while [ "${p%/}" != "$p" ]; do
-      p=${p%/}
-    done
-    [ -n "$p" ] || return 0
-    printf '%s\n' "$(escape_text "$p")" >>"$WORK/check.only"
-  done
-  SCOPE_ONLY="$WORK/check.only"
-}
-
-# Check the regular files of UNIT_NAME, version UNIT_VER, that were restored
-# into $1, against the index. With $2, a file of escaped paths, only those
-# (a fill). With --path, only what was asked for. The files that fail are left
-# in $CHECK_BAD, one per line and escaped as the index escapes a path; their
-# number is CHECK_FAILED.
-file_check() { # <destination> [<file of escaped paths to check>]
-  local destdir=$1 only=${2:-} p
-  local rows=0 files=0 checked=0 nohash=0
-  : >"$CHECK_BAD"
-  CHECK_FAILED=0
-  if [ "$FILE_CHECK" = 0 ]; then
-    said_before off || {
-      info "File check skipped (--no-file-check): the restored files are checked by dar's own checksum only,"
-      info "  not against the sha256 recorded for them in the index."
-    }
-    return 0
-  fi
-  if [ -n "$only" ] && [ ! -s "$only" ]; then
-    return 0
-  fi
-  index_for_unit "$UNIT_NAME" "$UNIT_VER" "$UNIT_UUID"
-  if [ -z "$CHECK_INDEX" ]; then
-    if [ "$CHECK_ANY_INDEX" = 0 ]; then
-      said_before no-index || {
-        info "File check: this tape carries no index (a tape written before version 1.3.0 has none), so the"
-        info "  restored files are checked by dar's own checksum only, not against a recorded sha256."
-      }
-    else
-      info "File check: no envelope this key opened lists '$(visible_text "$UNIT_NAME")' version $UNIT_VER with its files, so they are"
-      info "  not checked against a recorded sha256 (the key of the tenant who owns the unit opens the envelope that does)."
-    fi
-    return 0
-  fi
-  # --path: only what it restored.
-  if [ -z "$only" ]; then
-    restored_scope
-    only=$SCOPE_ONLY
-  fi
-  if ! CHK_UNIT="$UNIT_NAME" CHK_VER="$UNIT_VER" CHK_ONLY="$only" CHK_SUMS="$WORK/check.sums" \
-    CHK_COUNTS="$WORK/check.counts" \
-    awk '__AWK_INDEX_COMMON__ __AWK_FILE_CHECK_LIST__' "$CHECK_INDEX"; then
-    echo "WARNING: this script could not make the list of files to check from the index in the envelope (it has no" >&2
-    echo "         unit, version or path column, or the work directory $WORK is full; TMPDIR moves it):" >&2
-    echo "         the restored files of '$(visible_text "$UNIT_NAME")' are not checked against a recorded sha256." >&2
-    return 0
-  fi
-  read -r rows files checked nohash <"$WORK/check.counts" || true
-  if [ "$checked" -eq 0 ]; then
-    if [ "$nohash" -gt 0 ]; then
-      info "File check: the index records no sha256 for the $nohash file(s) of '$(visible_text "$UNIT_NAME")' version $UNIT_VER: not checked."
-    fi
-    return 0
-  fi
-  # Each file is hashed on its own, read from standard input, so sha256sum
-  # prints a hash and no name: nothing it prints is matched back to a file (a
-  # sha256sum may quote or escape a name in what it prints, and versions
-  # differ). A path that is not a regular file here, or cannot be read, has
-  # no hash and is listed. Each restored file is read once.
-  local want esc got
-  while IFS=$'\t' read -r want esc; do
-    unesc_line "$esc"
-    got=""
-    if [ -f "$destdir/$UNESC" ]; then
-      got=$(sha256sum 2>/dev/null <"$destdir/$UNESC") || got=""
-      got=${got%% *}
-    fi
-    [ "$got" = "$want" ] || printf '%s\n' "$esc" >>"$CHECK_BAD"
-  done <"$WORK/check.sums"
-  CHECK_FAILED=$(wc -l <"$CHECK_BAD")
-  local what="'$(visible_text "$UNIT_NAME")' version $UNIT_VER"
-  if [ "$CHECK_FAILED" -eq 0 ]; then
-    if [ "$nohash" -gt 0 ]; then
-      info "File check: $checked restored file(s) of $what match the sha256 recorded in the index ($nohash more not checked: no sha256 recorded)"
-    else
-      info "File check: $checked restored file(s) of $what match the sha256 recorded in the index"
-    fi
-    return 0
-  fi
-  info "File check: $CHECK_FAILED of $checked file(s) of $what do NOT match their recorded sha256, or are missing:"
-  head -n 10 "$CHECK_BAD" | while IFS= read -r p; do
-    info "    $(printable_path "$p")"
-  done
-  if [ "$CHECK_FAILED" -gt 10 ]; then
-    info "    ... and $((CHECK_FAILED - 10)) more (all are in the damaged-file list)"
-  fi
-}
-
-# What a finished dar extraction (log $1, exit status $2, into $3) means.
-# Complete: status 0 and nothing skipped. Damage: status 5, which dar uses when
-# a file could not be restored, and it named the files (a failed CRC, a slice
-# cut short): they go in the unit's list and the run goes on to the next unit,
-# ending INCOMPLETE. $4 is the slices that were not available: with a slice
-# missing, a file dar skipped (user choice) is a file that was in it, not one
-# that was already there. Anything else is fatal, as it has always been.
-# Either way the restored files are then checked against the index
-# (file_check): the files dar named ($WORK/damaged.new, possibly none) and the
-# ones the check finds go in one list.
-dar_result() { # <log> <status> <destination> [slices not available]
-  local log=$1 rc=$2 destdir=$3 gone=${4:-} errs=0 skipped=0 unmapped=0 failed=0 skips=0 n
-  UNIT_OK=1
-  cat "$log"
-  if [ "$rc" != 0 ] && grep -i 'no space left' "$log" >/dev/null 2>&1; then
-    die_io "dar extraction failed" "$log" "$destdir"
-  fi
-  [ -z "$gone" ] || skips=1
-  : >"$WORK/damaged.new"
-  if [ "$rc" = 0 ] && [ "$skips" = 0 ]; then
-    die_if_dar_skipped "$log" "$destdir"
-    finish_damage "$destdir" ""
-    return 0
-  fi
-  if [ "$rc" != 0 ] && [ "$rc" != 5 ]; then
-    die "dar extraction failed (exit $rc) — dar's own message is above"
-  fi
-  # Status 5 is also what dar says when the disk, not the archive, refused a
-  # file. Those are not damaged files: a fill from another tape would meet the
-  # same refusal. They stop the run, as ever.
-  if [ "$rc" = 5 ] && grep -E ' : (Permission denied|Operation not permitted|Read-only file system|No such file or directory|Not a directory|Is a directory|File name too long|Too many open files|Too many levels of symbolic links|Disk quota exceeded|File exists|Input/output error|Cannot allocate memory)$' "$log" >/dev/null 2>&1; then
-    die "dar extraction failed (exit $rc): the file system refused a file — dar's own message is above.
-       This is not a damaged archive, so no list of damaged files is written."
-  fi
-  DAMAGED_ROOT="$(abs_dir "$destdir")" DAMAGED_SKIPS="$skips" DAMAGED_COUNTS="$WORK/damaged.counts" \
-    awk '__AWK_DAR_DAMAGED__' "$log" >"$WORK/damaged.new"
-  read -r errs skipped unmapped failed <"$WORK/damaged.counts" || true
-  n=$(wc -l <"$WORK/damaged.new")
-  if [ "$n" -eq 0 ]; then
-    if [ "$rc" != 0 ]; then
-      die "dar extraction failed (exit $rc) — dar's own message is above"
-    fi
-    echo "NOTE: slice(s) $gone were not available, yet dar names no file it could not restore." >&2
-    finish_damage "$destdir" ""
-    return 0
-  fi
-  if [ "$unmapped" -gt 0 ] || { [ "$rc" = 5 ] && [ "$errs" -ne "$failed" ]; }; then
-    echo "WARNING: dar reported $failed file(s) failed and $skipped skipped, and this script could name" >&2
-    echo "         $((errs + skipped - unmapped)) of them; the list written below may be short. Read dar's messages above." >&2
-  fi
-  finish_damage "$destdir" "$gone"
-}
-
-# A folder on a list of damaged paths, replaced by what is under it when the
-# tape's index records it (ADR-0012 item 102): with the slice that holds a
-# folder's own entry missing, dar names the folder, restores nothing in it
-# ("No file in this directory will be restored.") and names nothing under it.
-# The list then names those files, a fill restores them like any other, and
-# the count counts files. With no index (a tape written before 1.3.0) the
-# folder stays on the list, and a fill restores what is missing in it
-# (fill_runs). This reads the envelopes on disk, not the tape, and is done
-# with --no-file-check too.
-expand_damaged_dirs() { # <file of escaped paths, rewritten in place>
-  local paths=$1
-  [ -s "$paths" ] || return 0
-  index_for_unit "$UNIT_NAME" "$UNIT_VER" "$UNIT_UUID"
-  [ -n "$CHECK_INDEX" ] || return 0
-  restored_scope
-  if CHK_UNIT="$UNIT_NAME" CHK_VER="$UNIT_VER" CHK_LIST="$paths" CHK_ONLY="$SCOPE_ONLY" \
-    awk '__AWK_INDEX_COMMON__ __AWK_DAMAGED_DIRS__' "$CHECK_INDEX" >"$paths.dirs"; then
-    mv "$paths.dirs" "$paths"
-  else
-    rm -f "$paths.dirs"
-  fi
-}
-
-# One unit's list, from the files dar named and the files the check finds: the
-# list is written when it holds any file, and a list left by an earlier run is
-# removed when it does not.
-finish_damage() { # <destination> <slices not available, or empty>
-  local destdir=$1 gone=${2:-} dar_n all_n
-  expand_damaged_dirs "$WORK/damaged.new"
-  file_check "$destdir"
-  dar_n=$(wc -l <"$WORK/damaged.new")
-  awk '!seen[$0]++' "$WORK/damaged.new" "$CHECK_BAD" >"$WORK/damaged.all"
-  all_n=$(wc -l <"$WORK/damaged.all")
-  CHECK_ADDED=$((all_n - dar_n))
-  if [ "$all_n" -gt 0 ]; then
-    record_damage "$destdir" "$WORK/damaged.all" "$gone"
-  else
-    clear_stale_list "$destdir"
-  fi
-}
-
-# ---- salvage mode: a unit's slices on disk, bad ones replaced ----
-
-JOB_N=0
-JOB_KIND=()
-JOB_DEST=()
-JOB_UNIT=()
-JOB_VER=()
-JOB_UUID=()
-PENDING=()
-EXTRACT_G=()
-TAPE1_UUID=""
-VERIFY_ONLY=0
-
-ensure_scratch() {
-  if [ -z "$SCRATCH" ]; then
-    SCRATCH="$(mktemp -d "$SCRATCH_PARENT/.tapectl-restore.XXXXXX")" ||
-      die "cannot create a scratch directory in $SCRATCH_PARENT"
-  fi
-}
-
-# Called once the first tape's File 0 has been read: remember which cartridge
-# it was, so a second tape that is the same one can be told apart.
-salvage_init() {
-  TAPE1_UUID=$(toml_val "$WORK/thunk.toml" uuid)
-}
-
-# The numbers of the slices job $1 still lacks, for a message.
-missing_numbers() { # <job>
-  awk -F'|' '{ printf "%s%s", sep, $1; sep = ", " }' "$WORK/job.$1.missing"
-}
-
-# A unit, in salvage mode. Its slices come off this tape one at a time into a
-# directory of its own in the scratch area; a slice that fails is looked for in
-# the --slices-from directories. With --swap-tapes a unit still short of slices
-# waits for the second cartridge while the next units are read; without it dar
-# is given what there is.
-salvage_unit() { # <slices file> <destination> <unit> <version>
-  local list=$1 destdir=$2 unit=$3 ver=$4 j bytes=0 num tpos size sha
-  while IFS='|' read -r num tpos size sha; do
-    bytes=$((bytes + size))
-  done <"$list"
-  check_space "$destdir" "$SCRATCH_PARENT" "$bytes" "$((bytes + BLOCK))"
-  ensure_scratch
-  j=$JOB_N
-  JOB_N=$((JOB_N + 1))
-  JOB_KIND[$j]=unit
-  JOB_DEST[$j]=$destdir
-  JOB_UNIT[$j]=$unit
-  JOB_VER[$j]=$ver
-  JOB_UUID[$j]=$UNIT_UUID
-  mkdir -p "$SCRATCH/job.$j"
-  spool_slices "$list" "$SCRATCH/job.$j" "$WORK/job.$j.missing"
-  if [ -s "$WORK/job.$j.missing" ] && [ "$SWAP_TAPES" = 1 ]; then
-    PENDING+=("$j")
-    info "'$unit' is still short of slice(s) $(missing_numbers "$j"); it waits for the second cartridge"
-    return 0
-  fi
-  job_run "$j"
-}
-
-job_run() { # <job>
-  case "${JOB_KIND[$1]}" in
-  fill) fill_extract "$1" ;;
-  *) job_extract "$1" ;;
-  esac
-}
-
-# dar reads a unit's decrypted slices from its directory in the scratch area.
-job_extract() { # <job>
-  local j=$1 destdir unit gone="" rc=0
-  destdir=${JOB_DEST[$j]}
-  unit=${JOB_UNIT[$j]}
-  UNIT_NAME=$unit UNIT_VER=${JOB_VER[$j]} UNIT_UUID=${JOB_UUID[$j]}
-  if [ -s "$WORK/job.$j.missing" ]; then
-    gone=$(missing_numbers "$j")
-    print_needs "$j"
-    echo "NOTE: restoring '$unit' without slice(s) $gone: the files in them will be listed, not restored." >&2
-  fi
-  local -a dar_opts=(-O -Q -N)
-  [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
-  info "The slices are on disk; dar extracts '$unit' to $destdir ..."
-  dar -x "$SCRATCH/job.$j/restore" -R "$(abs_dir "$destdir")" "${dar_opts[@]}" ${EXTRACT_G[@]+"${EXTRACT_G[@]}"} >"$WORK/extract.log" 2>&1 </dev/null || rc=$?
-  rm -rf "$SCRATCH/job.$j"
-  if [ -n "$gone" ] && [ "$rc" != 0 ] && [ "$rc" != 5 ]; then
-    cat "$WORK/extract.log" >&2
-    die "dar could not restore '$unit' without slice(s) $gone (exit $rc). The first and the last slice of a
-       unit cannot be left out: they hold the archive's header and its catalogue."
-  fi
-  dar_result "$WORK/extract.log" "$rc" "$destdir" "$gone"
-  if [ "$UNIT_OK" = 1 ]; then
-    if [ ${#RESTORE_PATHS[@]} -gt 0 ]; then
-      DONE_LINES+=("${RESTORE_PATHS[*]} of '$unit' restored to: $destdir")
-    else
-      DONE_LINES+=("Unit '$unit' restored to: $destdir")
-    fi
-  fi
-}
-
-# The slices a pending job is still short of: job|number|bytes|sha256|label.
-needed_slices() {
-  local j
-  for j in ${PENDING[@]+"${PENDING[@]}"}; do
-    U="${JOB_UNIT[$j]}" awk -F'|' -v j="$j" -v q="'" '{ print j "|" $1 "|" $3 "|" $4 "|unit " q ENVIRON["U"] q " slice " $1 }' "$WORK/job.$j.missing"
-  done
-}
-
-# What is still needed, by sha256: the figure to look for in another tape's
-# front index, and the number to find it by in this unit.
-print_needs() { # <job: its missing file is read, or - to print $WORK/needed.txt>
-  local job num size sha label
-  echo ""
-  info "Slices still needed. Another copy holds each one as the same bytes, listed under the same sha256"
-  info "in its front index (the number is only this tape's numbering of the unit):"
-  if [ "$1" = - ]; then
-    while IFS='|' read -r job num size sha label; do
-      info "  $label, $size bytes, sha256 $sha"
-    done <"$WORK/needed.txt"
-  else
-    while IFS='|' read -r num _ size sha; do
-      info "  unit '${JOB_UNIT[$1]}' slice $num, $size bytes, sha256 $sha"
-    done <"$WORK/job.$1.missing"
-  fi
-}
-
-# The cartridge now in the drive, as far as this script needs it: its label,
-# and its file map in $WORK/other.files (position|type|size|sha256 per line).
-# Everything the first tape established is put back afterwards. A cartridge
-# that requires short-seal has its seal read first, before any of its slices,
-# and nothing after its ended_after is taken from it (R5): its map keeps only
-# the files on it.
-# OTHER_END is the last file before the cartridge's seal, as a valid seal
-# marker says, and empty when none was read: nothing is taken from a cartridge
-# without one, by a restore across tapes (span_accept) or by --swap-tapes
-# (swap_fetch), and nothing from past it (R5, R8). A cartridge that does not
-# require short-seal never ends early, and its seal is read for that only. The
-# plan as its front index lists it, before the files after the end are
-# dropped, is kept in $WORK/other.plan, so a refusal can say why.
-OTHER_TAPE=0
-OTHER_LABEL=""
-OTHER_END=""
-other_tape_map() {
-  local k_fi=$FRONT_INDEX k_seal=$SEAL_MARKER k_total=$TOTAL_FILES k_label=$TAPE_LABEL
-  local k_created=${CREATED:-} k_files=$FILES_TXT k_src=${FILES_SOURCE:-} uuid ok=0
-  local k_short=$TAPE_SHORT_SEAL k_end=$ENDED_AFTER
-  cp "$FILES_TXT" "$WORK/tape1.files"
-  OTHER_TAPE=1
-  OTHER_END=""
-  CUR=""
-  bootstrap_thunk
-  OTHER_TAPE=0
-  OTHER_LABEL=$TAPE_LABEL
-  uuid=$(toml_val "$WORK/thunk.toml" uuid)
-  if [ -n "$uuid" ] && [ "$uuid" = "$TAPE1_UUID" ]; then
-    info "That is the cartridge this run started with (volume uuid $(safe_str "$uuid")). It cannot hold a good copy of its own bad slices."
-  elif try_front_index; then
-    cp "$WORK/files_from_index.txt" "$WORK/other.files"
-    ok=1
-    learn_end
-    if [ -n "$ENDED_AFTER" ]; then
-      OTHER_END=$ENDED_AFTER
-    elif [ "$TAPE_SHORT_SEAL" = 0 ] && try_seal_copy; then
-      OTHER_END=$SEAL_LAST
-    fi
-  elif try_seal_copy; then
-    echo "WARNING: the front index of this cartridge is unreadable: using the seal marker's copy of it." >&2
-    cp "$WORK/files_from_seal.txt" "$WORK/other.files"
-    ok=1
-    learn_end 1
-    OTHER_END=$SEAL_LAST
-  else
-    info "Neither the front index of this cartridge nor the seal marker's copy of it can be read."
-  fi
-  [ "$ok" = 0 ] || cp "$WORK/other.files" "$WORK/other.plan"
-  if [ "$ok" = 1 ] && tape_is_short; then
-    info "This cartridge ended early, after file $ENDED_AFTER (its seal marker says so): nothing after that is read from it."
-    awk -F'|' -v k="$ENDED_AFTER" '$1 + 0 <= k + 0' "$WORK/other.files" >"$WORK/other.files.new"
-    mv "$WORK/other.files.new" "$WORK/other.files"
-  fi
-  FRONT_INDEX=$k_fi SEAL_MARKER=$k_seal TOTAL_FILES=$k_total TAPE_LABEL=$k_label CREATED=$k_created
-  FILES_SOURCE=$k_src TAPE_SHORT_SEAL=$k_short ENDED_AFTER=$k_end
-  cp "$WORK/tape1.files" "$k_files"
-  [ "$ok" = 1 ]
-}
-
-# Read the cartridge now in the drive for the slices still needed (the file
-# $WORK/needed.txt), by sha256 only, in the order they lie on it: one rewind,
-# then forward. Its seal is read first, and it gives a slice only at a position
-# at or before its OTHER_END (R5, R8): any tape that holds the slice, one that
-# holds a range of a unit held across tapes or the version whole included
-# (ADR-0012 item 139). In restore mode each is read into the scratch area,
-# checked against the sha256 the first tape's front index gave, and decrypted
-# into the slice directory of every job short of it; in verify mode it is only
-# hashed.
-swap_fetch() {
-  local pos sha size job num rest past
-  if ! (tape_init) 2>"$WORK/swap.err"; then
-    echo "NOTE: the drive is not ready: $(head -n 1 "$WORK/swap.err" 2>/dev/null)" >&2
-    echo "      Wait until the cartridge is loaded, then press ENTER again." >&2
-    return 1
-  fi
-  other_tape_map || return 1
-  info "This cartridge identifies as: $(safe_str "${OTHER_LABEL:-<unreadable>}")"
-  sealed_other || return 1
-  awk -F'|' -v end="$OTHER_END" '
-    FILENAME == ARGV[1] { need[$4] = $3; next }
-    $2 == "data_slice" && $1 ~ /^[0-9]+$/ && $1 + 0 <= end + 0 && ($4 in need) && $3 == need[$4] && !($4 in seen) { seen[$4] = 1; print $1 "|" $4 "|" $3 }
-  ' "$WORK/needed.txt" "$WORK/other.files" >"$WORK/fetch.plan"
-  if [ ! -s "$WORK/fetch.plan" ]; then
-    info "No file in the front index of this cartridge has the sha256 of a slice still needed at a position"
-    info "its seal marker covers."
-    past=$(awk -F'|' -v end="$OTHER_END" '
-      FILENAME == ARGV[1] { need[$4] = 1; next }
-      $2 == "data_slice" && ($4 in need) && $1 + 0 > end + 0 { printf "%s%s", sep, $1; sep = ", " }
-    ' "$WORK/needed.txt" "$WORK/other.plan" 2>/dev/null || true)
-    if [ -n "$past" ]; then
-      info "Its front index lists such a slice at tape file(s) $past, after file $OTHER_END, where the tape ended"
-      info "(its seal marker says so): that is not on it. Nothing is taken from it."
-    fi
-    return 1
-  fi
-  : >"$WORK/fetched.txt"
-  while IFS='|' read -r pos sha size; do
-    require_uint position "$pos"
-    require_uint size_bytes "$size"
-    info "Tape file $pos of this cartridge lists sha256 ${sha:0:16}..., a slice still needed"
-    if [ "$VERIFY_ONLY" = 1 ]; then
-      if hash_tape_file "$pos" "$size" && [ "$TAPE_SHA" = "$sha" ]; then
-        info "  checksum verified: a good copy"
-        echo "$sha" >>"$WORK/fetched.txt"
-      else
-        echo "NOTE: tape file $pos of this cartridge does not hash to that sha256 either." >&2
-      fi
-      continue
-    fi
-    if read_slice_checked "$pos" "$size" "$sha" "$SCRATCH/fetch.enc"; then
-      info "  checksum verified against the first tape's front index"
-      while IFS='|' read -r job num _ rest; do
-        [ "${rest%%|*}" = "$sha" ] || continue
-        decrypt_slice "$SCRATCH/fetch.enc" "$SCRATCH/job.$job/restore.$num.dar" "$num"
-      done <"$WORK/needed.txt"
-      rm -f "$SCRATCH/fetch.enc"
-      echo "$sha" >>"$WORK/fetched.txt"
-    else
-      echo "NOTE: tape file $pos of this cartridge $SLICE_WHY: it is not used." >&2
-    fi
-  done <"$WORK/fetch.plan"
-  for job in ${PENDING[@]+"${PENDING[@]}"}; do
-    awk -F'|' 'FILENAME == ARGV[1] { got[$1] = 1; next } !($4 in got)' "$WORK/fetched.txt" "$WORK/job.$job.missing" >"$WORK/job.$job.missing.new"
-    mv "$WORK/job.$job.missing.new" "$WORK/job.$job.missing"
-  done
-  if [ "$VERIFY_ONLY" = 1 ]; then
-    local e
-    local -a keep=()
-    for e in ${VERIFY_BAD[@]+"${VERIFY_BAD[@]}"}; do
-      grep -qxF -- "${e##*|}" "$WORK/fetched.txt" || keep+=("$e")
-    done
-    VERIFY_BAD=(${keep[@]+"${keep[@]}"})
-  fi
-}
-
-# Ask for cartridges until nothing pending is still short or the heir says to
-# go on without. The first tape has been read to its end by now; nothing here
-# moves it back. With SPAN_NEED set (a unit held across tapes), ask for the
-# cartridge that gives that slice until one does (span_accept); stopping there
-# ends the restore, which cannot go on without it. The answer is read from the
-# input, with no time limit, and no tape device is open while it waits.
-swap_loop() {
-  local reply
-  while true; do
-    if [ -n "$SPAN_NEED" ]; then
-      span_ask
-    else
-      if [ "$VERIFY_ONLY" = 1 ]; then
-        verify_needed >"$WORK/needed.txt"
-      else
-        needed_slices >"$WORK/needed.txt"
-      fi
-      [ -s "$WORK/needed.txt" ] || return 0
-      print_needs -
-      eject_first
-      info "Load a cartridge that holds copies of these slices into $DEVICE (any tape whose front index lists"
-      info "the sha256 values above; it need not be a copy of the whole tape), wait until the drive is ready,"
-      info "then press ENTER. Type done and ENTER (or end the input) to go on without them."
-    fi
-    reply=quit
-    IFS= read -r reply || reply=quit
-    case "$reply" in
-    [dD]one | DONE | q | quit)
-      [ -z "$SPAN_NEED" ] || span_stop
-      info "Going on without them."
-      return 0
-      ;;
-    esac
-    if [ -z "$SPAN_NEED" ]; then
-      swap_fetch || true
-    elif span_accept; then
-      return 0
-    fi
-  done
-}
-
-# After the last unit has been read from the first tape: the second cartridge
-# for the units still short, then dar for each of them.
-finish_pending() {
-  local j
-  [ ${#PENDING[@]} -gt 0 ] || return 0
-  swap_loop
-  for j in "${PENDING[@]}"; do
-    job_run "$j"
-  done
-  PENDING=()
-}
-
-# The end of a restore: COMPLETE only when no unit came back short. A unit
-# --all left out because the tape ended before it, or because this tape holds
-# only a range of it, is named, not counted short: it is not on this tape
-# whole by design, and other tapes hold it.
-restore_end() {
-  local line
-  note_other_units
-  note_cut_units
-  note_range_units
-  echo ""
-  if [ ${#INCOMPLETE[@]} -gt 0 ]; then
-    info "RESTORE INCOMPLETE"
-    for line in "${INCOMPLETE[@]}"; do
-      printf '%s\n' "$line" | sed 's/^/>>> /'
-    done
-    for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"}; do
-      info "$line"
-    done
-    late_notes
-    exit 1
-  fi
-  info "RESTORE COMPLETE"
-  for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"}; do
-    info "$line"
-  done
-  late_notes
-}
-
-# The damage a restore did not need (ADR-0012 item 182, late_damage), said
-# again at the end: the tape is to be replaced, though what was restored
-# checked out.
-late_notes() {
-  local line
-  for line in ${LATE_NOTES[@]+"${LATE_NOTES[@]}"}; do
-    info "$line"
-  done
-}
-
-# ---- --restore --fill-from LIST: the files an earlier restore could not restore ----
-
-# Restore, from the tape in the drive, exactly the files a damaged-file list
-# names, over the damaged or missing copies in the directory the list sits in,
-# and nothing else there. The tape is used only if its envelope lists the same
-# unit with the same uuid at the same version as the list's header; dar's own
-# checks confirm each file it restores. The list is rewritten with whatever is
-# still damaged, and removed when nothing is.
-FILL_ESC=()
-FILL_PATH=()
-FILL_KIND=()
-FILL_DIRS=0
-do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
-  local destdir=$1 want_version=${2:-} scr=${3:-} list=$FILL_FROM
-  local first magic fmt f_unit f_uuid f_ver unit uuid ver line p root listdir todir sub
-  [ -f "$list" ] || die "--fill-from: no such file: $list"
-  [ -d "$destdir" ] || die "--to $destdir does not exist: a fill restores into the directory the earlier restore wrote"
-  first=""
-  IFS= read -r first <"$list" || true
-  magic="" fmt="" f_unit="" f_uuid="" f_ver=""
-  IFS=$'\t' read -r magic fmt f_unit f_uuid f_ver _ <<<"$first" || true
-  [ "$magic" = '#tapectl-damaged-files' ] ||
-    die "$list is not a list of damaged files written by this script: its first line is not the header"
-  [ "$fmt" = 1 ] || die "$list is a list of format $(safe_str "$fmt"); this script reads format 1"
-  case "$f_unit:$f_uuid:$f_ver" in
-  unit=*:uuid=?*:version=?*) ;;
-  *) die "$list: the header does not name a unit, its uuid and its version" ;;
-  esac
-  unesc_line "${f_unit#unit=}"
-  unit=$UNESC
-  uuid=${f_uuid#uuid=}
-  ver=${f_ver#version=}
-  require_uint version "$ver"
-  case "$uuid" in
-  *[!0-9a-fA-F-]*) die "$list: the unit uuid in the header is not a uuid" ;;
-  esac
-  if [ ${#RESTORE_UNITS[@]} -ne 1 ] || [ "${RESTORE_UNITS[0]}" != "$unit" ]; then
-    die "this list is for unit '$(visible_text "$unit")', version $ver: give --unit '$(visible_text "$unit")' (and only that unit)"
-  fi
-  if [ -n "$want_version" ] && [ "$want_version" != "$ver" ]; then
-    die "this list is for version $ver of '$(visible_text "$unit")', and --version says $want_version: a fill uses the list's version only"
-  fi
-
-  # The directory the list sits in is the unit's directory: --to itself for a
-  # restore of one unit, --to/UNIT for several.
-  listdir=$(cd "$(dirname -- "$list")" && pwd -P) || die "cannot enter the directory of $list"
-  todir=$(cd "$destdir" && pwd -P) || die "cannot enter --to $destdir"
-  root=""
-  if [ "$listdir" = "$todir" ]; then
-    root=$todir
-  else
-    sub=$(cd "$todir/$unit" 2>/dev/null && pwd -P) || sub=""
-    if [ -n "$sub" ] && [ "$listdir" = "$sub" ]; then
-      root=$sub
-    fi
-  fi
-  [ -n "$root" ] ||
-    die "$list is not in --to ($todir) or in --to/UNIT: keep the list where the restore wrote it,
-       in the unit's own directory, and give the same --to"
-  [ "$(basename -- "$list")" = "$DAMAGED_NAME" ] || echo "NOTE: the list is named $(basename -- "$list"), not $DAMAGED_NAME; it is rewritten under the name it has." >&2
-
-  FILL_ESC=()
-  FILL_PATH=()
-  FILL_KIND=()
-  FILL_DIRS=0
-  : >"$WORK/fill.wanted"
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ -n "$line" ] || continue
-    unesc_line "$line"
-    p=$UNESC
-    case "$p" in
-    /*) die "$list names an absolute path ($(visible_text "$p")): a list names paths inside the unit" ;;
-    esac
-    case "/$p/" in
-    */../*) die "$list names a path with .. in it ($(visible_text "$p")): a list names paths inside the unit" ;;
-    esac
-    # A folder here is one dar restored nothing in (a tape with no index
-    # names the folder, not the files under it): what is missing in it is
-    # restored, and nothing there is overwritten.
-    if [ -d "$root/$p" ] && [ ! -L "$root/$p" ]; then
-      FILL_KIND+=(dir)
-      FILL_DIRS=$((FILL_DIRS + 1))
-    else
-      FILL_KIND+=(file)
-    fi
-    FILL_ESC+=("$line")
-    FILL_PATH+=("$p")
-    printf '%s\n' "$line" >>"$WORK/fill.wanted"
-  done < <(tail -n +2 "$list")
-  [ ${#FILL_PATH[@]} -gt 0 ] || die "$list names no file"
-  info "Filling ${#FILL_PATH[@]} file(s) of unit '$(visible_text "$unit")', version $ver, in $root"
-  if [ "$FILL_DIRS" -gt 0 ]; then
-    info "  $FILL_DIRS of them are folder(s): what is missing in each is restored, and nothing there is overwritten"
-  fi
-
-  SCRATCH_PARENT=${scr:-$root}
-  mkdir -p "$SCRATCH_PARENT"
-  check_stale_scratch "$root" "$SCRATCH_PARENT"
-  dar_check
-  set_age_ids
-  establish_files
-  [ "$SALVAGE" = 0 ] || salvage_init
-
-  walk_envelopes pick_for_restore
-  [ -n "$CHOSEN_ENV" ] || die_no_envelope "$(visible_text "$unit")"
-  info "Decrypted envelope at file $CHOSEN_POS"
-  info "  opened with key $CHOSEN_KEY"
-  local manifest="$CHOSEN_ENV/MANIFEST.toml" here
-  [ -f "$manifest" ] || die "envelope missing MANIFEST.toml"
-  here=$(unit_uuid_of "$CHOSEN_ENV" "$unit" "$ver")
-  if [ -z "$here" ]; then
-    echo "This tape lists the unit '$(visible_text "$unit")' as:" >&2
-    units_table "$manifest" >&2
-    die "this tape holds no version $ver of unit '$(visible_text "$unit")'. A fill uses the same unit at the same version
-       only (another version may differ in the very files that are damaged). Nothing was changed."
-  fi
-  if [ "$here" != "$uuid" ]; then
-    die "this tape's version $ver of '$(visible_text "$unit")' has unit uuid $(safe_str "$here"), and the list says $(safe_str "$uuid"):
-       it is not the same unit. Nothing was changed."
-  fi
-  local base
-  base=$(catalogue_path "$CHOSEN_ENV" "$unit" "$ver")
-  [ -n "$base" ] || die "this tape's envelope carries no dar catalogue for '$(visible_text "$unit")' version $ver, so a fill cannot
-       tell which slices hold the files. Restore the whole unit into another directory instead
-       (--restore --unit NAME --to NEWDIR) and copy the files from there."
-
-  # Which of the files this version's catalogue holds, and in which slices.
-  dar -l "$base" -N -Q -Tslice 2>"$WORK/fill.dar.err" |
-    FILL_WANTED="$WORK/fill.wanted" awk '__AWK_FILL_LISTING__' >"$WORK/fill.found" ||
-    die "dar could not read the catalogue of '$(visible_text "$unit")': $(tail -n 3 "$WORK/fill.dar.err")"
-  awk -F'\t' '$1 == "P" { print $2 }' "$WORK/fill.found" >"$WORK/fill.present"
-  awk -F'\t' '$1 == "S" { print $2 }' "$WORK/fill.found" | sort -n >"$WORK/fill.slices"
-  awk 'FILENAME == ARGV[1] { a[$0] = 1; next } !($0 in a)' "$WORK/fill.present" "$WORK/fill.wanted" >"$WORK/fill.absent"
-  if [ -s "$WORK/fill.absent" ]; then
-    echo "NOTE: $(wc -l <"$WORK/fill.absent") listed path(s) are not in this tape's catalogue of the version; they stay in the list:" >&2
-    sed 's/^/        /' "$WORK/fill.absent" | head -n 20 >&2
-  fi
-  if [ ! -s "$WORK/fill.present" ]; then
-    die "none of the listed files is in this tape's version $ver of '$(visible_text "$unit")'. The list is unchanged."
-  fi
-
-  pick_slices "$manifest" "$unit" "$WORK/slices.0" "$ver"
-  # A fill takes nothing from a tape that does not hold the version whole (R4,
-  # R5): the tape it reads is the other copy, and its own seal said where it
-  # ended. The list is unchanged.
-  [ "$PICKED_CUT" = 0 ] || die "$(cut_text "$unit" "$ver" "$PICKED_LAST")
-       A fill uses a tape that holds the unit whole. Nothing was changed."
-  # Nor from a tape that holds a range of it (ADR-0012 item 143): a range is
-  # never a fill source.
-  [ "$PICKED_RANGE" = 0 ] || die "$(range_text "$unit" "$ver")
-       A fill takes files only from a tape that holds the version whole, and a range is never
-       a fill source. Nothing was changed."
-  local last
-  last=$(tail -n 1 "$WORK/slices.0" | cut -d'|' -f1)
-  awk -F'|' -v last="$last" 'FILENAME == ARGV[1] { need[$1] = 1; next } ($1 in need) || $1 == last' "$WORK/fill.slices" "$WORK/slices.0" >"$WORK/fill.slice.list"
-  local total=0 n num tpos size sha
-  n=$(wc -l <"$WORK/fill.slice.list")
-  while IFS='|' read -r num tpos size sha; do
-    total=$((total + size))
-  done <"$WORK/fill.slice.list"
-  info "The files lie in $((n - 1)) slice(s) of $last; reading those and the last"
-  check_space "$root" "$SCRATCH_PARENT" "$total" "$total"
-  ensure_scratch
-
-  local j=$JOB_N
-  JOB_N=$((JOB_N + 1))
-  JOB_KIND[$j]=fill
-  JOB_DEST[$j]=$root
-  JOB_UNIT[$j]=$unit
-  JOB_VER[$j]=$ver
-  JOB_UUID[$j]=$uuid
-  mkdir -p "$SCRATCH/job.$j"
-  FILL_HEADER=$first
-  spool_slices "$WORK/fill.slice.list" "$SCRATCH/job.$j" "$WORK/job.$j.missing"
-  if [ -s "$WORK/job.$j.missing" ] && [ "$SWAP_TAPES" = 1 ]; then
-    PENDING+=("$j")
-    finish_pending
-  else
-    job_run "$j"
-  fi
-  fill_end "$list" "$root"
-}
-
-FILL_HEADER=""
-FILL_BAD="$WORK/fill.bad"
-
-# dar over the paths of a fill: what dar reports it could not restore, and
-# every path it was never asked for because it is not in the catalogue, is
-# still damaged.
-fill_extract() { # <job>
-  local j=$1 root
-  root=$(abs_dir "${JOB_DEST[$j]}")
-  UNIT_NAME=${JOB_UNIT[$j]} UNIT_VER=${JOB_VER[$j]} UNIT_UUID=${JOB_UUID[$j]}
-  : >"$FILL_BAD"
-  local gone=""
-  if [ -s "$WORK/job.$j.missing" ]; then
-    gone=$(missing_numbers "$j")
-    print_needs "$j"
-    echo "NOTE: filling without slice(s) $gone: the files in them stay in the list." >&2
-  fi
-  awk 'FILENAME == ARGV[1] { a[$0] = 1; next } ($0 in a) { print FNR }' "$WORK/fill.present" "$WORK/fill.wanted" >"$WORK/fill.rows"
-  fill_runs "$j" "$root" file
-  fill_runs "$j" "$root" dir
-  rm -rf "$SCRATCH/job.$j"
-}
-
-# The listed paths of one kind, 500 to a dar run. A file is restored over its
-# damaged copy (-w: these are the files to replace); a folder with what is
-# missing in it and nothing there overwritten (-n). -g names a path and takes
-# no pattern, and a folder brings what is under it.
-FILL_RUN=0
-fill_runs() { # <job> <root> <file|dir>
-  local j=$1 root=$2 kind=$3 row rc errs skipped unmapped failed opt=-w
-  [ "$kind" = file ] || opt=-n
-  local -a g=()
-  while true; do
-    g=()
-    while [ ${#g[@]} -lt 1000 ] && IFS= read -r row <&3; do
-      [ "${FILL_KIND[$((row - 1))]}" = "$kind" ] || continue
-      g+=(-g "${FILL_PATH[$((row - 1))]}")
-    done
-    [ ${#g[@]} -gt 0 ] || break
-    FILL_RUN=$((FILL_RUN + 1))
-    rc=0
-    if [ "$kind" = file ]; then
-      info "Restoring $((${#g[@]} / 2)) file(s) over their damaged copies ..."
-    else
-      info "Restoring what is missing in $((${#g[@]} / 2)) folder(s), overwriting nothing there ..."
-    fi
-    dar -x "$SCRATCH/job.$j/restore" -R "$root" -O -Q -N "$opt" "${g[@]}" >"$WORK/fill.$FILL_RUN.log" 2>&1 </dev/null || rc=$?
-    cat "$WORK/fill.$FILL_RUN.log"
-    if [ "$rc" != 0 ] && grep -i 'no space left' "$WORK/fill.$FILL_RUN.log" >/dev/null 2>&1; then
-      die_io "dar extraction failed" "$WORK/fill.$FILL_RUN.log" "$root"
-    fi
-    if [ "$rc" != 0 ] && [ "$rc" != 5 ]; then
-      die "dar extraction failed (exit $rc) — dar's own message is above. The list is unchanged."
-    fi
-    DAMAGED_ROOT=$root DAMAGED_SKIPS=1 DAMAGED_COUNTS="$WORK/damaged.counts" \
-      awk '__AWK_DAR_DAMAGED__' "$WORK/fill.$FILL_RUN.log" >>"$FILL_BAD"
-    errs=0 skipped=0 unmapped=0 failed=0
-    read -r errs skipped unmapped failed <"$WORK/damaged.counts" || true
-    if [ "$unmapped" -gt 0 ] || [ "$failed" -ne "$errs" ]; then
-      echo "WARNING: dar reported $failed file(s) failed and this script could name $errs; a file it could not" >&2
-      echo "         name is missing from the rewritten list. Read dar's messages above." >&2
-    fi
-  done 3<"$WORK/fill.rows"
-}
-
-# After the fill: the list now holds the files still damaged, or is gone.
-fill_end() { # <list> <root>
-  local list=$1 root=$2 n
-  awk '
-    FILENAME == ARGV[1] { bad[$0] = 1; ord[++k] = $0; next }
-    FILENAME == ARGV[2] { if (!($0 in bad)) { bad[$0] = 1; ord[++k] = $0 } next }
-    { w[$0] = 1; if (($0 in bad) && !($0 in out)) { out[$0] = 1; print } }
-    END { for (i = 1; i <= k; i++) if (!(ord[i] in out)) { out[ord[i]] = 1; print ord[i] } }
-  ' "$WORK/fill.absent" "$FILL_BAD" "$WORK/fill.wanted" >"$WORK/fill.still"
-  # What dar restored without complaint is checked against the index too
-  # (ADR-0012 item 103): a file that fails stays in the list.
-  awk 'FILENAME == ARGV[1] { s[$0] = 1; next } !($0 in s)' "$WORK/fill.still" "$WORK/fill.wanted" >"$WORK/fill.restored"
-  file_check "$root" "$WORK/fill.restored"
-  if [ "$CHECK_FAILED" -gt 0 ]; then
-    awk '!seen[$0]++' "$WORK/fill.still" "$CHECK_BAD" >"$WORK/fill.still.new"
-    mv "$WORK/fill.still.new" "$WORK/fill.still"
-  fi
-  expand_damaged_dirs "$WORK/fill.still"
-  n=$(wc -l <"$WORK/fill.still")
-  echo ""
-  if [ "$n" -eq 0 ]; then
-    rm -f "$list"
-    info "FILL COMPLETE: every listed file of '$(visible_text "$UNIT_NAME")' was restored from this tape into $root"
-    info "  (dar checked each one). $list is removed."
-    if [ "$FILL_DIRS" -gt 0 ]; then
-      info "  In the $FILL_DIRS listed folder(s) only what was missing was restored: what was there already"
-      info "  is as it was."
-    fi
-    return 0
-  fi
-  {
-    printf '%s\n' "$FILL_HEADER"
-    cat "$WORK/fill.still"
-  } >"$list"
-  info "FILL INCOMPLETE: $n file(s) of '$(visible_text "$UNIT_NAME")' are still damaged or missing. The list now holds only those:"
-  info "  $list"
-  info "Fill them from another tape holding this unit at version $UNIT_VER, the same way."
-  exit 1
-}
-
-# ---- the cross-volume index (--where, --find; volume-format-v2.md 1.5) ----
-
-# A tape written since version 1.3.0 carries, in each tenant envelope,
-# index/units.tsv (that tenant's units: every version and every tape holding it)
-# and index/paths.tsv (every path of those versions); the operator envelope
-# carries index/units.tsv for every tenant. Both are tab-separated text with a
-# header line naming the columns, and both are read here with awk, so they need
-# no more than the tools that open an envelope. The index is as of the moment
-# its own tape was written: it never names a tape written after it, and a tape
-# it names may since have been retired or erased.
-INDEX_OPENED=0
-INDEX_HAD=0
-
-# The versions an opened envelope lists that this tape does not hold whole:
-# those the end of a short tape cut go to $WORK/cut.versions (uuid TAB version),
-# and those of a unit held across tapes, of which this tape holds a range, to
-# $WORK/range.versions (uuid TAB version TAB first TAB last slice here TAB
-# slices). The index programs read them through INDEX_CUT and INDEX_RANGE: a
-# this-tape row of either is never a holder of the whole version, and the
-# loaded tape does not count as holding it (R4, volume-format-v2.md 4.4).
-note_cut_versions() { # <envelope dir>
-  local k=""
-  [ -f "$1/MANIFEST.toml" ] || return 0
-  ! tape_is_short || k=$ENDED_AFTER
-  RANGE_OUT="$WORK/range.versions" awk -v k="$k" '__AWK_CUT_VERSIONS__' "$1/MANIFEST.toml" >>"$WORK/cut.versions"
-}
-
-# The line after a listing whose holders include a version this tape cut.
-note_cut_holders() {
-  [ -s "$WORK/cut.versions" ] || return 0
-  info "A holder marked CUT on this tape is the loaded tape, which ended early, after file $ENDED_AFTER (its"
-  info "seal marker says so), before the last slice of that version: it does not hold it whole."
-}
-
-# The line after a listing that printed a holder of only some slices of a
-# version (volume-format-v2.md 1.5, 4.4).
-note_range_holders() {
-  [ -s "$WORK/partial.flag" ] || return 0
-  info "A holder marked 'a range' holds only the slices it names of that version, and is not a copy of it"
-  info "on its own: a restore needs every slice, 1 to the last, in slice order, from the tapes that hold them."
-}
-
-index_banner() {
-  echo ""
-  info "Index read from tape: ${TAPE_LABEL:-<unreadable>} (written $(safe_str "${CREATED:-unknown}"))"
-  info "An index is as of the moment its own tape was written. It never names a tape written"
-  info "after it, and a tape it names may since have been retired or erased. The newest tape"
-  info "you hold has the most complete index: if this is not it, run this on that one."
-}
-
-# A tape with no index says so and points at what it can do. Exit 1: the answer
-# is not on this tape.
-die_no_index() {
-  echo ""
-  info "This tape carries no index. Tapes written before version 1.3.0 have none, and nothing"
-  info "on this tape says where a unit's other versions or copies are."
-  info "What this tape can tell you about itself:"
-  info "  $0 --find-envelope $(keys_args)     the units, versions and slices it holds"
-  info "  $0 --list $(keys_args)              the files of a unit (add --unit NAME)"
-  info "For another tape, load it and run its own RESTORE.sh the same way; a tape written"
-  info "since version 1.3.0 can answer for all the tapes written before it."
-  exit 1
-}
-
-# --where: copy out the units.tsv of each envelope a key opens, then remove the
-# envelope (an escrow key opens them all, and a paths.tsv can be large). An
-# operator envelope's units.tsv lists every tenant's units, so the walk stops
-# at it; the tenant envelopes come before it on the tape.
-WHERE_FILES=()
-WHERE_TENANTS=()
-WHERE_OPERATOR=""
-where_envelope() { # <position>
-  local pos=$1 d="$WORK/opened.$1" ty who=""
-  INDEX_OPENED=$((INDEX_OPENED + 1))
-  note_cut_versions "$d"
-  ty=$(file_type_at "$pos" "$FILES_TXT")
-  if [ -f "$d/index/units.tsv" ]; then
-    INDEX_HAD=$((INDEX_HAD + 1))
-    mv "$d/index/units.tsv" "$WORK/where.$pos.tsv"
-    case "$ty" in
-    operator_envelope*)
-      WHERE_OPERATOR="$WORK/where.$pos.tsv"
-      rm -rf "$d"
-      return 1
-      ;;
-    esac
-    who=$(toml_val "$d/MANIFEST.toml" tenant 2>/dev/null || true)
-    WHERE_FILES+=("$WORK/where.$pos.tsv")
-    WHERE_TENANTS+=("$(safe_str "$who")")
-  fi
-  rm -rf "$d"
-  return 0
-}
-
-# --where --all: every unit the index names, with no limit. The awk reads each
-# index file whole and writes the totals and the units whose newest version this
-# tape does not hold to two files, so the summary can come before the listing.
-where_every_unit() {
-  local i f rc n a total=0 here=0
-  : >"$WORK/all.absent"
-  : >"$WORK/all.out"
-  for ((i = 0; i < ${#WHERE_FILES[@]}; i++)); do
-    f=${WHERE_FILES[$i]}
-    : >"$WORK/all.counts"
-    rc=0
-    ALL_TENANT="${WHERE_TENANTS[$i]}" ALL_COUNTS="$WORK/all.counts" ALL_ABSENT="$WORK/all.absent" \
-      INDEX_CUT="$WORK/cut.versions" INDEX_RANGE="$WORK/range.versions" INDEX_PARTIAL="$WORK/partial.flag" \
-      awk '__AWK_INDEX_COMMON__ __AWK_INDEX_ALL__' "$f" >>"$WORK/all.out" || rc=$?
-    case "$rc" in
-    0 | 1)
-      n="" a=""
-      read -r n a <"$WORK/all.counts" || true
-      if is_uint "$n" && is_uint "$a"; then
-        total=$((total + n))
-        here=$((here + a))
-      fi
-      ;;
-    *) echo "WARNING: an index in this tape's envelopes has no unit or version column, so this script cannot read it." >&2 ;;
-    esac
-  done
-  if [ "$total" -eq 0 ]; then
-    info "This index names no unit."
-    exit 1
-  fi
-  info "$total unit(s) in this index; this tape holds the newest version of $here of them."
-  if [ -s "$WORK/all.absent" ]; then
-    echo ""
-    info "The newest version of these is NOT on this tape (unit, version, unit uuid, the tapes that hold it):"
-    cat "$WORK/all.absent"
-  fi
-  echo ""
-  info "Every unit the index names, with every version and every tape that holds it:"
-  echo ""
-  cat "$WORK/all.out"
-  info "A holder marked 'this tape' is the tape you have loaded. For any other, find the cartridge"
-  info "by its label or its chip serial, load it, and use the RESTORE.sh stored on that tape."
-  note_cut_holders
-  note_range_holders
-}
-
-do_where() { # <unit, or --all for every unit>
-  local unit=$1 i rc found=0 f
-  establish_files
-  : >"$WORK/cut.versions"
-  : >"$WORK/range.versions"
-  rm -f "$WORK/partial.flag"
-  walk_envelopes where_envelope
-  [ "$INDEX_OPENED" -gt 0 ] || die_no_envelope
-  index_banner
-  echo ""
-  if [ -n "$WHERE_OPERATOR" ]; then
-    WHERE_FILES=("$WHERE_OPERATOR")
-    WHERE_TENANTS=("")
-  fi
-  [ "$INDEX_HAD" -gt 0 ] || die_no_index
-  if [ "$unit" = --all ]; then
-    where_every_unit
-    return 0
-  fi
-  : >"$WORK/where.known"
-  for ((i = 0; i < ${#WHERE_FILES[@]}; i++)); do
-    f=${WHERE_FILES[$i]}
-    rc=0
-    WHERE_UNIT="$unit" WHERE_KNOWN="$WORK/where.known" WHERE_TENANT="${WHERE_TENANTS[$i]}" \
-      INDEX_CUT="$WORK/cut.versions" INDEX_RANGE="$WORK/range.versions" INDEX_PARTIAL="$WORK/partial.flag" \
-      awk '__AWK_INDEX_COMMON__ __AWK_INDEX_WHERE__' "$f" || rc=$?
-    case "$rc" in
-    0) found=1 ;;
-    1) ;;
-    *) echo "WARNING: an index in this tape's envelopes has no unit or version column, so this script cannot read it." >&2 ;;
-    esac
-  done
-  if [ "$found" = 0 ]; then
-    echo ""
-    info "No unit named '$unit' is in this index."
-    if [ -s "$WORK/where.known" ]; then
-      info "It names these units (all of them; each one's newest version and holders:"
-      info "  $0 --where --all $(keys_args)):"
-      sort -u "$WORK/where.known" | sed 's/^/    /'
-    fi
-    if [ -z "$WHERE_OPERATOR" ]; then
-      info "A tenant's key opens that tenant's index only; the operator or escrow key opens the"
-      info "index of every tenant."
-    fi
-    exit 1
-  fi
-  echo ""
-  info "A holder marked 'this tape' is the tape you have loaded. For any other, find the cartridge"
-  info "by its label or its chip serial, load it, and use the RESTORE.sh stored on that tape."
-  note_cut_holders
-  note_range_holders
-}
-
-# --find: the matches of each tenant envelope's paths.tsv, kept in a file so the
-# banner can come first. One limit is shared by every envelope.
-FIND_TEXT=""
-FIND_LEFT=50
-FIND_SHOWN=0
-FIND_TOTAL=0
-find_in_envelope() { # <position>
-  local pos=$1 d="$WORK/opened.$1" u who shown total
-  INDEX_OPENED=$((INDEX_OPENED + 1))
-  note_cut_versions "$d"
-  if [ -f "$d/index/units.tsv" ] || [ -f "$d/index/paths.tsv" ]; then
-    INDEX_HAD=$((INDEX_HAD + 1))
-  fi
-  if [ -f "$d/index/paths.tsv" ]; then
-    u="$d/index/units.tsv"
-    [ -f "$u" ] || u=/dev/null
-    who=$(toml_val "$d/MANIFEST.toml" tenant 2>/dev/null || true)
-    : >"$WORK/find.counts"
-    FIND_TEXT="$FIND_TEXT" FIND_LIMIT="$FIND_LEFT" FIND_UNITS="$u" FIND_COUNTS="$WORK/find.counts" \
-      FIND_WHO="tenant $(safe_str "$who")" INDEX_CUT="$WORK/cut.versions" \
-      INDEX_RANGE="$WORK/range.versions" INDEX_PARTIAL="$WORK/partial.flag" \
-      awk '__AWK_INDEX_COMMON__ __AWK_INDEX_FIND__' "$d/index/paths.tsv" >>"$WORK/find.out" || {
-      echo "WARNING: the index in the envelope at file $pos has no unit, version or path column, so this script cannot read it." >&2
-      : >"$WORK/find.counts"
-    }
-    shown=0
-    total=0
-    read -r shown total <"$WORK/find.counts" || true
-    if is_uint "$shown" && is_uint "$total"; then
-      FIND_SHOWN=$((FIND_SHOWN + shown))
-      FIND_TOTAL=$((FIND_TOTAL + total))
-      FIND_LEFT=$((FIND_LEFT - shown))
-    fi
-  fi
-  rm -rf "$d"
-  return 0
-}
-
-# The text given, with a TAB, newline or carriage return written out, so a
-# message about it stays on its own line.
-visible_text() { # <text>
-  local t=$1
-  t=${t//$'\t'/\\t}
-  t=${t//$'\n'/\\n}
-  t=${t//$'\r'/\\r}
-  printf '%s' "$t"
-}
-
-do_find() { # <text>
-  FIND_TEXT=$1
-  : >"$WORK/find.out"
-  establish_files
-  : >"$WORK/cut.versions"
-  : >"$WORK/range.versions"
-  rm -f "$WORK/partial.flag"
-  walk_envelopes find_in_envelope
-  [ "$INDEX_OPENED" -gt 0 ] || die_no_envelope
-  index_banner
-  [ "$INDEX_HAD" -gt 0 ] || die_no_index
-  if [ "$FIND_TOTAL" -eq 0 ]; then
-    echo ""
-    info "No path in this index contains '$(visible_text "$FIND_TEXT")'. (The text is matched as it stands, not as a"
-    info "pattern, and capitals matter. A path is relative to its unit's root.)"
-    exit 1
-  fi
-  echo ""
-  info "Paths containing '$(visible_text "$FIND_TEXT")' (unit, version, kind, size, path; kind is d directory,"
-  info "f file, l symlink, s special). A TAB, newline or carriage return in a path is shown as"
-  info "\\t, \\n or \\r."
-  echo ""
-  cat "$WORK/find.out"
-  echo ""
-  if [ "$FIND_TOTAL" -gt "$FIND_SHOWN" ]; then
-    info "$((FIND_TOTAL - FIND_SHOWN)) more match(es) are not shown: this prints the first $FIND_SHOWN. Give more of"
-    info "the path to narrow it."
-  fi
-  note_cut_holders
-  note_range_holders
-  info "To restore one of these from the tape that holds it:"
-  info "  $0 --restore $(keys_args) --unit UNIT --path PATH --to /your/destination"
-}
-
-# ---- main ----
-
-case "${1:-}" in
---info)
-  require_tools "${TOOLS_READ[@]}"
-  do_info
-  ;;
---verify)
-  shift
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --slices-from)
-      [ $# -ge 2 ] || die "--slices-from needs a directory
-
-       usage: $0 --verify [--slices-from DIR ...] [--swap-tapes]"
-      SLICES_FROM+=("$2")
-      shift 2
-      ;;
-    --swap-tapes)
-      SWAP_TAPES=1
-      shift
-      ;;
-    *) die "unknown option: $1
-
-       usage: $0 --verify [--slices-from DIR ...] [--swap-tapes]" ;;
-    esac
-  done
-  check_slices_from
-  require_tools "${TOOLS_READ[@]}"
-  do_verify
-  ;;
---find-envelope)
-  shift
-  # --key may be repeated; every key is tried against every envelope (#288).
-  KEYS=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --key)
-      [ -n "${2:-}" ] || die "usage: $0 --find-envelope --key KEYFILE"
-      KEYS+=("$2")
-      shift 2
-      ;;
-    *) die "usage: $0 --find-envelope --key KEYFILE" ;;
-    esac
-  done
-  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --find-envelope --key KEYFILE"
-  require_tools "${TOOLS_ENVELOPE[@]}"
-  require_key_files
-  do_find_envelope
-  ;;
---restore)
-  shift
-  KEYS=()
-  dest="" want="" scratch=""
-  # Every flag but the switches takes a value. `shift 2` on a TRAILING bare
-  # flag fails because $# is 1, `set -e` fires, and the script exits 1 having
-  # printed nothing at all — the usage check below is never reached. Check the
-  # arity first and say which flag was short (#133).
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --key | --to | --unit | --version | --scratch | --path | --slices-from | --fill-from)
-      [ $# -ge 2 ] || die "$1 needs a value
-
-       usage: $0 --restore --key KEYFILE --to DIR [--unit U | --all] [--version N]"
-      case "$1" in
-      --key) KEYS+=("$2") ;;
-      --to) dest=$2 ;;
-      --unit) RESTORE_UNITS+=("$2") ;;
-      --version) want=$2 ;;
-      --scratch) scratch=$2 ;;
-      --path) RESTORE_PATHS+=("$2") ;;
-      --slices-from) SLICES_FROM+=("$2") ;;
-      --fill-from) FILL_FROM=$2 ;;
-      esac
-      shift 2
-      ;;
-    --all)
-      RESTORE_ALL=1
-      shift
-      ;;
-    --swap-tapes)
-      SWAP_TAPES=1
-      shift
-      ;;
-    --stream-tapes)
-      STREAM_TAPES=1
-      shift
-      ;;
-    --no-space-check)
-      SKIP_SPACE_CHECK=1
-      shift
-      ;;
-    --overwrite)
-      OVERWRITE=1
-      shift
-      ;;
-    --no-file-check)
-      FILE_CHECK=0
-      shift
-      ;;
-    *) die "unknown option: $1" ;;
-    esac
-  done
-  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U | --all] [--version N]"
-  [ -n "$dest" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U | --all] [--version N]"
-  if [ "$RESTORE_ALL" = 1 ] && [ ${#RESTORE_UNITS[@]} -gt 0 ]; then
-    die "--all restores every unit; give it without --unit"
-  fi
-  check_slices_from
-  if [ "$STREAM_TAPES" = 1 ]; then
-    [ "$RESTORE_ALL" = 0 ] || die "--stream-tapes reads one unit across tapes: give --unit U, not --all"
-    [ ${#RESTORE_PATHS[@]} -eq 0 ] || die "--stream-tapes reads a whole unit across tapes: it takes no --path"
-    [ -z "$FILL_FROM" ] || die "--stream-tapes reads a whole unit across tapes: it takes no --fill-from"
-    [ "$SALVAGE" = 0 ] || die "--stream-tapes takes every slice by its sha256 from the cartridges it asks for:
-       it takes no --slices-from or --swap-tapes"
-  fi
-  if [ -n "$FILL_FROM" ]; then
-    [ "$RESTORE_ALL" = 0 ] || die "--fill-from fills the files of one unit: give --unit U, not --all"
-    [ ${#RESTORE_PATHS[@]} -eq 0 ] || die "--fill-from restores the files its list names: it takes no --path"
-    [ ${#RESTORE_UNITS[@]} -eq 1 ] || die "--fill-from needs the unit its list is for: give --unit U (once)"
-  fi
-  if [ ${#RESTORE_PATHS[@]} -gt 0 ]; then
-    require_tools "${TOOLS_PATH[@]}"
-  else
-    require_tools "${TOOLS_RESTORE[@]}"
-  fi
-  require_key_files
-  [ -z "$want" ] || require_uint version "$want"
-  if [ -n "$FILL_FROM" ]; then
-    do_fill "$dest" "$want" "$scratch"
-  else
-    do_restore "$dest" "$want" "$scratch"
-  fi
-  ;;
---list)
-  shift
-  KEYS=()
-  want=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --key | --unit | --version)
-      [ $# -ge 2 ] || die "$1 needs a value
-
-       usage: $0 --list --key KEYFILE [--unit U] [--version N]"
-      case "$1" in
-      --key) KEYS+=("$2") ;;
-      --unit) RESTORE_UNITS+=("$2") ;;
-      --version) want=$2 ;;
-      esac
-      shift 2
-      ;;
-    *) die "unknown option: $1" ;;
-    esac
-  done
-  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --list --key KEYFILE [--unit U] [--version N]"
-  require_tools "${TOOLS_LIST[@]}"
-  require_key_files
-  [ -z "$want" ] || require_uint version "$want"
-  do_list "$want"
-  ;;
---where)
-  shift
-  if [ $# -lt 1 ] || [ "$1" = --key ]; then
-    die "--where needs a unit name, or --all for every unit the index names
-
-       usage: $0 --where UNIT|--all --key KEYFILE [--key K2 ...]"
-  fi
-  where_unit=$1
-  shift
-  KEYS=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --key)
-      [ $# -ge 2 ] || die "--key needs a value
-
-       usage: $0 --where UNIT|--all --key KEYFILE [--key K2 ...]"
-      KEYS+=("$2")
-      shift 2
-      ;;
-    *) die "unknown option: $1" ;;
-    esac
-  done
-  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --where UNIT|--all --key KEYFILE [--key K2 ...]"
-  require_tools "${TOOLS_INDEX[@]}"
-  require_key_files
-  do_where "$where_unit"
-  ;;
---find)
-  shift
-  if [ $# -lt 1 ] || [ "$1" = --key ]; then
-    die "--find needs the text to look for
-
-       usage: $0 --find TEXT --key KEYFILE [--key K2 ...]"
-  fi
-  [ -n "$1" ] || die "--find needs the text to look for: an empty text matches every path"
-  find_text=$1
-  shift
-  KEYS=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --key)
-      [ $# -ge 2 ] || die "--key needs a value
-
-       usage: $0 --find TEXT --key KEYFILE [--key K2 ...]"
-      KEYS+=("$2")
-      shift 2
-      ;;
-    *) die "unknown option: $1" ;;
-    esac
-  done
-  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --find TEXT --key KEYFILE [--key K2 ...]"
-  require_tools "${TOOLS_INDEX[@]}"
-  require_key_files
-  do_find "$find_text"
-  ;;
---help | -h)
-  echo "RESTORE.sh — Emergency restore for tapectl volume $LABEL (layout v2)"
-  echo ""
-  echo "Usage:"
-  echo "  $0 --info                                       Show tape layout + seal verdict"
-  echo "  $0 --verify [--slices-from DIR ...] [--swap-tapes]   Keyless integrity check"
-  echo "  $0 --find-envelope --key KEYFILE [--key K2 ...]  Decrypt your envelope"
-  echo "  $0 --restore --key KEYFILE [--key K2 ...] --to DIR"
-  echo "               [--unit U [--unit U2 ...] | --all] [--version N]"
-  echo "               [--no-space-check] [--overwrite] [--no-file-check] [--slices-from DIR ...] [--swap-tapes]"
-  echo "      Full restore. Without --version the NEWEST version of the unit on"
-  echo "      this volume is restored. To see which versions this tape holds,"
-  echo "      run --find-envelope --key KEYFILE: snapshot_version lives in the"
-  echo "      encrypted envelope manifest, so --info cannot report it."
-  echo "      --all restores every unit of the envelope (--unit repeated, the"
-  echo "      ones named), in one pass along the tape, each into --to/UNIT."
-  echo "  $0 --restore --key KEYFILE --to DIR --unit U --path P [--path P2 ...]"
-  echo "               [--version N] [--scratch DIR]"
-  echo "      Restore only P (a file or folder, as --list prints it), reading"
-  echo "      just the slices that hold it and the last. Those wait in a scratch"
-  echo "      directory inside --to, or in --scratch DIR. Of a unit held across"
-  echo "      tapes it reads them from whichever tapes hold them, starting on any"
-  echo "      of them: the ones this tape holds first, then it asks for each further"
-  echo "      cartridge as a restore across tapes does (below), keeping them still"
-  echo "      encrypted until all are read."
-  echo "  $0 --list --key KEYFILE [--unit U] [--version N]"
-  echo "      A unit's files, from the dar catalogue in the envelope: no slice"
-  echo "      is read."
-  echo "  $0 --where UNIT --key KEYFILE [--key K2 ...]"
-  echo "      Which tapes hold UNIT: every version of it in the cross-volume index"
-  echo "      this tape carries, with its slices and bytes and each tape holding it"
-  echo "      (label, volume uuid, cartridge serial, generation, state, when it"
-  echo "      sealed). The operator or escrow key reads the operator envelope's"
-  echo "      map of every tenant's units; a tenant's key reads that tenant's."
-  echo "  $0 --where --all --key KEYFILE [--key K2 ...]"
-  echo "      EVERY unit the index names, with no limit: for each unit its newest"
-  echo "      version (the highest number, per unit uuid), whether this tape holds"
-  echo "      it, and every version with each tape that holds it (label, volume"
-  echo "      uuid, cartridge serial, generation, state). The units whose newest"
-  echo "      version is not on this tape are named first. It reads the same"
-  echo "      envelopes, with the same keys, as --where UNIT. Exit 1 when the tape"
-  echo "      has no index."
-  echo "  $0 --find TEXT --key KEYFILE [--key K2 ...]"
-  echo "      Which unit, version and tape hold a file: every path in each tenant"
-  echo "      envelope's index that contains TEXT (the characters as they stand,"
-  echo "      not a pattern; capitals matter), with unit, version, kind, size, and"
-  echo "      then the tapes holding that version. At most 50 matches are printed,"
-  echo "      with a count of the rest. A TAB, newline or carriage return in a path"
-  printf '%s\n' '      is shown as \t, \n or \r.'
-  echo "      An index is as of the moment its own tape was written, so the newest"
-  echo "      tape you hold has the most complete one. A tape written before"
-  echo "      version 1.3.0 has none, and these modes say so. Both exit 1 when"
-  echo "      nothing matched or the tape has no index."
-  echo ""
-  echo "  --key may be repeated, and each key is tried on its own for the"
-  echo "      envelope and for every slice: a key rotation between staging a"
-  echo "      unit and writing the volume seals the two to different key"
-  echo "      generations, so no single key opens both."
-  echo ""
-  echo "  Disk space: each slice streams from the tape through age into dar,"
-  echo "      so --to needs room for the restored files only, about the unit's"
-  echo "      size (counted from the slices' encrypted size on tape: a compressed"
-  echo "      unit may need more). The script checks before it reads any slice. Where this"
-  echo "      dar cannot stream a unit safely (no catalogue in the envelope and"
-  echo "      dar older than 2.7.21, or dar older than 2.7.9) its slices are"
-  echo "      decrypted to disk first, in --scratch DIR (default: inside --to)."
-  echo "      A unit across tapes (by default) keeps all of its slices there too, still"
-  echo "      encrypted: about the unit's size again, beside the restored files"
-  echo "      (--stream-tapes keeps none on disk)."
-  echo "  A dar built with GPG support needs gpg (package gnupg) to start."
-  echo "  --slices-from DIR   (--restore, --verify; repeat it for more directories) A directory of"
-  echo "      slice files copied off another tape that holds a copy of the unit, under any names."
-  echo "      When a slice of this tape fails its sha256 or will not read, a file in DIR is used in"
-  echo "      its place only if the sha256 of its first bytes is the one this tape's front index"
-  echo "      lists for that slice: never by position or by name. A copy made with dd, still"
-  echo "      padded to the tape block, will do. A file of the right size but another hash is"
-  echo "      named and not used."
-  echo "  --swap-tapes   (--restore, --verify) When slices are still missing after this tape has"
-  echo "      been read, say which (their number and sha256), wait for ENTER with another cartridge"
-  echo "      in the drive, and read just those slices from it: any tape whose front index lists the"
-  echo "      same sha256 values at positions its seal marker covers (its seal is read first; a tape"
-  echo "      whose seal cannot be read gives none), a tape holding part of a unit held across tapes"
-  echo "      included. Each tape is read forward from one rewind. Type done and ENTER to"
-  echo "      go on without them. Needs the input to be a terminal, or a line of input per swap."
-  echo "      Either option restores the way an older dar does, a slice at a time onto disk, so --to"
-  echo "      needs about twice the unit's size (--scratch DIR puts the slices on another disk)."
-  echo "      Without them a slice that fails stops the restore, and says so."
-  echo "  A restore in which dar names files it could not restore (a failed CRC, a slice it was"
-  echo "      not given) writes their paths, one per line, to .tapectl-damaged-files.txt in the"
-  echo "      unit's directory, restores the rest, and ends RESTORE INCOMPLETE with exit status 1."
-  echo "  $0 --restore --key KEYFILE --to DIR --unit U --fill-from LIST"
-  echo "      With another tape that holds the SAME unit AT THE SAME VERSION: restore only the"
-  echo "      files LIST names, over their damaged copies, and nothing else in the directory. The"
-  echo "      first line of the list records the unit, its uuid and its version, and a tape that"
-  echo "      lists another is refused; no other version is ever used. dar checks each file, and so"
-  echo "      does the sha256 check below. The list is rewritten with what is still damaged and"
-  echo "      removed when nothing is. Give --to the same directory as the restore (the list is in"
-  echo "      it, or in --to/UNIT). The tape must hold that version WHOLE: one that holds only part"
-  echo "      of a unit held across tapes is refused."
-  echo "      A folder on the list (a tape with no index names one dar restored nothing in) has what"
-  echo "      is missing in it restored, and nothing there is overwritten."
-  echo "  --no-file-check   (--restore, with --fill-from too) dar checks each file it restores with a"
-  echo "      short checksum, so a damaged file can come back with no error. A tape written since"
-  echo "      version 1.3.0 records the sha256 of every regular file in its index, and after each"
-  echo "      restore and fill this script reads the restored files back and checks them against it"
-  echo "      (with --path, only the paths restored). A file that does not match, or is missing, goes"
-  echo "      on the damaged-file list like one dar named, so --fill-from can take it from another"
-  echo "      copy, and the run ends RESTORE INCOMPLETE. The cost is one read of the restored files"
-  echo "      from disk; the tape is not read again. --no-file-check skips it. A file with no sha256"
-  echo "      recorded is not checked, and a tape written before 1.3.0 has no index: both are said."
-  echo "  --no-space-check   Skip that check (a compressed or thin-provisioned"
-  echo "      filesystem can hold more than df reports)."
-  echo "  --overwrite   --to must otherwise be empty or new: dar keeps a file"
-  echo "      that is already there and reports success. --overwrite replaces"
-  echo "      such files, to finish a restore of the same unit that stopped."
-  echo "  A tape written since version 1.6.0 may end early, at the end of its medium: its seal"
-  echo "      marker, the last file, says where (ended_after). --info says so, and --info and"
-  echo "      --verify print one NOT ON TAPE line for the planned files after it (not a failure)."
-  echo "      A unit with a slice after it is not on that tape whole: --restore refuses it by name"
-  echo "      (--all restores the rest and names it), --list says so, and --where marks that tape"
-  echo "      CUT for it."
-  echo "  A tape written since version 1.7.0 may hold part of a unit held across tapes (a range,"
-  echo "      one run of its slices; File 0 requires spanning). --list says which of its slices this"
-  echo "      tape holds, and --where and --find print a tape's run of slices when it is not the"
-  echo "      whole version. --all restores the units this tape holds whole and names the others,"
-  echo "      and --path reads the slices it needs across tapes, starting on any of them."
-  echo "  $0 --restore --key KEYFILE --to DIR --unit U [--stream-tapes] [--scratch DIR]"
-  echo "      A unit held across tapes, restored with every slice, 1 to the last, in slice order."
-  echo "      Start with a tape that holds its slice 1 (on any other this refuses before it reads a"
-  echo "      slice, naming the tapes an index says hold slice 1). When that tape's run ends, it says"
-  echo "      which slice it needs next and waits, for as long as you take, for you to load another"
-  echo "      cartridge and press ENTER. It takes that cartridge only when its front index lists the"
-  echo "      slice's sha256 at a position its seal marker covers, never by its label, and otherwise"
-  echo "      says why and asks again; done or quit stops it. By default each tape's slices are kept, still"
-  echo "      encrypted, in a scratch directory inside --to (or --scratch DIR) until all are read,"
-  echo "      and dar then runs once over them: the disk needs room for the whole unit's encrypted"
-  echo "      slices as well as its files, checked before a slice is read. Ctrl-C, a closed terminal or"
-  echo "      kill ends the run and removes that directory with the slices read, so run it in screen or"
-  echo "      tmux; only kill -9 or a crash leaves it, to remove by hand. A slice that fails is asked"
-  echo "      for again from another cartridge."
-  echo "  --stream-tapes   (--restore --unit U) One dar run fed from each tape in turn, through"
-  echo "      pipes: no slice is kept on disk, so the disk needs room for the files only, and every"
-  echo "      cartridge must be at hand, loaded when asked. A slice that fails ends the run."
-  echo ""
-  echo "Environment:"
-  echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
-  echo "  TMPDIR        Where the work directory is made (default: /tmp). It holds the"
-  echo "      decrypted envelopes (the operator envelope's catalog.db, the dar"
-  echo "      catalogues), which grow with the number of files on the tape; --all"
-  echo "      keeps every envelope it opens. No data slice goes there."
-  echo ""
-  echo "Requirements: mt (mt-st), __TOOLS_ALL__"
-  ;;
-"")
-  echo "RESTORE.sh for tapectl volume $LABEL"
-  echo "Run '$0 --help' for usage."
-  ;;
-*)
-  # Exit 2, not 0. A typo'd mode used to print this and report success, so a
-  # wrapper or cron job around the heir path read "restore worked" (#133).
-  echo "RESTORE.sh for tapectl volume $LABEL" >&2
-  echo "Unknown mode: $1" >&2
-  echo "Run '$0 --help' for usage." >&2
-  exit 2
-  ;;
-esac
-"#;
-
-    let result = script
-        .replace("__AWK_PARSE_FILE_LIST__", AWK_PARSE_FILE_LIST)
-        .replace("__AWK_CHECK_FILE_LIST__", AWK_CHECK_FILE_LIST)
-        .replace("__AWK_FIND_ENVELOPE__", AWK_FIND_ENVELOPE)
-        .replace("__AWK_MANIFEST_HAS_UNIT__", AWK_MANIFEST_HAS_UNIT)
-        .replace("__AWK_UNIT_LIST__", AWK_UNIT_LIST)
-        .replace("__AWK_SELECT_VERSION__", AWK_SELECT_VERSION)
-        .replace("__AWK_MT_POSITION__", AWK_MT_POSITION)
-        .replace("__AWK_UNITS_TABLE__", AWK_UNITS_TABLE)
-        .replace("__AWK_UNIT_UUID__", AWK_UNIT_UUID)
-        .replace("__AWK_INDEX_COMMON__", AWK_INDEX_COMMON)
-        .replace("__AWK_INDEX_WHERE__", AWK_INDEX_WHERE)
-        .replace("__AWK_INDEX_ALL__", AWK_INDEX_ALL)
-        .replace("__AWK_INDEX_FIND__", AWK_INDEX_FIND)
-        .replace("__AWK_INDEX_HOLDERS__", AWK_INDEX_HOLDERS)
-        .replace("__AWK_DAR_DAMAGED__", AWK_DAR_DAMAGED)
-        .replace("__AWK_DAR_HEADER__", AWK_DAR_HEADER)
-        .replace("__AWK_FILL_LISTING__", AWK_FILL_LISTING)
-        .replace("__AWK_FILE_CHECK_LISTED__", AWK_FILE_CHECK_LISTED)
-        .replace("__AWK_FILE_CHECK_LIST__", AWK_FILE_CHECK_LIST)
-        .replace("__AWK_DAMAGED_DIRS__", AWK_DAMAGED_DIRS)
-        .replace("__AWK_CUT_VERSIONS__", AWK_CUT_VERSIONS)
-        .replace("__TOOLS_READ__", &tools_for(MODE_READ).join(" "))
-        .replace("__TOOLS_ENVELOPE__", &tools_for(MODE_ENVELOPE).join(" "))
-        .replace("__TOOLS_LIST__", &tools_for(MODE_LIST).join(" "))
-        .replace("__TOOLS_PATH__", &tools_for(MODE_PATH).join(" "))
-        .replace("__TOOLS_RESTORE__", &tools_for(MODE_RESTORE).join(" "))
-        .replace("__TOOLS_INDEX__", &tools_for(MODE_INDEX).join(" "))
-        .replace("__TOOLS_ALL__", &restore_sh_tools().join(", "))
-        .replace("__LABEL__", label)
-        .replace("__TOTAL_FILES__", &total_files.to_string());
-
-    // No named-fragment placeholder may survive assembly — a stray one would
-    // mean a placeholder in the template does not match any const's name (or
-    // vice versa), and would ship an inert `__AWK_...__` token straight onto
-    // tape. Debug-only: `no_awk_placeholder_survives_assembly` (mod tests)
-    // covers the release-mode case unconditionally.
-    debug_assert!(
-        !result.contains("__AWK_") && !result.contains("__TOOLS_"),
-        "a placeholder was not substituted in generate_restore_script_v2"
-    );
-
-    result
-}
-
-/// Generate the planning header content — pre-v2 this was written as a
-/// standalone tape file (File 3, encrypted to operator); at the v2 flip its
-/// content becomes the `PLAN.toml` member of the operator envelope tar (same
-/// recipients: operator + escrow) instead of a separate tape file
-/// (`docs/design/volume-format-v2.md` §8 "What v2 removes" — the standalone
-/// zone and `ZoneKind::PlanningHeader` are removed by the write flip, not by
 /// this function). The generator itself is unchanged; only its caller and
 /// packaging change in T8.
 pub fn generate_planning_header(
@@ -8069,7 +2363,7 @@ total_bytes = {bytes}
 /// the front index's own entry (its length is self-referential), and
 /// `sha256_encrypted` is `None` for both the front index itself (self-reference)
 /// and the seal marker (not yet written when File 3 is generated). See
-/// `docs/design/volume-format-v2.md` §3-4 and ADR-0007.
+/// `docs/design/volume-format-v3.md` §4-4 and ADR-0007.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontIndexFile {
     pub position: i32,
@@ -8086,7 +2380,7 @@ pub struct FrontIndexFile {
 /// giving an heir keyless navigation and keyless byte-integrity with only `dd`
 /// and `sha256sum` (ADR-0007). It carries NO content metadata: no filenames, no
 /// plaintext-content hashes, no tenant/unit names — the isolation invariant of
-/// `volume-format-v2.md` §2. The ciphertext hashes are safe in plaintext because
+/// `volume-format-v3.md` §2. The ciphertext hashes are safe in plaintext because
 /// they hash pseudorandom age output and are non-attributable (D4).
 ///
 /// File 3 is the PLAN (§3): it is written before any slice, so from 1.6.0 its
@@ -8094,6 +2388,7 @@ pub struct FrontIndexFile {
 /// paragraph §3 fixes word for word, and the seal's `ended_after` says where
 /// the tape really ended (ADR-0012 item 111). It decides nothing for a reader.
 pub fn generate_front_index(label: &str, files: &[FrontIndexFile]) -> String {
+    let t_label = crate::volume::format::toml_string(label);
     let mut s = format!(
         r#"================================================================
                     TAPECTL FRONT INDEX
@@ -8115,8 +2410,8 @@ after that position is not on this tape.
 ================================================================
 
 [index]
-volume = "{label}"
-layout_version = 2
+volume = {t_label}
+layout_version = 3
 may_end_early = true
 "#
     );
@@ -8149,12 +2444,12 @@ fn append_files_entries(s: &mut String, files: &[FrontIndexFile]) {
 /// "every file before me is present" — and its `front_index_sha256` binds the
 /// front index, making the seal marker the unhashed root of the keyless
 /// integrity chain (seal marker → front index → every content file; ADR-0007,
-/// `volume-format-v2.md` §4). Its absence means the tape is legitimately
+/// `volume-format-v3.md` §5). Its absence means the tape is legitimately
 /// unsealed (interrupted or EOT-aborted).
 ///
-/// From 1.6.0 it is §4.1's **full seal**: `requires = ["short-seal"]` (every
-/// 1.6.0 seal, full or short, ADR-0012 item 111) and `ended_after =
-/// file_count - 2`, the last data slice. `build` sizes the seal placeholder
+/// It is §5's **full seal**: `requires` as File 0 states it (empty on every
+/// Layout 3 tape, §1.2) and `ended_after = file_count - 2`, the last data
+/// slice. `build` sizes the seal placeholder
 /// with this function, and a short seal ([`generate_short_seal_marker`]) is
 /// never longer than it.
 ///
@@ -8166,19 +2461,19 @@ fn append_files_entries(s: &mut String, files: &[FrontIndexFile]) {
 /// complete than File 3 itself); only the seal marker's own entry stays
 /// hash-less (self-reference). The copy is not hash-protected by anything on
 /// the tape — readers validate its per-file claims by hashing the files they
-/// describe (`volume-format-v2.md` §4).
+/// describe (`volume-format-v3.md` §5).
 pub fn generate_seal_marker(
     label: &str,
     file_count: i32,
     front_index_sha256: &str,
     files: &[FrontIndexFile],
 ) -> String {
-    generate_seal_marker_requiring(label, file_count, front_index_sha256, files, REQUIRES_WHOLE)
+    generate_seal_marker_requiring(label, file_count, front_index_sha256, files, REQUIRES)
 }
 
 /// The full seal stating `features` in `requires`, as File 0 of the same tape
-/// states them (`volume-format-v2.md` §4.1: "From 1.7.0 the seal of a span
-/// tape states `requires = ["short-seal", "spanning"]`"; ADR-0012 item 124).
+/// states them (`volume-format-v3.md` §1.2: the seal repeats File 0's
+/// `requires`).
 /// `build` sizes the placeholder with it; the seal written at execute time
 /// must state the same features, or it is not the placeholder's length.
 pub fn generate_seal_marker_requiring(
@@ -8199,9 +2494,9 @@ pub fn generate_seal_marker_requiring(
     s
 }
 
-/// Generate the plaintext **short seal marker** (`volume-format-v2.md` §4.1,
+/// Generate the plaintext **short seal marker** (`volume-format-v3.md` §5,
 /// tapectl 1.6.0): the seal at K+1 of a tape the drive's early warning ended
-/// after data slice K (§4.3 W4), `ended_after = K`, `file_count = K+2`.
+/// after data slice K (§5.2 W4), `ended_after = K`, `file_count = K+2`.
 ///
 /// `files_through_k` is File 3's entries 0 to K, with File 3's own entry
 /// filled in as for a full seal (its `size_bytes` and `sha256_encrypted`);
@@ -8211,7 +2506,7 @@ pub fn generate_seal_marker_requiring(
 ///
 /// The header is the full seal's, word for word, and the timestamp the same
 /// fixed width: a short seal is never longer than the placeholder `build`
-/// sized with [`generate_seal_marker`] (§4.1 "Length"), which
+/// sized with [`generate_seal_marker`] (§5 "Length"), which
 /// `ReadyToSeal::seal` checks.
 pub fn generate_short_seal_marker(
     label: &str,
@@ -8224,7 +2519,7 @@ pub fn generate_short_seal_marker(
         ended_after,
         front_index_sha256,
         files_through_k,
-        REQUIRES_WHOLE,
+        REQUIRES,
     )
 }
 
@@ -8265,7 +2560,7 @@ pub fn generate_short_seal_marker_requiring(
 }
 
 /// The seal marker's human header and `[seal]` table, the same for a full
-/// and a short seal (`volume-format-v2.md` §4.1, "Grammar" and "The
+/// and a short seal (`volume-format-v3.md` §5, "Grammar" and "The
 /// human-readable header"), so the two kinds cannot drift apart in anything
 /// but the numbers and the embedded copy.
 fn seal_document(
@@ -8290,6 +2585,7 @@ fn seal_document(
     // always — second precision is ample for an audit timestamp, and
     // fixed width is what the sizing trick actually requires.
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let t_label = crate::volume::format::toml_string(label);
     format!(
         r#"================================================================
                     TAPECTL SEAL MARKER
@@ -8310,8 +2606,8 @@ verify any entry by hashing the file it describes.
 ================================================================
 
 [seal]
-volume = "{label}"
-layout_version = 2
+volume = {t_label}
+layout_version = 3
 requires = {requires}
 file_count = {file_count}
 ended_after = {ended_after}
@@ -8334,8 +2630,8 @@ pub fn generate_manifest_toml(label: &str, tenant_name: &str, units: &[ManifestU
         volume: label.to_string(),
         tenant: tenant_name.to_string(),
         created_at: now,
-        // Every envelope of every tape 1.6.0 writes (`volume-format-v2.md`
-        // §1.7, ADR-0012 item 111): the tape may end early, and only its seal
+        // Every envelope of every tape 1.6.0 writes (`volume-format-v3.md`
+        // §1.8, ADR-0012 item 111): the tape may end early, and only its seal
         // says whether it did.
         may_end_early: true,
         units: units.to_vec(),
@@ -8343,33 +2639,12 @@ pub fn generate_manifest_toml(label: &str, tenant_name: &str, units: &[ManifestU
     manifest.to_toml()
 }
 
-/// The stem of a unit's dar catalogue inside its envelope: the `catalogs/`
-/// members are `<stem>.N.dar` (`staging` names them `<uuid8>_v<version>`).
-fn catalogue_stem(unit: &ManifestUnit) -> String {
-    format!(
-        "{}_v{}",
-        unit.uuid.get(..8).unwrap_or(&unit.uuid),
-        unit.snapshot_version
-    )
-}
-
-/// Does an envelope whose `catalogs/` members are `members` (bare file names,
-/// as `build` puts them in the tar) hold the dar catalogue `stem`?
-fn holds_catalogue(members: &[String], stem: &str) -> bool {
-    let prefix = format!("{stem}.");
-    members
-        .iter()
-        .any(|m| m.starts_with(&prefix) && m.ends_with(".dar"))
-}
-
-/// RECOVERY.md's section on the cross-volume index (`volume-format-v2.md`
-/// sec 1.5, tapectl 1.3.0): what `index/units.tsv` and `index/paths.tsv`
-/// hold, where each is, the staleness rule, and one `awk` line for each that
-/// reads the text as it is stored (escaped). One section serves both kinds of
-/// envelope, so `generate_recovery_md` needs no more arguments: it says which
-/// envelope has which member. It must not name the dar catalogues
-/// (`catalogs/`, `dar -l`): a unit's section does that only when the envelope
-/// holds one (#449).
+/// RECOVERY.md's section on the cross-volume index (`volume-format-v3.md`
+/// §1.5): what `index/units.tsv` and `index/paths.tsv` hold, where each is,
+/// the staleness rule, and one `awk` line for each that reads the text as it
+/// is stored (escaped). One section serves both kinds of envelope, so
+/// `generate_recovery_md` needs no more arguments: it says which envelope has
+/// which member.
 const RECOVERY_INDEX_SECTION: &str = r##"## The index of other tapes
 
 This envelope also holds an index of the archive as it was known when
@@ -8381,16 +2656,13 @@ this tape was written, next to MANIFEST.toml:
 - `index/paths.tsv`: every path of those versions, with its unit and
   version. A tenant's envelope has it; the operator's does not.
 
-An envelope from a tape written before tapectl 1.3.0 has no `index/`.
-
 A unit that was renamed after this tape was written is listed here under
 the name it had then, and a newer tape's index lists it under its newer
 name. They are one unit when their `unit_uuid` is the same, so match units by
 `unit_uuid`, and on each tape give RESTORE.sh the name that tape shows
 (`--unit` takes a name, and an envelope knows a unit by the name it had when
 its tape was written). Two units of one name but different `unit_uuid` are
-different units: restore each into a directory of its own, such as
-`/destination/UNIT-` and the first 8 characters of the uuid.
+different units: restore each into a directory of its own.
 
 An index is as of the moment its own tape was written. It never names a
 tape written after it, and a tape it names may since have been retired or
@@ -8417,8 +2689,8 @@ file, `l` symlink, `s` special), `size_bytes`, `sha256` (the file's content
 hash as 64 hex characters; empty for anything but a regular file, and where
 none was recorded) and `path`.
 
-These two lines print the rows for a unit, and the paths that contain some
-text. They compare the text as it is stored, so type a backslash, TAB or
+These two lines (run them inside `env/`) print the rows for a unit, and the
+paths that contain some text. They compare the text as it is stored, so type a backslash, TAB or
 newline of a name the way the file writes it:
 
 ```bash
@@ -8441,16 +2713,18 @@ the unit, into a directory of its own.
 
 "##;
 
-/// RECOVERY.md's section on where the tape ended (`volume-format-v2.md` §1.7,
-/// tapectl 1.6.0, ADR-0012 item 111), after the units table and before the
-/// first unit's section: the table is the plan, the seal marker says where
-/// the tape really ended, the four lines that read it with no key, and the
-/// rule for a unit whose slices run past it. The same in every envelope.
+/// RECOVERY.md's section on where the tape ended (`volume-format-v3.md` §5,
+/// §7.5), after the units table and before the first unit's section: the
+/// table is the plan, the seal marker says where the tape really ended, the
+/// four lines that read it with no key, and what a slice after it means. The
+/// same in every envelope.
 const RECOVERY_END_SECTION: &str = r##"## Where this tape ended
 
 This tape may end before the last tape file the write planned, because the
 drive reached the end of its medium. The table above is the plan, written
-before any slice was.
+before any slice was. A unit that does not fit continues on the next
+cartridge: this tape then holds the first slices of it (a range), and the
+rest are on another tape.
 
 The seal marker, the last file on the tape, says where it ended: its
 `ended_after` is the last tape file before the seal, and every tape file
@@ -8465,134 +2739,78 @@ mt -f /dev/nst0 bsfm 2
 dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(file_count|ended_after) ='
 ```
 
-When the last tape file of a unit (the end of its "Tape files" above) is
-after `ended_after`, this tape does not hold the unit whole. Do not start
-reading its slices: it is restorable only from another tape. The index
-(`index/units.tsv`, below) and `RESTORE.sh --where UNIT` name the tapes that
-hold it. `RESTORE.sh` (tape file 2) does all of this by itself: `--info` and
-`--verify` report where the tape ended.
+When a slice of a unit (its tape file in the table above) is after
+`ended_after`, it is on another tape: never read it from this one. The files
+whose slices are all here are restored by the steps below with the slices that
+are; the others need the other tape. The index (`index/units.tsv`, below)
+and `RESTORE.sh --where UNIT` name the tapes that hold them. `RESTORE.sh`
+(tape file 2) does all of this by itself: `--info` and `--verify` report where
+the tape ended.
 
 "##;
 
-/// RECOVERY.md's section on a damaged slice or file (ADR-0012 items 101 and
-/// 102, tapectl 1.3.0): the two RESTORE.sh commands and the rule that only
-/// the same unit at the same version is used. Like the index section it
-/// serves every kind of envelope, and so it names no dar catalogue (#449).
-/// Since the fresh read of File 1 for a span (#478; ADR-0012 items 135 and
-/// 143): same slices only within one staging run, no `--slices-from` or
-/// `--swap-tapes` for a unit this tape holds part of (with the routes that
-/// do work, [`RECOVERY_DAMAGE_SPAN`]), and a fill only from a tape that holds
-/// the version whole ([`RECOVERY_DAMAGE_REST`]). This const is the section's
-/// head, to the replacement-slice commands.
+/// RECOVERY.md's section on a damaged slice or file (`volume-format-v3.md`
+/// §1.7, §7.4): what a slice that fails is, the one repair from another copy
+/// of the unit, and leaving a slice out by hand. It serves every kind of
+/// envelope.
 const RECOVERY_DAMAGE_SECTION: &str = r##"## If a slice or a file is damaged
 
 Another tape that holds this unit at the same version holds the same slices,
-byte for byte, when both tapes were written from one staging run of it: its
-front index (File 3) lists the same `sha256_encrypted`
-for each, at whatever tape file and under whatever number that tape puts
-it. Only the same unit at the same version is a copy; another version may
-differ in the very files that are damaged. A tape written from another
-staging run of the same version holds the same files but other ciphertext:
-its slices have other `sha256_encrypted` values, so none of them is ever
-taken for a slice of this tape (it is refused by hash), but a tape that
-holds the version whole that way restores it alone, with its own
-`RESTORE.sh`.
+byte for byte, when both tapes were written from one staging of it: its
+front index (File 3) lists the same `sha256_encrypted` for each, at whatever
+tape file and under whatever number that tape puts it. Only the same unit at
+the same version is a copy; another version may differ in the very files that
+are damaged.
 
-A slice that fails its `sha256sum -c` above is damaged: do not decrypt it.
-Take it from the other tape instead, found by its `sha256_encrypted` and by
-nothing else. `RESTORE.sh` (tape file 2) does that for you, from slice files
-you copied off the other tape (`dd`, block padding and all, under any names)
-or from the other cartridge itself, which it asks for after it has read this
-one:
+A slice that fails its `sha256sum -c` above is damaged: do not decrypt it,
+and do not put an empty file in its place. `RESTORE.sh` (tape file 2) leaves
+a slice that fails out by itself, restores every file whose slices are good,
+and writes the paths of the others, one per line (a backslash, TAB, newline
+and carriage return escaped as the index escapes them), to
+`.tapectl-damaged-files.txt` in the unit's directory. Load a tape that holds
+the same unit at the same version and run that list through its one repair,
+into the same directory (here `/destination/UNIT` stands for the unit's
+directory):
 
 ```bash
-./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --slices-from DIR --to /destination/UNIT
-./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --swap-tapes --to /destination/UNIT
+./RESTORE.sh --restore --key YOUR_KEY.age.key --paths-from /destination/UNIT/.tapectl-damaged-files.txt --to /destination/UNIT
 ```
+
+It restores exactly the listed files over their damaged copies, leaves
+everything else in the directory alone, checks each against the unit's file
+table, and refuses a tape that holds another unit or another version.
+
+By hand, with no other copy, leave the failed slice out of the steps above:
+remove its `slice.N.tar`, and if it is part of a long file's run (it or a
+slice just before it states `continues = true` in MANIFEST.toml) leave out the
+whole run, so that tar is never given the head of a file without its tail.
+The slices that are left, joined in order, are a tar stream of whole files,
+and tar restores every file in them; the file table's `slice` column says
+which files were in the slices you left out. A file's sha256 in the table is
+the check: the line after the steps prints `FAILED` for each file that is
+missing or differs.
 
 "##;
 
-/// The paragraph of RECOVERY.md's damage section on a unit held across tapes
-/// (the fresh read of File 1, #478; `volume-format-v2.md` §4.4): RESTORE.sh
-/// takes no `--slices-from` or `--swap-tapes` for a unit this tape holds part
-/// of, and the routes that do work with no good copy of a slice. Only in an
-/// envelope that lists a block stating `may_span = true`, as
-/// [`recovery_span_section`] is.
-const RECOVERY_DAMAGE_SPAN: &str = r##"Neither applies to a unit held across tapes that this tape holds only part
-of (its block in MANIFEST.toml states `may_span = true` and gives some
-slices no tape position): `RESTORE.sh` refuses `--slices-from` and
-`--swap-tapes` for it. Its restore across tapes asks for the next tape at a
-prompt, and asks there again for a slice that fails, from another cartridge
-that holds it (with `--stream-tapes`, a slice that fails ends the run). With
-no good copy of that slice anywhere, `RESTORE.sh` restores nothing of the
-unit, and `done` at the prompt stops the restore. What does work then:
-`--restore --unit UNIT --path PATH` for a folder or a file whose slices all
-avoid the failed one (it reads only the slices that hold the path, and the
-last slice, which must therefore be good); tapectl's own restore, which
-reads a unit across tapes and reads around a damaged 64 KiB piece of a
-slice (File 1, "tapectl itself"); and the steps above by hand, for each
-tape's slices of the unit, all into one directory, with the failed slice
-left out as below.
+/// The directory name of a unit's work and destination: the unit uuid's
+/// first eight characters, `_v` and the version, the stem of its file table
+/// (a unit's name may hold a `/` or a space, so it is never a path).
+fn unit_dir_name(unit: &ManifestUnit) -> String {
+    format!(
+        "{}_v{}",
+        unit.uuid.get(..8).unwrap_or(&unit.uuid),
+        unit.snapshot_version
+    )
+}
 
-"##;
+/// Whether this tape's plan holds only some of the staging's slices: its
+/// block gives some slices no `tape_position` (`volume-format-v3.md` §5.3).
+/// Layout 3 has no span key (item 288): every staging may continue on
+/// another cartridge, and the positions say what this tape holds.
+fn held_in_part(unit: &ManifestUnit) -> bool {
+    unit.slices.iter().any(|sl| sl.tape_position.is_none())
+}
 
-/// The rest of RECOVERY.md's damage section, after the replacement-slice
-/// commands (and [`RECOVERY_DAMAGE_SPAN`] where it is): no other copy, the
-/// damaged-file list and the fill, and the sha256 check of restored files.
-const RECOVERY_DAMAGE_REST: &str = r##"With no other copy, leave the failed slice out of the steps above: do not
-decrypt it, and do not put an empty file in its place. The other slices keep
-their numbers (`restore.1.dar`, `restore.2.dar`, `restore.4.dar` ..., a gap
-where the failed one was), and dar, run as above into an empty directory
-(`dar -x restore -R /destination -O -Q -N > dar.log 2>&1`), restores every
-file whose slices are all there. For each of the others it prints `PATH not
-restored (user choice)` (`grep 'not restored (user choice)' dar.log` lists
-them) and leaves an EMPTY or short file of that name, which is not the real
-file; its exit status is still 0. If a folder's own entry lies in the
-failed slice, dar names the folder and restores nothing in it ("No file in
-this directory will be restored"). If the failed slice is the last one, dar
-stops ("The last file of the set is not present"); add `-0` to restore, in
-order, everything before the first missing slice.
-
-If dar says it could not restore some files, `RESTORE.sh` restores the rest,
-ends `RESTORE INCOMPLETE`, and writes their paths, one per line (a
-backslash, TAB, newline and carriage return escaped as the index escapes
-them), to `.tapectl-damaged-files.txt` in the unit's directory (with each
-unit restored into `/destination/UNIT`, that is
-`/destination/UNIT/.tapectl-damaged-files.txt`; a restore of one unit with
-`--all` puts the files straight into `--to`, and the list is
-`--to/.tapectl-damaged-files.txt`). Load a tape that holds the
-same unit at the same version WHOLE (a tape that holds only some of its
-slices is refused) and run that tape's own `RESTORE.sh`, with that
-list and that directory: it restores exactly those files over their damaged
-copies, leaves everything else in the directory alone, and refuses a tape
-that holds another unit or another version:
-
-```bash
-./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --fill-from /destination/UNIT/.tapectl-damaged-files.txt --to /destination/UNIT
-```
-
-For a folder dar restored nothing in, the list names the files the index
-records under it, and the fill restores them like any other.
-
-dar checks each file it restores with a short checksum, not a hash, so a
-damaged file can come back with no error. A tape written since 1.3.0 records
-each regular file's sha256 in `index/paths.tsv`, and `RESTORE.sh` checks every
-file it restores, and every file it fills, against it: a file that does not
-match, or is missing, goes on the same list and the run ends `RESTORE
-INCOMPLETE`. It costs one read of the restored files from disk, and
-`--no-file-check` skips it. By hand, for a unit and version, in the unpacked
-envelope's directory (a name with a backslash, TAB, newline or carriage return
-is written escaped there, and this line does not decode it):
-
-```bash
-V=1 U='photos/2019' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next } $c["unit"] == ENVIRON["U"] && $c["version"] == ENVIRON["V"] && $c["sha256"] != "" { print $c["sha256"] "  " $c["path"] }' index/paths.tsv | (cd /destination && sha256sum -c --quiet)
-```
-
-"##;
-
-/// The tape positions a unit's MANIFEST block gives, in slice order: every
-/// slice of a whole unit, and only the run this tape plans of a unit that may
-/// span (ADR-0012 item 125).
 fn slices_here(unit: &ManifestUnit) -> Vec<i64> {
     unit.slices
         .iter()
@@ -8600,22 +2818,22 @@ fn slices_here(unit: &ManifestUnit) -> Vec<i64> {
         .collect()
 }
 
-/// RECOVERY.md's section on a unit across tapes (`volume-format-v2.md` §4.4,
-/// "File 1 and RECOVERY.md"; ADR-0012 item 135), after the section on where
-/// the tape ended, in an envelope that lists a block stating `may_span =
-/// true`: which slices of each such unit this tape's plan holds, that the
-/// others are on other tapes, that a restore needs every slice in slice order
-/// matched by `sha256_encrypted`, and that RESTORE.sh does it.
+/// RECOVERY.md's section on a unit across tapes (`volume-format-v3.md` §5.3,
+/// §7.5), after the section on where the tape ended, in an envelope that
+/// lists a block this tape holds only some of: which slices of each such unit
+/// this tape's plan holds, that the others are on other tapes, what a read of
+/// this tape alone gives, and that RESTORE.sh asks for the next cartridge.
+/// (`span_proofs` holds the section's title to "a block held in part".)
 fn recovery_span_section(units: &[ManifestUnit]) -> String {
     let mut s = String::from(
         "## A unit across tapes\n\n\
-         These units may run across tapes (their blocks in MANIFEST.toml state\n\
-         `may_span = true`). Each block lists every slice of the unit, and this\n\
-         tape's plan holds the slices given a tape position:\n\n\
+         These units continue on another cartridge (a slice of each has no tape\n\
+         position in MANIFEST.toml). Each block lists every slice of the unit, and\n\
+         this tape's plan holds the slices given a tape position:\n\n\
          | Unit | Snapshot | Slices on this tape | Tape files | Slices in all |\n\
          |------|----------|---------------------|------------|---------------|\n",
     );
-    for unit in units.iter().filter(|u| u.may_span) {
+    for unit in units.iter().filter(|u| held_in_part(u)) {
         let held: Vec<(i64, i64)> = unit
             .slices
             .iter()
@@ -8634,38 +2852,158 @@ fn recovery_span_section(units: &[ManifestUnit]) -> String {
     }
     s.push_str(
         "\nThe slices with no tape position, and any after the seal marker's\n\
-         `ended_after` (\"Where this tape ended\", above), are on other tapes. A\n\
-         restore needs every slice, 1 to the last, in slice order, from the tapes\n\
-         that hold them: take each from a tape whose front index (File 3) lists the\n\
-         slice's `sha256_encrypted` (MANIFEST.toml gives every slice's, and the unit's\n\
-         section below repeats it), and by nothing else. `RESTORE.sh` (tape file 2)\n\
-         does it: run it with `--restore --unit UNIT` on the tape that holds slice 1,\n\
-         which `RESTORE.sh --where UNIT` on the newest tape names, and it asks for the\n\
-         next. The unit's section below gives the steps for the slices this tape\n\
-         holds.\n\n",
+         `ended_after` (\"Where this tape ended\", above), are on other tapes. A slice\n\
+         holds whole files, so this tape alone restores every file whose slices are\n\
+         all on it: the unit's block below reads the slices this tape holds, tar\n\
+         restores those files, and the check after it names the others. A restore of\n\
+         the whole unit needs every slice, 1 to the last, in slice order, from the\n\
+         tapes that hold them, each taken from a tape whose front index (File 3)\n\
+         lists the slice's `sha256_encrypted` (MANIFEST.toml gives every slice's)\n\
+         and by nothing else. `RESTORE.sh` (tape file 2) does it, starting on any\n\
+         tape that holds some of the unit: it asks for the next cartridge at a\n\
+         prompt (ENTER after you load it, `done` or the end of the input for \"I do\n\
+         not have it\", `quit` to stop), and `RESTORE.sh --where UNIT` on the newest\n\
+         tape names the tapes that hold the rest.\n\n",
     );
     s
 }
 
-/// Generate RECOVERY.md for an envelope. `catalogue_members` are the bare
-/// names of the `catalogs/` members the envelope actually holds: a unit's
-/// section names its dar catalogue (`dar -l`, `-A`) only when the envelope
-/// carries it (#449). A unit staged without one has no such paragraph.
+/// RECOVERY.md's block of one unit: make its own work directory and its own
+/// destination, read each slice this tape holds, join them into one tar run
+/// and remove the work directory (#522: no block reads another's slices, and
+/// no two units meet in one directory). `decompress` is the tool that reads
+/// each slice after it is decrypted, for a compressed unit.
+fn recovery_unit_block(unit: &ManifestUnit) -> String {
+    let dir = unit_dir_name(unit);
+    let work = format!("work/{dir}");
+    let decompress = match unit.compression.as_deref() {
+        Some("gzip") => " | gzip -dc",
+        Some("xz") => " | xz -dc",
+        Some("zstd") => " | zstd -dc",
+        _ => "",
+    };
+    let mut s = format!(
+        "```bash\n\
+         mkdir -p {work} /destination/{dir}\n\
+         mt -f /dev/nst0 setblk 524288\n\n\
+         # On each `age -d` line, add `-i <file>` for every other key you hold\n\
+         # (see \"Which key\" above).\n\n"
+    );
+    // A slice that continues a file begun on another tape is not read: its
+    // first bytes are the middle of a file, and tar must begin at a file.
+    let first_here = unit.slices.iter().position(|sl| sl.tape_position.is_some());
+    let mut leading_skipped = 0usize;
+    if let Some(f) = first_here {
+        while unit
+            .slices
+            .get(f + leading_skipped)
+            .is_some_and(|sl| sl.continues && sl.tape_position.is_some())
+        {
+            leading_skipped += 1;
+        }
+    }
+    let mut joined: Vec<String> = Vec::new();
+    let mut next: Option<i64> = None;
+    for (i, slice) in unit.slices.iter().enumerate() {
+        let Some(tape_position) = slice.tape_position else {
+            s.push_str(&format!(
+                "# Slice {n} — on another tape (no tape position here): {eb} bytes,\n\
+                 # sha256_encrypted {sha}\n\n",
+                n = slice.number,
+                eb = slice.encrypted_bytes,
+                sha = slice.sha256_encrypted,
+            ));
+            continue;
+        };
+        if first_here.is_some_and(|f| i >= f && i < f + leading_skipped) {
+            s.push_str(&format!(
+                "# Slice {n} — tape file {tape_position}: it continues a file that begins on\n\
+                 # another tape, so it is not read here\n\n",
+                n = slice.number,
+            ));
+            continue;
+        }
+        // One rewind per unit (#412): a read leaves the tape at the next
+        // file, so only a gap between slices needs a forward space.
+        let position = match next {
+            None => format!("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {tape_position}\n"),
+            Some(n) if tape_position > n => {
+                format!("mt -f /dev/nst0 fsf {}\n", tape_position - n)
+            }
+            Some(n) if tape_position == n => String::new(),
+            Some(_) => {
+                format!("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {tape_position}\n")
+            }
+        };
+        next = Some(tape_position + 1);
+        let n = slice.number;
+        s.push_str(&format!(
+            "# Slice {n} — tape file {tape_position}, {eb} bytes{cont}\n\
+             {position}\
+             dd if=/dev/nst0 bs=512k of={work}/slice.{n}.age\n\
+             truncate -s {eb} {work}/slice.{n}.age\n\
+             echo \"{sha}  {work}/slice.{n}.age\" | sha256sum -c - && age -d -i YOUR_KEY.age.key {work}/slice.{n}.age{decompress} > {work}/slice.{n}.tar && rm {work}/slice.{n}.age\n\
+             test $(wc -c < {work}/slice.{n}.tar) -eq {plain_bytes} && echo \"{sha_plain}  {work}/slice.{n}.tar\" | sha256sum -c -\n\n",
+            eb = slice.encrypted_bytes,
+            sha = slice.sha256_encrypted,
+            plain_bytes = slice.size_bytes,
+            sha_plain = slice.sha256_plain,
+            cont = if slice.continues {
+                " (it continues the file begun in the slice before it)"
+            } else {
+                ""
+            },
+        ));
+        joined.push(format!("{work}/slice.{n}.tar"));
+    }
+    if joined.is_empty() {
+        s.push_str(
+            "# No slice of this unit is readable from this tape: see \"Where this tape ended\".\n",
+        );
+    } else {
+        s.push_str(&format!(
+            "# The slices, joined in order, are the unit's tar stream. One tar run, into the\n\
+             # directory made above (numbers, not names, for owner and group; with another\n\
+             # tar than GNU tar, leave out the flags it does not know):\n\
+             cat {} | LC_ALL=C tar -x --numeric-owner -p --xattrs --acls -f - -C /destination/{dir}\n\
+             rm -r {work}\n",
+            joined.join(" "),
+        ));
+    }
+    s.push_str("```\n\n");
+    s
+}
+
+/// Generate RECOVERY.md for an envelope (`volume-format-v3.md` §7.5). Each
+/// unit gets a block that makes a work directory and a destination of its
+/// own (#522), reads this tape's slices of it, and joins them into one tar
+/// run; a tenant's envelope also gets the check against the unit's file
+/// table and the id map. `_catalogue_members` is kept for the callers that
+/// pass the bare names of the envelope's extra members; Layout 3 has no
+/// per-unit catalogue file to name, so nothing is drawn from it.
 pub fn generate_recovery_md(
     label: &str,
     tenant_name: &str,
     units: &[ManifestUnit],
-    catalogue_members: &[String],
+    _catalogue_members: &[String],
 ) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let mut s = format!(
         "# Recovery Guide for {tenant_name}\n\n\
          Volume: {label}\n\
          Date: {now}\n\n\
-         This tape holds age-encrypted `dar` archives. With your age key(s) and the\n\
-         standard tools (`mt`, `dd`, `truncate`, `age`, `dar`, `sha256sum`) you can\n\
-         recover your data by hand — no tapectl required. The automated `RESTORE.sh`\n\
-         (tape file 2) does exactly these steps for you; use it if you can.\n\n\
+         This tape holds age-encrypted pieces of tar archives: each unit is one tar\n\
+         stream, cut into slices that begin where a file begins, and each slice is\n\
+         encrypted on its own. With your age key(s) and the standard tools (`mt`,\n\
+         `dd`, `truncate`, `age`, `tar`, `sha256sum`) you can recover your data by\n\
+         hand — no tapectl required. The automated `RESTORE.sh` (tape file 2) does\n\
+         the same for you, and checks every restored file against the unit's file\n\
+         table; use it if you can.\n\n\
+         The commands below are written for the directory this envelope was\n\
+         unpacked in (`env/` in the guide's steps): run them from the directory\n\
+         that holds `env/`. Each unit's block makes a work directory and a\n\
+         destination of its own, so the blocks can be run one after another in\n\
+         one place and never read each other's slices.\n\n\
          ## Which key\n\n\
          The key that opened this envelope is\n\
          not necessarily the key that opens the slices below.\n\
@@ -8674,27 +3012,27 @@ pub fn generate_recovery_md(
          slices need an older key. `age` accepts several keys at once and uses\n\
          whichever one matches, so pass every key you hold:\n\n\
          ```bash\n\
-         age -d -i OLD.age.key -i NEW.age.key ...\n\
+         age -d -i OLD.age.key -i NEW.age.key slice.1.age > slice.1.tar\n\
          ```\n\n\
          Name only key files that exist:\n\
          one unreadable `-i` path fails the whole command.\n\
          If every key fails with `no identity matched any of the recipients`, the\n\
          slice was sealed to a key you have not supplied — the data is not corrupt.\n\
          `age-keygen -y YOUR_KEY.age.key` shows whether a file is a key at all (it\n\
-         prints the key's public `age1...` line, or an error), and the guide on this\n\
-         tape (File 1, \"Which file is your key\") tells a bad key file from a tape\n\
-         of another installation.\n\n\
+         prints that one key's public `age1...` line, or an error), and the guide on\n\
+         this tape (File 1, \"Which file is your key\") tells a bad key file from a\n\
+         tape of another installation.\n\n\
          ## Units in this envelope\n\n\
          | Unit | Snapshot | Slices | Tape files |\n\
          |------|----------|--------|------------|\n"
     );
     for unit in units {
-        // A whole unit's every slice has a position. A unit that may span
-        // lists every slice of its set, and only the slices this tape plans
-        // have one (ADR-0012 item 125): a slice with none is on another tape,
-        // never at tape file 0, so its row counts and spans only those.
+        // A whole unit's every slice has a position. A unit this tape holds
+        // part of lists every slice of its set, and only the slices this tape
+        // plans have one: a slice with none is on another tape, never at tape
+        // file 0, so its row counts and spans only those.
         let here = slices_here(unit);
-        let (count, files) = if unit.may_span {
+        let (count, files) = if held_in_part(unit) {
             (
                 format!("{} of {}", here.len(), unit.slices.len()),
                 match (here.first(), here.last()) {
@@ -8716,29 +3054,54 @@ pub fn generate_recovery_md(
     }
     s.push('\n');
     s.push_str(RECOVERY_END_SECTION);
-    if units.iter().any(|u| u.may_span) {
+    if units.iter().any(held_in_part) {
         s.push_str(&recovery_span_section(units));
     }
 
     for unit in units {
-        let stem = catalogue_stem(unit);
-        let held = holds_catalogue(catalogue_members, &stem);
-        let catalogue = format!("catalogs/{stem}");
+        let dir = unit_dir_name(unit);
         s.push_str(&format!(
             "## {}\n\n\
-             UUID: `{}`  ·  snapshot v{}\n\n",
-            unit.name, unit.uuid, unit.snapshot_version,
+             UUID: `{}`  ·  snapshot v{}  ·  {} bytes of tar stream",
+            unit.name, unit.uuid, unit.snapshot_version, unit.stream_bytes,
         ));
-        if held {
+        s.push_str("\n\n");
+        if let Some(alg) = unit.compression.as_deref() {
+            let (tool, package) = match alg {
+                "gzip" => ("gzip -dc", "gzip"),
+                "xz" => ("xz -dc", "xz-utils"),
+                "zstd" => ("zstd -dc", "zstd"),
+                _ => ("the tool of that algorithm", "its package"),
+            };
             s.push_str(&format!(
-                "This envelope also holds the unit's dar catalogue, `{cat}.1.dar`. It\n\
-                 lists every file of the unit without reading the tape:\n\n\
-                 ```bash\n\
-                 dar -l {cat} -N -Q              # every file, with sizes and dates\n\
-                 dar -l {cat} -N -Q -T slice     # which slice holds each file\n\
-                 ```\n\n",
-                cat = catalogue,
+                "Each slice of this unit was compressed with {alg}, after the cut and before\n\
+                 it was encrypted: the block below pipes each decrypted slice through\n\
+                 `{tool}` (package {package}). The length and the hash it checks are of the\n\
+                 decompressed slice.\n\n"
             ));
+        }
+        if let Some(table) = &unit.file_table {
+            s.push_str(&format!(
+                "This envelope holds the unit's file table, `{table}` (every file's kind,\n\
+                 slice, place in the stream, size, sha256 and path), and its id map,\n\
+                 `{ids}` (who each user and group number was on the computer that wrote\n\
+                 the tape; shown, never used). A restore here is judged by the table.\n\n",
+                ids = unit.id_map.as_deref().unwrap_or("tables/…ids.tsv"),
+            ));
+        } else {
+            s.push_str(
+                "This (the operator's) envelope lists the unit but holds its file table only\n\
+                 as rows of `catalog.db`; the unit's own tenant's envelope has it as a file.\n\n",
+            );
+        }
+        if held_in_part(unit) {
+            s.push_str(
+                "This tape holds only some of this unit's slices (the others are on other\n\
+                 tapes: \"Where this tape ended\"). The block reads the ones it holds; tar\n\
+                 then restores every file whose slices are all here, and says \"Unexpected\n\
+                 EOF in archive\" for a file that runs on into a slice on another tape: that\n\
+                 file is not whole, and the check says so.\n\n",
+            );
         }
         s.push_str(
             "Put the drive in fixed 512KB block mode, then read, trim, verify and\n\
@@ -8748,100 +3111,43 @@ pub fn generate_recovery_md(
              the head inside that file instead: `mt rewind`, then `mt fsf` to the\n\
              tape file of the slice you want next, which its `# Slice` line gives.\n\
              `/dev/nst0` below is an example — run `ls -l /dev/tape/by-id/` and\n\
-             substitute your own drive, or you may read a different tape. Work in\n\
-             a directory with room for the whole unit plus one slice: each\n\
-             encrypted slice is removed once it is decrypted.\n\n\
-             ```bash\n\
-             mt -f /dev/nst0 setblk 524288\n\n\
-             # On each `age -d` line, add `-i <file>` for every other key you hold\n\
-             # (see \"Which key\" above).\n\n",
+             substitute your own drive, or you may read a different tape. The block\n\
+             makes `work/` and a directory for this unit and removes it when the unit is\n\
+             restored: it needs room for the whole unit's slices (its stream size) once,\n\
+             and the destination needs the same again.\n\n",
         );
-        let mut next: Option<i64> = None;
-        for slice in &unit.slices {
-            // A slice with no position is on another tape (ADR-0012 item 125):
-            // named, with what matches it there, and never read from this one.
-            let Some(tape_position) = slice.tape_position else {
-                s.push_str(&format!(
-                    "# Slice {n} — on another tape (no tape position here): {eb} bytes,\n\
-                     # sha256_encrypted {sha}\n\n",
-                    n = slice.number,
-                    eb = slice.encrypted_bytes,
-                    sha = slice.sha256_encrypted,
-                ));
-                continue;
-            };
-            // The number in `restore.N.dar` MUST be dar's slice number, and the
-            // slices MUST share the base name `restore` — this is dar's required
-            // `base.N.dar` convention. `truncate` trims the 512KB block padding
-            // that would otherwise make age reject the ciphertext. One rewind
-            // per unit (#412): a read leaves the tape at the next file, so
-            // only a gap between slices needs a forward space.
-            let position = match next {
-                None => format!("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {tape_position}\n"),
-                Some(n) if tape_position > n => {
-                    format!("mt -f /dev/nst0 fsf {}\n", tape_position - n)
-                }
-                Some(n) if tape_position == n => String::new(),
-                Some(_) => {
-                    format!("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {tape_position}\n")
-                }
-            };
-            next = Some(tape_position + 1);
+        s.push_str(&recovery_unit_block(unit));
+        if let Some(table) = &unit.file_table {
+            let table = table.trim_start_matches("tables/");
             s.push_str(&format!(
-                "# Slice {n} — tape file {pos}, {eb} bytes\n\
-                 {position}\
-                 dd if=/dev/nst0 bs=512k of=restore.{n}.dar.age\n\
-                 truncate -s {eb} restore.{n}.dar.age\n\
-                 echo \"{sha}  restore.{n}.dar.age\" | sha256sum -c - && age -d -i YOUR_KEY.age.key restore.{n}.dar.age > restore.{n}.dar && rm restore.{n}.dar.age\n\n",
-                n = slice.number,
-                pos = tape_position,
-                eb = slice.encrypted_bytes,
-                sha = slice.sha256_encrypted,
+                "Check the unit against its file table: this prints nothing when every file\n\
+                 passes and `FAILED` for each that does not (a file whose name holds a\n\
+                 backslash, TAB, newline or carriage return is written escaped in the table\n\
+                 and is left out of this line; `RESTORE.sh` checks it):\n\n\
+                 ```bash\n\
+                 awk -F'\\t' '!/^#/ && ($1 == \"f\" || $1 == \"h\") && index($7, \"\\\\\") == 0 {{ print $6 \"  ./\" $7 }}' env/tables/{table} | (cd /destination/{dir} && sha256sum -c --quiet)\n\
+                 ```\n\n",
             ));
         }
-        if unit.may_span {
-            s.push_str(
-                "# This unit may run across tapes: run dar only once every slice, 1 to the\n\
-                 # last, is here as restore.N.dar. Read each one this tape does not hold the\n\
-                 # same way from a tape whose front index lists its sha256_encrypted.\n\n",
-            );
-        }
-        s.push_str(
-            "# Reassemble and extract all slices (they share the base name `restore`),\n\
-             # into an EMPTY directory that exists (dar will not create it):\n\
-             mkdir /destination\n\
-             dar -x restore -R /destination -O -Q -N\n\
-             ```\n\n\
-             `-O` ignores stored ownership, needed when restoring as a non-root user.\n\
-             `-N` keeps a `~/.darrc` on your machine from changing what is restored.\n\
-             dar keeps a file that already exists and still reports success, so\n\
-             restore into an empty directory; to finish a restore that stopped part\n\
-             way, run the same `dar -x` again with `-w` (overwrite) added.",
-        );
-        if held {
-            s.push_str(&format!(
-                " If dar\n\
-                 cannot read the catalogue at the end of the last slice, `-A {cat}`\n\
-                 gives it this envelope's dar catalogue instead.",
-                cat = catalogue,
-            ));
-        }
-        s.push_str("\n\n");
     }
 
     s.push_str(RECOVERY_INDEX_SECTION);
     s.push_str(RECOVERY_DAMAGE_SECTION);
-    if units.iter().any(|u| u.may_span) {
-        s.push_str(RECOVERY_DAMAGE_SPAN);
-    }
-    s.push_str(RECOVERY_DAMAGE_REST);
     s.push_str(
         "## Troubleshooting\n\n\
-         - **age: \"unexpected data\" / decryption fails** — the slice still has 512KB\n\
-           block padding. Re-run `truncate -s <bytes>` to the exact size shown above.\n\
-         - **dar: cannot open the archive** — the decrypted slices must be named\n\
-           `restore.1.dar`, `restore.2.dar`, … with no gaps, and extracted with\n\
-           `dar -x restore` (base name `restore`, no `.N.dar` suffix in the command).\n\
+         - **age: \"failed to decrypt and authenticate payload chunk\"** (age 1.1.1) — the\n\
+           file still has 512KB block padding, or a part of it is damaged. Re-run\n\
+           `truncate -s <bytes>` to the exact `encrypted_bytes` shown above (a slice's\n\
+           `size_bytes` in MANIFEST.toml is its PLAIN length: never trim to that); if the\n\
+           sha256 of the trimmed file matches, the file is whole and the key is the\n\
+           question, and if it does not, the slice is damaged.\n\
+         - **age: \"failed to read header: parsing age header\"** — what was read is not\n\
+           an age file: the wrong tape file, or the head was not where you thought.\n\
+           `mt rewind`, `fsf` to the slice's tape file, and read it again.\n\
+         - **tar: \"Unexpected EOF in archive\" or \"This does not look like a tar\n\
+           archive\"** — the slices given to tar are not whole files in order: one is\n\
+           missing, left out, or the first begins in the middle of a file. The check\n\
+           against the file table names what is missing; tar's exit status never does.\n\
          - **sha256 mismatch** — re-read the slice from tape; a short read or the wrong\n\
            block mode (must be 512KB fixed) is the usual cause.\n\
          - **age: \"no identity matched any of the recipients\"** — none of the keys\n\
@@ -8865,23 +3171,15 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAMAGED_DIRS, AWK_DAR_DAMAGED, AWK_DAR_HEADER,
-        AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
-        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
-        AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
-        AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
-    };
 
-    // ---- what a 1.6.0 tape declares up front (volume-format-v2.md §1.7,
+    // ---- what a 1.6.0 tape declares up front (volume-format-v3.md §1.8,
     // ADR-0012 item 111, #420) ----
 
-    /// File 0 states `requires = ["short-seal"]` on every 1.6.0 tape, on the
-    /// line after `layout_version` (§1.2), and nothing else of it changes:
-    /// `id_thunk_with_no_identity_source_is_byte_identical_to_the_pre_field_output`
-    /// undoes this one line and gets its old digest back.
+    /// D1 (`volume-format-v3.md` §1.1, §1.2): File 0 states Layout 3's magic
+    /// and `layout_version = 3`, and `requires = []` on the line after it, on
+    /// every tape. This tapectl reads its own File 0.
     #[test]
-    fn file_0_requires_short_seal_on_the_line_after_layout_version() {
+    fn file_0_states_layout_3_and_requires_nothing_after_layout_version() {
         let t = generate_id_thunk_v2(&IdThunkV2Params {
             label: "SS01",
             uuid: "u",
@@ -8898,15 +3196,23 @@ mod tests {
             cartridge_identity_source: None,
         });
         assert_eq!(
-            t.matches("\nlayout_version = 2\nrequires = [\"short-seal\"]\n")
-                .count(),
+            t.matches("\nmagic = \"tapectl-volume-v3\"\n").count(),
+            1,
+            "{t}"
+        );
+        assert_eq!(
+            t.matches("\nlayout_version = 3\nrequires = []\n").count(),
             1,
             "{t}"
         );
         assert_eq!(t.matches("requires").count(), 1, "{t}");
         let claims = crate::volume::format::parse_id_thunk_claims(&t).unwrap();
-        assert_eq!(claims.requires, vec!["short-seal".to_string()]);
-        assert_eq!(claims.refusal("File 0"), None, "1.6.0 reads its own tape");
+        assert!(claims.requires.is_empty() && claims.requires_stated);
+        assert_eq!(
+            claims.refusal("File 0"),
+            None,
+            "this tapectl reads its own tape"
+        );
         // File 0 is the plan: its pointers are the planned seal and count.
         assert!(t.contains("\nseal_marker = 8\ntotal_files = 9\n"), "{t}");
     }
@@ -8929,131 +3235,38 @@ mod tests {
         }
     }
 
-    /// ADR-0012 item 124, `volume-format-v2.md` §1.2: File 0 states exactly
-    /// one `requires` line, the line after `layout_version`, spelled as the
-    /// spec rules it: `["short-seal", "spanning"]` on a span tape (each
-    /// feature quoted, a comma and ONE space between), `["short-seal"]` on
-    /// every other. The old generator is the whole-tape sibling, byte for byte.
+    /// `volume-format-v3.md` §1.2, for a later feature's fence: File 0 states
+    /// exactly one `requires` line, the line after `layout_version`, spelled
+    /// as the spec rules it: each feature quoted, a comma and ONE space
+    /// between, no space inside the brackets. Every other byte is the
+    /// generator's with `requires = []`, and this tapectl refuses the tape by
+    /// name: it knows no feature (D1).
     #[test]
-    fn file_0_states_one_requires_line_with_the_tapes_features() {
+    fn a_later_features_requires_line_is_spelled_as_section_1_2_rules() {
         let p = span_thunk_params();
-        for (holds_a_span, line, features) in [
-            (
-                false,
-                "requires = [\"short-seal\"]",
-                vec!["short-seal".to_string()],
-            ),
-            (
-                true,
-                "requires = [\"short-seal\", \"spanning\"]",
-                vec!["short-seal".to_string(), "spanning".to_string()],
-            ),
-        ] {
-            let t = generate_id_thunk_v2_requiring(&p, tape_requires(holds_a_span));
-            assert_eq!(t.matches("requires").count(), 1, "{t}");
-            assert_eq!(
-                t.matches(&format!("\nlayout_version = 2\n{line}\ntapectl_version = "))
-                    .count(),
-                1,
-                "{t}"
-            );
-            let claims = crate::volume::format::parse_id_thunk_claims(&t).unwrap();
-            assert_eq!(claims.requires, features);
-            assert_eq!(claims.refusal("File 0"), None, "1.7.0 reads its own tape");
-        }
+        let later = generate_id_thunk_v2_requiring(&p, &["one-feature", "another"]);
+        assert_eq!(later.matches("requires").count(), 1, "{later}");
         assert_eq!(
-            generate_id_thunk_v2(&p),
-            generate_id_thunk_v2_requiring(&p, REQUIRES_WHOLE),
-            "the old generator is the whole tape's"
-        );
-        // The span line is the whole line plus `, "spanning"` and nothing else.
-        let whole = generate_id_thunk_v2(&p);
-        let span = generate_id_thunk_v2_requiring(&p, REQUIRES_SPAN);
-        assert_eq!(
-            span,
-            whole.replace(
-                "requires = [\"short-seal\"]",
-                "requires = [\"short-seal\", \"spanning\"]"
+            later,
+            generate_id_thunk_v2(&p).replace(
+                "\nrequires = []\n",
+                "\nrequires = [\"one-feature\", \"another\"]\n"
             )
         );
+        assert_eq!(
+            generate_id_thunk_v2(&p),
+            generate_id_thunk_v2_requiring(&p, REQUIRES)
+        );
+        let claims = crate::volume::format::parse_id_thunk_claims(&later).unwrap();
+        assert_eq!(claims.requires, vec!["one-feature", "another"]);
+        assert!(claims.refusal("File 0").is_some());
     }
 
-    /// `volume-format-v2.md` §4.1 "Length" and item 124: a seal stating both
-    /// features keeps rules S1-S6 (full and short), the short one is no longer
-    /// than a full placeholder stating the same features, and the full one is
-    /// exactly that placeholder's length. A seal stating `short-seal` alone is
-    /// `, "spanning"` (12 bytes) shorter than a span tape's placeholder, so the
-    /// seal written at execute time must state the features File 0 states.
+    /// `build` states `requires = []` in File 0 and in the seal's
+    /// placeholder, whether or not a unit's block lists slices on other tapes
+    /// (D1; item 288: no `spanning` feature, no span key).
     #[test]
-    fn a_two_feature_seal_keeps_the_rules_and_fits_its_placeholder() {
-        use crate::volume::format::{parse_seal_marker, SealEnding};
-        let fi = "ef".repeat(32);
-        let m = 9;
-        let planned = (m + 1) as u64;
-        let copy = planned_seal_copy(m);
-        let placeholder = generate_seal_marker_requiring("SPAN1", m + 1, &fi, &copy, REQUIRES_SPAN);
-        let full = generate_seal_marker_requiring("SPAN1", m + 1, &fi, &copy, REQUIRES_SPAN);
-        assert_eq!(
-            full.len(),
-            placeholder.len(),
-            "the full seal is the placeholder's length"
-        );
-        assert_eq!(
-            full.matches("\nrequires = [\"short-seal\", \"spanning\"]\nfile_count = ")
-                .count(),
-            1,
-            "{full}"
-        );
-        let parsed = parse_seal_marker(&full).expect("a full span seal parses");
-        assert_eq!(parsed.check_parse_rules(), Ok(()));
-        assert_eq!(parsed.requires, vec!["short-seal", "spanning"]);
-        assert_eq!(parsed.refusal(), None);
-        assert_eq!(parsed.ending(planned), SealEnding::Full);
-
-        for k in 5..=m - 2 {
-            let short = generate_short_seal_marker_requiring(
-                "SPAN1",
-                k,
-                &fi,
-                &short_seal_copy(m, k),
-                REQUIRES_SPAN,
-            );
-            let p = parse_seal_marker(&short).unwrap_or_else(|e| panic!("K={k}: {e}"));
-            assert_eq!(p.check_parse_rules(), Ok(()), "K={k}");
-            assert_eq!(p.requires, vec!["short-seal", "spanning"], "K={k}");
-            assert_eq!(
-                p.ending(planned),
-                SealEnding::Short {
-                    ended_after: k as u64
-                }
-            );
-            assert!(short.len() <= placeholder.len(), "K={k}");
-            // Every byte but the requires line is the 1.6.0 short seal's (item
-            // 126), sealed_at aside.
-            let one = generate_short_seal_marker("SPAN1", k, &fi, &short_seal_copy(m, k));
-            let strip = |s: &str| {
-                s.lines()
-                    .filter(|l| !l.starts_with("sealed_at = ") && !l.starts_with("requires = "))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            assert_eq!(strip(&short), strip(&one), "K={k}");
-        }
-
-        let whole = generate_seal_marker("SPAN1", m + 1, &fi, &copy);
-        assert_eq!(
-            placeholder.len() - whole.len(),
-            ", \"spanning\"".len(),
-            "a seal stating short-seal alone does not fill a span tape's placeholder"
-        );
-    }
-
-    /// `build` states the tape's features in File 0 and in the seal's
-    /// placeholder from one fact (ADR-0012 item 124): `spanning` beside
-    /// `short-seal` when a unit's MANIFEST block may span, and `short-seal`
-    /// alone when none does.
-    #[test]
-    fn build_states_spanning_in_file_0_and_the_placeholder_only_for_a_span() {
+    fn build_states_requires_nothing_in_file_0_and_the_placeholder_span_or_not() {
         use crate::volume::build::{
             build, BuildInputs, BuildSlice, BuildUnit, SpanSlice, TenantInfo, UnitSpan,
         };
@@ -9063,6 +3276,7 @@ mod tests {
             let path = src.path().join(format!("slice-{id}"));
             std::fs::write(&path, bytes).unwrap();
             BuildSlice {
+                continues: false,
                 slice_id: id,
                 slice_number: number,
                 size_bytes: bytes.len() as i64,
@@ -9081,6 +3295,7 @@ mod tests {
             all.insert(
                 0,
                 SpanSlice {
+                    continues: false,
                     slice_id: 11,
                     slice_number: 1,
                     size_bytes: 9,
@@ -9090,6 +3305,7 @@ mod tests {
                 },
             );
             BuildInputs {
+                tables: None,
                 label: "SPANB1".into(),
                 volume_uuid: "550e8400-e29b-41d4-a716-4466554400c1".into(),
                 media_type: "LTO-6".into(),
@@ -9111,9 +3327,9 @@ mod tests {
                     unit_name: "unit-span".into(),
                     unit_uuid: "cccccccc-1111-4222-8333-444444444444".into(),
                     tenant_id: 1,
-                    dar_version: None,
-                    dar_command: None,
-                    catalog_path: None,
+                    tar_version: None,
+                    stream_bytes: 0,
+                    compression: None,
                     snapshot_version: 1,
                     slices: if span {
                         planned
@@ -9145,10 +3361,7 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         };
-        for (span, line) in [
-            (false, "requires = [\"short-seal\"]"),
-            (true, "requires = [\"short-seal\", \"spanning\"]"),
-        ] {
+        for (span, line) in [(false, "requires = []"), (true, "requires = []")] {
             let session = tempfile::tempdir().unwrap();
             let built = build(&inputs(span), session.path()).unwrap();
             let file0 = read_zone(&built, |k| matches!(k, ZoneKind::IdThunk));
@@ -9156,7 +3369,7 @@ mod tests {
             for (what, text) in [("File 0", &file0), ("the seal placeholder", &seal)] {
                 assert_eq!(text.matches("requires = ").count(), 1, "{what}: {text}");
                 assert_eq!(
-                    text.matches(&format!("\nlayout_version = 2\n{line}\n"))
+                    text.matches(&format!("\nlayout_version = 3\n{line}\n"))
                         .count(),
                     1,
                     "span {span}, {what}: {text}"
@@ -9197,7 +3410,7 @@ mod tests {
                          \x20             MACHINE-READABLE DATA (TOML)\n";
         assert_eq!(s.matches(paragraph).count(), 1, "{s}");
         assert_eq!(
-            s.matches("[index]\nvolume = \"ME01\"\nlayout_version = 2\nmay_end_early = true\n")
+            s.matches("[index]\nvolume = \"ME01\"\nlayout_version = 3\nmay_end_early = true\n")
                 .count(),
             1,
             "{s}"
@@ -9218,9 +3431,12 @@ mod tests {
                 uuid: "uuid-u".into(),
                 snapshot_version: 1,
                 stage_set_id: 1,
-                may_span: false,
-                dar_version: None,
-                dar_command: None,
+                payload: "tar".to_string(),
+                stream_bytes: 0,
+                file_table: None,
+                id_map: None,
+                tar_version: None,
+                compression: None,
                 slices: vec![],
             }],
         );
@@ -9230,719 +3446,6 @@ mod tests {
             "{m}"
         );
         assert!(crate::volume::manifest::Manifest::declares_may_end_early(&m).unwrap());
-    }
-
-    /// RECOVERY.md says where the tape ended, after the units table and
-    /// before the first unit's section (§1.7): the table is the plan, the
-    /// seal says where, the four lines that read it with the device caution,
-    /// the rule for a unit past it, and what RESTORE.sh does.
-    #[test]
-    fn recovery_md_says_where_the_tape_ended_between_the_table_and_the_first_unit() {
-        let units = vec![ManifestUnit {
-            name: "alpha".into(),
-            uuid: "11111111-aaaa".into(),
-            snapshot_version: 2,
-            stage_set_id: 7,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![ManifestSlice {
-                number: 1,
-                tape_position: Some(9),
-                size_bytes: 10,
-                encrypted_bytes: 30,
-                sha256_plain: "p".into(),
-                sha256_encrypted: "e".into(),
-            }],
-        }];
-        let r = generate_recovery_md("RE01", "alice", &units, &[]);
-        let table = r.find("| alpha | v2 | 1 | 9..9 |").expect("the table");
-        let section = r.find("## Where this tape ended").expect("the section");
-        let first_unit = r.find("## alpha").expect("the unit's section");
-        assert!(table < section && section < first_unit, "{r}");
-        let sec = &r[section..first_unit];
-        assert!(
-            sec.contains(
-                "```bash\n\
-                 mt -f /dev/nst0 setblk 524288\n\
-                 mt -f /dev/nst0 eod          # GNU mt: eom\n\
-                 mt -f /dev/nst0 bsfm 2\n\
-                 dd if=/dev/nst0 bs=512k | tr -d '\\0' | grep -E '^(file_count|ended_after) ='\n\
-                 ```\n"
-            ),
-            "{sec}"
-        );
-        let f = flat_text(sec);
-        for needle in [
-            "This tape may end before the last tape file the write planned, because the drive reached the end of its medium. The table above is the plan, written before any slice was.",
-            "The seal marker, the last file on the tape, says where it ended: its `ended_after` is the last tape file before the seal, and every tape file after `ended_after` is not on this tape.",
-            "`/dev/nst0` below is an example — run `ls -l /dev/tape/by-id/` and substitute your own drive",
-            "When the last tape file of a unit (the end of its \"Tape files\" above) is after `ended_after`, this tape does not hold the unit whole. Do not start reading its slices: it is restorable only from another tape.",
-            "The index (`index/units.tsv`, below) and `RESTORE.sh --where UNIT` name the tapes that hold it.",
-            "`--info` and `--verify` report where the tape ended.",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-    }
-
-    /// RECOVERY.md in an envelope that lists a unit that may span
-    /// (`volume-format-v2.md` §4.4, "File 1 and RECOVERY.md"; ADR-0012 item
-    /// 135): its row of the units table counts and spans only the slices this
-    /// tape plans; a section after "Where this tape ended" says which slices
-    /// of it this tape holds, that the others are on other tapes, that a
-    /// restore needs every slice in slice order matched by `sha256_encrypted`,
-    /// and that RESTORE.sh does it; and the unit's own steps name each slice on
-    /// another tape and never read one at tape file 0. An envelope with no such
-    /// block has no such section.
-    #[test]
-    fn recovery_md_names_a_range_and_never_reads_a_slice_at_file_0() {
-        let slice = |number: i64, tape_position: Option<i64>| ManifestSlice {
-            number,
-            tape_position,
-            size_bytes: 10,
-            encrypted_bytes: 30 + number,
-            sha256_plain: "p".into(),
-            sha256_encrypted: format!("e{number}").repeat(32),
-        };
-        let whole = ManifestUnit {
-            name: "alpha".into(),
-            uuid: "11111111-aaaa".into(),
-            snapshot_version: 1,
-            stage_set_id: 7,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![slice(1, Some(10)), slice(2, Some(11))],
-        };
-        let big = ManifestUnit {
-            name: "big".into(),
-            uuid: "88888888-9999".into(),
-            snapshot_version: 2,
-            stage_set_id: 8,
-            may_span: true,
-            slices: vec![
-                slice(1, None),
-                slice(2, None),
-                slice(3, Some(12)),
-                slice(4, Some(13)),
-            ],
-            ..whole.clone()
-        };
-        let r = generate_recovery_md("SPR1", "alice", &[whole.clone(), big.clone()], &[]);
-        assert!(r.contains("| alpha | v1 | 2 | 10..11 |\n"), "{r}");
-        assert!(r.contains("| big | v2 | 2 of 4 | 12..13 |\n"), "{r}");
-        let end = r.find("## Where this tape ended").expect("the end section");
-        let span = r.find("## A unit across tapes").expect("the span section");
-        let first_unit = r.find("## alpha").expect("the first unit's section");
-        assert!(end < span && span < first_unit, "{r}");
-        let sec = &r[span..first_unit];
-        assert!(
-            sec.contains("| big | v2 | 3 to 4 | 12..13 | 4 |\n"),
-            "{sec}"
-        );
-        assert!(!sec.contains("| alpha |"), "{sec}");
-        let f = flat_text(sec);
-        for needle in [
-            "These units may run across tapes (their blocks in MANIFEST.toml state `may_span = true`). Each block lists every slice of the unit, and this tape's plan holds the slices given a tape position",
-            "The slices with no tape position, and any after the seal marker's `ended_after` (\"Where this tape ended\", above), are on other tapes.",
-            "A restore needs every slice, 1 to the last, in slice order, from the tapes that hold them: take each from a tape whose front index (File 3) lists the slice's `sha256_encrypted`",
-            "`RESTORE.sh` (tape file 2) does it: run it with `--restore --unit UNIT` on the tape that holds slice 1",
-            "The unit's section below gives the steps for the slices this tape holds.",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-
-        let unit_sec = &r[r.find("## big").expect("big's section")..];
-        let unit_sec = &unit_sec[..unit_sec.find("\n## ").unwrap_or(unit_sec.len())];
-        for n in [1, 2] {
-            assert!(
-                unit_sec.contains(&format!(
-                    "# Slice {n} — on another tape (no tape position here): {} bytes,\n# sha256_encrypted {}\n",
-                    30 + n,
-                    format!("e{n}").repeat(32)
-                )),
-                "{unit_sec}"
-            );
-            assert!(
-                !unit_sec.contains(&format!("restore.{n}.dar.age\n")),
-                "{unit_sec}"
-            );
-        }
-        assert!(!unit_sec.contains("tape file 0"), "{unit_sec}");
-        assert!(!unit_sec.contains("fsf 0"), "{unit_sec}");
-        assert!(
-            unit_sec.contains("# Slice 3 — tape file 12, 33 bytes\nmt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 12\n"),
-            "{unit_sec}"
-        );
-        assert!(
-            unit_sec.contains("# Slice 4 — tape file 13, 34 bytes\ndd if="),
-            "{unit_sec}"
-        );
-        assert!(
-            unit_sec.contains(
-                "# This unit may run across tapes: run dar only once every slice, 1 to the\n"
-            ),
-            "{unit_sec}"
-        );
-
-        let plain = generate_recovery_md("SPR1", "alice", &[whole], &[]);
-        assert!(!plain.contains("across tapes"), "{plain}");
-    }
-
-    /// The fresh read of File 1 for a span (#478, S2): `--find-envelope`'s
-    /// table marks a unit this tape's plan holds only part of, by the slices
-    /// its block gives a tape position, against the block's N, so the heir
-    /// does not count two halves as two copies. A whole block is unmarked, and
-    /// a unit in two versions is marked for the version held in part only.
-    /// Slices and bytes still count every slice the blocks list. Every awk on
-    /// the host agrees.
-    #[test]
-    fn units_table_marks_a_version_this_tapes_plan_holds_only_part_of() {
-        let slice = |number: i64, tape_position: Option<i64>| ManifestSlice {
-            number,
-            tape_position,
-            size_bytes: 10,
-            encrypted_bytes: 30 + number,
-            sha256_plain: "p".into(),
-            sha256_encrypted: format!("e{number}").repeat(32),
-        };
-        let whole = ManifestUnit {
-            name: "alpha".into(),
-            uuid: "11111111-aaaa".into(),
-            snapshot_version: 1,
-            stage_set_id: 7,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![slice(1, Some(10)), slice(2, Some(11))],
-        };
-        let big_v1 = ManifestUnit {
-            name: "big".into(),
-            uuid: "88888888-9999".into(),
-            snapshot_version: 1,
-            stage_set_id: 8,
-            may_span: true,
-            slices: vec![slice(1, Some(12))],
-            ..whole.clone()
-        };
-        let big_v2 = ManifestUnit {
-            snapshot_version: 2,
-            stage_set_id: 9,
-            slices: vec![
-                slice(1, None),
-                slice(2, None),
-                slice(3, Some(13)),
-                slice(4, Some(14)),
-            ],
-            ..big_v1.clone()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let m = dir.path().join("MANIFEST.toml");
-        std::fs::write(
-            &m,
-            generate_manifest_toml("SPR2", "alice", &[whole, big_v1, big_v2]),
-        )
-        .unwrap();
-        let (code, out) = run_awk(false, AWK_UNITS_TABLE, &m, &[]);
-        assert_eq!(code, 0, "{out}");
-        assert_eq!(
-            out,
-            "alpha|1|2|63|\nbig|1,2|5|161|version 2, slices 3 to 4 of 4\n"
-        );
-        let script = generate_restore_script_v2("SPR2", 20);
-        assert_eq!(
-            script
-                .matches("printf \"    %-32s  %-10s  %6s  %10s  PART: %s\\n\"")
-                .count(),
-            1,
-            "the row of a unit held in part names the run"
-        );
-        assert_eq!(
-            script
-                .matches("PART: a unit held across tapes, of which this tape's plan holds only the slices named")
-                .count(),
-            1,
-            "and the table says what the mark means"
-        );
-    }
-
-    /// File 1 says the same for the heir (§1.7): what `requires =
-    /// ["short-seal"]` means (the glossary no longer says the list is empty),
-    /// that the seal's `ended_after` says where the tape ended, the four
-    /// lines, that a unit past it is not on this tape whole and where to look,
-    /// and that RESTORE.sh prints NOT ON TAPE. The manual steps check it.
-    #[test]
-    fn file_1_says_where_the_tape_ended_and_how_to_read_the_seal() {
-        let g = generate_system_guide_v2_for_media("SS02", 20, "LTO-6");
-        let words = flat_text(guide_section(&g, "Words this guide uses"));
-        assert!(
-            words.contains(
-                "A tape written by tapectl 1.6.0 or later states `requires = [\"short-seal\"]`"
-            ),
-            "{words}"
-        );
-        assert!(!words.contains("on the tapes written so far"), "{words}");
-        let sec = guide_section(&g, "Where the tape ended");
-        assert!(
-            sec.contains(
-                "    mt -f /dev/nst0 setblk 524288\n\
-                 \x20   mt -f /dev/nst0 eod          # GNU mt: eom\n\
-                 \x20   mt -f /dev/nst0 bsfm 2\n\
-                 \x20   dd if=/dev/nst0 bs=512k | tr -d '\\0' | grep -E '^(file_count|ended_after) ='\n"
-            ),
-            "{sec}"
-        );
-        let f = flat_text(sec);
-        for needle in [
-            "only the seal marker, the last file on the tape, says where the tape really ended",
-            "Its `ended_after` is the last tape file before the seal marker, and its `file_count` is `ended_after` plus 2",
-            "Every tape file the front index lists after `ended_after` is not on this tape",
-            "is not on this tape whole: do not start reading its slices",
-            "`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key`",
-            "`--info` and `--verify` print one `NOT ON TAPE` line for the planned files after `ended_after`, naming the first and the last of them, which is not a failure",
-            "NOT ON TAPE files 12 to 15 (planned; the tape ended after file 11, and its seal marker is file 12)",
-            "`--restore` refuses a unit the end of the tape cut, by name",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains("check first that the `tape_position` of the unit's last slice is at or before the seal marker's `ended_after`"),
-            "{manual}"
-        );
-        assert!(
-            manual.contains("the seal marker's `ended_after` is the last file before it, and every entry of the front index after that is not on the tape"),
-            "{manual}"
-        );
-        // Every section the new text names is a heading of the guide.
-        assert!(g.contains("\n## Which device?\n"), "{g}");
-        assert!(g.contains("\n## The rest of the box"), "{g}");
-    }
-
-    /// ADR-0012 item 135 (`volume-format-v2.md` §4.4, "File 1 and
-    /// RECOVERY.md"): File 1's glossary entry for `requires` names both
-    /// features, the glossary says what a range is, and a section on a unit
-    /// across tapes says what one tape shows, that a restore needs every slice
-    /// 1 to N in slice order, that it starts from the tape holding slice 1,
-    /// which `--where` on the newest tape names, that a tape is accepted by
-    /// hash, that RESTORE.sh asks for the next cartridge, and what each of its
-    /// two modes needs. On every tape 1.7.0 writes.
-    #[test]
-    fn file_1_says_what_a_unit_across_tapes_is_and_how_it_restores() {
-        let g = generate_system_guide_v2_for_media("SP02", 20, "LTO-6");
-        let words = flat_text(guide_section(&g, "Words this guide uses"));
-        for needle in [
-            "A tape written by tapectl 1.7.0 or later that holds a slice of a unit allowed to run across tapes states `requires = [\"short-seal\", \"spanning\"]`: some slices of that unit may be on other tapes (\"A unit across tapes\").",
-            "a tape then holds a **range** of it, one unbroken run of its slices in order",
-        ] {
-            assert!(words.contains(needle), "{needle:?}: {words}");
-        }
-        let sec = flat_text(guide_section(&g, "A unit across tapes"));
-        for needle in [
-            "A tape that holds only some of them holds a RANGE: one unbroken run of the unit's slices, in slice order.",
-            "states `requires = [\"short-seal\", \"spanning\"]` in File 0 and its seal marker",
-            "A range is not damage, and it is not a copy of the unit on its own.",
-            "lists EVERY slice of the unit, 1 to N, each with its `encrypted_bytes` and its `sha256_encrypted`, and gives a `tape_position` only to the slices this tape's plan holds",
-            "A slice with no `tape_position` is on another tape: it is never at tape file 0.",
-            "`--info` and `--verify` need no key and see the range as data slices like any other.",
-            "`--list` says which slices of the unit this tape holds.",
-            "What a restore needs: every slice, 1 to N, in slice order, from the tapes that hold them. dar never runs over one tape's slices alone.",
-            "Start from the tape that holds slice 1: `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` on the NEWEST tape names the tapes and the slices each holds",
-            "it names the slice it needs next and the tapes an index names for it, and waits for you to load another cartridge and press ENTER",
-            "It takes a cartridge only when that tape's front index lists the next slice's `sha256_encrypted`, at a position its own seal marker covers",
-            "so that disk needs room for the whole unit's encrypted slices (the sum of their `encrypted_bytes`) besides the restored files",
-            "when the room is not there it refuses and names `--stream-tapes`",
-            "`--stream-tapes` keeps no slice on disk: it feeds dar from each tape in turn, so it needs every cartridge at hand",
-            // What L2 built (ADR-0012 item 132, the coordinator's prompt ruling).
-            "Either way it waits at each change of cartridge for as long as you take, reading your answer from its input, and `quit` stops it.",
-            "A slice that fails its hash or will not read is asked for again, by default, from another cartridge that holds it; with `--stream-tapes` it ends the run.",
-            // The fresh read's m2 (#478): the exit trap removes it on Ctrl-C, a
-            // hangup or kill; only a run with no chance to clean up leaves it.
-            "Only a run that had no chance to clean up (`kill -9`, a crash, a power cut) leaves its scratch directory inside `--to` (or `--scratch DIR`), named `.tapectl-restore.` and some letters and holding encrypted slices only: remove it by hand",
-            "A dar older than 2.7.9 (or than 2.7.21, when the envelope holds no dar catalogue of the unit) cannot read slices this way, and RESTORE.sh says so before it reads one.",
-            "`--restore --unit UNIT --path PATH` reads across tapes too, and needs only the slices that hold the path and the last one.",
-            "It can start on any tape of the unit that your key opens: it takes the slices that tape holds first, then asks for each further cartridge in slice order, taken by hash in the same way.",
-            "They wait, still encrypted, in the scratch directory until all are read, and only then are they decrypted for dar.",
-        ] {
-            assert!(sec.contains(needle), "{needle:?}: {sec}");
-        }
-        let end = flat_text(guide_section(&g, "Where the tape ended"));
-        assert!(
-            end.contains(
-                "with a slice at or before `ended_after` is not cut: this tape holds a range of it"
-            ),
-            "{end}"
-        );
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains("A block that states `may_span = true` is a unit across tapes: a slice with no `tape_position` is on another tape"),
-            "{manual}"
-        );
-        // The guide is the same on every tape 1.7.0 writes, a span tape or not.
-        assert_eq!(g, generate_system_guide_v2_for_media("SP02", 20, "LTO-6"));
-    }
-
-    /// The fresh read of File 1 for a span (#478; ADR-0012 items 108 and
-    /// 135), S2: the stock-taking rule counted two tapes that each hold part
-    /// of a unit as two copies. A tape counts as a copy only when it holds the
-    /// version whole; `--list --unit` and `--where` tell, and the table of
-    /// `--find-envelope` marks a unit held in part from the plan alone.
-    #[test]
-    fn fresh_read_478_s2_two_halves_are_one_copy() {
-        let g = generate_system_guide_v2_for_media("FR01", 20, "LTO-6");
-        let bx = box_section(&g);
-        for needle in [
-            "A unit that appears at the same version AND with the same unit uuid on two tapes has two copies only when each of the two tapes holds that version WHOLE: then they are the same content, and either restores it alone.",
-            "A tape that holds only part of a unit across tapes (\"A unit across tapes\") is not a copy: two tapes that each hold part of a unit are ONE copy, and restore it only together.",
-            "run `./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT` on the tape: it says \"HELD ACROSS TAPES\" when the tape holds only part of that version, and `--where UNIT` marks such a tape \"a range\".",
-            "The table of `--find-envelope` marks such a unit `PART:` from the tape's plan alone; a tape that ended early (\"Where the tape ended\") can hold less than its plan, and `--list` and `--where` know it.",
-        ] {
-            assert!(bx.contains(needle), "{needle:?}: {bx}");
-        }
-        // The words it sends the heir to look for are the script's own.
-        let script = generate_restore_script_v2("FR01", 20);
-        for said in [
-            "    HELD ACROSS TAPES: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of this version's $PICKED_COUNT",
-            ", a range: not the whole version",
-            "  PART: %s\\n\"",
-        ] {
-            assert!(script.contains(said), "{said:?}");
-        }
-    }
-
-    /// The fresh read, S3: File 1 promised that with no other copy of a bad
-    /// slice RESTORE.sh restores the files wholly inside the good ones
-    /// (`--swap-tapes`, then `done`). For a unit across tapes it refuses
-    /// `--swap-tapes` and restores nothing without every slice. Both places
-    /// say so, and "No other copy" gives the routes that do exist; no partial
-    /// restore across tapes is built.
-    #[test]
-    fn fresh_read_478_s3_no_partial_restore_across_tapes_and_the_routes_that_exist() {
-        let g = generate_system_guide_v2_for_media("FR02", 20, "LTO-6");
-        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
-        assert!(
-            verdict.contains("The files in the failed slices are lost. Not so for a unit across tapes when no tape you hold has that version whole (\"A unit across tapes\"): RESTORE.sh refuses `--swap-tapes` for it, `done` at its prompt stops the restore, and it restores nothing of the unit without every slice. \"No other copy\" names the ways that do work for it."),
-            "{verdict}"
-        );
-        let f = flat_text(guide_section(&g, "If a slice or a file is damaged"));
-        for needle in [
-            "Not for a unit across tapes when no tape you hold has that version whole (\"A unit across tapes\"): RESTORE.sh takes no `--swap-tapes` or `--slices-from` for it, and `done` at its prompt stops the restore with nothing of the unit restored. What does work for such a unit:",
-            "- `--restore --unit UNIT --path PATH` restores a folder or a file whose slices all avoid the failed one. It reads only the slices that hold the path, and the last slice, which must therefore be good;",
-            "- tapectl's own restore reads a unit across tapes, asking for each cartridge, and reads around a damaged 64 KiB piece of a slice, losing only the files in that piece (\"tapectl itself\").",
-            "- By hand, as below: step 7 of \"Manual Recovery Steps\" reads each tape's slices of the unit into the one directory, matched by their `sha256_encrypted`, and the failed slice is left out.",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        // What the text describes is what the script does.
-        let script = generate_restore_script_v2("FR02", 20);
-        for does in [
-            "--slices-from or --swap-tapes. Run the same command without them.",
-            "restored only with every slice, so nothing of it was restored, and the encrypted slices read so",
-        ] {
-            assert!(script.contains(does), "{does:?}");
-        }
-    }
-
-    /// The fresh read, m1: at the prompt of a restore across tapes `done` is
-    /// `quit` (swap_loop calls span_stop for both), and the exit trap removes
-    /// the scratch with the slices read. File 1 taught `done` as "go on
-    /// without"; the prompt, the help and File 1 now say that it stops.
-    #[test]
-    fn fresh_read_478_m1_done_at_the_cross_tape_prompt_stops_the_restore() {
-        let g = generate_system_guide_v2_for_media("FR03", 20, "LTO-6");
-        let sec = flat_text(guide_section(&g, "A unit across tapes"));
-        assert!(
-            sec.contains("and `quit` stops it. So does `done`: here it does not go on without the slice, as it does after `--swap-tapes` (\"If a slice or a file is damaged\"); either one ends the restore and discards the slices read so far (with `--stream-tapes`, the files dar has written are only part of the unit)."),
-            "{sec}"
-        );
-        let script = generate_restore_script_v2("FR03", 20);
-        for said in [
-            "    info \"done or quit STOPS this restore: it does not go on without the slice, and the files dar has\"\n    info \"written so far are only part of the unit.\"\n",
-            "    info \"done or quit STOPS this restore and discards the slices read so far, with the scratch directory:\"\n    info \"it does not go on without the slice.\"\n",
-            "says why and asks again; done or quit stops it.",
-            // What it describes: both words reach span_stop.
-            "    [dD]one | DONE | q | quit)\n      [ -z \"$SPAN_NEED\" ] || span_stop\n",
-        ] {
-            assert_eq!(script.matches(said).count(), 1, "{said:?}");
-        }
-    }
-
-    /// The fresh read, m10: neither prompt for another cartridge said to
-    /// eject the one in the drive. Both now say it first, with the drive's
-    /// button or `mt offline` from another terminal, which is safe because
-    /// no tape device is open while a prompt waits.
-    #[test]
-    fn fresh_read_478_m10_each_cartridge_prompt_says_to_eject_first() {
-        let script = generate_restore_script_v2("FR04", 20);
-        for said in [
-            "eject_first() {\n  info \"First eject the cartridge now in the drive: its eject button, or mt -f $DEVICE offline in another\"\n  info \"terminal, which is safe while this waits (no tape device is held open).\"\n}\n",
-            "  eject_first\n  info \"Load the cartridge that holds slice $SPAN_NEED into $DEVICE,",
-            "      eject_first\n      info \"Load a cartridge that holds copies of these slices into $DEVICE",
-        ] {
-            assert_eq!(script.matches(said).count(), 1, "{said:?}");
-        }
-        assert_eq!(script.matches("eject_first").count(), 3);
-    }
-
-    /// The fresh read, m2: "a run that is killed leaves its scratch
-    /// directory" was wrong for Ctrl-C and a closed terminal. The exit trap
-    /// (cleanup) runs on SIGINT, SIGHUP and SIGTERM and removes SCRATCH with
-    /// every slice read; only SIGKILL, a crash or a power cut leaves it. File
-    /// 1, the help and the run's own note say which exits leave it, and
-    /// advise screen or tmux.
-    #[test]
-    fn fresh_read_478_m2_which_exits_leave_the_scratch_and_screen_or_tmux() {
-        let g = generate_system_guide_v2_for_media("FR05", 20, "LTO-6");
-        let sec = flat_text(guide_section(&g, "A unit across tapes"));
-        for needle in [
-            "Ctrl-C, a closed terminal or a lost connection to the computer, and `kill` end the run too, and REMOVE its scratch directory with every slice read so far",
-            "so run it inside `screen` or `tmux`, where a closed window or a lost connection does not end it.",
-            "remove it by hand before you run the restore again, which starts from the beginning.",
-        ] {
-            assert!(sec.contains(needle), "{needle:?}: {sec}");
-        }
-        assert!(!sec.contains("A run that is killed leaves"), "{sec}");
-        let script = generate_restore_script_v2("FR05", 20);
-        for said in [
-            "cleanup() {",
-            "  [ -z \"$SCRATCH\" ] || rm -rf \"$SCRATCH\"\n}\ntrap cleanup EXIT\n",
-            "this run and removes that directory with the slices read: run it in screen or tmux. A run",
-            "stopped with no chance to clean up (kill -9, a crash) leaves that directory: remove it by hand",
-            "kill ends the run and removes that directory with the slices read, so run it in screen or",
-            "tmux; only kill -9 or a crash leaves it, to remove by hand.",
-        ] {
-            assert!(script.contains(said), "{said:?}");
-        }
-        assert!(!script.contains("If this run is killed, that directory stays"));
-        assert!(!script.contains("a run that is killed\""));
-    }
-
-    /// The fresh read, m3: Disk space and the help listed the restores that
-    /// keep slices on disk, but not the default restore across tapes, which
-    /// keeps every slice of the unit, still encrypted, in scratch.
-    #[test]
-    fn fresh_read_478_m3_disk_space_counts_a_unit_across_tapes() {
-        let g = generate_system_guide_v2_for_media("FR06", 20, "LTO-6");
-        let disk = flat_text(guide_section(&g, "Disk space"));
-        assert!(
-            disk.contains("and asking for a replacement slice (`--slices-from`, `--swap-tapes`: \"If a slice or a file is damaged\"); and a unit across tapes, by default: all of its slices, still encrypted, about the unit's size again beside its restored files (the sum of its slices' `encrypted_bytes`; `--stream-tapes` keeps none on disk: \"A unit across tapes\")."),
-            "{disk}"
-        );
-        let script = generate_restore_script_v2("FR06", 20);
-        assert_eq!(
-            script
-                .matches("  echo \"      A unit across tapes (by default) keeps all of its slices there too, still\"\n  echo \"      encrypted: about the unit's size again, beside the restored files\"\n  echo \"      (--stream-tapes keeps none on disk).\"\n")
-                .count(),
-            1
-        );
-    }
-
-    /// The fresh read, m7: Tools Required said an older dar restores by
-    /// decrypting the slices to disk first, but a unit across tapes is refused
-    /// with such a dar (restore_across_tapes): it says so there.
-    #[test]
-    fn fresh_read_478_m7_an_older_dar_cannot_restore_a_unit_across_tapes() {
-        let g = generate_system_guide_v2_for_media("FR07", 20, "LTO-6");
-        let tools = flat_text(guide_section(&g, "Tools Required"));
-        assert!(
-            tools.contains("A unit across tapes is the exception: it is fed to dar only through pipes (only its encrypted slices are ever kept on disk), so it needs dar 2.7.9 or later with the unit's dar catalogue, or 2.7.21 or later, and with an older dar RESTORE.sh refuses it before it reads a slice (\"A unit across tapes\")."),
-            "{tools}"
-        );
-        let script = generate_restore_script_v2("FR07", 20);
-        assert!(script.contains(
-            "  if ! { [ -n \"$cat\" ] && dar_at_least 2.7.9; } && ! dar_at_least 2.7.21; then\n"
-        ));
-    }
-
-    /// The fresh read, m6: "RESTORE.sh does not need the seal" is true of the
-    /// tape a restore starts on only. Every later cartridge and every
-    /// `--swap-tapes` source is refused without a readable seal (R5, R8;
-    /// sealed_other), and the guide gives the manual route for such a tape.
-    #[test]
-    fn fresh_read_478_m6_a_later_cartridge_needs_its_seal() {
-        let g = generate_system_guide_v2_for_media("FR08", 20, "LTO-6");
-        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
-        for needle in [
-            "RESTORE.sh does not need the seal, and checks every slice again as it restores. That holds for the tape in the drive when the restore starts.",
-            "Every LATER cartridge, of a unit across tapes, and every cartridge `--swap-tapes` reads for a replacement slice, is refused without a readable seal marker: a slice is taken from another tape only at a position its own seal says that tape holds (\"A unit across tapes\").",
-            "With such a tape as a later part of a unit across tapes, read its slices by hand (step 7 of \"Manual Recovery Steps\"), each checked against the `sha256_encrypted` the manifest gives, into one directory with the other tapes' slices of the unit, and run dar there once every slice is in it.",
-            "For a slice of a whole unit, copy it off with `dd` and give it to `--slices-from DIR` (\"If a slice or a file is damaged\"), which matches by sha256 alone.",
-        ] {
-            assert!(verdict.contains(needle), "{needle:?}: {verdict}");
-        }
-        let script = generate_restore_script_v2("FR08", 20);
-        assert!(script.contains(
-            "sealed_other() {\n  [ -z \"$OTHER_END\" ] || return 0\n  info \"Its seal marker cannot be read, so nothing is taken from it:"
-        ));
-    }
-
-    /// The fresh read, m8: a fill takes files only from a tape that holds the
-    /// version whole (ADR-0012 item 143; a range is never a fill source), and
-    /// File 1, the script's note after a damaged restore and the help now say
-    /// so where they send the heir to another tape.
-    #[test]
-    fn fresh_read_478_m8_a_fill_needs_a_tape_that_holds_the_version_whole() {
-        let g = generate_system_guide_v2_for_media("FR09", 20, "LTO-6");
-        let f = flat_text(guide_section(&g, "If a slice or a file is damaged"));
-        assert!(
-            f.contains("Load a tape that holds the same unit at the same version WHOLE (a tape that holds only part of a unit across tapes is refused: \"A unit across tapes\") and run ITS RESTORE.sh, with the list and `--to` of that same unit directory:"),
-            "{f}"
-        );
-        let script = generate_restore_script_v2("FR09", 20);
-        for said in [
-            "  echo \"  A tape that does not hold this unit at this version is refused: no other version is used.\"\n  echo \"  It must hold this version WHOLE: a tape that holds only part of a unit held across tapes is\"\n  echo \"  refused too (--list --unit on that tape says which it is).\"\n",
-            "  echo \"      it, or in --to/UNIT). The tape must hold that version WHOLE: one that holds only part\"\n  echo \"      of a unit held across tapes is refused.\"\n",
-            // What it describes (do_fill).
-            "A fill takes files only from a tape that holds the version whole, and a range is never",
-        ] {
-            assert_eq!(script.matches(said).count(), 1, "{said:?}");
-        }
-    }
-
-    /// The fresh read, m4: "Run THAT tape's RESTORE.sh with `--restore --unit
-    /// UNIT`" lacked `--key` and `--to`, which the script requires; and Start
-    /// here never mentioned a unit across tapes.
-    #[test]
-    fn fresh_read_478_m4_the_full_command_and_a_line_in_start_here() {
-        let g = generate_system_guide_v2_for_media("FR10", 20, "LTO-6");
-        let sec = guide_section(&g, "A unit across tapes");
-        assert!(
-            sec.contains("\n    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to /destination/UNIT\n"),
-            "{sec}"
-        );
-        let f = flat_text(sec);
-        assert!(
-            f.contains("Load the tape that holds slice 1 and run THAT tape's RESTORE.sh (saved as `RESTORE-<label>.sh`, as for any tape):"),
-            "{f}"
-        );
-        assert!(!f.contains("with `--restore --unit UNIT`."), "{f}");
-        let start = flat_text(guide_section(&g, "Start here"));
-        assert!(
-            start.contains("A unit across tapes (`--where` shows a tape holding a range of it) restores from a tape that holds it whole, or from the tape that holds its slice 1, which asks for the others: \"A unit across tapes\"."),
-            "{start}"
-        );
-    }
-
-    /// The fresh read, m5: nothing told the heir to write down the holders
-    /// and their slices before a restore across tapes, though the first tape
-    /// cannot name the rest and the prompt sends the heir to `--where` on the
-    /// newest tape, a swap in the middle of the restore with one drive.
-    #[test]
-    fn fresh_read_478_m5_write_down_the_holders_before_you_start() {
-        let g = generate_system_guide_v2_for_media("FR11", 20, "LTO-6");
-        let f = flat_text(guide_section(&g, "A unit across tapes"));
-        assert!(
-            f.contains("Before you start, write down every tape it names and the slices each holds: the restore asks for the next slice by number, the tape then in the drive can name only tapes written before it, and to run `--where` on the newest tape again you would have to change cartridges in the middle of the restore."),
-            "{f}"
-        );
-    }
-
-    /// The fresh read, m9: nothing said to prefer a whole copy, and a whole
-    /// copy from another staging run is refused by hash at a swap prompt
-    /// (R8) though `--where` names it, yet restores alone.
-    #[test]
-    fn fresh_read_478_m9_prefer_a_whole_copy() {
-        let g = generate_system_guide_v2_for_media("FR12", 20, "LTO-6");
-        let f = flat_text(guide_section(&g, "A unit across tapes"));
-        for needle in [
-            "Prefer a whole copy: if any tape holds the version whole (`--where` prints no \"a range\" beside it), restore from that tape alone, as any unit, with no change of cartridge and no scratch.",
-            "A whole copy written from another staging run of the same version has slices of other sha256 values: the prompt below refuses it by hash, though `--where` names it, and it still restores alone.",
-            "If none does, read the version across tapes. Start from the tape that holds slice 1:",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-    }
-
-    /// The fresh read's findings, in RECOVERY.md (in every envelope) as in
-    /// File 1 (#478, the coordinator's follow-up): its damage section said a
-    /// copy holds the same slices byte for byte (only within one staging
-    /// run), offered `--slices-from` and `--swap-tapes` with no exception for
-    /// a unit held across tapes (refused by restore_across_tapes and
-    /// die_range_path), and sent a fill to any tape of the same version (a
-    /// range is never a fill source, item 143). The first and the last are
-    /// in every envelope; the paragraph on a unit held across tapes only in
-    /// one that lists a block stating `may_span = true`, as the section on a
-    /// unit across tapes is. RESTORE.sh embeds none of it.
-    #[test]
-    fn fresh_read_478_recovery_md_damage_section_says_staging_run_span_and_whole() {
-        let slice = |number: i64, tape_position: Option<i64>| ManifestSlice {
-            number,
-            tape_position,
-            size_bytes: 10,
-            encrypted_bytes: 30 + number,
-            sha256_plain: "p".into(),
-            sha256_encrypted: format!("e{number}").repeat(32),
-        };
-        let whole = ManifestUnit {
-            name: "alpha".into(),
-            uuid: "11111111-aaaa".into(),
-            snapshot_version: 1,
-            stage_set_id: 7,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![slice(1, Some(10))],
-        };
-        let big = ManifestUnit {
-            name: "big".into(),
-            uuid: "88888888-9999".into(),
-            stage_set_id: 8,
-            may_span: true,
-            slices: vec![slice(1, None), slice(2, Some(11))],
-            ..whole.clone()
-        };
-        let plain = generate_recovery_md("RM01", "alice", std::slice::from_ref(&whole), &[]);
-        let span = generate_recovery_md("RM01", "alice", &[whole, big], &[]);
-        // In every envelope: 1, byte for byte only within one staging run;
-        // 3, a fill only from a tape that holds the version whole.
-        for r in [&plain, &span] {
-            let sec = flat_text(guide_section(r, "If a slice or a file is damaged"));
-            for needle in [
-                "Another tape that holds this unit at the same version holds the same slices, byte for byte, when both tapes were written from one staging run of it: its front index (File 3) lists the same `sha256_encrypted` for each",
-                "A tape written from another staging run of the same version holds the same files but other ciphertext: its slices have other `sha256_encrypted` values, so none of them is ever taken for a slice of this tape (it is refused by hash), but a tape that holds the version whole that way restores it alone, with its own `RESTORE.sh`.",
-                "Load a tape that holds the same unit at the same version WHOLE (a tape that holds only some of its slices is refused) and run that tape's own `RESTORE.sh`",
-            ] {
-                assert!(sec.contains(needle), "{needle:?}: {sec}");
-            }
-            assert!(
-                !sec.contains("holds the same slices, byte for byte: its front index"),
-                "{sec}"
-            );
-        }
-        // 2, in an envelope that lists a unit that may span: no --slices-from
-        // or --swap-tapes across tapes, and the routes that work. An envelope
-        // with no such block says nothing of tapes held in part, as before.
-        let sec = flat_text(guide_section(&span, "If a slice or a file is damaged"));
-        for needle in [
-            "Neither applies to a unit held across tapes that this tape holds only part of (its block in MANIFEST.toml states `may_span = true` and gives some slices no tape position): `RESTORE.sh` refuses `--slices-from` and `--swap-tapes` for it.",
-            "Its restore across tapes asks for the next tape at a prompt, and asks there again for a slice that fails, from another cartridge that holds it (with `--stream-tapes`, a slice that fails ends the run).",
-            "With no good copy of that slice anywhere, `RESTORE.sh` restores nothing of the unit, and `done` at the prompt stops the restore.",
-            "What does work then: `--restore --unit UNIT --path PATH` for a folder or a file whose slices all avoid the failed one (it reads only the slices that hold the path, and the last slice, which must therefore be good); tapectl's own restore, which reads a unit across tapes and reads around a damaged 64 KiB piece of a slice (File 1, \"tapectl itself\"); and the steps above by hand, for each tape's slices of the unit, all into one directory, with the failed slice left out as below.",
-        ] {
-            assert!(sec.contains(needle), "{needle:?}: {sec}");
-        }
-        // It sits between the replacement-slice commands and "With no other copy".
-        let cmds = span.find("--swap-tapes --to /destination/UNIT\n```\n\nNeither applies");
-        let rest =
-            span.find("left out as below.\n\nWith no other copy, leave the failed slice out");
-        assert!(cmds.is_some() && rest.is_some(), "{span}");
-        assert!(!plain.contains("Neither applies"), "{plain}");
-        assert!(
-            plain.contains("--swap-tapes --to /destination/UNIT\n```\n\nWith no other copy, leave the failed slice out"),
-            "{plain}"
-        );
-        // File 1 names the section the text points to.
-        let g = generate_system_guide_v2_for_media("RM01", 20, "LTO-6");
-        assert!(g.contains("\n## tapectl itself\n"));
-        // What the text describes is what the script does.
-        let script = generate_restore_script_v2("RM01", 20);
-        for does in [
-            "--slices-from or --swap-tapes. Run the same command without them.",
-            "A fill takes files only from a tape that holds the version whole, and a range is never",
-        ] {
-            assert!(script.contains(does), "{does:?}");
-        }
-        assert!(!script.contains("when both tapes were written from one staging run"));
     }
 
     /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query
@@ -9977,17 +3480,16 @@ mod tests {
                       (3, 1, 3, 10, 20, 'p3', 'e3'), (4, 1, 4, 10, 20, 'p4', 'e4');
              INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
                VALUES (1, 'V1', 'lto', 'p', 1000, 'sealed'), (2, 'V2', 'lto', 'p', 1000, 'sealed'),
-                      (3, 'V3', 'lto', 'p', 1000, 'sealed'), (4, 'V4', 'lto', 'p', 1000, 'sealed');
-             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, may_span)
-               VALUES (1, 1, 1, 1, 'range', 1), (2, 1, 1, 2, 'completed', 1),
-                      (3, 1, 1, 3, 'range', 1), (4, 1, 1, 4, 'cut', 1);
+                      (3, 'V3', 'lto', 'p', 1000, 'sealed');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status)
+               VALUES (1, 1, 1, 1, 'range'), (2, 1, 1, 2, 'completed'),
+                      (3, 1, 1, 3, 'range');
              INSERT INTO write_positions (write_id, stage_slice_id, position, status)
                VALUES (1, 1, '10', 'written'), (1, 2, '11', 'written'),
                       (1, 3, '12', 'pending'), (1, 4, '13', 'pending'),
                       (2, 1, '8', 'written'), (2, 2, '9', 'written'),
                       (2, 3, '10', 'written'), (2, 4, '11', 'written'),
-                      (3, 3, '4', 'written'), (3, 4, '5', 'written'),
-                      (4, 1, '20', 'pending');",
+                      (3, 3, '4', 'written'), (3, 4, '5', 'written');",
         )
         .unwrap();
         let mut stmt = conn.prepare(sql).expect("the query runs on this schema");
@@ -10032,26 +3534,6 @@ mod tests {
         );
     }
 
-    /// RESTORE.sh knows `short-seal` and `spanning` (`volume-format-v2.md`
-    /// §1.2: `KNOWN_FEATURES="short-seal spanning"` from 1.7.0), and the text
-    /// that says a tape needs a newer reader names 1.7.0, the only tapectl
-    /// version the script names (ADR-0012 item 135).
-    #[test]
-    fn restore_sh_knows_short_seal_and_spanning_and_says_it_is_1_7_0() {
-        let s = generate_restore_script_v2("SS03", 20);
-        assert_eq!(
-            s.matches("\nKNOWN_FEATURES=\"short-seal spanning\"\n")
-                .count(),
-            1
-        );
-        assert_eq!(
-            s.matches("This RESTORE.sh (layout v2, tapectl 1.7.0) cannot read it safely")
-                .count(),
-            1
-        );
-        assert_eq!(s.matches("tapectl 1.").count(), 1, "no other version named");
-    }
-
     #[test]
     fn front_index_lists_every_file_with_hashes() {
         let files = vec![
@@ -10085,7 +3567,7 @@ mod tests {
         let parsed: toml::Value = body.parse().expect("TOML parses");
         let idx = parsed.get("index").unwrap();
         assert_eq!(idx.get("volume").unwrap().as_str(), Some("TEST01"));
-        assert_eq!(idx.get("layout_version").unwrap().as_integer(), Some(2));
+        assert_eq!(idx.get("layout_version").unwrap().as_integer(), Some(3));
 
         let arr = parsed.get("files").unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 4);
@@ -10137,7 +3619,7 @@ mod tests {
     }
 
     /// A seal's embedded copy for a plan of `m + 1` files that keeps
-    /// `volume-format-v2.md` §4.1's rules: Files 0-2, File 3 (filled in, as
+    /// `volume-format-v3.md` §5's rules: Files 0-2, File 3 (filled in, as
     /// the seal step fills it), the operator envelope at 4, data slices from
     /// 5 to `m - 1`, the seal's own bare entry at `m`. Sizes and hashes have
     /// production widths (a slice's size has 10 digits, a hash 64), so the
@@ -10182,12 +3664,12 @@ mod tests {
         let parsed: toml::Value = body.parse().expect("TOML parses");
         let seal = parsed.get("seal").unwrap();
         assert_eq!(seal.get("volume").unwrap().as_str(), Some("TEST01"));
-        assert_eq!(seal.get("layout_version").unwrap().as_integer(), Some(2));
+        assert_eq!(seal.get("layout_version").unwrap().as_integer(), Some(3));
         assert_eq!(seal.get("file_count").unwrap().as_integer(), Some(7));
         assert_eq!(seal.get("ended_after").unwrap().as_integer(), Some(5));
-        assert_eq!(
-            seal.get("requires").unwrap().as_array().unwrap(),
-            &vec![toml::Value::String("short-seal".into())]
+        assert!(
+            seal.get("requires").unwrap().as_array().unwrap().is_empty(),
+            "D1: a Layout 3 seal states no feature"
         );
         assert_eq!(
             seal.get("front_index_sha256").unwrap().as_str(),
@@ -10198,7 +3680,7 @@ mod tests {
         assert!(chrono::DateTime::parse_from_rfc3339(sealed_at).is_ok());
     }
 
-    /// `volume-format-v2.md` §4.1 "Grammar": one `key = value` per line, in
+    /// `volume-format-v3.md` §5 "Grammar": one `key = value` per line, in
     /// exactly this order, on both kinds. RESTORE.sh's line-oriented reads
     /// depend on it, so the lines are pinned as text, not as TOML.
     #[test]
@@ -10229,15 +3711,15 @@ mod tests {
                 ]
             );
             assert_eq!(table[1], "volume = \"ORDER1\"");
-            assert_eq!(table[2], "layout_version = 2");
-            assert_eq!(table[3], "requires = [\"short-seal\"]");
+            assert_eq!(table[2], "layout_version = 3");
+            assert_eq!(table[3], "requires = []");
             assert_eq!(table[4], format!("file_count = {file_count}"));
             assert_eq!(table[5], format!("ended_after = {ended_after}"));
             assert_eq!(table[7], format!("front_index_sha256 = \"{fi}\""));
         }
     }
 
-    /// §4.1 "The human-readable header": the same on both kinds, so it does
+    /// §5 "The human-readable header": the same on both kinds, so it does
     /// not change a seal's length, and exactly the spec's words.
     #[test]
     fn both_seals_carry_the_specs_header_word_for_word() {
@@ -10268,7 +3750,7 @@ verify any entry by hashing the file it describes.
     }
 
     /// Both kinds round-trip through `format.rs`'s parser (A's reader), keep
-    /// rules S1-S5, and classify against the plan as §4.1 says: the full seal
+    /// rules S1-S5, and classify against the plan as §5 says: the full seal
     /// `Full`, the short one `Short { ended_after: K }`.
     #[test]
     fn the_full_and_the_short_seal_round_trip_through_the_parser() {
@@ -10283,8 +3765,8 @@ verify any entry by hashing the file it describes.
             &fi,
             &planned_seal_copy(m),
         ))
-        .expect("a full 1.6.0 seal parses");
-        assert!(full.requires_short_seal());
+        .expect("a full seal parses");
+        assert!(full.requires.is_empty(), "D1");
         assert_eq!(full.file_count, m + 1);
         assert_eq!(full.ended_after, Some((m - 1) as u64));
         assert_eq!(full.front_index_sha256, fi);
@@ -10300,7 +3782,7 @@ verify any entry by hashing the file it describes.
                 &short_seal_copy(m, k),
             ))
             .unwrap_or_else(|e| panic!("the short seal at {} parses: {e}", k + 1));
-            assert!(short.requires_short_seal());
+            assert!(short.requires.is_empty(), "D1");
             assert_eq!(short.file_count, k + 2);
             assert_eq!(short.ended_after, Some(k as u64));
             assert_eq!(short.front_index_sha256, fi, "it binds the same File 3");
@@ -10328,7 +3810,7 @@ verify any entry by hashing the file it describes.
         }
     }
 
-    /// §4.1 "Length": `build` sizes the seal with the full seal as a
+    /// §5 "Length": `build` sizes the seal with the full seal as a
     /// placeholder, and a short seal must never be longer (the writer checks
     /// `<=`, the full seal `==`). Every K from the first data slice to M-2,
     /// over plans whose M crosses a digit boundary (9→10, 99→100, 999→1000),
@@ -10449,7 +3931,7 @@ verify any entry by hashing the file it describes.
         // The seal marker's own entry stays hash-less.
         assert_eq!(arr[5].get("type").unwrap().as_str(), Some("seal_marker"));
         assert!(arr[5].get("sha256_encrypted").is_none());
-        // A consistent 1.6.0 seal: it parses by §4.1's rules.
+        // A consistent 1.6.0 seal: it parses by §5's rules.
         assert!(crate::volume::format::parse_seal_marker(&s).is_ok());
         // The embedded copy's grammar matches the front index's byte-for-byte
         // (same emitter): the [[files]] tail of both documents is identical.
@@ -10480,42 +3962,6 @@ verify any entry by hashing the file it describes.
         assert_eq!(units_arr[1]["uuid"].as_str(), Some("uuid-b"));
     }
 
-    #[test]
-    fn tenant_recovery_md_has_working_dar_recipe() {
-        // The generated manual recipe must match what the (gate-verified)
-        // RESTORE.sh does: truncate to encrypted_bytes, restore.N.dar naming,
-        // `dar -x restore`. The old recipe (H2) had none of these.
-        let units = vec![ManifestUnit {
-            name: "alpha".into(),
-            uuid: "uuid-a".into(),
-            snapshot_version: 2,
-            stage_set_id: 7,
-            may_span: false,
-            dar_version: Some("2.7.20".into()),
-            dar_command: Some("dar -c base -R /src".into()),
-            slices: vec![ManifestSlice {
-                number: 1,
-                tape_position: Some(4),
-                size_bytes: 1_048_576,
-                encrypted_bytes: 1_049_000,
-                sha256_plain: "abc".into(),
-                sha256_encrypted: "def456".into(),
-            }],
-        }];
-        let s = generate_recovery_md("LAB01", "alice", &units, &[]);
-        // Correct commands present:
-        assert!(s.contains("mt -f /dev/nst0 setblk 524288"));
-        assert!(s.contains("dd if=/dev/nst0 bs=512k of=restore.1.dar.age"));
-        assert!(s.contains("truncate -s 1049000 restore.1.dar.age"));
-        assert!(s.contains("def456  restore.1.dar.age")); // sha256sum -c line
-        assert!(s.contains("> restore.1.dar"));
-        assert!(s.contains("dar -x restore -R /destination -O -Q"));
-        // Broken forms from H2 must be gone:
-        assert!(!s.contains("slice_1.dar"), "old slice_N naming leaked");
-        assert!(!s.contains("ARCHIVE_BASE"), "placeholder leaked");
-        assert!(!s.contains("bs=64k"));
-    }
-
     /// #312: the envelope is sealed at WRITE time and each slice at STAGE
     /// time (`build.rs` vs `staging/mod.rs`), so a `key rotate` between the
     /// two leaves no single key that opens both (#288, on a real tape).
@@ -10532,10 +3978,14 @@ verify any entry by hashing the file it describes.
             uuid: "uuid-a".into(),
             snapshot_version: 1,
             stage_set_id: 1,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
+            payload: "tar".to_string(),
+            stream_bytes: 0,
+            file_table: None,
+            id_map: None,
+            tar_version: None,
+            compression: None,
             slices: vec![ManifestSlice {
+                continues: false,
                 number: 1,
                 tape_position: Some(4),
                 size_bytes: 1,
@@ -10600,10 +4050,14 @@ verify any entry by hashing the file it describes.
             uuid: "uuid-a".into(),
             snapshot_version: 2,
             stage_set_id: 7,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
+            payload: "tar".to_string(),
+            stream_bytes: 0,
+            file_table: None,
+            id_map: None,
+            tar_version: None,
+            compression: None,
             slices: vec![ManifestSlice {
+                continues: false,
                 number: 1,
                 tape_position: Some(4),
                 size_bytes: 1_048_576,
@@ -10671,10 +4125,14 @@ verify any entry by hashing the file it describes.
             uuid: "uuid-a".into(),
             snapshot_version: 1,
             stage_set_id: 7,
-            may_span: false,
-            dar_version: Some("2.7.20".into()),
-            dar_command: Some("dar -c base -R /src".into()),
+            payload: "tar".to_string(),
+            stream_bytes: 0,
+            file_table: None,
+            id_map: None,
+            tar_version: None,
+            compression: None,
             slices: vec![ManifestSlice {
+                continues: false,
                 number: 1,
                 tape_position: Some(4),
                 size_bytes: 1_048_576,
@@ -10690,13 +4148,10 @@ verify any entry by hashing the file it describes.
         assert_eq!(m.get("tenant").unwrap().as_str(), Some("alice"));
         let u = &parsed.get("units").unwrap().as_array().unwrap()[0];
         assert_eq!(u.get("name").unwrap().as_str(), Some("alpha"));
-        assert_eq!(u.get("dar_version").unwrap().as_str(), Some("2.7.20"));
+        assert_eq!(u.get("payload").unwrap().as_str(), Some("tar"));
         // #39: provenance fields for selective restore.
         assert_eq!(u.get("stage_set_id").unwrap().as_integer(), Some(7));
-        assert_eq!(
-            u.get("dar_command").unwrap().as_str(),
-            Some("dar -c base -R /src")
-        );
+        assert!(u.get("dar_version").is_none() && u.get("dar_command").is_none());
         let slice = &u.get("slices").unwrap().as_array().unwrap()[0];
         assert_eq!(slice.get("number").unwrap().as_integer(), Some(1));
         assert_eq!(slice.get("tape_position").unwrap().as_integer(), Some(4));
@@ -10728,14 +4183,14 @@ verify any entry by hashing the file it describes.
         let volume = parsed.get("volume").unwrap();
         assert_eq!(
             volume.get("magic").unwrap().as_str(),
-            Some("tapectl-volume-v2")
+            Some("tapectl-volume-v3")
         );
         assert_eq!(volume.get("label").unwrap().as_str(), Some("TEST01"));
         assert_eq!(
             volume.get("uuid").unwrap().as_str(),
             Some("11111111-2222-3333-4444-555555555555")
         );
-        assert_eq!(volume.get("layout_version").unwrap().as_integer(), Some(2));
+        assert_eq!(volume.get("layout_version").unwrap().as_integer(), Some(3));
 
         // [layout] carries ONLY front_index, seal_marker, total_files (sheet
         // §2.3) — every v1 position field is gone entirely, not just unset.
@@ -10893,13 +4348,16 @@ verify any entry by hashing the file it describes.
         let good = "tr -d '\\0' > GUIDE.md";
         assert_eq!(rendered.matches(good).count(), 2, "{rendered}");
         // 1.1.0 (ADR-0012 amendment item 15): File 0 states `requires`, one
-        // line after layout_version; from 1.6.0 it is `["short-seal"]` on
-        // every tape (item 111). Undo exactly that line too.
-        let requires = "layout_version = 2\nrequires = [\"short-seal\"]\n";
+        // line after layout_version; Layout 3 states it empty and moves the
+        // magic and the layout version (D1). Undo exactly those too.
+        let requires = "layout_version = 3\nrequires = []\n";
         assert_eq!(rendered.matches(requires).count(), 1, "{rendered}");
+        let magic = "magic = \"tapectl-volume-v3\"\n";
+        assert_eq!(rendered.matches(magic).count(), 1, "{rendered}");
         let pre_fix = rendered
             .replace(good, "tr -d '\\\\0' > GUIDE.md")
-            .replace(requires, "layout_version = 2\n");
+            .replace(requires, "layout_version = 2\n")
+            .replace(magic, "magic = \"tapectl-volume-v2\"\n");
         let mut h = Sha256::new();
         h.update(pre_fix.as_bytes());
         let digest = format!("{:x}", h.finalize());
@@ -10911,7 +4369,7 @@ verify any entry by hashing the file it describes.
 
         // ...and the present case differs by exactly one inserted line, in
         // exactly one place: immediately after `cartridge_serial`, inside
-        // `[media]` (`docs/design/volume-format-v2.md` §1.1).
+        // `[media]` (`docs/design/volume-format-v3.md` §1.1).
         let with_source = generate_id_thunk_v2(&IdThunkV2Params {
             cartridge_identity_source: Some("mam"),
             ..params
@@ -10944,91 +4402,15 @@ verify any entry by hashing the file it describes.
     }
 
     #[test]
-    fn restore_script_v2_is_valid_bash() {
-        // T1 floor, v2: the generated emergency script must at least parse.
-        let s = generate_restore_script_v2("SYN01", 20);
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut f, s.as_bytes()).unwrap();
-        let out = std::process::Command::new("bash")
-            .arg("-n")
-            .arg(f.path())
-            .output()
-            .expect("run bash -n");
-        assert!(
-            out.status.success(),
-            "RESTORE.sh v2 failed bash -n: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    #[test]
-    fn restore_script_v2_has_all_modes_and_rung2_fallback() {
-        let s = generate_restore_script_v2("VOL01", 27);
-        // Block size matches tapectl's 512KB fixed block mode
-        assert!(s.contains("BLOCK=524288"));
-        // All four command modes (v2 adds --verify to v1's three)
-        assert!(s.contains("--info)"));
-        assert!(s.contains("--verify)"));
-        assert!(s.contains("--find-envelope)"));
-        assert!(s.contains("--restore)"));
-        // Key operations
-        assert!(s.contains("mt -f \"$DEVICE\" setblk"));
-        assert!(s.contains("age -d -i"));
-        assert!(s.contains("sha256sum"));
-        assert!(s.contains("dar -x"));
-        assert!(s.contains("truncate -s"));
-        assert!(s.contains("head -c"));
-        // Envelope is tar archive
-        assert!(s.contains("tar xf"));
-        assert!(s.contains("MANIFEST.toml"));
-        // Exact §2.5 verdict tokens, tied to the actual assignment sites (not
-        // just an incidental substring of one another).
-        assert!(s.contains("verdict=\"SEALED\""));
-        assert!(s.contains("verdict=\"UNSEALED\""));
-        assert!(s.contains("verdict=\"DAMAGED (ends disagree)\""));
-        // Rung-2 fallback: File 3 unreadable/inconsistent falls back to the
-        // seal marker's embedded copy, loudly warned (sheet §3.4).
-        assert!(s.contains("RUNG-2"));
-        assert!(s.contains("degradation ladder"));
-    }
-
-    #[test]
-    fn restore_script_v2_is_hardened() {
-        let s = generate_restore_script_v2("HARD2", 20);
-        // S2: every plaintext-tape value from the ID thunk is
-        // integer-validated before use — v2's field set (front_index /
-        // seal_marker / total_files) replaces v1's data_start/mini_index/etc.
-        assert!(s.contains("require_uint()"));
-        for key in ["front_index", "seal_marker", "total_files"] {
-            assert!(
-                s.contains(&format!("require_uint {key} ")),
-                "missing require_uint for {key}"
-            );
-        }
-        // S7: no predictable temp path; mktemp + restrictive umask instead.
-        assert!(s.contains("mktemp -d"));
-        assert!(s.contains("umask 077"));
-        assert!(
-            !s.contains("tapectl-restore-$$"),
-            "predictable /tmp path leaked"
-        );
-    }
-
-    #[test]
     fn v2_generators_never_mention_mini_index() {
-        // The v1 mid-tape mini-index is gone in v2 (volume-format-v2.md §8);
-        // its facts moved into the front index (File 3). Neither v2 generator
+        // There is no mid-tape mini-index; its facts are in the front index
+        // (File 3). Neither v2 generator
         // may reference it under either spelling, in any case.
         let guide = generate_system_guide_v2("MINI1", 12).to_lowercase();
-        let script = generate_restore_script_v2("MINI1", 12).to_lowercase();
         for needle in ["mini-index", "mini_index"] {
             assert!(
                 !guide.contains(needle),
                 "v2 guide must not mention '{needle}'"
-            );
-            assert!(
-                !script.contains(needle),
-                "v2 restore script must not mention '{needle}'"
             );
         }
     }
@@ -11046,2040 +4428,10 @@ verify any entry by hashing the file it describes.
         // DEFAULT_BLOCK_SIZE ever changes without this text changing too,
         // this test is what catches it.
         let guide = generate_system_guide_v2("LOCK01", 20);
-        let script = generate_restore_script_v2("LOCK01", 20);
         assert!(guide.contains(&format!(
             "setblk {}",
             crate::cli::volume::DEFAULT_BLOCK_SIZE
         )));
-        assert!(script.contains(&format!("BLOCK={}", crate::cli::volume::DEFAULT_BLOCK_SIZE)));
-    }
-
-    /// RESTORE.sh sanitizes the tape's label before echoing it (the ID thunk is
-    /// unauthenticated), and then compares it against the label baked into the
-    /// script. Those two things are only safe together while `safe_str`'s
-    /// allowlist is a SUPERSET of what `validate_volume_label` accepts: if a
-    /// legitimate label were altered by sanitizing, it could never equal
-    /// `$LABEL`, and every correct tape would raise a permanent "WRONG TAPE"
-    /// warning — and now also fail the gate's heir_info assertion.
-    ///
-    /// This runs the real `safe_str` out of the real generated script, so
-    /// widening `validate_segment` without widening the allowlist fails here.
-    #[test]
-    fn safe_str_never_alters_a_label_that_tapectl_would_accept() {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
-        // The widest label validate_volume_label accepts: every permitted
-        // character class, at exactly the maximum length, and not starting with
-        // a dash or dot.
-        let mut label = String::from("Az9");
-        while label.len() < 64 {
-            label.push_str("._-Az9");
-        }
-        label.truncate(64);
-        crate::naming::validate_volume_label(&label)
-            .expect("test fixture must itself be a valid volume label");
-
-        let script = generate_restore_script_v2("PROBE1", 20);
-        let body = script
-            .split_once("safe_str() {")
-            .and_then(|(_, rest)| rest.split_once("\n}"))
-            .map(|(b, _)| b)
-            .expect("generated RESTORE.sh must define safe_str()");
-
-        let mut child = Command::new("bash")
-            .args(["-s", "--", &label])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn bash");
-        write!(
-            child.stdin.as_mut().unwrap(),
-            "safe_str() {{{body}\n}}\nsafe_str \"$1\"\n"
-        )
-        .unwrap();
-        drop(child.stdin.take());
-        let out = child.wait_with_output().expect("bash ran");
-        let got = String::from_utf8_lossy(&out.stdout).to_string();
-        assert_eq!(
-            got,
-            label,
-            "safe_str altered a legitimate {}-char label — every correct tape \
-             would now warn WRONG TAPE. Widen the tr allowlist in RESTORE.sh to \
-             cover validate_segment, or narrow validate_segment.",
-            label.len()
-        );
-    }
-
-    /// Issue #131: a volume can carry the SAME unit twice — two snapshot
-    /// versions, two stage sets. RESTORE.sh used to collect every matching
-    /// [[units]] block, concatenating both versions' slices and handing the mix
-    /// to dar. When the versions had different recipients (a `tenant reassign`
-    /// between them) the first slice was one the key could not open, and the
-    /// failure read as "wrong key" — on the heir path, where there is no DB to
-    /// fall back on.
-    ///
-    /// Drives the real awk out of the real generated script, so the selection
-    /// rule cannot rot independently of the script that ships.
-    #[test]
-    fn restore_sh_picks_one_version_of_a_unit_present_twice() {
-        use std::process::{Command, Stdio};
-
-        let program = AWK_SELECT_VERSION;
-
-        // Built through the real writer, not hand-typed: a hand-typed sample
-        // would keep parsing after the writer's shape changed underneath it.
-        let unit =
-            |name: &str, version: i64, tape_position: i64, eb: i64, sha: &str| ManifestUnit {
-                name: name.to_string(),
-                uuid: format!("uuid-{name}-{version}"),
-                snapshot_version: version,
-                stage_set_id: version,
-                may_span: false,
-                dar_version: None,
-                dar_command: None,
-                slices: vec![ManifestSlice {
-                    number: 1,
-                    tape_position: Some(tape_position),
-                    size_bytes: 1,
-                    encrypted_bytes: eb,
-                    sha256_plain: "x".repeat(64),
-                    sha256_encrypted: sha.to_string(),
-                }],
-            };
-        let manifest = generate_manifest_toml(
-            "MULTI1",
-            "alice",
-            &[
-                unit("photos", 1, 20, 111, "aaa"),
-                unit("docs", 1, 21, 222, "bbb"),
-                unit("photos", 2, 30, 333, "ccc"),
-            ],
-        );
-        let dir = std::env::temp_dir().join(format!("tapectl-awk-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let man = dir.join("MANIFEST.toml");
-        std::fs::write(&man, manifest).unwrap();
-        let prog = dir.join("sel.awk");
-        std::fs::write(&prog, program).unwrap();
-
-        let run = |unit: &str, want: &str| -> String {
-            let mut c = Command::new("awk")
-                .args([
-                    "-v",
-                    &format!("unit={unit}"),
-                    "-v",
-                    &format!("want={want}"),
-                    "-f",
-                    prog.to_str().unwrap(),
-                    man.to_str().unwrap(),
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn awk");
-            let _ = c.stdin.take();
-            let o = c.wait_with_output().unwrap();
-            String::from_utf8_lossy(&o.stdout).to_string()
-        };
-
-        // Newest version by default — NOT both versions concatenated.
-        let newest = run("photos", "");
-        assert_eq!(
-            newest.lines().count(),
-            1,
-            "expected exactly one version's slices, got:\n{newest}"
-        );
-        assert!(newest.contains("|30|"), "expected v2's slice:\n{newest}");
-        assert!(
-            !newest.contains("|20|"),
-            "v1's slice must not be mixed in:\n{newest}"
-        );
-
-        // An explicit older version is selectable.
-        let v1 = run("photos", "1");
-        assert!(v1.contains("|20|"), "expected v1's slice:\n{v1}");
-        assert!(!v1.contains("|30|"), "v2 must not leak in:\n{v1}");
-
-        // A unit present once is unaffected, and a missing version yields
-        // nothing (the caller turns that into a clear error).
-        assert!(run("docs", "").contains("|21|"));
-        assert!(run("photos", "9").trim().is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #133: the sibling the #131 fix did not cover. `--restore` without
-    /// `--unit` collects the unit names from the manifest and auto-selects
-    /// when there is exactly one. A unit stored in two snapshot versions has
-    /// two `[[units]]` blocks, so it was listed twice and took the "multiple
-    /// units" branch — telling the heir to disambiguate between a name and
-    /// itself. `do_find_envelope` suggests exactly that no-`--unit` form, so
-    /// the script's own advice walked into it.
-    ///
-    /// The #131 test runs the version-selecting awk standalone with an
-    /// explicit `unit=`, which is precisely why it never saw this.
-    #[test]
-    fn restore_sh_lists_a_unit_stored_twice_only_once() {
-        use std::process::{Command, Stdio};
-
-        let program = AWK_UNIT_LIST;
-
-        // Built through the real writer, not hand-typed (see the sibling
-        // #131 test above for why).
-        let unit = |name: &str, version: i64| ManifestUnit {
-            name: name.to_string(),
-            uuid: format!("uuid-{name}-{version}"),
-            snapshot_version: version,
-            stage_set_id: version,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![],
-        };
-        let manifest = generate_manifest_toml(
-            "MULTI2",
-            "alice",
-            &[unit("photos", 1), unit("photos", 2), unit("docs", 1)],
-        );
-        let dir = std::env::temp_dir().join(format!("tapectl-names-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let man = dir.join("MANIFEST.toml");
-        std::fs::write(&man, manifest).unwrap();
-        let prog = dir.join("names.awk");
-        std::fs::write(&prog, program).unwrap();
-
-        let out = Command::new("awk")
-            .args(["-f", prog.to_str().unwrap(), man.to_str().unwrap()])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .expect("spawn awk");
-        let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect();
-
-        assert_eq!(
-            names,
-            vec!["photos".to_string(), "docs".to_string()],
-            "a unit stored in two versions must be named once, in first-seen order"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #135: a `name` key outside the `[[units]]` head must not retarget the
-    /// version selector. Nothing emits one today — `naming.rs` also bans the
-    /// characters that would break the field split — so this guards the
-    /// direction of travel, not a live defect. The failure it prevents is the
-    /// worst kind: the selector silently switches units mid-block and the
-    /// restore succeeds with part of the data.
-    #[test]
-    fn a_name_key_outside_the_units_head_does_not_retarget_the_selector() {
-        use std::process::{Command, Stdio};
-
-        let program = AWK_SELECT_VERSION;
-
-        // A slice table carrying its own `name`, as some future field might.
-        let manifest = "\
-[[units]]
-name = \"photos\"
-snapshot_version = 1
-
-[[units.slices]]
-number = 1
-name = \"decoy\"
-tape_position = 20
-encrypted_bytes = 111
-sha256_encrypted = \"aaa\"
-
-[[units.slices]]
-number = 2
-tape_position = 21
-encrypted_bytes = 222
-sha256_encrypted = \"bbb\"
-";
-        let dir = std::env::temp_dir().join(format!("tapectl-guard-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let man = dir.join("MANIFEST.toml");
-        std::fs::write(&man, manifest).unwrap();
-        let prog = dir.join("sel.awk");
-        std::fs::write(&prog, program).unwrap();
-
-        let out = Command::new("awk")
-            .args([
-                "-v",
-                "unit=photos",
-                "-v",
-                "want=",
-                "-f",
-                prog.to_str().unwrap(),
-                man.to_str().unwrap(),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .expect("spawn awk");
-        let got = String::from_utf8_lossy(&out.stdout).to_string();
-
-        assert_eq!(
-            got.lines().count(),
-            2,
-            "both slices must survive a decoy name key:\n{got}"
-        );
-        assert!(got.contains("|20|") && got.contains("|21|"), "{got}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The generated script must be syntactically valid bash. Cheap, and it
-    /// catches the trap this file keeps setting: the awk programs are
-    /// single-quoted in the shell, so one apostrophe anywhere inside one —
-    /// including in a comment — ends the program early and breaks the script
-    /// that gets frozen onto tape. `bash -n` parses without executing.
-    #[test]
-    fn the_generated_script_parses_as_bash() {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
-        let script = generate_restore_script_v2("SYNTAX1", 20);
-        let mut child = Command::new("bash")
-            .arg("-n")
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn bash -n");
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(script.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "generated RESTORE.sh is not valid bash:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// Architecture review 2026-09-11 (candidate C6): every named `awk`
-    /// fragment must reassemble into the generated script byte-for-byte —
-    /// if a placeholder's boundaries or a const's content were ever off by
-    /// one character, this fails here instead of only as an opaque
-    /// `on_tape_golden` hash mismatch.
-    #[test]
-    fn every_named_awk_fragment_is_present_verbatim_in_the_assembled_script() {
-        let script = generate_restore_script_v2("FRAG01", 20);
-        for (name, fragment) in [
-            ("AWK_PARSE_FILE_LIST", AWK_PARSE_FILE_LIST),
-            ("AWK_CHECK_FILE_LIST", AWK_CHECK_FILE_LIST),
-            ("AWK_FIND_ENVELOPE", AWK_FIND_ENVELOPE),
-            ("AWK_MANIFEST_HAS_UNIT", AWK_MANIFEST_HAS_UNIT),
-            ("AWK_UNIT_LIST", AWK_UNIT_LIST),
-            ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
-            ("AWK_MT_POSITION", AWK_MT_POSITION),
-            ("AWK_UNITS_TABLE", AWK_UNITS_TABLE),
-            ("AWK_UNIT_UUID", AWK_UNIT_UUID),
-            ("AWK_INDEX_COMMON", AWK_INDEX_COMMON),
-            ("AWK_INDEX_WHERE", AWK_INDEX_WHERE),
-            ("AWK_INDEX_ALL", AWK_INDEX_ALL),
-            ("AWK_INDEX_FIND", AWK_INDEX_FIND),
-            ("AWK_INDEX_HOLDERS", AWK_INDEX_HOLDERS),
-            ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
-            ("AWK_DAR_HEADER", AWK_DAR_HEADER),
-            ("AWK_FILL_LISTING", AWK_FILL_LISTING),
-            ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
-            ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
-            ("AWK_DAMAGED_DIRS", AWK_DAMAGED_DIRS),
-            ("AWK_CUT_VERSIONS", AWK_CUT_VERSIONS),
-        ] {
-            assert!(
-                script.contains(fragment),
-                "{name} is not a verbatim substring of the assembled script"
-            );
-        }
-    }
-
-    /// Run an awk program (`AWK_INDEX_COMMON` first when `common`) over `input`
-    /// with `env`, under every awk this host has, and return what each prints
-    /// with its exit status. The three must agree.
-    fn run_awk(
-        common: bool,
-        program: &str,
-        input: &std::path::Path,
-        env: &[(&str, String)],
-    ) -> (i32, String) {
-        use std::process::Command;
-        let text = if common {
-            format!("{AWK_INDEX_COMMON} {program}")
-        } else {
-            program.to_string()
-        };
-        let mut seen: Vec<(i32, String)> = Vec::new();
-        for awk in ["awk", "mawk", "gawk"] {
-            let mut cmd = Command::new(awk);
-            cmd.arg(&text).arg(input);
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
-            let Ok(o) = cmd.output() else { continue };
-            seen.push((
-                o.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&o.stdout).to_string(),
-            ));
-        }
-        assert!(!seen.is_empty(), "no awk on this host");
-        assert!(
-            seen.windows(2).all(|w| w[0] == w[1]),
-            "awks differ: {seen:?}"
-        );
-        seen.remove(0)
-    }
-
-    /// `volume-format-v2.md` §4.4 in the fragments, under every awk on the
-    /// host: what a MANIFEST block is on this tape. `AWK_CUT_VERSIONS` prints a
-    /// block as cut (a whole unit with a slice after `k`; a unit that may span
-    /// with no slice here) and reports a range (some slices here, the others
-    /// with no position or after `k`) with its run, never reading a missing
-    /// position as 0; with no `k` (a full or unsealed tape) only a run with
-    /// slices elsewhere is a range. `AWK_SELECT_VERSION` gives a slice with no
-    /// position an EMPTY field and reports the block's `may_span`.
-    /// `AWK_INDEX_HOLDERS` prints a version's holders, this tape's as the run
-    /// `INDEX_RANGE` gives and another's run marked a range, and notes it.
-    #[test]
-    fn the_range_fragments_read_alike_under_every_awk() {
-        use std::process::Command;
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        let slice = |number: i64, tape_position: Option<i64>| ManifestSlice {
-            number,
-            tape_position,
-            size_bytes: 10,
-            encrypted_bytes: 30 + number,
-            sha256_plain: "p".repeat(64),
-            sha256_encrypted: format!("{number:064x}"),
-        };
-        let unit =
-            |name: &str, version: i64, may_span: bool, slices: Vec<ManifestSlice>| ManifestUnit {
-                name: name.into(),
-                uuid: format!("uuid-{name}"),
-                snapshot_version: version,
-                stage_set_id: version,
-                may_span,
-                dar_version: None,
-                dar_command: None,
-                slices,
-            };
-        let manifest = generate_manifest_toml(
-            "AWKR1",
-            "alice",
-            &[
-                unit(
-                    "whole",
-                    1,
-                    false,
-                    vec![slice(1, Some(9)), slice(2, Some(10))],
-                ),
-                unit(
-                    "cutw",
-                    1,
-                    false,
-                    vec![slice(1, Some(12)), slice(2, Some(13))],
-                ),
-                unit(
-                    "tail",
-                    2,
-                    true,
-                    vec![
-                        slice(1, None),
-                        slice(2, None),
-                        slice(3, Some(4)),
-                        slice(4, Some(5)),
-                    ],
-                ),
-                unit(
-                    "head",
-                    3,
-                    true,
-                    vec![
-                        slice(1, Some(11)),
-                        slice(2, Some(12)),
-                        slice(3, Some(13)),
-                        slice(4, Some(14)),
-                    ],
-                ),
-                unit(
-                    "gone",
-                    1,
-                    true,
-                    vec![slice(1, Some(13)), slice(2, Some(14))],
-                ),
-                unit(
-                    "allspan",
-                    1,
-                    true,
-                    vec![slice(1, Some(6)), slice(2, Some(7))],
-                ),
-            ],
-        );
-        let man = d.join("MANIFEST.toml");
-        std::fs::write(&man, &manifest).unwrap();
-        let units = "unit\tunit_uuid\tversion\tnum_slices\tfirst_slice\tlast_slice\tvolume\tstate\tsealed_at\n\
-                     tail\tuuid-tail\t2\t4\t3\t4\tTHIS1\tthis-tape\t\n\
-                     tail\tuuid-tail\t2\t4\t1\t2\tOTHER2\tsealed\t2026-09-01T10:00:00Z\n\
-                     whole\tuuid-whole\t1\t2\t1\t2\tTHIS1\tthis-tape\t\n";
-        let uf = d.join("units.tsv");
-        std::fs::write(&uf, units).unwrap();
-        let ranges = d.join("range.here");
-        std::fs::write(&ranges, "uuid-tail\t2\t3\t4\t4\n").unwrap();
-        let holders_prog = format!("{AWK_INDEX_COMMON} {AWK_INDEX_HOLDERS}");
-
-        let awks: &[(&str, &[&str])] = &[
-            ("awk", &[]),
-            ("gawk", &[]),
-            ("mawk", &[]),
-            ("nawk", &[]),
-            ("original-awk", &[]),
-            ("busybox", &["awk"]),
-        ];
-        let mut outputs: Vec<(String, String)> = Vec::new();
-        for (bin, pre) in awks {
-            let run =
-                |args: &[&str], env: &[(&str, &std::path::Path)]| -> Option<(String, String)> {
-                    let mut cmd = Command::new(bin);
-                    cmd.args(*pre).args(args).env("LC_ALL", "C");
-                    for (k, v) in env {
-                        cmd.env(k, v);
-                    }
-                    let o = cmd.output().ok()?;
-                    Some((
-                        format!(
-                            "exit {:?}\n{}",
-                            o.status.code(),
-                            String::from_utf8_lossy(&o.stdout)
-                        ),
-                        String::from_utf8_lossy(&o.stderr).to_string(),
-                    ))
-                };
-            let mut out = String::new();
-            let mut ok = true;
-            for k in ["12", ""] {
-                let rf = d.join(format!("ranges-{bin}-{k}"));
-                let Some((o, _)) = run(
-                    &[
-                        "-v",
-                        &format!("k={k}"),
-                        AWK_CUT_VERSIONS,
-                        man.to_str().unwrap(),
-                    ],
-                    &[("RANGE_OUT", &rf)],
-                ) else {
-                    ok = false;
-                    break;
-                };
-                out.push_str(&format!(
-                    "cut k={k}:\n{o}ranges:\n{}",
-                    std::fs::read_to_string(&rf).unwrap_or_default()
-                ));
-            }
-            if !ok {
-                continue;
-            }
-            for (u, want) in [("tail", ""), ("whole", ""), ("head", "3")] {
-                let (o, e) = run(
-                    &[
-                        "-v",
-                        &format!("unit={u}"),
-                        "-v",
-                        &format!("want={want}"),
-                        AWK_SELECT_VERSION,
-                        man.to_str().unwrap(),
-                    ],
-                    &[],
-                )
-                .unwrap();
-                out.push_str(&format!("select {u}:\n{o}stderr: {e}"));
-            }
-            let flag = d.join(format!("partial-{bin}"));
-            let mut cmd = Command::new(bin);
-            cmd.args(*pre)
-                .arg(&holders_prog)
-                .arg(&uf)
-                .env("LC_ALL", "C")
-                .env("CHK_UNIT", "tail")
-                .env("CHK_VER", "2")
-                .env("CHK_UUID", "uuid-tail")
-                .env("INDEX_RANGE", &ranges)
-                .env("INDEX_PARTIAL", &flag);
-            let h = cmd.output().unwrap();
-            out.push_str(&format!(
-                "holders exit {:?}:\n{}flag: {}",
-                h.status.code(),
-                String::from_utf8_lossy(&h.stdout),
-                std::fs::read_to_string(&flag).unwrap_or_default()
-            ));
-            outputs.push((bin.to_string(), out));
-        }
-        assert!(outputs.len() >= 2, "want two awks at least: {outputs:?}");
-        for w in outputs.windows(2) {
-            assert_eq!(w[0].1, w[1].1, "{} and {} differ", w[0].0, w[1].0);
-        }
-        let got = &outputs[0].1;
-        let want_cut_12 = "cut k=12:\nexit Some(0)\nuuid-cutw\t1\nuuid-gone\t1\n\
-                           ranges:\nuuid-tail\t2\t3\t4\t4\nuuid-head\t3\t1\t2\t4\n";
-        assert!(got.starts_with(want_cut_12), "{got}");
-        assert!(
-            got.contains("cut k=:\nexit Some(0)\nranges:\nuuid-tail\t2\t3\t4\t4\nselect"),
-            "with no ended_after only a run with slices elsewhere is a range:\n{got}"
-        );
-        let tail_sel = format!(
-            "select tail:\nexit Some(0)\n1||31|{:064x}\n2||32|{:064x}\n3|4|33|{:064x}\n4|5|34|{:064x}\nstderr: 2 1\n",
-            1, 2, 3, 4
-        );
-        assert!(got.contains(&tail_sel), "{got}");
-        assert!(got.contains("stderr: 1 0\n"), "whole: may_span 0:\n{got}");
-        assert!(
-            got.contains("stderr: 3 1\n"),
-            "head: version 3, may_span 1:\n{got}"
-        );
-        assert!(
-            got.contains(
-                "holders exit Some(0):\n    tape THIS1  (this tape, a range: not the whole version)  slices 3-4 of 4\n"
-            ),
-            "{got}"
-        );
-        assert!(
-            got.contains("    tape OTHER2  (sealed 2026-09-01T10:00:00Z, a range: not the whole version)  slices 1-2 of 4\n"),
-            "{got}"
-        );
-        assert!(got.ends_with("flag: 1\n"), "{got}");
-    }
-
-    /// R6 in the script: `slice_here` passes a slice with a tape position and
-    /// stops, naming it, at one with none, so no consumer of a slice list can
-    /// seek to an empty position (bash would read `fsf ""` and `-gt ""` as
-    /// errors, and `$((tpos + 1))` as file 1).
-    #[test]
-    fn slice_here_refuses_a_slice_with_no_tape_position() {
-        let script = generate_restore_script_v2("SH01", 20);
-        let from = script.find("slice_here() {").expect("slice_here");
-        let body = &script[from..];
-        let body = &body[..body.find("\n}\n").unwrap() + 3];
-        let run = |pos: &str| {
-            std::process::Command::new("bash")
-                .arg("-c")
-                .arg(format!(
-                    "die() {{ echo \"FATAL: $*\"; exit 1; }}\n{body}slice_here 3 '{pos}' && echo PASSED"
-                ))
-                .output()
-                .unwrap()
-        };
-        let ok = run("12");
-        assert!(ok.status.success());
-        assert_eq!(String::from_utf8_lossy(&ok.stdout), "PASSED\n");
-        let away = run("");
-        assert_eq!(away.status.code(), Some(1));
-        let text = String::from_utf8_lossy(&away.stdout);
-        assert!(
-            text.starts_with(
-                "FATAL: slice 3 has no tape position on this tape: it is on another tape"
-            ),
-            "{text}"
-        );
-    }
-
-    /// ADR-0012 item 103: the two fragments of the file check, on text as the
-    /// index writes it (names holding a TAB, a newline and a backslash), under
-    /// every awk on the host. Which version an envelope lists, and what a
-    /// version asks to be checked: every file with its hash and its path in the
-    /// index's escaped form, which RESTORE.sh decodes to hash the file from
-    /// standard input (no name is read back from `sha256sum`).
-    #[test]
-    fn the_file_check_fragments_read_the_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        let hash = |n: u8| format!("{n:02x}").repeat(32);
-
-        // Which version an envelope lists: by decoded name, version and, when
-        // both sides state one, the uuid.
-        let units = d.join("units.tsv");
-        std::fs::write(
-            &units,
-            "volume\tunit\tunit_uuid\tzz_future\tversion\nV1\tphotos/2019\tuuid-a\tx\t2\nV2\tdocs\tuuid-b\tx\t1\nV3\ta\\tb\t\tx\t1\n",
-        )
-        .unwrap();
-        let listed = |unit: &str, ver: &str, uuid: &str| {
-            run_awk(
-                true,
-                AWK_FILE_CHECK_LISTED,
-                &units,
-                &[
-                    ("CHK_UNIT", unit.to_string()),
-                    ("CHK_VER", ver.to_string()),
-                    ("CHK_UUID", uuid.to_string()),
-                ],
-            )
-            .0
-        };
-        assert_eq!(listed("photos/2019", "2", "uuid-a"), 0);
-        assert_eq!(listed("photos/2019", "2", ""), 0, "no uuid to compare");
-        assert_eq!(listed("photos/2019", "1", "uuid-a"), 1, "another version");
-        assert_eq!(
-            listed("photos/2019", "2", "uuid-z"),
-            1,
-            "another unit of the name"
-        );
-        assert_eq!(
-            listed("a\tb", "1", "uuid-q"),
-            0,
-            "the row states no uuid; the name is decoded"
-        );
-        assert_eq!(listed("nothing", "1", ""), 1);
-        let bad = d.join("bad.tsv");
-        std::fs::write(&bad, "volume\tversion\nV1\t1\n").unwrap();
-        assert_eq!(
-            run_awk(true, AWK_FILE_CHECK_LISTED, &bad, &[]).0,
-            2,
-            "a file with no unit column cannot be read"
-        );
-
-        // What a version asks to be checked.
-        let paths = d.join("paths.tsv");
-        let h1 = hash(0xab);
-        let h2 = hash(0xcd);
-        std::fs::write(
-            &paths,
-            format!(
-                "unit\tversion\tkind\tsize_bytes\tsha256\tpath\n\
-                 docs\t1\td\t0\t\tsub\n\
-                 docs\t1\tf\t5\t{h1}\tsub/a\\tb\n\
-                 docs\t1\tf\t5\t{h2}\tc\\\\d.txt\n\
-                 docs\t1\tf\t5\t{h1}\tl\\nf.txt\n\
-                 docs\t1\tf\t7\t\tnohash\n\
-                 docs\t1\tf\t7\tnot-a-hash\tbadhash\n\
-                 docs\t1\tl\t7\t{h1}\ta-link\n\
-                 docs\t2\tf\t7\t{h1}\tother\n\
-                 docs\t1\tf\t7\t{h1}\t../escape\n\
-                 docs\t1\tf\t7\t{h1}\t/absolute\n\
-                 docs\t1\tf\t7\t{h2}\tplain\n"
-            ),
-        )
-        .unwrap();
-        let outs = |n: &str| d.join(n);
-        let env = |only: &str| -> Vec<(&'static str, String)> {
-            vec![
-                ("CHK_UNIT", "docs".into()),
-                ("CHK_VER", "1".into()),
-                ("CHK_ONLY", only.into()),
-                ("CHK_SUMS", outs("sums").display().to_string()),
-                ("CHK_COUNTS", outs("counts").display().to_string()),
-            ]
-        };
-        let (code, _) = run_awk(true, AWK_FILE_CHECK_LIST, &paths, &env(""));
-        assert_eq!(code, 0);
-        // rows of the version; regular files; checked; no hash
-        assert_eq!(
-            std::fs::read_to_string(outs("counts")).unwrap().trim(),
-            "10 8 4 4",
-            "badhash, nohash, ../escape and /absolute are never hashed"
-        );
-        assert_eq!(
-            std::fs::read_to_string(outs("sums")).unwrap(),
-            format!("{h1}\tsub/a\\tb\n{h2}\tc\\\\d.txt\n{h1}\tl\\nf.txt\n{h2}\tplain\n"),
-            "every file, in index order, its path kept in its escaped form: a TAB, a backslash \
-             and a newline never reach this list raw"
-        );
-
-        // Only some paths: a name, and a folder with what is under it.
-        let only = d.join("only");
-        std::fs::write(&only, "plain\nsub\n").unwrap();
-        run_awk(
-            true,
-            AWK_FILE_CHECK_LIST,
-            &paths,
-            &env(only.to_str().unwrap()),
-        );
-        assert_eq!(
-            std::fs::read_to_string(outs("sums")).unwrap(),
-            format!("{h1}\tsub/a\\tb\n{h2}\tplain\n")
-        );
-        std::fs::write(&only, "pla\nsu\n").unwrap();
-        run_awk(
-            true,
-            AWK_FILE_CHECK_LIST,
-            &paths,
-            &env(only.to_str().unwrap()),
-        );
-        assert_eq!(
-            std::fs::read_to_string(outs("sums")).unwrap(),
-            "",
-            "a prefix of a name is not the name"
-        );
-
-        // An index written before the column existed records no hash at all.
-        let old = d.join("old.tsv");
-        std::fs::write(
-            &old,
-            "unit\tversion\tkind\tsize_bytes\tpath\ndocs\t1\td\t0\tsub\ndocs\t1\tf\t5\tsub/a\n",
-        )
-        .unwrap();
-        run_awk(true, AWK_FILE_CHECK_LIST, &old, &env(""));
-        assert_eq!(
-            std::fs::read_to_string(outs("counts")).unwrap().trim(),
-            "2 1 0 1"
-        );
-        assert_eq!(std::fs::read_to_string(outs("sums")).unwrap(), "");
-        assert_eq!(
-            run_awk(true, AWK_FILE_CHECK_LIST, &bad, &env("")).0,
-            2,
-            "no path column"
-        );
-    }
-
-    /// ADR-0012 item 102 (R2): the two fragments a folder dar restored nothing
-    /// in goes through, under every awk on the host. `AWK_DAMAGED_DIRS` puts
-    /// what the index records under a listed folder in its place (each entry
-    /// that is not a directory, and each directory with nothing under it),
-    /// keeps every other path of the list as it stands, never prints a path
-    /// that leaves the unit, and keeps to a `--path` scope. `AWK_FILL_LISTING`
-    /// asks for the slices of each wanted entry, of everything under a wanted
-    /// folder, and of the own entry of each folder above a wanted entry, and
-    /// matches an entry that has no slice (a symlink).
-    #[test]
-    fn the_folder_fragments_read_the_index_and_the_listing() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        let paths = d.join("paths.tsv");
-        std::fs::write(
-            &paths,
-            "unit\tversion\tkind\tsize_bytes\tsha256\tpath\n\
-             docs\t1\td\t0\t\tbare\n\
-             docs\t1\td\t0\t\tlost\n\
-             docs\t1\tf\t5\t\tlost-not/x.bin\n\
-             docs\t1\tf\t5\t\tlost/../escape\n\
-             docs\t1\tf\t5\t\tlost/a.bin\n\
-             docs\t1\td\t0\t\tlost/deep\n\
-             docs\t1\tf\t5\t\tlost/deep/t\\tab.bin\n\
-             docs\t1\td\t0\t\tlost/empty\n\
-             docs\t1\tl\t0\t\tlost/link\n\
-             docs\t1\tf\t5\t\tnodir/x.bin\n\
-             docs\t1\tf\t5\t\tplain.bin\n\
-             docs\t2\tf\t5\t\tlost/other-version.bin\n\
-             other\t1\tf\t5\t\tlost/other-unit.bin\n",
-        )
-        .unwrap();
-        let list = d.join("list");
-        std::fs::write(&list, "plain.bin\nlost\nghost\nbare\nlost/a.bin\nnodir\n").unwrap();
-        let env = |only: &str| -> Vec<(&'static str, String)> {
-            vec![
-                ("CHK_UNIT", "docs".into()),
-                ("CHK_VER", "1".into()),
-                ("CHK_LIST", list.display().to_string()),
-                ("CHK_ONLY", only.into()),
-            ]
-        };
-        let (code, out) = run_awk(true, AWK_DAMAGED_DIRS, &paths, &env(""));
-        assert_eq!(code, 0);
-        assert_eq!(
-            out,
-            "plain.bin\nlost/a.bin\nlost/deep/t\\tab.bin\nlost/empty\nlost/link\nghost\nbare\nnodir\n",
-            "a folder is its files, a symlink and an empty folder, in its place; a path the \
-             index lacks stays, an empty folder stays, a path stays once, and a path the index \
-             records no folder row for stays as it is"
-        );
-        let only = d.join("only");
-        std::fs::write(&only, "lost/deep\n").unwrap();
-        let (_, out) = run_awk(true, AWK_DAMAGED_DIRS, &paths, &env(only.to_str().unwrap()));
-        assert_eq!(
-            out, "plain.bin\nlost/deep/t\\tab.bin\nghost\nlost/a.bin\nnodir\n",
-            "--path lost/deep: only what it asked for comes in a folder's place"
-        );
-        let bad = d.join("bad.tsv");
-        std::fs::write(&bad, "unit\tversion\tpath\ndocs\t1\tlost\n").unwrap();
-        assert_eq!(
-            run_awk(true, AWK_DAMAGED_DIRS, &bad, &env("")).0,
-            2,
-            "no kind column: the caller keeps the list as it is"
-        );
-
-        // The slices a fill reads, from a listing in dar's form.
-        let listing = d.join("listing");
-        std::fs::write(
-            &listing,
-            "Slice(s)|[Data ][D][ EA  ][FSA][Compr][S]|Permission| Filemane\n\
-             --------+--------------------------------+----------+-----------------------------\n\
-             1\t [Saved][-]       [-L-][   0%][ ] drwxrwxr-x top\n\
-             1\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- top/first.bin\n\
-             2-3\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- top/second.bin\n\
-             4\t [Saved][-]       [-L-][   0%][ ] drwxrwxr-x top/sub\n\
-             5\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- top/sub/deep.bin\n\
-             \t [Saved][-]       [---][-----][ ] lrwxrwxrwx top/link\n\
-             6\t [Saved][-]       [-L-][   0%][ ] drwxrwxr-x whole\n\
-             7-8\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- whole/in.bin\n\
-             9\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- nl\n\
-             line.bin\n\
-             10\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- other.bin\n\
-             -----\n\
-             All displayed files have their data in slice range [1-10]\n\
-             -----\n",
-        )
-        .unwrap();
-        let wanted = d.join("wanted");
-        std::fs::write(
-            &wanted,
-            "top/second.bin\ntop/sub/deep.bin\ntop/link\nwhole\nnl\\nline.bin\nabsent.bin\n",
-        )
-        .unwrap();
-        let (code, out) = run_awk(
-            false,
-            AWK_FILL_LISTING,
-            &listing,
-            &[("FILL_WANTED", wanted.display().to_string())],
-        );
-        assert_eq!(code, 0);
-        let found: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("P\t")).collect();
-        assert_eq!(
-            found,
-            vec![
-                "top/second.bin",
-                "top/sub/deep.bin",
-                "top/link",
-                "whole",
-                "nl\\nline.bin"
-            ],
-            "{out}"
-        );
-        let mut slices: Vec<u32> = out
-            .lines()
-            .filter_map(|l| l.strip_prefix("S\t"))
-            .map(|n| n.parse().unwrap())
-            .collect();
-        let n = slices.len();
-        slices.sort_unstable();
-        slices.dedup();
-        assert_eq!(slices.len(), n, "each slice once: {out}");
-        assert_eq!(
-            slices,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
-            "the files' own slices, all of whole/, and top's and top/sub's entries; \
-             not other.bin's: {out}"
-        );
-    }
-
-    /// ADR-0012 item 102: the fragment that reads dar's messages, on dar's
-    /// REAL output for names that break a line-by-line reading: a name holding
-    /// the very separator dar prints, a newline, a TAB and a backslash. Each
-    /// comes out once, escaped as sec 1.5 escapes a path; the count it names
-    /// equals the one in dar's own summary. Needs `dar` and `awk` (issue #43).
-    #[test]
-    fn the_damaged_file_reader_names_every_file_dar_could_not_restore() {
-        use std::process::Command;
-        let work = tempfile::tempdir().unwrap();
-        let dir = work.path();
-        let src = dir.join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        let names = [
-            "plain.bin",
-            "we ird : name.bin",
-            "nl\nline.bin",
-            "tab\there.bin",
-            "back\\slash.bin",
-        ];
-        for (i, n) in names.iter().enumerate() {
-            let body: Vec<u8> = (0..50_000u32)
-                .map(|k| (k.wrapping_mul(2654435761).wrapping_add(i as u32 * 97) >> 13) as u8)
-                .collect();
-            std::fs::write(src.join(n), body).unwrap();
-        }
-        let dar = |args: &[&str]| {
-            Command::new("dar")
-                .args(args)
-                .env("HOME", "/nonexistent")
-                .output()
-                .expect("dar must be on PATH (issue #43)")
-        };
-        let arch = dir.join("arch");
-        let o = dar(&[
-            "-c",
-            arch.to_str().unwrap(),
-            "-R",
-            src.to_str().unwrap(),
-            "-s",
-            "50k",
-            "-Q",
-            "-N",
-        ]);
-        assert!(o.status.success());
-        // Damage every slice but the last (it holds the catalogue), in
-        // several places.
-        let mut n = 1;
-        while dir.join(format!("arch.{}.dar", n + 1)).exists() {
-            let p = dir.join(format!("arch.{n}.dar"));
-            let mut b = std::fs::read(&p).unwrap();
-            for off in [1_000usize, 10_007, 20_015, 30_031, 40_063] {
-                b[off] ^= 0xff;
-            }
-            std::fs::write(&p, b).unwrap();
-            n += 1;
-        }
-        assert!(n > 2, "positive control: several slices were damaged");
-        let out = dir.join("out");
-        std::fs::create_dir_all(&out).unwrap();
-        let o = dar(&[
-            "-x",
-            arch.to_str().unwrap(),
-            "-R",
-            out.to_str().unwrap(),
-            "-O",
-            "-Q",
-            "-N",
-        ]);
-        assert_eq!(o.status.code(), Some(5), "dar says some files failed");
-        let log = format!(
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        );
-        let log_path = dir.join("dar.log");
-        std::fs::write(&log_path, &log).unwrap();
-        let counts = dir.join("counts");
-        let o = Command::new("awk")
-            .arg(AWK_DAR_DAMAGED)
-            .arg(&log_path)
-            .env("DAMAGED_ROOT", &out)
-            .env("DAMAGED_SKIPS", "0")
-            .env("DAMAGED_COUNTS", &counts)
-            .output()
-            .expect("awk");
-        assert!(o.status.success());
-        let mut listed: Vec<String> = String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect();
-        let esc = |s: &str| {
-            s.replace('\\', "\\\\")
-                .replace('\t', "\\t")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-        };
-        let mut want: Vec<String> = names
-            .iter()
-            .filter(|n| std::fs::read(out.join(n)).ok() != std::fs::read(src.join(n)).ok())
-            .map(|n| esc(n))
-            .collect();
-        assert!(want.len() >= 3, "positive control: {want:?}\n{log}");
-        listed.sort();
-        want.sort();
-        assert_eq!(listed, want, "{log}");
-        let c = std::fs::read_to_string(&counts).unwrap();
-        let nums: Vec<usize> = c.split_whitespace().map(|x| x.parse().unwrap()).collect();
-        assert_eq!(nums[0], listed.len(), "errors named: {c}");
-        assert_eq!(nums[2], 0, "none left unnamed: {c}");
-        assert_eq!(nums[3], listed.len(), "dar's own failed count: {c}");
-        // Which files the flips above damage depends on dar's file order, which
-        // is the file system's directory order (ext4 here, another on CI): the
-        // last slice is left whole, so whatever lands in it is not damaged. The
-        // name holding the separator is checked from real dar output when it was
-        // damaged, and always from a line in dar's own form below.
-        if want.iter().any(|w| w == "we ird : name.bin") {
-            assert!(
-                listed.iter().any(|l| l == "we ird : name.bin"),
-                "a name holding the separator keeps its whole name: {listed:?}"
-            );
-        }
-        let crafted_log = dir.join("crafted.log");
-        std::fs::write(
-            &crafted_log,
-            format!(
-                "Error while restoring {}/we ird : name.bin : Bad CRC, data corruption occurred\n",
-                out.display()
-            ),
-        )
-        .unwrap();
-        let o = Command::new("awk")
-            .arg(AWK_DAR_DAMAGED)
-            .arg(&crafted_log)
-            .env("DAMAGED_ROOT", &out)
-            .env("DAMAGED_SKIPS", "0")
-            .env("DAMAGED_COUNTS", dir.join("crafted.counts"))
-            .output()
-            .expect("awk");
-        assert!(o.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .collect::<Vec<_>>(),
-            vec!["we ird : name.bin"],
-            "a name holding the separator keeps its whole name (the reason follows the LAST ' : ')"
-        );
-
-        // The other form dar prints: a slice that was never there.
-        let clean = dir.join("clean");
-        std::fs::create_dir_all(&clean).unwrap();
-        let o = dar(&[
-            "-c",
-            clean.join("arch").to_str().unwrap(),
-            "-R",
-            src.to_str().unwrap(),
-            "-s",
-            "50k",
-            "-Q",
-            "-N",
-        ]);
-        assert!(o.status.success());
-        std::fs::remove_file(clean.join("arch.2.dar")).unwrap();
-        let out2 = dir.join("out2");
-        std::fs::create_dir_all(&out2).unwrap();
-        let o = dar(&[
-            "-x",
-            clean.join("arch").to_str().unwrap(),
-            "-R",
-            out2.to_str().unwrap(),
-            "-O",
-            "-Q",
-            "-N",
-        ]);
-        let log2 = format!(
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        );
-        std::fs::write(&log_path, &log2).unwrap();
-        let run = |skips: &str| -> Vec<String> {
-            let o = Command::new("awk")
-                .arg(AWK_DAR_DAMAGED)
-                .arg(&log_path)
-                .env("DAMAGED_ROOT", &out2)
-                .env("DAMAGED_SKIPS", skips)
-                .env("DAMAGED_COUNTS", &counts)
-                .output()
-                .expect("awk");
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::to_string)
-                .collect()
-        };
-        let mut skipped = run("1");
-        let mut want2: Vec<String> = names
-            .iter()
-            .filter(|n| std::fs::read(out2.join(n)).ok() != std::fs::read(src.join(n)).ok())
-            .map(|n| esc(n))
-            .collect();
-        assert!(
-            !want2.is_empty(),
-            "positive control: a slice's files are missing\n{log2}"
-        );
-        skipped.sort();
-        want2.sort();
-        assert_eq!(skipped, want2, "{log2}");
-        assert!(
-            run("0").is_empty(),
-            "without a missing slice, 'user choice' means a file that was already there"
-        );
-    }
-
-    /// The template substitutes each `__AWK_*__` placeholder for its named
-    /// const before `__LABEL__`/`__TOTAL_FILES__`; a stray one surviving
-    /// would mean a placeholder and a const's name drifted apart, and would
-    /// ship an inert token straight onto tape.
-    #[test]
-    fn no_awk_placeholder_survives_assembly() {
-        let script = generate_restore_script_v2("FRAG02", 20);
-        assert!(
-            !script.contains("__AWK_"),
-            "an __AWK_*__ placeholder was not substituted"
-        );
-    }
-
-    /// #135's near-miss: every named fragment is single-quoted in the
-    /// generated shell script, so a `'` anywhere inside one — including
-    /// inside an awk comment — would end the quoting early and corrupt
-    /// every RESTORE.sh built from it.
-    #[test]
-    fn no_named_fragment_contains_an_apostrophe() {
-        for (name, fragment) in [
-            ("AWK_PARSE_FILE_LIST", AWK_PARSE_FILE_LIST),
-            ("AWK_CHECK_FILE_LIST", AWK_CHECK_FILE_LIST),
-            ("AWK_FIND_ENVELOPE", AWK_FIND_ENVELOPE),
-            ("AWK_MANIFEST_HAS_UNIT", AWK_MANIFEST_HAS_UNIT),
-            ("AWK_UNIT_LIST", AWK_UNIT_LIST),
-            ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
-            ("AWK_MT_POSITION", AWK_MT_POSITION),
-            ("AWK_UNITS_TABLE", AWK_UNITS_TABLE),
-            ("AWK_UNIT_UUID", AWK_UNIT_UUID),
-            ("AWK_INDEX_COMMON", AWK_INDEX_COMMON),
-            ("AWK_INDEX_WHERE", AWK_INDEX_WHERE),
-            ("AWK_INDEX_ALL", AWK_INDEX_ALL),
-            ("AWK_INDEX_FIND", AWK_INDEX_FIND),
-            ("AWK_INDEX_HOLDERS", AWK_INDEX_HOLDERS),
-            ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
-            ("AWK_DAR_HEADER", AWK_DAR_HEADER),
-            ("AWK_FILL_LISTING", AWK_FILL_LISTING),
-            ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
-            ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
-            ("AWK_DAMAGED_DIRS", AWK_DAMAGED_DIRS),
-            ("AWK_CUT_VERSIONS", AWK_CUT_VERSIONS),
-        ] {
-            assert!(!fragment.contains('\''), "{name} contains an apostrophe");
-        }
-    }
-
-    /// `AWK_DAR_HEADER`, under every awk on the host, reads a dar header as
-    /// `dar::slice`'s parser does (#498, ADR-0012 item 181): dar's own
-    /// standard-output header and slice headers at 50 and 54 bytes (the slice
-    /// size two 4-byte groups wide above 4 GiB), each with its length, flag,
-    /// slice size and the offset of its data name; and the same refusals,
-    /// never a guess.
-    #[test]
-    fn the_dar_header_fragment_reads_dar_headers_alike_under_every_awk() {
-        use std::process::Command;
-        let dir = std::env::temp_dir().join(format!("tapectl-darhdr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("empty")).unwrap();
-        // One header in dar's layout: magic, internal name, flag, extension,
-        // a one-group infinint count, then each field (u16 type, a one-group
-        // infinint length, the value).
-        let hdr = |flag: u8, ext: u8, fields: &[(u16, Vec<u8>)]| -> Vec<u8> {
-            let mut h = vec![0, 0, 0, 0x7b];
-            h.extend_from_slice(b"0123456789");
-            h.extend_from_slice(&[flag, ext, 0x80, 0, 0, 0, fields.len() as u8]);
-            for (t, v) in fields {
-                h.extend_from_slice(&t.to_be_bytes());
-                h.extend_from_slice(&[0x80, 0, 0, 0, v.len() as u8]);
-                h.extend_from_slice(v);
-            }
-            h
-        };
-        let name = b"DATANAME!!".to_vec();
-        let one_mib = vec![0x80, 0, 0x10, 0, 0];
-        let ten_gib = vec![0x40, 0, 0, 0, 2, 0x80, 0, 0, 0];
-        let read = |bytes: &[u8]| -> (i32, String) {
-            let text: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
-            let input = dir.join("od.txt");
-            std::fs::write(&input, text.join(" ")).unwrap();
-            run_awk(false, AWK_DAR_HEADER, &input, &[])
-        };
-        for (what, bytes, want) in [
-            (
-                "stdout",
-                hdr(b'T', b'T', &[(3, name.clone())]),
-                "38 T - 28\n",
-            ),
-            (
-                "1M slice",
-                hdr(b'E', b'T', &[(1, one_mib.clone()), (3, name.clone())]),
-                "50 E 1048576 40\n",
-            ),
-            (
-                "10G slice",
-                hdr(b'E', b'T', &[(1, ten_gib.clone()), (3, name.clone())]),
-                "54 E 10737418240 44\n",
-            ),
-        ] {
-            // What follows the header is not read as part of it.
-            let mut more = bytes.clone();
-            more.extend_from_slice(&[0, 0, 0, 0x7b, 9, 9, 9]);
-            assert_eq!(read(&more), (0, want.to_string()), "{what}");
-        }
-        let mut bad_magic = hdr(b'T', b'T', &[(3, name.clone())]);
-        bad_magic[3] = 0x7c;
-        let mut wide = hdr(b'T', b'T', &[(3, name.clone())]);
-        wide[16] = 0x03;
-        let short = hdr(b'E', b'T', &[(1, one_mib.clone()), (3, name.clone())]);
-        for (what, bytes, want) in [
-            (
-                "magic",
-                bad_magic,
-                "the data does not start with the magic number of dar",
-            ),
-            (
-                "flag",
-                hdr(b'X', b'T', &[(3, name.clone())]),
-                "an unknown slice flag 88",
-            ),
-            (
-                "extension",
-                hdr(b'T', b'N', &[(3, name.clone())]),
-                "a header extension that is not a list of fields",
-            ),
-            (
-                "width byte",
-                wide,
-                "an integer width byte 3 with more than one bit set",
-            ),
-            (
-                "field type",
-                hdr(b'E', b'T', &[(2, one_mib.clone()), (3, name.clone())]),
-                "an unknown header field type 2",
-            ),
-            (
-                "two sizes",
-                hdr(
-                    b'E',
-                    b'T',
-                    &[
-                        (1, one_mib.clone()),
-                        (1, one_mib.clone()),
-                        (3, name.clone()),
-                    ],
-                ),
-                "two slice-size fields",
-            ),
-            (
-                "no data name",
-                hdr(b'E', b'T', &[(1, one_mib.clone())]),
-                "no data-name field",
-            ),
-            (
-                "short data name",
-                hdr(b'T', b'T', &[(3, b"NINEBYTES".to_vec())]),
-                "a data-name field 9 bytes long",
-            ),
-            ("ends early", short[..45].to_vec(), "the header ends early"),
-        ] {
-            assert_eq!(read(&bytes), (1, format!("{want}\n")), "{what}");
-        }
-
-        // dar's own: its standard-output header, and a slice header above 4 GiB.
-        let tmpl = Command::new("dar")
-            .args(["-N", "-c", "-", "-R"])
-            .arg(dir.join("empty"))
-            .args(["-an", "-D", "-Q"])
-            .env("HOME", "/nonexistent")
-            .output()
-            .expect("dar must be on PATH (issue #43)");
-        assert!(tmpl.status.success());
-        let (code, out) = read(&tmpl.stdout[..tmpl.stdout.len().min(4096)]);
-        assert_eq!((code, out.split(' ').nth(1)), (0, Some("T")), "{out}");
-        assert!(out.ends_with(" - 28\n") && out.starts_with("38 "), "{out}");
-        let base = dir.join("big");
-        let made = Command::new("dar")
-            .args(["-N", "-c"])
-            .arg(&base)
-            .arg("-R")
-            .arg(dir.join("empty"))
-            .args(["-s", "10G", "-Q"])
-            .env("HOME", "/nonexistent")
-            .output()
-            .expect("dar");
-        assert!(made.status.success());
-        let slice = std::fs::read(dir.join("big.1.dar")).unwrap();
-        assert_eq!(
-            read(&slice[..slice.len().min(4096)]),
-            (0, "54 E 10737418240 44\n".to_string())
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #133 defects 2 and 4, at the process boundary: how the script answers
-    /// argv. Both are silent-success failures, which no assertion on the
-    /// script's *text* would catch, so this runs the real thing.
-    ///
-    /// Every path here returns before any tape I/O — the mode dispatch and the
-    /// argument loop both sit ahead of it — so this needs no device.
-    #[test]
-    fn restore_sh_reports_bad_invocations_instead_of_exiting_quietly() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-
-        let dir = std::env::temp_dir().join(format!("tapectl-argv-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sh = dir.join("RESTORE.sh");
-        std::fs::write(&sh, generate_restore_script_v2("ARGV1", 20)).unwrap();
-
-        // The script's prerequisite loop refuses to run without mt/age/dar, and
-        // CI has none of them — it died with "missing required tool: age"
-        // before reaching the dispatch under test. Stub every required tool on
-        // PATH instead of installing tape software into CI: argv handling has
-        // nothing to do with those binaries, and none of the paths exercised
-        // here ever runs one. `command -v` only checks for an executable file,
-        // so the stubs are never executed either.
-        let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        for tool in [
-            "mt",
-            "dd",
-            "age",
-            "dar",
-            "sha256sum",
-            "head",
-            "truncate",
-            "tar",
-        ] {
-            let stub = bin.join(tool);
-            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-
-        // Invoked as `bash RESTORE.sh`, not exec'd. A script written moments
-        // earlier and then exec'd hits ETXTBSY whenever a sibling test thread
-        // forks while this file's write fd is still open in the parent — the
-        // classic fork/exec race, and nothing to do with what is being tested.
-        let run = |args: &[&str]| -> (i32, String) {
-            let o = Command::new("bash")
-                .arg(&sh)
-                .args(args)
-                .env("PATH", &path)
-                .output()
-                .expect("spawn script");
-            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.code().unwrap_or(-1), text)
-        };
-
-        // Bare invocation is a friendly no-op and stays successful.
-        let (code, text) = run(&[]);
-        assert_eq!(code, 0, "bare invocation should succeed:\n{text}");
-        assert!(text.contains("--help"), "should point at --help:\n{text}");
-
-        // A typo'd mode must NOT look like a completed restore to a wrapper.
-        let (code, text) = run(&["--resore"]);
-        assert_eq!(code, 2, "an unknown mode must exit 2:\n{text}");
-        assert!(text.contains("Unknown mode"), "should say so:\n{text}");
-
-        // A trailing bare flag used to fail `shift 2` under `set -e` and exit
-        // 1 having printed NOTHING. The message is the whole point.
-        let (code, text) = run(&["--restore", "--key"]);
-        assert_ne!(code, 0, "a flag with no value must fail:\n{text}");
-        assert!(
-            text.contains("--key needs a value"),
-            "a short flag must name itself, not exit silently:\n{text:?}"
-        );
-
-        // --info is keyless and cannot see snapshot_version; --help must send
-        // the heir to the command that can (#133 defect 3).
-        let (_, help) = run(&["--help"]);
-        assert!(
-            help.contains("run --find-envelope --key KEYFILE"),
-            "--help must point version discovery at --find-envelope:\n{help}"
-        );
-
-        // #288: --help must say --key repeats, and why. An heir who does not
-        // know that a rotation splits envelope and slices across two key
-        // generations has no reason to try passing a second key.
-        assert!(
-            help.contains("--key may be repeated"),
-            "--help must document repeated --key:\n{help}"
-        );
-        assert!(
-            help.contains("key rotation"),
-            "--help must say WHY --key repeats:\n{help}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Lay out a directory holding the generated script plus stub versions of
-    /// every tool its prerequisite loop demands, and return the script path
-    /// and a `PATH` that finds the stubs.
-    ///
-    /// `mt` and `dd` are not inert stubs: they touch `$TAPECTL_TEST_SENTINEL`.
-    /// That is how a test can tell "refused before any tape read" from
-    /// "refused after reading tape", which is the whole point of validating
-    /// key paths up front.
-    #[cfg(test)]
-    fn stubbed_script_dir(tag: &str, label: &str) -> (std::path::PathBuf, String) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("tapectl-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sh = dir.join("RESTORE.sh");
-        std::fs::write(&sh, generate_restore_script_v2(label, 20)).unwrap();
-
-        let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        // `mt-st` too: the script prefers it by name, and the host's real one
-        // must never be reached from a test.
-        for tool in [
-            "mt",
-            "mt-st",
-            "dd",
-            "age",
-            "dar",
-            "sha256sum",
-            "head",
-            "truncate",
-            "tar",
-        ] {
-            let body = if tool == "mt" || tool == "mt-st" || tool == "dd" {
-                "#!/bin/sh\nif [ -n \"${TAPECTL_TEST_SENTINEL:-}\" ]; then \
-                 : >\"$TAPECTL_TEST_SENTINEL\"; fi\nexit 0\n"
-            } else {
-                "#!/bin/sh\nexit 0\n"
-            };
-            let stub = bin.join(tool);
-            std::fs::write(&stub, body).unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        (dir, path)
-    }
-
-    /// Issue #288, CTO ruling 2026-09-22: `--key` repeats, and every key path
-    /// is validated BEFORE the first tape read.
-    ///
-    /// The discriminating cases are the ORDERING ones. Old single-key code
-    /// accepted `--key a --key b` too — `--find-envelope` ignored the trailing
-    /// pair and `--restore` simply overwrote — so "two keys are accepted"
-    /// proves nothing on its own. What the old code could not do is notice a
-    /// bad path that is not the last one: it checked exactly one file.
-    ///
-    /// `age -d -i good.key -i missing.key` fails outright rather than skipping
-    /// the bad identity, so a mistyped path has to be caught here and not
-    /// minutes into a restore — hence the sentinel, and hence the positive
-    /// control that proves the sentinel can fire at all.
-    #[test]
-    fn restore_sh_takes_repeated_keys_and_names_a_missing_one_before_reading_tape() {
-        use std::process::Command;
-
-        let (dir, path) = stubbed_script_dir("multikey", "MULTI1");
-        let sh = dir.join("RESTORE.sh");
-        let sentinel = dir.join("tape-was-read");
-
-        let good = dir.join("good.age.key");
-        let good2 = dir.join("good2.age.key");
-        std::fs::write(&good, "AGE-SECRET-KEY-1PLACEHOLDER\n").unwrap();
-        std::fs::write(&good2, "AGE-SECRET-KEY-1PLACEHOLDER2\n").unwrap();
-        let missing = dir.join("typo.age.key");
-
-        let run = |args: &[&str]| -> (i32, String, bool) {
-            let _ = std::fs::remove_file(&sentinel);
-            let o = Command::new("bash")
-                .arg(&sh)
-                .args(args)
-                .env("PATH", &path)
-                .env("TAPECTL_TEST_SENTINEL", &sentinel)
-                .output()
-                .expect("spawn script");
-            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.code().unwrap_or(-1), text, sentinel.exists())
-        };
-
-        let missing_s = missing.display().to_string();
-        let good_s = good.display().to_string();
-        let good2_s = good2.display().to_string();
-
-        // --find-envelope: the bad path is the SECOND one. Old code never
-        // looked at it.
-        let (code, text, read) = run(&["--find-envelope", "--key", &good_s, "--key", &missing_s]);
-        assert_ne!(code, 0, "a missing key file must fail:\n{text}");
-        assert!(
-            text.contains(&format!("key file not found: {missing_s}")),
-            "the missing key must be named:\n{text}"
-        );
-        assert!(
-            !read,
-            "no tape may be read before the key paths are checked"
-        );
-
-        // --restore: the bad path is the FIRST one. Old code checked only the
-        // last `--key` it saw and would have proceeded.
-        let dest = dir.join("dest");
-        let dest_s = dest.display().to_string();
-        let (code, text, read) = run(&[
-            "--restore",
-            "--key",
-            &missing_s,
-            "--key",
-            &good_s,
-            "--to",
-            &dest_s,
-        ]);
-        assert_ne!(code, 0, "a missing key file must fail:\n{text}");
-        assert!(
-            text.contains(&format!("key file not found: {missing_s}")),
-            "the missing key must be named:\n{text}"
-        );
-        assert!(
-            !read,
-            "no tape may be read before the key paths are checked"
-        );
-
-        // Positive control: with every key present, argument parsing accepts
-        // the repetition and the script goes on to touch the tape. Without
-        // this, "sentinel absent" could just mean the stub never runs.
-        let (_, text, read) = run(&["--find-envelope", "--key", &good_s, "--key", &good2_s]);
-        assert!(
-            !text.contains("key file not found"),
-            "two valid keys must both pass validation:\n{text}"
-        );
-        assert!(
-            !text.contains("usage:"),
-            "repeated --key must be accepted, not rejected as usage:\n{text}"
-        );
-        assert!(
-            read,
-            "control: with valid keys the script must reach the tape:\n{text}"
-        );
-
-        let (_, text, read) = run(&[
-            "--restore",
-            "--key",
-            &good_s,
-            "--key",
-            &good2_s,
-            "--to",
-            &dest_s,
-        ]);
-        assert!(
-            !text.contains("key file not found") && !text.contains("usage:"),
-            "--restore must accept repeated --key:\n{text}"
-        );
-        assert!(
-            read,
-            "control: with valid keys --restore must reach the tape:\n{text}"
-        );
-
-        // Zero keys is still a usage error, in both modes.
-        let (code, text, _) = run(&["--find-envelope"]);
-        assert_ne!(code, 0, "no --key at all must fail:\n{text}");
-        assert!(
-            text.contains("usage: "),
-            "no --key must print usage:\n{text}"
-        );
-        let (code, text, _) = run(&["--restore", "--to", &dest_s]);
-        assert_ne!(code, 0, "no --key at all must fail:\n{text}");
-        assert!(
-            text.contains("usage: "),
-            "no --key must print usage:\n{text}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Issue #291 + the quoting defect: all three "no envelope opened" exits
-    /// must carry the unit (where there is one), the device/label sentence and
-    /// the key-rotation sentence — and must RENDER, which the template text
-    /// alone cannot prove.
-    ///
-    /// The exits sit behind `establish_files`, which reads tape, so argv alone
-    /// cannot reach them. Sourcing the script defines its functions without
-    /// running a mode (with no positional args the trailing `case` takes the
-    /// `""` branch, which does not exit), and `die_no_envelope` can then be
-    /// called directly with the globals set the way a real failure would leave
-    /// them.
-    #[test]
-    fn the_three_no_envelope_exits_render_unit_label_and_the_rotation_hint() {
-        use std::process::Command;
-
-        let (dir, path) = stubbed_script_dir("noenv", "GOLD01");
-        let sh = dir.join("RESTORE.sh");
-
-        let call = |snippet: &str| -> (i32, String) {
-            let prog = format!(
-                "source \"{}\"\nDEVICE=/dev/nst1\nTAPE_LABEL=VOL-A\nKEYS=(k1 k2 k3)\n{snippet}\n",
-                sh.display()
-            );
-            let o = Command::new("bash")
-                .arg("-c")
-                .arg(&prog)
-                .env("PATH", &path)
-                .output()
-                .expect("spawn bash -c");
-            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.code().unwrap_or(-1), text)
-        };
-
-        // The shape every one of the three must have.
-        let shared = |text: &str, what: &str| {
-            assert!(
-                text.contains("Tape in /dev/nst1 identifies as 'VOL-A'"),
-                "{what}: the device/label sentence must render with plain \
-                 quotes:\n{text}"
-            );
-            assert!(
-                text.contains("this script is for 'GOLD01'"),
-                "{what}: the script's own label must render:\n{text}"
-            );
-            assert!(
-                !text.contains("'\\''"),
-                "{what}: the single-quote-inside-single-quotes idiom is \
-                 literal inside a double-quoted string and must not appear \
-                 in the output:\n{text}"
-            );
-            assert!(
-                text.contains("wrong cartridge or the wrong drive"),
-                "{what}: must say it may be the wrong cartridge:\n{text}"
-            );
-            assert!(
-                text.contains("sealed with the key"),
-                "{what}: must name the rotation cause (#288):\n{text}"
-            );
-            assert!(
-                text.contains("Keys tried: k1 k2 k3"),
-                "{what}: must name every key tried:\n{text}"
-            );
-        };
-
-        // Exit 1 — do_find_envelope. Exit 2 — do_restore with no --unit.
-        // Both are the no-unit form.
-        let (code, text) = call("die_no_envelope");
-        assert_ne!(code, 0, "die_no_envelope must exit non-zero:\n{text}");
-        assert!(
-            text.contains("no envelope matched any of the 3 keys provided"),
-            "the headline must count the keys:\n{text}"
-        );
-        shared(&text, "no-unit form");
-
-        // Exit 3 — do_restore WITH --unit. This is the one an heir actually
-        // hits, and the one that used to be a bare one-liner (#291).
-        let (code, text) = call("die_no_envelope photos");
-        assert_ne!(code, 0, "die_no_envelope must exit non-zero:\n{text}");
-        assert!(
-            text.contains("no envelope for unit 'photos' matched any of the 3 keys provided"),
-            "the --unit form must still name the unit:\n{text}"
-        );
-        shared(&text, "unit form");
-
-        // A single key reads as a singular, not "any of the 1 keys".
-        let prog = format!(
-            "source \"{}\"\nDEVICE=/dev/nst1\nTAPE_LABEL=VOL-A\nKEYS=(only.key)\ndie_no_envelope\n",
-            sh.display()
-        );
-        let o = Command::new("bash")
-            .arg("-c")
-            .arg(&prog)
-            .env("PATH", &path)
-            .output()
-            .expect("spawn bash -c");
-        let text = String::from_utf8_lossy(&o.stderr).to_string();
-        assert!(
-            text.contains("no envelope matched the key provided"),
-            "one key must read as a singular:\n{text}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Issue #288 at the slice, executed: every key reaches age at once (a
-    /// streamed slice cannot be re-read for a second key, 1.1.0, #412), so a
-    /// slice sealed to ANY of them opens; age's own stderr stays visible; and
-    /// "no key works" still fails with the rotation hint.
-    ///
-    /// The real `age` CLI is not a test dependency here, so the stub decides
-    /// by key NAME: what is under test is the script, not the cryptography.
-    #[test]
-    fn a_slice_is_decrypted_with_every_key_at_once() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-
-        let (dir, path) = stubbed_script_dir("slicekeys", "SLICEK");
-        let sh = dir.join("RESTORE.sh");
-
-        // An `age` that succeeds when any -i names $AGE_GOOD, records every
-        // call's keys on one line in $AGE_TRIED, and otherwise fails the way
-        // the real one does.
-        let age_stub = dir.join("bin").join("age");
-        std::fs::write(
-            &age_stub,
-            "#!/bin/sh\nkeys=\"\"\nok=0\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n  \
-             -i) keys=\"$keys $2\"; [ \"$2\" = \"$AGE_GOOD\" ] && ok=1; shift 2 ;;\n  \
-             *) shift ;;\n  esac\ndone\n\
-             echo \"$keys\" >>\"$AGE_TRIED\"\nif [ $ok = 1 ]; then\n  cat\n  exit 0\nfi\n\
-             echo \"age: error: no identity matched any of the recipients\" >&2\nexit 1\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&age_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let d = dir.display();
-        let run = |prog: String| -> (i32, String) {
-            let o = Command::new("bash")
-                .arg("-c")
-                .arg(&prog)
-                .env("PATH", &path)
-                .output()
-                .expect("spawn bash -c");
-            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.code().unwrap_or(-1), text)
-        };
-
-        let (code, text) = run(format!(
-            "source \"{sh}\"\nKEYS=(kA kB kC)\nset_age_ids\nexport AGE_GOOD=kB\n\
-             export AGE_TRIED={d}/tried\n: >\"$AGE_TRIED\"\n\
-             printf payload >{d}/in\n\
-             decrypt_slice {d}/in {d}/out1 1\n\
-             echo \"TRIED: $(cat \"$AGE_TRIED\")\"\n\
-             echo \"OUT1: $(cat {d}/out1)\"\n",
-            sh = sh.display()
-        ));
-        assert_eq!(code, 0, "a key that works must succeed:\n{text}");
-        assert!(
-            text.contains("TRIED:  kA kB kC\n"),
-            "one age call, every key:\n{text}"
-        );
-        assert!(text.contains("OUT1: payload"), "{text}");
-
-        let (code, text) = run(format!(
-            "source \"{sh}\"\nKEYS=(kA kB kC)\nset_age_ids\nexport AGE_GOOD=none\n\
-             export AGE_TRIED={d}/tried2\n: >\"$AGE_TRIED\"\n\
-             printf payload >{d}/in\n\
-             decrypt_slice {d}/in {d}/out3 7\n",
-            sh = sh.display()
-        ));
-        assert_ne!(code, 0, "no working key must still fail:\n{text}");
-        assert!(text.contains("cannot decrypt slice 7"), "{text}");
-        assert!(text.contains("Keys tried: kA kB kC"), "{text}");
-        assert!(text.contains("key rotation between the two"), "{text}");
-        assert!(
-            text.contains("no identity matched any of the recipients"),
-            "age's own stderr must not be suppressed:\n{text}"
-        );
-        assert!(!dir.join("out3").exists(), "no partial plaintext is left");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The three exits must keep going through the one helper. A future edit
-    /// that inlines a message again would pass the rendering test above (which
-    /// calls the helper directly) while re-opening #291, so pin the call sites
-    /// and pin the absence of the old single-key wording.
-    #[test]
-    fn every_no_envelope_exit_routes_through_the_shared_helper() {
-        let s = generate_restore_script_v2("ROUTE1", 20);
-        assert!(
-            s.contains("die_no_envelope() {"),
-            "the shared helper must exist"
-        );
-        // do_find_envelope's exit, and do_restore's (one call, covering both
-        // its --unit and no---unit branches via the argument).
-        assert!(
-            s.contains("|| die_no_envelope\n"),
-            "do_find_envelope must use the helper"
-        );
-        assert!(
-            s.contains("die_no_envelope \"${wanted// /, }\""),
-            "do_restore must use the helper and pass the unit(s)"
-        );
-        assert!(
-            !s.contains("matched the provided key"),
-            "the old single-key wording must be gone from every exit"
-        );
-        // The rendering defect must not survive anywhere in the script.
-        assert!(
-            !s.contains("'\\''"),
-            "the '\\'' idiom is literal inside a double-quoted string"
-        );
-    }
-
-    /// Issue #288's other half, as 1.1.0 streams slices (#412): every slice
-    /// goes to age with EVERY key at once — the restore and --path alike —
-    /// and a slice no key opens still names the keys and the rotation fact.
-    #[test]
-    fn every_slice_is_offered_every_key() {
-        let s = generate_restore_script_v2("SLICE1", 20);
-        assert!(
-            s.contains("AGE_IDS+=(-i \"$k\")"),
-            "every key becomes an -i"
-        );
-        assert!(
-            s.contains(
-                "age -d \"${AGE_IDS[@]}\" 2>\"$WORK/age.err\" |\n        {\n          [ \"$sink\" = /dev/null ] || join_slice"
-            ),
-            "the streamed slice is decrypted with every key, into dar's stream (#498: joined \
-             into the one stream; #497: what dar leaves is drained after it)"
-        );
-        assert!(
-            s.contains("if age -d \"${AGE_IDS[@]}\" <\"$in\" >\"$out\""),
-            "--path's on-disk slices too"
-        );
-        assert!(!s.contains("SLICE_KEY"), "no per-key retry is left");
-        assert!(s.contains("key rotation between the two puts them on"));
-        assert!(s.contains("Keys tried: $(keys_list)"));
-        // #218 (ADR-0012): no binary figure is labelled decimal.
-        assert!(!s.contains("$((bytes / 1048576)) MB"));
-        assert!(
-            s.contains("--restore $(keys_args) --to /your/destination"),
-            "the restore hint must echo all the keys"
-        );
-    }
-
-    /// Find `name` on the test process's own PATH, for building a PATH that
-    /// holds exactly the tools a test chooses and nothing else.
-    fn host_tool(name: &str) -> std::path::PathBuf {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|d| d.join(name))
-            .find(|p| p.is_file())
-            .unwrap_or_else(|| panic!("test host has no `{name}` on PATH"))
-    }
-
-    /// Issue #349, CTO ruling 2026-09-28: RESTORE.sh unpacks the decrypted
-    /// envelope with `tar xf -`, so an heir without `tar` must be told so up
-    /// front by the prerequisite check, not meet a confusing failure after
-    /// the tape has already been read and decrypted. Since 1.2.0 the check
-    /// belongs to each mode (#449 item 2): `--restore` runs tar, and a bare
-    /// invocation, `--help` and a typo'd mode run nothing and need nothing.
-    ///
-    /// Executed, not grepped: the script runs on a PATH holding every other
-    /// tool the check demands (inert stubs, plus the real `mktemp`/`rm` the
-    /// preamble uses) and no `tar`. The positive control adds a `tar` stub to
-    /// the same PATH and must get past the check — without it, a failure
-    /// here could just mean the stripped PATH broke something else.
-    #[test]
-    fn restore_sh_refuses_up_front_when_tar_is_missing() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-
-        let dir = std::env::temp_dir().join(format!("tapectl-notar-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let sh = dir.join("RESTORE.sh");
-        std::fs::write(&sh, generate_restore_script_v2("NOTAR1", 20)).unwrap();
-        for tool in ["mt"].into_iter().chain(restore_sh_tools()) {
-            if tool == "tar" {
-                continue;
-            }
-            let stub = bin.join(tool);
-            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        for tool in ["mktemp", "rm"] {
-            std::os::unix::fs::symlink(host_tool(tool), bin.join(tool)).unwrap();
-        }
-        let bash = host_tool("bash");
-        let run = |args: &[&str]| -> (i32, String) {
-            let o = Command::new(&bash)
-                .arg(&sh)
-                .args(args)
-                .env("PATH", &bin)
-                .output()
-                .expect("spawn script");
-            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.code().unwrap_or(-1), text)
-        };
-        let restore = ["--restore", "--key", "k.key", "--to", "out"];
-
-        let (code, text) = run(&restore);
-        assert_eq!(code, 1, "no tar on PATH must be a fatal exit:\n{text}");
-        assert!(
-            text.contains("missing required tool: tar"),
-            "the prerequisite check must name tar:\n{text}"
-        );
-
-        // A mode that runs no tar does not ask for it: --info and --verify
-        // read and hash, and get as far as the (stub) tape.
-        for mode in ["--info", "--verify"] {
-            let (_, text) = run(&[mode]);
-            assert!(
-                !text.contains("missing required tool"),
-                "{mode} runs no tar:\n{text}"
-            );
-        }
-        let (code, text) = run(&[]);
-        assert_eq!(code, 0, "a bare invocation needs no tool:\n{text}");
-        let (code, _) = run(&["--help"]);
-        assert_eq!(code, 0, "--help needs no tool");
-
-        // Positive control: the same PATH plus tar gets past the check (the
-        // key file does not exist, which is the next thing the mode asks).
-        let stub = bin.join("tar");
-        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (code, text) = run(&restore);
-        assert_eq!(
-            code, 1,
-            "control: it then stops at the missing key:\n{text}"
-        );
-        assert!(!text.contains("missing required tool"), "{text}");
-        assert!(text.contains("key file not found"), "{text}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #449 item 2, the one source of truth: RESTORE.sh's per-mode sets are
-    /// read back out of the generated script and compared to the table they
-    /// come from. The union is what `--restore` checks, what File 1 and the
-    /// cover sheet list, and what the Requirements lines say; every smaller
-    /// set is drawn from it; and the sets widen the way the modes do.
-    #[test]
-    fn restore_sh_tool_sets_are_drawn_from_one_table() {
-        let s = generate_restore_script_v2("TOOLSET", 20);
-        assert!(!s.contains("__TOOLS_"), "a placeholder survived assembly");
-        let set = |name: &str| -> Vec<String> {
-            let line = s
-                .lines()
-                .find(|l| l.starts_with(&format!("{name}=(")))
-                .unwrap_or_else(|| panic!("no {name} line"));
-            line.trim_start_matches(&format!("{name}=("))
-                .split(')')
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .map(str::to_string)
-                .collect()
-        };
-        let union: Vec<String> = restore_sh_tools().iter().map(|t| t.to_string()).collect();
-        assert_eq!(
-            union,
-            [
-                "dd",
-                "age",
-                "dar",
-                "sha256sum",
-                "head",
-                "truncate",
-                "tar",
-                "mkfifo",
-                "tee"
-            ],
-            "the union, in the order RESTORE.sh's Requirements lines have always listed it"
-        );
-        assert_eq!(set("TOOLS_RESTORE"), union, "--restore checks the union");
-        let (read, envelope, list, path) = (
-            set("TOOLS_READ"),
-            set("TOOLS_ENVELOPE"),
-            set("TOOLS_LIST"),
-            set("TOOLS_PATH"),
-        );
-        for (name, sub) in [
-            ("read", &read),
-            ("envelope", &envelope),
-            ("list", &list),
-            ("path", &path),
-        ] {
-            for tool in sub {
-                assert!(union.contains(tool), "{name}: {tool} is not in the union");
-            }
-        }
-        // The widening: --info/--verify read and hash; --find-envelope adds
-        // what unpacks an envelope; --list adds dar; --path adds tee;
-        // --restore adds mkfifo.
-        assert_eq!(read, ["dd", "sha256sum", "head"]);
-        assert_eq!(
-            envelope,
-            ["dd", "age", "sha256sum", "head", "truncate", "tar"]
-        );
-        assert_eq!(
-            list,
-            ["dd", "age", "dar", "sha256sum", "head", "truncate", "tar"]
-        );
-        assert!(path.contains(&"tee".to_string()) && !path.contains(&"mkfifo".to_string()));
-        assert!(path.iter().all(|t| list.contains(t) || t == "tee"));
-        // --where and --find (1.3.0) open envelopes and read plain text out of
-        // them: the --find-envelope set exactly, no dar, tee or mkfifo.
-        assert_eq!(set("TOOLS_INDEX"), envelope, "the index modes' tools");
-        // The two Requirements lines say the union, mt first.
-        let req = format!("mt (mt-st), {}", union.join(", "));
-        assert!(s.contains(&format!("# Requirements: {req}\n")));
-        assert!(s.contains(&format!("echo \"Requirements: {req}\"")));
-        // The prerequisite loop is gone: no mode checks tools it does not run.
-        assert!(!s.contains("for tool in dd age"), "the every-mode loop");
     }
 
     /// Issue #349: File 1 is where an heir learns what to install before
@@ -13105,460 +4457,6 @@ sha256_encrypted = \"bbb\"
     }
 
     // ---- the 2026-09-30 heir-path batch (ADR-0012 2026-09-30 amendment) ----
-
-    /// A directory holding the generated script and a `bin/` of stubs that
-    /// shadow the host's tools, one `(name, body)` per stub. Everything not
-    /// stubbed (sha256sum, head, df, stat, awk, mktemp, ...) is the host's
-    /// real tool, which these tests need: they execute the script's own
-    /// helpers rather than grep for them.
-    #[cfg(test)]
-    fn heir_harness(tag: &str, stubs: &[(&str, &str)]) -> (std::path::PathBuf, String) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("tapectl-heir-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(
-            dir.join("RESTORE.sh"),
-            generate_restore_script_v2("HEIR01", 20),
-        )
-        .unwrap();
-        // The prerequisite loop demands these; inert unless a test says more.
-        // `mt-st` too: the script prefers it by name, and the host's real one
-        // must never be reached from a test.
-        let mut all: Vec<(&str, &str)> = vec![
-            ("mt", "#!/bin/sh\nexit 0\n"),
-            ("mt-st", "#!/bin/sh\nexit 0\n"),
-            ("dd", "#!/bin/sh\nexit 0\n"),
-            ("age", "#!/bin/sh\nexit 0\n"),
-            ("dar", "#!/bin/sh\nexit 0\n"),
-        ];
-        all.retain(|(n, _)| !stubs.iter().any(|(m, _)| m == n));
-        all.extend_from_slice(stubs);
-        for (name, body) in all {
-            let stub = bin.join(name);
-            std::fs::write(&stub, body).unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        (dir, path)
-    }
-
-    /// Source the harness's script (defining its functions without running a
-    /// mode) and run `snippet` in the same shell.
-    #[cfg(test)]
-    fn heir_run(dir: &std::path::Path, path: &str, snippet: &str) -> (i32, String) {
-        let prog = format!(
-            "source \"{}\" >/dev/null\n{snippet}\n",
-            dir.join("RESTORE.sh").display()
-        );
-        let o = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&prog)
-            .env("PATH", path)
-            .output()
-            .expect("spawn bash -c");
-        let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&o.stderr));
-        (o.status.code().unwrap_or(-1), text)
-    }
-
-    /// A `df -Pk` stub reporting `kib` KiB available on every path.
-    #[cfg(test)]
-    fn df_stub(kib: u64) -> String {
-        format!(
-            "#!/bin/sh\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo \"/dev/x 999999999999 0 {kib} 0% /\"\n"
-        )
-    }
-
-    /// The space check refuses a restore that cannot fit, names the fix, and
-    /// says no slice has been read; with room it passes and says how much it
-    /// needs. 1.1.0 streams slices into dar (#412), so a restore needs room
-    /// for the files only — the unit's size, no longer about twice it plus a
-    /// slice, which refused a 470 GiB unit on a 1 TB disk.
-    #[test]
-    fn restore_space_check_refuses_a_unit_that_cannot_fit() {
-        let gib: u64 = 1 << 30;
-        let total = 20 * gib;
-
-        // 8 GiB free: refused.
-        let small = df_stub(8 * (1 << 20));
-        let (dir, path) = heir_harness("space-small", &[("df", &small)]);
-        let dest = dir.join("dest");
-        std::fs::create_dir_all(&dest).unwrap();
-        let call = format!("check_space \"{0}\" \"{0}\" {total} 0", dest.display());
-        let (code, text) = heir_run(&dir, &path, &call);
-        assert_ne!(code, 0, "a unit that cannot fit must be refused:\n{text}");
-        assert!(text.contains("not enough disk space in"), "{text}");
-        assert!(text.contains("No slice has been read yet"), "{text}");
-        assert!(
-            text.contains("--no-space-check"),
-            "the escape must be named:\n{text}"
-        );
-        assert!(
-            text.contains("it needs about 20.0 GiB, and 8.0 GiB is free"),
-            "the files only:\n{text}"
-        );
-
-        // Positive control: 25 GiB free holds a 20 GiB unit (1.0.x asked 50).
-        let big = df_stub(25 * (1 << 20));
-        let (dir2, path2) = heir_harness("space-big", &[("df", &big)]);
-        let dest2 = dir2.join("dest");
-        std::fs::create_dir_all(&dest2).unwrap();
-        let call = format!(
-            "check_space \"{0}\" \"{0}\" {total} 0 && echo PASSED",
-            dest2.display()
-        );
-        let (code, text) = heir_run(&dir2, &path2, &call);
-        assert_eq!(code, 0, "{text}");
-        assert!(text.contains("PASSED"), "{text}");
-        assert!(
-            text.contains("Disk space: needs about 20.0 GiB in") && text.contains("(the files)"),
-            "{text}"
-        );
-
-        // --no-space-check skips it, even when it would refuse.
-        let call = format!(
-            "SKIP_SPACE_CHECK=1\ncheck_space \"{0}\" \"{0}\" {total} 0 && echo PASSED",
-            dest.display()
-        );
-        let (code, text) = heir_run(&dir, &path, &call);
-        assert_eq!(code, 0, "{text}");
-        assert!(
-            text.contains("not checked (--no-space-check)") && text.contains("PASSED"),
-            "{text}"
-        );
-
-        // A df that cannot answer warns and carries on: the check must never be
-        // what stops an heir.
-        let (dir3, path3) = heir_harness("space-nodf", &[("df", "#!/bin/sh\nexit 1\n")]);
-        let call = format!("check_space /x /x {total} 0 && echo PASSED");
-        let (code, text) = heir_run(&dir3, &path3, &call);
-        assert_eq!(code, 0, "{text}");
-        assert!(
-            text.contains("cannot measure free disk space") && text.contains("PASSED"),
-            "{text}"
-        );
-
-        for d in [dir, dir2, dir3] {
-            let _ = std::fs::remove_dir_all(&d);
-        }
-    }
-
-    /// Sizes in the space messages pick their unit: a small unit must not read
-    /// as "needs about 0.0 GiB, and 0.0 GiB is free" (seen on a real tape).
-    #[test]
-    fn restore_space_messages_name_small_sizes_in_small_units() {
-        let (dir, path) = heir_harness("sizes", &[]);
-        let (code, text) = heir_run(
-            &dir,
-            &path,
-            "size_str 5000; echo; size_str 3145728; echo; size_str 53687091200",
-        );
-        assert_eq!(code, 0, "{text}");
-        assert_eq!(text, "4.9 KiB\n3.0 MiB\n50.0 GiB", "{text}");
-
-        // And in the refusal itself: 64 KiB free against a 3 MiB unit.
-        let df = df_stub(64);
-        let (dir2, path2) = heir_harness("sizes-refuse", &[("df", &df)]);
-        let (code, text) = heir_run(&dir2, &path2, "check_space /d /d 3145728 0");
-        assert_ne!(code, 0, "{text}");
-        assert!(
-            text.contains("it needs about 3.0 MiB, and 64.0 KiB is free"),
-            "{text}"
-        );
-        for d in [dir, dir2] {
-            let _ = std::fs::remove_dir_all(&d);
-        }
-    }
-
-    /// --path keeps the slices it reads on disk (scratch). With --scratch on
-    /// another filesystem each disk is asked only for its own share: 21 GiB
-    /// free on each passes 20 GiB of slices and 20 GiB of files that one
-    /// 21 GiB disk holding both could not.
-    #[test]
-    fn restore_space_check_splits_the_need_across_two_filesystems() {
-        let gib: u64 = 1 << 30;
-        let df = df_stub(21 * (1 << 20));
-        // stat reports a different device per directory name.
-        let stat = "#!/bin/sh\ncase \"$*\" in *scr*) echo 11 ;; *) echo 22 ;; esac\n";
-        let (dir, path) = heir_harness("space-split", &[("df", &df), ("stat", stat)]);
-        let call = format!(
-            "check_space /d/dest /d/scr {} {} && echo PASSED",
-            20 * gib,
-            20 * gib
-        );
-        let (code, text) = heir_run(&dir, &path, &call);
-        assert_eq!(code, 0, "{text}");
-        assert!(text.contains("PASSED"), "{text}");
-        assert!(text.contains("in /d/scr (slices read)"), "{text}");
-        assert!(text.contains("in /d/dest (the files)"), "{text}");
-
-        // Control: the same disks as ONE filesystem must refuse.
-        let same = "#!/bin/sh\necho 11\n";
-        let (dir2, path2) = heir_harness("space-same", &[("df", &df), ("stat", same)]);
-        let (code, text) = heir_run(&dir2, &path2, &call);
-        assert_ne!(code, 0, "one 21 GiB disk cannot hold both:\n{text}");
-        for d in [dir, dir2] {
-            let _ = std::fs::remove_dir_all(&d);
-        }
-    }
-
-    /// The check runs after the versions are picked and BEFORE the first slice
-    /// is read; a full restore streams its slices from the tape into dar,
-    /// joined into one stream on dar's standard input through one FIFO (never
-    /// a FIFO per slice, #498), and no slice lands in WORK (which is /tmp).
-    #[test]
-    fn restore_measures_space_before_the_first_slice_and_streams_into_dar() {
-        let s = generate_restore_script_v2("ORDER1", 20);
-        let check = s
-            .find("check_space \"$destdir\" \"$destdir\" \"$total\" 0")
-            .expect("do_restore calls check_space");
-        let picked = s
-            .find("snapshot version ${PICKED_VERSION:-unknown}")
-            .unwrap();
-        let first_read = s
-            .find("restore_unit \"$WORK/slices.$i\"")
-            .expect("slice read");
-        // dar is given the envelope's catalogue when it streams: dar 2.7.13
-        // loses a file's tail streaming without one.
-        assert!(s.contains("[ -z \"$cat\" ] || dar_opts+=(-A \"$cat\")"));
-        assert!(
-            picked < check && check < first_read,
-            "order: version, space, slices"
-        );
-        assert!(s.contains("mkfifo \"$fifos/stream\" \"$fifos/cipher\"\n"));
-        assert!(!s.contains("mkfifo \"$fifos/restore."), "no FIFO per slice");
-        assert!(s.contains(
-            "dar -x - -R \"$(abs_dir \"$destdir\")\" \"${dar_opts[@]}\" <\"$fifos/stream\""
-        ));
-        assert!(s.contains("exec 3>\"$fifos/stream\""));
-        assert!(s.contains("local -a dar_opts=(-O -Q -N --sequential-read)"));
-        assert!(!s.contains("$WORK/slice.enc") && !s.contains("$WORK/dar/"));
-        // --verify hashes as it streams; it copies nothing to WORK.
-        assert!(
-            !s.contains("$WORK/chk."),
-            "--verify must not copy tape files to WORK"
-        );
-        // The trap kills a dar left waiting on a FIFO, and removes scratch.
-        assert!(s.contains("trap cleanup EXIT"));
-        assert!(s.contains("kill -KILL \"$p\""));
-        assert!(s.contains("[ -z \"$SCRATCH\" ] || rm -rf \"$SCRATCH\""));
-    }
-
-    /// A full disk while age writes a slice is reported as a full disk, on
-    /// the first key, instead of every key failing in turn and the script
-    /// blaming a key rotation.
-    #[test]
-    fn a_full_disk_while_decrypting_is_not_reported_as_a_wrong_key() {
-        let age_full = "#!/bin/sh\necho 'age: error: failed to write output: write /x: no space left on device' >&2\nexit 1\n";
-        let (dir, path) = heir_harness("age-full", &[("age", age_full)]);
-        let snippet = format!(
-            "KEYS=(k1 k2)\nset_age_ids\n: >\"{0}/in\"\ndecrypt_slice \"{0}/in\" \"{0}/out\" 3",
-            dir.display()
-        );
-        let (code, text) = heir_run(&dir, &path, &snippet);
-        assert_ne!(code, 0, "{text}");
-        assert!(
-            text.contains("decrypting slice 3 failed: OUT OF DISK SPACE"),
-            "{text}"
-        );
-        assert!(text.contains("This is not a tape or key problem"), "{text}");
-        assert!(
-            !text.contains("none of the"),
-            "must not blame the keys:\n{text}"
-        );
-        assert!(
-            !text.contains("key k2"),
-            "a full disk must stop at the first key:\n{text}"
-        );
-        assert!(
-            !dir.join("out").exists(),
-            "the partial plaintext is removed"
-        );
-
-        // Control: a genuinely wrong key still walks every key and ends on the
-        // rotation hint.
-        let age_wrong =
-            "#!/bin/sh\necho 'age: error: no identity matched any of the recipients' >&2\nexit 1\n";
-        let (dir2, path2) = heir_harness("age-wrong", &[("age", age_wrong)]);
-        let snippet = format!(
-            "KEYS=(k1 k2)\nset_age_ids\n: >\"{0}/in\"\ndecrypt_slice \"{0}/in\" \"{0}/out\" 3",
-            dir2.display()
-        );
-        let (code, text) = heir_run(&dir2, &path2, &snippet);
-        assert_ne!(code, 0, "{text}");
-        assert!(text.contains("Keys tried: k1 k2"), "{text}");
-        assert!(text.contains("none of the 2 key(s) decrypted it"), "{text}");
-        assert!(
-            text.contains("no identity matched"),
-            "age's own stderr stays visible:\n{text}"
-        );
-        for d in [dir, dir2] {
-            let _ = std::fs::remove_dir_all(&d);
-        }
-    }
-
-    /// A full disk while dd copies a slice off the tape names the cause; it
-    /// used to end the script with no message at all (dd's stderr went to
-    /// /dev/null under `set -e`).
-    #[test]
-    fn a_full_disk_while_reading_a_slice_names_the_cause() {
-        let dd_full = "#!/bin/sh\necho \"dd: error writing 'x': No space left on device\" >&2\n\
-                       echo '3+0 records in' >&2\necho '2+0 records out' >&2\nexit 1\n";
-        let (dir, path) = heir_harness("dd-full", &[("dd", dd_full)]);
-        let snippet = format!("read_tape_raw 7 \"{}/slice.enc\"", dir.display());
-        let (code, text) = heir_run(&dir, &path, &snippet);
-        assert_ne!(code, 0, "{text}");
-        assert!(
-            text.contains("reading tape file 7 failed: OUT OF DISK SPACE in"),
-            "{text}"
-        );
-        assert!(
-            text.contains("No space left on device"),
-            "dd's own line is kept:\n{text}"
-        );
-        assert!(
-            !text.contains("records in"),
-            "dd's record counts are noise:\n{text}"
-        );
-
-        // Control: a dd that succeeds returns quietly.
-        let (dir2, path2) = heir_harness("dd-ok", &[]);
-        let snippet = format!(
-            "read_tape_raw 7 \"{}/slice.enc\" && echo READ",
-            dir2.display()
-        );
-        let (code, text) = heir_run(&dir2, &path2, &snippet);
-        assert_eq!(code, 0, "{text}");
-        assert!(text.contains("READ"), "{text}");
-        for d in [dir, dir2] {
-            let _ = std::fs::remove_dir_all(&d);
-        }
-    }
-
-    /// --verify's hash of a tape file: exactly the first `size` bytes, taken
-    /// as the file streams off the tape, with the block padding behind it
-    /// drained so dd never dies of SIGPIPE (which pipefail would report as an
-    /// unreadable file). The padding here is far larger than a pipe buffer, so
-    /// a missing drain fails this test.
-    #[test]
-    fn verify_hashes_a_tape_file_as_it_streams() {
-        use sha2::{Digest, Sha256};
-
-        let dir0 = std::env::temp_dir().join(format!("tapectl-heir-tape-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir0);
-        std::fs::create_dir_all(&dir0).unwrap();
-        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
-        let mut on_tape = payload.clone();
-        on_tape.resize(payload.len() + 4 * 1024 * 1024, 0); // block padding
-        let tape = dir0.join("tapefile");
-        std::fs::write(&tape, &on_tape).unwrap();
-        let want = format!("{:x}", Sha256::digest(&payload));
-        let want_padded = format!("{:x}", Sha256::digest(&on_tape));
-
-        let dd = format!("#!/bin/sh\ncat \"{}\"\n", tape.display());
-        let (dir, path) = heir_harness("stream", &[("dd", &dd)]);
-        let (code, text) = heir_run(
-            &dir,
-            &path,
-            &format!("hash_tape_file 5 {} && echo \"$TAPE_SHA\"", payload.len()),
-        );
-        assert_eq!(code, 0, "{text}");
-        assert!(
-            text.contains(&want),
-            "the hash of exactly size_bytes:\n{text}"
-        );
-        // No size: the whole file, padding included (as before).
-        let (code, text) = heir_run(&dir, &path, "hash_tape_file 5 '' && echo \"$TAPE_SHA\"");
-        assert_eq!(code, 0, "{text}");
-        assert!(text.contains(&want_padded), "{text}");
-
-        // Nothing off the tape, or a dd that fails, is unreadable (return 1).
-        let (dir2, path2) = heir_harness("stream-empty", &[("dd", "#!/bin/sh\nexit 0\n")]);
-        let (code, text) = heir_run(&dir2, &path2, "hash_tape_file 5 100 || echo UNREADABLE");
-        assert_eq!(code, 0, "{text}");
-        assert!(text.contains("UNREADABLE"), "{text}");
-        let (dir3, path3) = heir_harness("stream-fail", &[("dd", "#!/bin/sh\nexit 1\n")]);
-        let (code, text) = heir_run(&dir3, &path3, "hash_tape_file 5 100 || echo UNREADABLE");
-        assert_eq!(code, 0, "{text}");
-        assert!(text.contains("UNREADABLE"), "{text}");
-        for d in [dir0, dir, dir2, dir3] {
-            let _ = std::fs::remove_dir_all(&d);
-        }
-    }
-
-    /// The script reads layout v2 only: another layout is refused, before
-    /// anything of it is interpreted, with the way to the tape's own script; a
-    /// missing value (a damaged thunk) warns and carries on; a crafted value is
-    /// sanitised before it is echoed.
-    #[test]
-    fn restore_sh_refuses_another_layout_and_warns_on_a_missing_one() {
-        let (dir, path) = heir_harness("layout", &[]);
-        let (code, text) = heir_run(&dir, &path, "check_layout_version 3");
-        assert_ne!(code, 0, "{text}");
-        assert!(
-            text.contains("this tape is layout_version 3; this script reads layout v2 only"),
-            "{text}"
-        );
-        assert!(
-            text.contains("fsf 2") && text.contains("tr -d '\\0' > RESTORE.sh"),
-            "{text}"
-        );
-
-        let (code, text) = heir_run(&dir, &path, "check_layout_version '' && echo GO");
-        assert_eq!(code, 0, "{text}");
-        assert!(
-            text.contains("states no layout_version") && text.contains("GO"),
-            "{text}"
-        );
-
-        let (code, text) = heir_run(&dir, &path, "check_layout_version 2 && echo GO");
-        assert_eq!(code, 0, "{text}");
-        assert_eq!(text.trim(), "GO", "a v2 tape reads silently:\n{text}");
-
-        let (code, text) = heir_run(&dir, &path, "check_layout_version $'3\\e[2J'");
-        assert_ne!(code, 0, "{text}");
-        assert!(
-            text.contains("(sanitized)") && !text.contains('\u{1b}'),
-            "{text}"
-        );
-
-        // bootstrap_thunk runs it before the pointers it would misread.
-        let s = generate_restore_script_v2("ORDER2", 20);
-        let guard = s.find("check_layout_version \"$(toml_val").unwrap();
-        let pointers = s.find("FRONT_INDEX=$(toml_val").unwrap();
-        assert!(guard < pointers);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// --restore accepts --all, repeated --unit, --overwrite and
-    /// --no-space-check; --scratch belongs to --path; the help and header say
-    /// what the space is for.
-    #[test]
-    fn restore_sh_documents_its_options_and_the_space_it_needs() {
-        let s = generate_restore_script_v2("DOC01", 20);
-        assert!(s.contains("--unit) RESTORE_UNITS+=(\"$2\") ;;"));
-        assert!(s.contains("--all)\n      RESTORE_ALL=1"));
-        assert!(s.contains("--overwrite)\n      OVERWRITE=1"));
-        assert!(s.contains("--no-space-check)\n      SKIP_SPACE_CHECK=1"));
-        assert!(s.contains("do_restore \"$dest\" \"$want\""));
-        let req = "mt (mt-st), dd, age, dar, sha256sum, head, truncate, tar, mkfifo, tee";
-        assert!(s.contains(&format!("# Requirements: {req}\n")));
-        assert!(s.contains(&format!("echo \"Requirements: {req}\"")));
-        assert!(s.contains("# Disk space: --restore streams each slice from the tape"));
-        let guide = generate_system_guide_v2("DOC01", 20);
-        assert!(
-            guide.contains("not in /tmp"),
-            "the manual steps warn off /tmp"
-        );
-    }
 
     // ---- #405 part 2: the rung-3 zero-strip recipe ----
 
@@ -13641,13 +4539,10 @@ sha256_encrypted = \"bbb\"
             "tr -d destroys the ciphertext"
         );
 
-        let (dir, path) = heir_harness("zerostrip", &[]);
-        let (_, script_text) = heir_run(&dir, &path, "zero_strip_instructions");
+        let dir = std::env::temp_dir().join(format!("zerostrip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let guide = generate_system_guide_v2("ZS01", 20);
-        for (source, text) in [
-            ("RESTORE.sh", script_text.as_str()),
-            ("guide", guide.as_str()),
-        ] {
+        for (source, text) in [("guide", guide.as_str())] {
             let recipe = zero_strip_recipe(text);
             assert!(!recipe.contains("tr -d"), "{source}: {recipe}");
             for (i, (plain, ct)) in cases.iter().enumerate() {
@@ -13681,203 +4576,6 @@ sha256_encrypted = \"bbb\"
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// File 1's manual dar step and RESTORE.sh's last instruction say to
-    /// extract into an EMPTY directory, and how to finish a stopped restore
-    /// (#405): dar under -Q keeps an existing file and reports success.
-    #[test]
-    fn the_manual_dar_step_says_empty_directory_and_w() {
-        let guide = generate_system_guide_v2("DAR01", 20);
-        let step8 = guide
-            .split_once("8. Reassemble dar slices")
-            .map(|(_, r)| r.split_once("\n\n").map_or(r, |(a, _)| a))
-            .expect("manual step 8");
-        assert!(step8.contains("EMPTY directory"), "{step8}");
-        assert!(step8.contains("`-w`"), "{step8}");
-        let s = generate_restore_script_v2("DAR01", 20);
-        assert!(
-            s.contains("in an empty directory: dar -x restore"),
-            "rung-3 text"
-        );
-    }
-
-    /// Issue #412 item 4: RECOVERY.md's by-hand recipe rewound before every
-    /// slice and kept both the .age and the .dar of every slice (about three
-    /// times the unit on disk). Now: one rewind per unit, consecutive reads
-    /// (a forward space only over a gap), each .age removed once decrypted,
-    /// and dar with -N into an empty directory, -w to finish a stopped one.
-    /// And (#418) it says the envelope's catalogues/ exist and how to use them.
-    #[test]
-    fn recovery_md_reads_forward_and_keeps_one_slice_of_ciphertext() {
-        let slice = |n: i64, pos: i64| ManifestSlice {
-            number: n,
-            tape_position: Some(pos),
-            size_bytes: 1000,
-            encrypted_bytes: 1100 + n,
-            sha256_plain: "p".into(),
-            sha256_encrypted: format!("sha{n}"),
-        };
-        let units = vec![ManifestUnit {
-            name: "alpha".into(),
-            uuid: "abcdef12-0000-0000-0000-000000000000".into(),
-            snapshot_version: 3,
-            stage_set_id: 7,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![slice(1, 10), slice(2, 11), slice(3, 14)],
-        }];
-        let s = generate_recovery_md("LAB01", "alice", &units, &["abcdef12_v3.1.dar".to_string()]);
-        assert_eq!(s.matches("mt -f /dev/nst0 rewind").count(), 1, "{s}");
-        assert!(
-            s.contains("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 10\n"),
-            "{s}"
-        );
-        // 11 follows 10 directly; 14 is two files further on.
-        assert_eq!(s.matches("mt -f /dev/nst0 fsf 2\n").count(), 1, "{s}");
-        assert_eq!(s.matches("mt -f /dev/nst0 fsf").count(), 2, "{s}");
-        for n in 1..=3 {
-            assert!(
-                s.contains(&format!(
-                    "age -d -i YOUR_KEY.age.key restore.{n}.dar.age > restore.{n}.dar && rm restore.{n}.dar.age"
-                )),
-                "{s}"
-            );
-        }
-        assert!(s.contains("dar -x restore -R /destination -O -Q -N"), "{s}");
-        assert!(s.contains("-w"), "{s}");
-        assert!(s.contains("EMPTY"), "{s}");
-        assert!(s.contains("catalogs/abcdef12_v3.1.dar"), "{s}");
-        assert!(s.contains("dar -l catalogs/abcdef12_v3 -N -Q"), "{s}");
-        assert!(s.contains("-A catalogs/abcdef12_v3"), "{s}");
-    }
-
-    /// #449 comment 1 (ADR-0012 2026-10-16 item 71): RESTORE.sh greps dar's
-    /// English output (`not restored (user choice)$`, `do not correspond to
-    /// the same data`, `INITIALIZATION FAILED FOR GPGME`, `no space left`)
-    /// and dar ships fr and sv translations, so the script asks for English
-    /// in any locale. The export comes right after `set -euo pipefail`, ahead
-    /// of every function, variable and tool call that follows.
-    #[test]
-    fn restore_sh_exports_lc_all_c_before_it_runs_any_tool() {
-        let s = generate_restore_script_v2("LOCALE1", 20);
-        assert_eq!(s.matches("\nexport LC_ALL=C\n").count(), 1, "exactly once");
-        let export = s.find("\nexport LC_ALL=C\n").unwrap();
-        let strict = s.find("\nset -euo pipefail\n").unwrap();
-        assert!(strict < export, "after the strict-mode line");
-        for first in [
-            "\nDEVICE=",
-            "\nWORK=\"$(mktemp",
-            "\ndie() {",
-            "\ndar_check() {",
-        ] {
-            let at = s.find(first).unwrap_or_else(|| panic!("{first:?} missing"));
-            assert!(export < at, "LC_ALL is exported before {first:?}");
-        }
-        // The words it greps are still the English ones.
-        for word in [
-            "not restored (user choice)$",
-            "do not correspond to the same data",
-            "INITIALIZATION FAILED FOR GPGME",
-            "no space left",
-        ] {
-            assert!(s.contains(word), "{word:?}");
-        }
-    }
-
-    /// #449 comment 2 (ADR-0012 2026-10-16 item 71): RECOVERY.md said every
-    /// unit's dar catalogue was in the envelope. It is there only when the
-    /// unit was staged with one, so the `dar -l` paragraph and the `-A` hint
-    /// belong to the units whose catalogue the envelope holds, and a unit
-    /// without one gets neither (RECOVERY.md is not golden-pinned: this test
-    /// is its only guard).
-    #[test]
-    fn recovery_md_names_a_catalogue_only_when_the_envelope_holds_it() {
-        let unit = |name: &str, uuid: &str, ver: i64| ManifestUnit {
-            name: name.into(),
-            uuid: uuid.into(),
-            snapshot_version: ver,
-            stage_set_id: 1,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![ManifestSlice {
-                number: 1,
-                tape_position: Some(9),
-                size_bytes: 1,
-                encrypted_bytes: 2,
-                sha256_plain: "p".into(),
-                sha256_encrypted: "e".into(),
-            }],
-        };
-        let units = vec![
-            unit("with", "aaaaaaaa-0000-0000-0000-000000000000", 2),
-            unit("without", "bbbbbbbb-0000-0000-0000-000000000000", 1),
-            // The same stem as `with`, another version: its own catalogue.
-            unit("with", "aaaaaaaa-0000-0000-0000-000000000000", 3),
-        ];
-        let members = vec![
-            "aaaaaaaa_v2.1.dar".to_string(),
-            "aaaaaaaa_v2.2.dar".to_string(),
-        ];
-        let s = generate_recovery_md("LAB01", "alice", &units, &members);
-        let sections: Vec<&str> = s.split("\n## ").collect();
-        let section = |header: &str| -> &str {
-            sections
-                .iter()
-                .find(|x| x.starts_with(header))
-                .copied()
-                .unwrap_or_else(|| panic!("no {header:?} section:\n{s}"))
-        };
-        // Sections in order: the unit table is under "Units in this envelope".
-        let with_v2 = sections
-            .iter()
-            .find(|x| x.contains("snapshot v2"))
-            .copied()
-            .unwrap();
-        let with_v3 = sections
-            .iter()
-            .find(|x| x.contains("snapshot v3"))
-            .copied()
-            .unwrap();
-        let without = section("without");
-        assert!(
-            with_v2.contains("dar -l catalogs/aaaaaaaa_v2 -N -Q"),
-            "{with_v2}"
-        );
-        assert!(
-            with_v2.contains("`catalogs/aaaaaaaa_v2.1.dar`"),
-            "{with_v2}"
-        );
-        assert!(with_v2.contains("-A catalogs/aaaaaaaa_v2"), "{with_v2}");
-        for (what, sec) in [("without", without), ("the other version", with_v3)] {
-            assert!(!sec.contains("dar -l"), "{what} has no dar -l:\n{sec}");
-            assert!(
-                !sec.contains("catalogs/"),
-                "{what} names no catalogue:\n{sec}"
-            );
-            assert!(!sec.contains("-A "), "{what} has no -A hint:\n{sec}");
-            assert!(!sec.contains("also holds the unit"), "{what}:\n{sec}");
-            // The recipe itself is untouched.
-            assert!(
-                sec.contains("dar -x restore -R /destination -O -Q -N"),
-                "{sec}"
-            );
-            assert!(sec.contains("mt -f /dev/nst0 setblk 524288"), "{sec}");
-        }
-        // And no catalogue at all: no dar -l anywhere in the document.
-        let none = generate_recovery_md("LAB01", "alice", &units, &[]);
-        assert!(!none.contains("dar -l"), "{none}");
-        assert!(!none.contains("catalogs/"), "{none}");
-        // A member that only shares a prefix is not the catalogue.
-        let close = generate_recovery_md(
-            "LAB01",
-            "alice",
-            &units,
-            &["aaaaaaaa_v20.1.dar".to_string()],
-        );
-        assert!(!close.contains("dar -l"), "{close}");
     }
 
     /// Whitespace-flattened, so a phrase wrapped across lines still matches.
@@ -13944,305 +4642,6 @@ sha256_encrypted = \"bbb\"
         );
     }
 
-    /// File 1's escrow-key restore lists first and restores with --all, and
-    /// says a single tenant's key opens only that tenant's part.
-    #[test]
-    fn system_guide_v2_shows_the_escrow_restore_as_list_then_all() {
-        let g = generate_system_guide_v2_for_media("ESC1", 20, "LTO-6");
-        // One placeholder throughout (#477 item 4): the escrow block uses
-        // `YOUR_KEY.age.key` too and says what it stands for. Its list comes
-        // first and its restore after it (the earlier restore example, in the
-        // list of modes, is not the one).
-        let list = g
-            .find("./RESTORE.sh --list --key YOUR_KEY.age.key\n")
-            .expect("the escrow --list example");
-        let all = g[list..]
-            .find("./RESTORE.sh --restore --key YOUR_KEY.age.key --all --to /destination\n")
-            .expect("the escrow --all example, after its --list");
-        assert!(all > 0, "list first, then restore");
-        assert!(
-            !g.contains("escrow.age.key"),
-            "no second key placeholder: {g}"
-        );
-        let flat = flat_text(&g);
-        assert!(
-            flat.contains("A single TENANT's key opens only that tenant's envelope"),
-            "{flat}"
-        );
-        assert!(
-            flat.contains("restores only that unit (it tells you what else the key opened)"),
-            "{flat}"
-        );
-    }
-
-    /// File 1's tool list, its opening sentence and RESTORE.sh's checks come
-    /// from one table (#449 item 2): every tool the script may check for is
-    /// in both, with the roles the item names (mt-st, gpg, age/rage format).
-    /// #448's acceptance read (2026-10-16): a reader who had not seen the
-    /// design docs took the headline "Full restore" example, which named no
-    /// `--all`, as restoring everything. Every full-restore example names
-    /// `--all`, the disk-space figure covers `--all`, and the guide never says
-    /// the tape is uncompressed while also saying a compressed unit restores
-    /// larger.
-    #[test]
-    fn the_guides_full_restore_examples_restore_everything_the_key_opens() {
-        let g = generate_system_guide_v2_for_media("FULL1", 20, "LTO-6");
-        assert!(
-            g.contains("./RESTORE.sh --restore --key YOUR_KEY.age.key --all --to /destination\n"),
-            "{g}"
-        );
-        for line in g.lines().filter(|l| l.contains("./RESTORE.sh --restore")) {
-            assert!(
-                line.contains("--all") || line.contains("--unit UNIT"),
-                "a restore example names neither --all nor --unit: {line}"
-            );
-        }
-        let flat = flat_text(&g);
-        assert!(flat.contains("the sum of them with `--all`"), "{flat}");
-        assert!(flat.contains("every unit on the tape"), "{flat}");
-        assert!(!flat.contains("uses no compression"), "{flat}");
-        assert!(
-            flat.contains("`bash`, `awk` and the basic coreutils"),
-            "{flat}"
-        );
-    }
-
-    #[test]
-    fn system_guide_v2_lists_the_tools_restore_sh_checks_for() {
-        let g = generate_system_guide_v2_for_media("TOOLS2", 20, "LTO-6");
-        let intro = g
-            .split_once("All you need is:")
-            .and_then(|(_, rest)| rest.split_once("\n\n"))
-            .map(|(list, _)| flat_text(list))
-            .expect("the guide states its tool list up front");
-        let section = g
-            .split_once("## Tools Required")
-            .and_then(|(_, rest)| rest.split_once("\n## "))
-            .map(|(body, _)| body)
-            .expect("a Tools Required section");
-        for tool in restore_sh_tools() {
-            assert!(
-                intro.contains(tool),
-                "the opening sentence lacks {tool}: {intro}"
-            );
-            assert!(
-                section
-                    .lines()
-                    .any(|l| l.starts_with(&format!("- `{tool}`"))),
-                "Tools Required lacks a bullet for {tool}:\n{section}"
-            );
-        }
-        assert!(
-            intro.contains("mt,") && intro.ends_with("and tee."),
-            "{intro}"
-        );
-        let section = flat_text(section);
-        assert!(section.contains("`mt` (mt-st package)"), "{section}");
-        assert!(section.contains("cannot set it"), "GNU cpio mt: {section}");
-        assert!(section.contains("`gpg` (package gnupg)"), "{section}");
-        assert!(section.contains("age v1 format"), "{section}");
-        assert!(
-            section.contains("`age` program and `rage` both read"),
-            "{section}"
-        );
-        assert!(
-            section.contains("RESTORE.sh runs a program named `age`"),
-            "{section}"
-        );
-        assert!(
-            section
-                .contains("`--info` and `--verify` need only `mt`, `dd`, `sha256sum` and `head`"),
-            "{section}"
-        );
-    }
-
-    /// File 1's disk-space statement matches RESTORE.sh since 1.1.0: about
-    /// one unit's size, the script streams; --scratch is for --path and the
-    /// old-dar fallback.
-    #[test]
-    fn system_guide_v2_states_one_units_disk_space() {
-        let g = flat_text(&generate_system_guide_v2_for_media("DISK1", 20, "LTO-6"));
-        assert!(g.contains("## Disk space"), "{g}");
-        assert!(g.contains("one unit's size for one unit"), "{g}");
-        assert!(
-            g.contains("streams each slice from the tape through"),
-            "{g}"
-        );
-        assert!(
-            g.contains("`--scratch DIR`") && g.contains("`--path`"),
-            "{g}"
-        );
-        assert!(g.contains("older-dar fallback"), "{g}");
-        assert!(g.contains("compressed restores larger"), "{g}");
-        assert!(g.contains("`$TMPDIR`"), "the work directory: {g}");
-        // The pre-1.1.0 claim, from the cover sheet's first version, is not here.
-        assert!(!g.contains("about twice the unit's size free"), "{g}");
-    }
-    /// Every awk an heir might have reads the index programs the same way
-    /// (1.3.0): the decoder and the visible form use no gawk extension, so the
-    /// output of `--where` and `--find` is byte-for-byte the same under every
-    /// awk this host has. A positive control: at least one awk ran, and its
-    /// output holds what the escapes must decode to.
-    #[test]
-    fn the_index_programs_read_the_same_under_every_awk_on_the_host() {
-        use std::process::Command;
-
-        let dir = tempfile::tempdir().unwrap();
-        // Columns reversed with an unknown one, so lookup is by name; a unit
-        // name and a path with the four escapes.
-        let units = "sealed_at\tstate\tzz_future\tgeneration\tcartridge_serial\tvolume_uuid\tvolume\tversion_bytes\tlast_slice\tfirst_slice\tnum_slices\tversion\tunit_uuid\tunit\n\
-                     \tthis-tape\tx\tLTO-6\tSER1\tuuid-1\tVOL1\t4096\t3\t1\t3\t2\tu-1\tphotos\\ttab\n\
-                     2026-09-01T10:00:00Z\tquarantined\tx\tLTO-5\t\tuuid-2\tVOL2\t4096\t3\t1\t3\t2\tu-1\tphotos\\ttab\n\
-                     \tthis-tape\tx\tLTO-6\tSER1\tuuid-1\tVOL1\t1048576\t1\t1\t1\t1\tu-2\tplain\n\
-                     2026-09-01T10:00:00Z\tsealed\tx\tLTO-6\tSER2\tuuid-2\tVOL2\t2048\t1\t1\t1\t1\tu-3\tgone\n\
-                     2026-09-01T10:00:00Z\tsealed\tx\tLTO-6\tSER2\tuuid-2\tVOL2\t2048\t1\t1\t1\t10\tu-3\tgone\n\
-                     2026-09-01T10:00:00Z\tsealed\tx\tLTO-6\tSER2\tuuid-2\tVOL2\t2048\t1\t1\t1\t9\tu-3\tgone\n\
-                     2026-09-01T10:00:00Z\tsealed\tx\tLTO-6\tSER2\tuuid-2\tVOL2\t512\t1\t1\t1\t1\tu-4\tdup\n\
-                     \tthis-tape\tx\tLTO-6\tSER1\tuuid-1\tVOL1\t512\t1\t1\t1\t1\tu-5\tdup\n\
-                     2026-09-01T10:00:00Z\tsealed\tx\tLTO-6\tSER2\tuuid-2\tVOL2\t512\t1\t1\t1\t2\tu-4\tdup\n";
-        let paths = "unit\tversion\tkind\tsize_bytes\tpath\n\
-                     photos\\ttab\t2\tf\t5\ta\\tb\\nc\\\\d\\\\te.txt\n\
-                     photos\\ttab\t2\td\t0\tdir\n\
-                     plain\t1\tf\t7\tnote.txt\n";
-        let uf = dir.path().join("units.tsv");
-        let pf = dir.path().join("paths.tsv");
-        std::fs::write(&uf, units).unwrap();
-        std::fs::write(&pf, paths).unwrap();
-        let where_prog = format!("{AWK_INDEX_COMMON} {AWK_INDEX_WHERE}");
-        let all_prog = format!("{AWK_INDEX_COMMON} {AWK_INDEX_ALL}");
-        let find_prog = format!("{AWK_INDEX_COMMON} {AWK_INDEX_FIND}");
-
-        let awks: &[(&str, &[&str])] = &[
-            ("awk", &[]),
-            ("gawk", &[]),
-            ("mawk", &[]),
-            ("nawk", &[]),
-            ("original-awk", &[]),
-            ("busybox", &["awk"]),
-        ];
-        let mut outputs: Vec<(String, String)> = Vec::new();
-        for (bin, pre) in awks {
-            let run =
-                |prog: &str, file: &std::path::Path, env: &[(&str, &str)]| -> Option<String> {
-                    let mut cmd = Command::new(bin);
-                    cmd.args(*pre).arg(prog).arg(file).env("LC_ALL", "C");
-                    for (k, v) in env {
-                        cmd.env(k, v);
-                    }
-                    let o = cmd.output().ok()?;
-                    Some(format!(
-                        "exit {:?}\n{}{}",
-                        o.status.code(),
-                        String::from_utf8_lossy(&o.stdout),
-                        String::from_utf8_lossy(&o.stderr)
-                    ))
-                };
-            let known = dir.path().join(format!("known-{bin}"));
-            let all_counts = dir.path().join(format!("all-counts-{bin}"));
-            let all_absent = dir.path().join(format!("all-absent-{bin}"));
-            let counts = dir.path().join(format!("counts-{bin}"));
-            // The escaped unit name, given as the DECODED text (a real TAB).
-            let Some(w) = run(
-                &where_prog,
-                &uf,
-                &[
-                    ("WHERE_UNIT", "photos\ttab"),
-                    ("WHERE_KNOWN", known.to_str().unwrap()),
-                    ("WHERE_TENANT", "alice"),
-                ],
-            ) else {
-                continue;
-            };
-            let a = run(
-                &all_prog,
-                &uf,
-                &[
-                    ("ALL_TENANT", "alice"),
-                    ("ALL_COUNTS", all_counts.to_str().unwrap()),
-                    ("ALL_ABSENT", all_absent.to_str().unwrap()),
-                ],
-            )
-            .unwrap();
-            let f = run(
-                &find_prog,
-                &pf,
-                &[
-                    // a real TAB, then a letter, then a real LF: the decoded path
-                    ("FIND_TEXT", "a\tb\nc\\d"),
-                    ("FIND_LIMIT", "50"),
-                    ("FIND_UNITS", uf.to_str().unwrap()),
-                    ("FIND_COUNTS", counts.to_str().unwrap()),
-                    ("FIND_WHO", "tenant alice"),
-                ],
-            )
-            .unwrap();
-            let known_txt = std::fs::read_to_string(&known).unwrap_or_default();
-            let all_counts_txt = std::fs::read_to_string(&all_counts).unwrap_or_default();
-            let all_absent_txt = std::fs::read_to_string(&all_absent).unwrap_or_default();
-            let counts_txt = std::fs::read_to_string(&counts).unwrap_or_default();
-            outputs.push((
-                bin.to_string(),
-                format!("{w}--\n{f}--\n{a}--\n{all_counts_txt}--\n{all_absent_txt}--\n{known_txt}--\n{counts_txt}"),
-            ));
-        }
-        assert!(!outputs.is_empty(), "no awk found on this host");
-        eprintln!(
-            "index programs compared under: {:?}",
-            outputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
-        );
-        let (first_name, first) = &outputs[0];
-        // What the escapes must decode to, once, under the first awk.
-        assert!(
-            first.contains("Unit photos\\ttab (tenant alice):"),
-            "{first}"
-        );
-        assert!(
-            first.contains("  Version 2: 3 slice(s), 4.0 KiB (4096 bytes); unit uuid u-1"),
-            "{first}"
-        );
-        assert!(
-            first.contains("    tape VOL1  (this tape)  slices 1-3 of 3"),
-            "{first}"
-        );
-        assert!(first.contains("QUARANTINED"), "{first}");
-        assert!(
-            first.contains("cartridge serial not known; generation LTO-5"),
-            "{first}"
-        );
-        assert!(
-            first.contains("  photos\\ttab  v2  f  5 bytes  a\\tb\\nc\\d\\te.txt\n"),
-            "{first}"
-        );
-        assert!(
-            first.contains("1 1\n"),
-            "one match printed, one matched: {first}"
-        );
-        // --where --all: the newest version by NUMBER (10, not the text-sorted 9),
-        // a unit made twice under one name is two units, and only the units whose
-        // newest version this tape lacks are named in the absent file.
-        assert!(
-            first.contains("Unit gone (tenant alice): newest version 10, NOT on this tape\n"),
-            "{first}"
-        );
-        assert!(
-            first
-                .contains("  Version 10 (newest): 1 slice(s), 2.0 KiB (2048 bytes); unit uuid u-3"),
-            "{first}"
-        );
-        assert!(
-            first.contains("Unit dup (tenant alice): newest version 2, NOT on this tape\n")
-                && first.contains("Unit dup (tenant alice): newest version 1, on this tape\n"),
-            "{first}"
-        );
-        assert!(
-            first.contains("--\n5 3\n--\n    gone (tenant alice), version 10, unit uuid u-3: VOL2\n    dup (tenant alice), version 2, unit uuid u-4: VOL2\n--\n"),
-            "five units listed, three of them with their newest version here: {first}"
-        );
-        for (name, out) in &outputs[1..] {
-            assert_eq!(out, first, "{name} differs from {first_name}");
-        }
-    }
-
     // ---- #477: File 1 for a reader who has never seen the design docs ----
 
     /// The section of `guide` that starts with the heading `## {title}` and
@@ -14296,190 +4695,6 @@ sha256_encrypted = \"bbb\"
         );
     }
 
-    /// #477 item 2: `tr -d '\0'` is for plain text. It is used only to fetch
-    /// the plaintext files, and wherever the guide uses it, it says it must
-    /// never touch ciphertext.
-    #[test]
-    fn file_1_says_tr_is_for_plain_text_only_where_it_is_used() {
-        let g = generate_system_guide_v2_for_media("TR1", 12, "LTO-6");
-        let plain = [
-            "RESTORE-TR1.sh",
-            "file0.txt",
-            "front_index.toml",
-            "seal.toml",
-        ];
-        let uses: Vec<&str> = g
-            .lines()
-            .filter(|l| l.contains("| tr -d '\\0' >"))
-            .collect();
-        assert_eq!(
-            uses.len(),
-            4,
-            "RESTORE.sh, File 0, File 3, seal marker: {uses:#?}"
-        );
-        for line in uses {
-            assert!(
-                plain.iter().any(|name| line.trim_end().ends_with(name)),
-                "tr -d on something that is not a plaintext file: {line}"
-            );
-        }
-        let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"));
-        assert!(
-            auto.contains("It is NEVER safe for an encrypted file, an envelope or a slice"),
-            "{auto}"
-        );
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains("An envelope or a slice is trimmed to its exact size with `truncate` instead, never with `tr`"),
-            "{manual}"
-        );
-        let ladder = flat_text(guide_section(&g, "If All Else Fails"));
-        assert!(
-            ladder.contains("Never do it with `tr -d '\\0'`, which is for plain text only"),
-            "{ladder}"
-        );
-    }
-
-    /// #477 item 3: whether `setblk` comes first, and what dd's errors mean.
-    #[test]
-    fn file_1_says_when_setblk_is_needed_and_what_a_dd_error_means() {
-        let g = generate_system_guide_v2_for_media("BLK1", 12, "LTO-6");
-        let auto = guide_section(&g, "Automated Recovery (recommended)");
-        let setblk = auto.find("mt -f /dev/nst0 setblk 524288").expect("setblk");
-        let fetch = auto
-            .find("> RESTORE-BLK1.sh")
-            .expect("the fetch of RESTORE.sh");
-        assert!(setblk < fetch, "setblk is the first line of the fetch");
-        let f = flat_text(auto);
-        assert!(
-            f.contains("it is not needed if you have just run File 0's commands"),
-            "{f}"
-        );
-        assert!(f.contains("Only mt-st's `mt` can do it"), "{f}");
-        // Consistent with RESTORE.sh's own note on a drive in its default mode.
-        assert!(
-            f.contains("`dd bs=512k` reads each 512 KiB block whole"),
-            "{f}"
-        );
-        assert!(
-            f.contains(
-                "\"Cannot allocate memory\": the tape's block is larger than the read you asked for"
-            ),
-            "{f}"
-        );
-        assert!(f.contains("(dd's default is 512 bytes)"), "{f}");
-        assert!(
-            f.contains("\"Input/output error\": the drive could not read"),
-            "{f}"
-        );
-        for cause in ["another fixed block size", "a dirty head", "a damaged tape"] {
-            assert!(f.contains(cause), "{cause}: {f}");
-        }
-    }
-
-    /// #477 item 4: each term defined once; one key placeholder everywhere;
-    /// what NAME is in `catalogs/NAME`.
-    #[test]
-    fn file_1_defines_its_words_and_uses_one_key_placeholder() {
-        let g = generate_system_guide_v2_for_media("WORDS1", 12, "LTO-6");
-        let words = flat_text(guide_section(&g, "Words this guide uses"));
-        for term in [
-            "**Tape file, \"File N\"**",
-            "**Unit**",
-            "**Tenant**",
-            "**Operator**",
-            "**escrow key**",
-            "**Envelope**",
-            "**Slice**",
-            "**dar catalogue**",
-        ] {
-            assert!(words.contains(term), "{term} is not defined: {words}");
-        }
-        // "your envelope" means something to an escrow holder.
-        assert!(
-            words.contains(
-                "\"Your envelope\" is an envelope your key opens: a tenant's key opens that \
-                 tenant's envelope only; the operator and escrow keys open all of them"
-            ),
-            "{words}"
-        );
-        // NAME in catalogs/NAME, with the worked example.
-        assert!(
-            words.contains(
-                "Its NAME in `catalogs/NAME` is the first eight characters of the unit's uuid, \
-                 then `_v` and the version number"
-            ),
-            "{words}"
-        );
-        assert!(words.contains("`catalogs/11111111_v2.1.dar`"), "{words}");
-        // One placeholder for the key file, defined once.
-        for stray in [
-            "your-key",
-            "escrow.age.key",
-            "KEYFILE",
-            "YOUR_KEY.age.key.age",
-        ] {
-            assert!(!g.contains(stray), "a second key placeholder {stray:?}");
-        }
-        assert!(
-            words.contains("**`YOUR_KEY.age.key`**: the one name this guide uses"),
-            "{words}"
-        );
-        // Every --key and -i in the guide names that placeholder.
-        for line in g.lines() {
-            for flag in ["--key ", "age -d -i "] {
-                if let Some(at) = line.find(flag) {
-                    let value = line[at + flag.len()..]
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_end_matches(['`', ')', ',', '.']);
-                    assert!(
-                        value == "YOUR_KEY.age.key" || value.is_empty(),
-                        "{flag}{value} in: {line}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// #477 item 5: the manual path has a command at every step, and says the
-    /// decrypted slices are `restore.N.dar`.
-    #[test]
-    fn file_1_manual_path_has_a_command_for_every_step() {
-        let g = generate_system_guide_v2_for_media("MAN1", 12, "LTO-6");
-        let manual = guide_section(&g, "Manual Recovery Steps");
-        for cmd in [
-            "mt -f /dev/nst0 setblk 524288",
-            "dd if=/dev/nst0 bs=512k | tr -d '\\0' > file0.txt",
-            "mt -f /dev/nst0 fsf 2",
-            "dd if=/dev/nst0 bs=512k | tr -d '\\0' > front_index.toml",
-            "sha256sum front_index.toml",
-            "dd if=/dev/nst0 bs=512k | tr -d '\\0' > seal.toml",
-            "dd if=/dev/nst0 bs=512k of=envelope.raw",
-            "truncate -s SIZE envelope.raw",
-            "sha256sum envelope.raw",
-            "age -d -i YOUR_KEY.age.key envelope.raw > envelope.tar",
-            "mkdir env && tar xf envelope.tar -C env",
-            "dd if=/dev/nst0 bs=512k of=restore.NUMBER.dar.age",
-            "truncate -s ENCRYPTED_BYTES restore.NUMBER.dar.age",
-            "echo \"SHA256_ENCRYPTED  restore.NUMBER.dar.age\" | sha256sum -c -",
-            "age -d -i YOUR_KEY.age.key restore.NUMBER.dar.age > restore.NUMBER.dar",
-            "dar -x restore -R /destination -O -Q -N",
-        ] {
-            assert!(
-                manual.contains(cmd),
-                "the manual path lacks {cmd:?}:\n{manual}"
-            );
-        }
-        let f = flat_text(manual);
-        assert!(
-            f.contains("The decrypted files must be named `restore.1.dar`, `restore.2.dar`"),
-            "{f}"
-        );
-        assert!(f.contains("(base name `restore`)"), "{f}");
-    }
-
     /// #477 item 6: `eod` and `bsfm 2` explained, and which file is last.
     #[test]
     fn file_1_explains_eod_bsfm_and_says_the_last_file_is_n_minus_1() {
@@ -14514,82 +4729,6 @@ sha256_encrypted = \"bbb\"
         );
     }
 
-    /// #477 item 7: what to do for UNSEALED and for DAMAGED, and how to find
-    /// the slices that are incomplete.
-    #[test]
-    fn file_1_says_what_to_do_for_unsealed_and_damaged() {
-        let g = generate_system_guide_v2_for_media("VERD1", 12, "LTO-6");
-        let sec = guide_section(&g, "If the verdict is UNSEALED or DAMAGED");
-        let f = flat_text(sec);
-        for needle in [
-            "UNSEALED: there is no valid seal marker. The write never finished",
-            "DAMAGED (ends disagree): a seal marker is there, but it does not match the front index",
-            "./RESTORE.sh --verify",
-            "It prints PASS or FAIL for every tape file, by number",
-            "To find which slices are incomplete, take the tape file numbers of a unit's slices from its MANIFEST.toml",
-            "A unit whose slices all PASS is complete: restore it as usual",
-            "A unit with a FAIL slice cannot be restored whole from this tape",
-            "Look for another copy first",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-    }
-
-    /// #477 item 8: how to know the restore got everything.
-    #[test]
-    fn file_1_gives_a_completeness_check() {
-        let g = generate_system_guide_v2_for_media("DONE1", 12, "LTO-6");
-        let sec = guide_section(&g, "Did the restore get everything?");
-        let f = flat_text(sec);
-        assert!(
-            f.contains("RESTORE.sh ended with `RESTORE COMPLETE` and exit status 0 (`echo $?`"),
-            "{f}"
-        );
-        for line in [
-            "inode(s) restored",
-            "0 inode(s) not restored (not saved in archive)",
-            "0 inode(s) not restored (overwriting policy decision)",
-            "0 inode(s) failed to restore (filesystem error)",
-        ] {
-            assert!(f.contains(line), "dar's summary line {line:?}: {f}");
-        }
-        assert!(sec.contains("| grep -c -E '^\\[.{5}\\]\\[.\\] '"), "{sec}");
-        assert!(f.contains("The count matches the dar catalogue"), "{f}");
-        assert!(f.contains("`--list`"), "{f}");
-    }
-
-    /// #477 item 9: the rest of the box, and the index.
-    #[test]
-    fn file_1_names_the_index_and_how_to_take_stock_of_the_other_tapes() {
-        let g = generate_system_guide_v2_for_media("BOX1", 12, "LTO-6");
-        let sec = guide_section(&g, "The rest of the box: other tapes, copies and the index");
-        let f = flat_text(sec);
-        for needle in [
-            "A tape may be a COPY of this one",
-            "or hold OTHER units, or hold other VERSIONS of a unit this tape holds",
-            "./RESTORE.sh --where UNIT --key YOUR_KEY.age.key",
-            "./RESTORE.sh --find report --key YOUR_KEY.age.key",
-            "An index is as of the moment its own tape was written",
-            "It never names a tape written after it",
-            "So the NEWEST tape's index is the most complete",
-            "A tape written before 1.3.0 has no index and says so",
-            "To take stock of a box without relying on the index, load each tape in turn",
-            "A unit that appears at the same version AND with the same unit uuid on two tapes has two copies",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        // The two modes are among the examples of the automated path too.
-        let auto = guide_section(&g, "Automated Recovery (recommended)");
-        assert!(
-            auto.contains("./RESTORE.sh --where UNIT --key YOUR_KEY.age.key"),
-            "{auto}"
-        );
-        assert!(
-            auto.contains("./RESTORE.sh --find some/file --key YOUR_KEY.age.key"),
-            "{auto}"
-        );
-    }
-
     /// #477 item 10: the hardware, and what a recovery firm can read.
     #[test]
     fn file_1_says_what_hardware_reads_the_tape_and_what_a_firm_can_read() {
@@ -14605,192 +4744,6 @@ sha256_encrypted = \"bbb\"
             "a tenant's key gives a firm that tenant's data and no one else's",
         ] {
             assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-    }
-
-    /// #477 item 11: where rung 3 stops looking for envelopes, and why up to
-    /// four zero bytes.
-    #[test]
-    fn file_1_says_where_rung_3_stops_and_why_four_zero_bytes() {
-        let g = generate_system_guide_v2_for_media("R3-1", 12, "LTO-6");
-        let f = flat_text(guide_section(&g, "If All Else Fails"));
-        for needle in [
-            "which is 2 x (tenants + 1) files, at most about eight on the usual tape of one to three tenants",
-            "The data slices follow them",
-            "so size is a hint, not proof",
-            "an envelope's decrypted bytes are a tar archive and a slice's are not",
-            "With a tenant's key, stop at the first file that decrypts to a tar archive listing MANIFEST.toml",
-            "Run `tar tf candidate.dec`",
-            "re-append a single zero byte and retry, up to four times",
-            "Step 2 cannot tell the padding from a zero that belongs to the ciphertext",
-            "About one ciphertext in 256 ends in a zero byte, one in 65 536 in two",
-            "a chance of about one in a trillion that more zeros were lost",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-    }
-
-    /// 1.3.0: RECOVERY.md names the index members, what they hold, the
-    /// staleness rule, and gives one awk line for each that works on the
-    /// text as stored. The lines are run here, on escaped rows.
-    #[test]
-    fn recovery_md_describes_the_index_and_its_awk_lines_work() {
-        let s = generate_recovery_md("LAB01", "alice", &[], &[]);
-        let sec = s
-            .split("\n## ")
-            .find(|x| x.starts_with("The index of other tapes"))
-            .unwrap_or_else(|| panic!("no index section:\n{s}"));
-        let f = flat_text(sec);
-        for needle in [
-            "`index/units.tsv`: every version of the units it knows of, and the tapes that hold each",
-            "`index/paths.tsv`: every path of those versions",
-            "A tenant's envelope has it; the operator's does not",
-            "An envelope from a tape written before tapectl 1.3.0 has no `index/`",
-            "An index is as of the moment its own tape was written. It never names a tape written after it",
-            "so the NEWEST tape's index is the most complete",
-            "a backslash is written `\\\\`, a TAB `\\t`, a newline `\\n` and a carriage return `\\r`",
-            "Find a column by its name, and ignore a column you do not know",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        // It stays out of the way of the dar-catalogue rules (#449): no
-        // catalogue is named when the envelope holds none.
-        assert!(!s.contains("catalogs/") && !s.contains("dar -l"), "{s}");
-
-        // Run both lines, on a units.tsv with its columns permuted plus one
-        // unknown, and a paths.tsv whose path holds an escaped TAB.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("index")).unwrap();
-        std::fs::write(
-            dir.path().join("index/units.tsv"),
-            "volume\tunit\tzz_future\tversion\nVOL1\tphotos/2019\tx\t2\nVOL2\tdocs\tx\t1\nVOL3\tphotos/2019\tx\t1\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("index/paths.tsv"),
-            "unit\tversion\tkind\tsize_bytes\tpath\ndocs\t1\tf\t5\ta\\tb.txt\ndocs\t1\tf\t5\tc.txt\n",
-        )
-        .unwrap();
-        let lines: Vec<&str> = sec
-            .lines()
-            .filter(|l| l.starts_with("U=") || l.starts_with("T="))
-            .collect();
-        assert_eq!(lines.len(), 2, "{sec}");
-        let run = |line: &str, awk: &str| -> String {
-            let o = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(line.replacen("awk", awk, 1))
-                .current_dir(dir.path())
-                .output()
-                .unwrap();
-            assert!(o.status.success(), "{line}: {o:?}");
-            String::from_utf8_lossy(&o.stdout).to_string()
-        };
-        for awk in ["awk", "mawk", "gawk"] {
-            if std::process::Command::new(awk)
-                .arg("BEGIN{}")
-                .output()
-                .is_err()
-            {
-                continue;
-            }
-            assert_eq!(
-                run(lines[0], awk),
-                "VOL1\tphotos/2019\tx\t2\nVOL3\tphotos/2019\tx\t1\n",
-                "{awk}: the unit line"
-            );
-            // The path is compared as stored: the TAB is the two characters.
-            assert_eq!(
-                run(&lines[1].replace("T='report'", "T='a\\tb'"), awk),
-                "docs\t1\tf\t5\ta\\tb.txt\n",
-                "{awk}: the path line"
-            );
-        }
-    }
-
-    /// ADR-0012 item 103: RECOVERY.md says the file check exists, what it
-    /// costs and how to skip it, names the `sha256` column, and its by-hand line
-    /// does what it says: it passes files that match the index and names the
-    /// ones that do not, under every awk. File 1 says the same of the script.
-    #[test]
-    fn the_guides_describe_the_file_check_and_the_by_hand_line_works() {
-        let r = generate_recovery_md("LAB01", "alice", &[], &[]);
-        let f = flat_text(&r);
-        for needle in [
-            "`sha256` (the file's content hash as 64 hex characters; empty for anything but a regular file, and where none was recorded)",
-            "dar checks each file it restores with a short checksum, not a hash",
-            "`RESTORE.sh` checks every file it restores, and every file it fills, against it",
-            "It costs one read of the restored files from disk",
-            "`--no-file-check` skips it",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        let g = flat_text(&generate_system_guide_v2_for_media("LAB01", 30, "LTO-6"));
-        for needle in [
-            "**A file fails its hash.**",
-            "dar checks each file it restores with a short checksum, not a hash",
-            "reads the restored files back from `--to` and checks them against it with `sha256sum`",
-            "one read of the restored files from disk and none of the tape",
-            "with `--path` only the paths restored are checked",
-            "a tape written before 1.3.0 has no index and is not checked at all",
-            "`--no-file-check` skips the check",
-        ] {
-            assert!(g.contains(needle), "{needle:?}: {g}");
-        }
-
-        let line = r
-            .lines()
-            .find(|l| l.starts_with("V=1 U="))
-            .unwrap_or_else(|| panic!("no by-hand line:\n{r}"));
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        std::fs::create_dir_all(d.join("index")).unwrap();
-        std::fs::create_dir_all(d.join("dest/sub")).unwrap();
-        let sha = |bytes: &[u8]| {
-            use sha2::{Digest, Sha256};
-            Sha256::digest(bytes)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        };
-        std::fs::write(d.join("dest/a.bin"), b"alpha").unwrap();
-        std::fs::write(d.join("dest/sub/b.bin"), b"CHANGED").unwrap();
-        std::fs::write(
-            d.join("index/paths.tsv"),
-            format!(
-                "unit\tversion\tkind\tsize_bytes\tsha256\tpath\n\
-                 photos/2019\t1\td\t0\t\tsub\n\
-                 photos/2019\t1\tf\t5\t{}\ta.bin\n\
-                 photos/2019\t1\tf\t5\t{}\tsub/b.bin\n\
-                 photos/2019\t1\tf\t5\t\tno-hash\n\
-                 photos/2019\t2\tf\t5\t{}\ta.bin\n",
-                sha(b"alpha"),
-                sha(b"bravo"),
-                sha(b"zzz"),
-            ),
-        )
-        .unwrap();
-        let line = line.replace("/destination", &d.join("dest").display().to_string());
-        for awk in ["awk", "mawk", "gawk"] {
-            if std::process::Command::new(awk)
-                .arg("BEGIN{}")
-                .output()
-                .is_err()
-            {
-                continue;
-            }
-            let o = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(line.replacen("awk", awk, 1))
-                .current_dir(d)
-                .output()
-                .unwrap();
-            let out = String::from_utf8_lossy(&o.stdout);
-            assert!(
-                out.contains("sub/b.bin: FAILED") && !out.contains("a.bin: FAILED"),
-                "{awk}: only the changed file is named: {out}{}",
-                String::from_utf8_lossy(&o.stderr)
-            );
         }
     }
 
@@ -14840,125 +4793,20 @@ sha256_encrypted = \"bbb\"
 
     // 2. /tmp: said once, in "Disk space", that it may be a small RAM disk and
     // TMPDIR moves the work directory; step 7 agrees and does not contradict.
-    #[test]
-    fn file_1_fix_2_tmp_is_one_story() {
-        let g = guide17();
-        let disk = flat_text(guide_section(&g, "Disk space"));
-        for needle in [
-            "`/tmp` is a small RAM disk on many systems (`df -h /tmp` says)",
-            "no data slice ever goes there",
-            "set `TMPDIR` to a directory on a real disk",
-            "TMPDIR=/big/disk/tmp ./RESTORE.sh",
-        ] {
-            assert!(disk.contains(needle), "{needle:?}: {disk}");
-        }
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains("on a real disk and not in /tmp, which is a small RAM disk on many systems (\"Disk space\")"),
-            "{manual}"
-        );
-        assert!(manual.contains("RESTORE.sh keeps only the envelopes there, never a slice"));
-    }
 
     // 3. The damaged-tape contradictions: (a) the front index lists the
     // slices an unsealed tape lacks; (b) a disagreement of the ends is
     // reconciled with "restoring is sound"; (c) an escrow-key holder is told
     // how to get the slice table; (d) RESTORE.sh's own fallback is stated.
-    #[test]
-    fn file_1_fix_3_the_damaged_tape_sections_agree_with_themselves() {
-        let g = guide17();
-        let all = flat_text(&g);
-        assert!(
-            !all.contains("everything the front index describes is still readable"),
-            "the contradicted sentence is gone"
-        );
-        let sec = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
-        for needle in [
-            "the front index lists EVERY file the write planned, slices that were never written included",
-            "such a slice shows as FAIL (\"unreadable\") below",
-            "neither can vouch for the other",
-            "What you can check yourself is each file against the hash the front index lists for it",
-            "it does not matter which for restoring, and restoring is sound",
-            // (c)
-            "The operator and escrow keys open several envelopes, and `--find-envelope` then prints only a table of units",
-            "decrypt the operator envelope by hand (steps 5 and 6 of \"Manual Recovery Steps\")",
-            "read `env/MANIFEST.toml`",
-            // (d)
-            "RESTORE.sh itself reads the front index from File 3 and, if that fails, from the seal marker's copy of it, with a warning",
-        ] {
-            assert!(sec.contains(needle), "{needle:?}: {sec}");
-        }
-        assert!(
-            !sec.contains("do not trust either alone"),
-            "the contradicted advice is gone"
-        );
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains(
-                "An unsealed tape may lack its last data slices (the front index still lists them)"
-            ),
-            "{manual}"
-        );
-        let ladder = flat_text(guide_section(&g, "If All Else Fails"));
-        assert!(
-            ladder.contains("RESTORE.sh climbs rungs 1 and 2 by itself"),
-            "{ladder}"
-        );
-    }
 
     // 4. A restore with no --unit and no --all: one unit restores, several are
     // listed and refused, and "the largest envelope" is defined.
-    #[test]
-    fn file_1_fix_4_the_default_restore_and_the_largest_envelope_are_defined() {
-        let g = guide17();
-        let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"));
-        for needle in [
-            "the envelope that lists the most units among those your key opens",
-            "with the escrow or operator key that is the operator envelope, which lists every unit on the tape",
-            "with a tenant's key it is that tenant's envelope",
-            "If that envelope lists SEVERAL units it will not guess: it prints them and stops before it reads a slice",
-            "you name one with `--unit UNIT` (repeat `--unit` for several, each into /destination/UNIT) or restore them all with `--all`",
-        ] {
-            assert!(auto.contains(needle), "{needle:?}: {auto}");
-        }
-        assert!(
-            !auto.contains("largest envelope"),
-            "the undefined phrase is gone"
-        );
-    }
 
     // 5. Versions: the option is named with the modes that take it, and a
     // version is a full archive, so the newest alone is complete; `[InRef]`
     // is explained.
-    #[test]
-    fn file_1_fix_5_versions_are_selectable_and_complete() {
-        let g = guide17();
-        let words = flat_text(guide_section(&g, "Words this guide uses"));
-        for needle in [
-            "`--version N` (with `--restore --unit UNIT`, or with `--list`) takes version N instead",
-            "`--find-envelope` shows which versions this tape holds",
-            "Every version is a FULL archive of the unit as it was: the newest version alone holds every file, and an older one is never needed to complete it",
-            "A dar catalogue's listing marks every entry `[InRef]`, dar's word for \"the data is in the archive this catalogue was cut from\"",
-            "It does not mean the unit is a difference from another version",
-        ] {
-            assert!(words.contains(needle), "{needle:?}: {words}");
-        }
-    }
 
     // 6. The completeness check for --path and --all.
-    #[test]
-    fn file_1_fix_6_the_completeness_check_covers_path_and_all() {
-        let g = guide17();
-        let f = flat_text(guide_section(&g, "Did the restore get everything?"));
-        for needle in [
-            "`RESTORE INCOMPLETE` (exit status 1) means dar named files it could not restore",
-            "With `--all`, or `--unit` given more than once, dar runs once for each unit and prints one summary for each",
-            "With `--path`, dar restores only what you asked for, plus the directories above it (a file `a/b/c.txt` brings `a` and `a/b` with it, so 3 inodes)",
-            "\"inode(s) ignored (excluded by filters)\" then counts every other inode of the unit, which is expected and not a failure",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-    }
 
     // 7. The zero-byte retry has a command and is cumulative.
     #[test]
@@ -14976,28 +4824,6 @@ sha256_encrypted = \"bbb\"
     }
 
     // 8 and 9. The whole box as a short procedure; the index's `state` values.
-    #[test]
-    fn file_1_fix_8_and_9_the_whole_box_and_the_states() {
-        let g = guide17();
-        let f = flat_text(guide_section(
-            &g,
-            "The rest of the box: other tapes, copies and the index",
-        ));
-        for needle in [
-            "The whole box, in short:",
-            "its label is \"Tape identifies as\" (File 0's label is the authority; a sticker on the case can have been replaced)",
-            "Start from the newest tape.",
-            "each unit into a directory of its own so that tapes never overwrite one another",
-            "Use THAT tape's own RESTORE.sh, File 2 of the tape in the drive, which reads that tape's format",
-            "You are done only when ALL of these hold; fewer is not done",
-            "use another holder it lists",
-            "`sealed` is a tape whose write finished and was sealed",
-            "`quarantined` is a sealed tape whose medium a verify proved bad (it may still read in part, so prefer another holder)",
-            "`this-tape` is the tape the index is on. A tape that was already retired or erased when the index was written is not listed, and one that is listed may have been retired or erased since.",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-    }
 
     // 10. Which file is a key; a passphrase-protected key; the escrow key fails.
     #[test]
@@ -15046,243 +4872,16 @@ sha256_encrypted = \"bbb\"
 
     // 12. Disk space up front: the capacity ceiling, the placeholder, how to
     // read the dar version and what "without its catalogue" means.
-    #[test]
-    fn file_1_fix_12_disk_space_is_stated_up_front() {
-        let g = guide17();
-        let disk = flat_text(guide_section(&g, "Disk space"));
-        assert!(
-            disk.contains("`/destination` in this guide is a placeholder for an empty directory"),
-            "{disk}"
-        );
-        assert!(
-            disk.contains("this tape is LTO-6, which holds 2.5 TB of data as the makers count it (decimal, uncompressed)"),
-            "{disk}"
-        );
-        let g8 = flat_text(&generate_system_guide_v2_for_media("L8", 30, "LTO-8"));
-        assert!(
-            g8.contains("this tape is LTO-8, which holds 12 TB of data"),
-            "{g8}"
-        );
-        let unknown = flat_text(&generate_system_guide_v2_for_media("U", 30, "DLT-IV"));
-        assert!(unknown.contains("LTO-6 2.5 TB, LTO-7 6 TB, LTO-8 12 TB, LTO-9 18 TB"));
-        let tools = flat_text(guide_section(&g, "Tools Required"));
-        for needle in [
-            "`dar --version` says which dar you have",
-            "\"without its dar catalogue\" means the envelope has none for that unit, or dar refuses the one it has",
-        ] {
-            assert!(tools.contains(needle), "{needle:?}: {tools}");
-        }
-    }
 
     // 13. The opening names the basic tools as well as the listed ones.
-    #[test]
-    fn file_1_fix_13_the_opening_names_the_basic_tools() {
-        let g = guide17();
-        let head = flat_text(&g[..g.find("## Words this guide uses").unwrap()]);
-        assert!(
-            head.contains("Besides those it uses `bash`, `awk` and the basic tools every Linux system has (`sed`, `grep`, `tr`, `cut`, `sort`, `stat`, `df`, `wc`, `tail`, `od`, `mktemp`), and `gpg` if your dar was built with GPG support"),
-            "{head}"
-        );
-    }
 
     // ADR-0012 items 101 and 102: File 1 and RECOVERY.md each have a section
     // on a damaged slice or file, with the two commands and the rule that only
     // the same unit and version is used.
-    #[test]
-    fn file_1_and_recovery_md_say_what_to_do_for_a_damaged_slice_or_file() {
-        let g = guide17();
-        let f = flat_text(guide_section(&g, "If a slice or a file is damaged"));
-        for needle in [
-            "./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT \\ --slices-from DIR --to /destination",
-            "./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT \\ --swap-tapes --to /destination",
-            "./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT \\ --fill-from /destination/UNIT/.tapectl-damaged-files.txt \\ --to /destination/UNIT",
-            "Matching is by that sha256 and nothing else, never by the number or position of a slice or by a file name",
-            "`RESTORE INCOMPLETE` with exit status 1",
-            "Only a tape whose envelope lists the same unit, with the same uuid, at the same version is used",
-            "another version can differ in the very files that are damaged",
-            "so `--to` needs room for the unit's slices beside its restored files",
-            // R2 (#478 L5): a folder dar restored nothing in.
-            "When the slice that holds a folder's own entry is lost, dar names the folder and restores nothing in it. On a tape written since 1.3.0 the list names the files the index records under that folder instead, and the fill restores them like any other. A tape written before 1.3.0 has no index, so the list names the folder itself, and the fill restores what is missing in it and overwrites nothing that is there.",
-            // volume-format-v2.md 4.2 R5, 4.4 R8 (#478 L3).
-            "`--swap-tapes` reads the other cartridge's seal marker first, and takes a slice from it only at a position the seal says the tape holds (\"Where the tape ended\"): a cartridge whose seal marker cannot be read gives none.",
-            "The other cartridge may hold only part of a unit held across tapes (\"A unit across tapes\"); it gives the slices it holds.",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        let unit = ManifestUnit {
-            name: "photos/2019".into(),
-            uuid: "11111111-2222-3333-4444-555555555555".into(),
-            snapshot_version: 2,
-            stage_set_id: 1,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![],
-        };
-        for members in [vec![], vec!["11111111_v2.1.dar".to_string()]] {
-            let r = generate_recovery_md("VOL", "alice", std::slice::from_ref(&unit), &members);
-            let sec = flat_text(guide_section(&r, "If a slice or a file is damaged"));
-            for needle in [
-                "--slices-from DIR --to /destination",
-                "--swap-tapes --to /destination",
-                "--fill-from /destination/UNIT/.tapectl-damaged-files.txt --to /destination/UNIT",
-                "found by its `sha256_encrypted` and by nothing else",
-                "refuses a tape that holds another unit or another version",
-                "Only the same unit at the same version is a copy",
-                // R2 (#478 L5): a folder dar restored nothing in.
-                "If a folder's own entry lies in the failed slice, dar names the folder and restores nothing in it (\"No file in this directory will be restored\").",
-                "For a folder dar restored nothing in, the list names the files the index records under it, and the fill restores them like any other.",
-            ] {
-                assert!(sec.contains(needle), "{needle:?}: {sec}");
-            }
-            if members.is_empty() {
-                assert!(
-                    !r.contains("catalogs/") && !r.contains("dar -l"),
-                    "a unit without a catalogue names none (#449)"
-                );
-            }
-        }
-    }
     // ---- the second fresh-reader read of File 1 (2026-10-19, ADR-0012 item 81, #477) ----
     //
     // Five serious gaps (S1-S5) and nine smaller ones (M6-M14). The commands the
     // fixes show are run in tests/heir_restore_sh.rs; here are the words.
-
-    /// S2: a short "Start here" is the first section, and every section it
-    /// names is a real heading of the guide.
-    #[test]
-    fn reread2_s2_start_here_comes_first_and_names_sections_that_exist() {
-        let g = guide17();
-        let start = g.find("## Start here").expect("a Start here section");
-        assert!(start < g.find("## Words this guide uses").unwrap());
-        let sec = flat_text(guide_section(&g, "Start here"));
-        for needle in [
-            "Check your key: \"Which file is your key\". A tenant's key opens that tenant's units only; the operator key and the escrow key open every tenant's",
-            "Run `--info` on EVERY tape you hold (this tape's script is `./RESTORE-",
-            "this guide writes `./RESTORE.sh` for any tape's",
-            "They decrypt into `$TMPDIR` (default `/tmp`; if `/tmp` is small, set `TMPDIR` to a directory on a real disk first: \"Disk space\")",
-            "check that it did (item 4 of \"Did the restore get everything?\")",
-            "Start from the NEWEST tape",
-            "`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` shows, for a unit, every version and every tape that holds it",
-            "restore each unit's NEWEST version once, from a tape that holds it, into a directory of its own (`/destination/UNIT`), with that tape's own RESTORE.sh, saved as `RESTORE-<label>.sh`, and never an older version first",
-            "Check each restore: \"Did the restore get everything?\"",
-            "Know when you are done",
-            "\"Manual Recovery Steps\" does the same job by hand",
-            "\"If All Else Fails\"",
-        ] {
-            assert!(sec.contains(needle), "{needle:?}: {sec}");
-        }
-        // Every quoted section name is a heading (or a prefix of one).
-        let headings: Vec<&str> = g.lines().filter_map(|l| l.strip_prefix("## ")).collect();
-        let mut named = 0;
-        for quoted in sec.split('"').skip(1).step_by(2) {
-            if ["Sealed at", "Verdict:"].contains(&quoted) || quoted.starts_with("`") {
-                continue;
-            }
-            // Only titles: a quoted string that is a heading's start.
-            if headings.iter().any(|h| h.starts_with(quoted)) {
-                named += 1;
-            } else {
-                // Quotes that are not section names.
-                assert!(
-                    ["Sealed at"].contains(&quoted) || quoted.len() > 60,
-                    "{quoted:?} is not a heading of the guide: {headings:#?}"
-                );
-            }
-        }
-        assert!(named >= 8, "the sequence points to sections: {sec}");
-        // Short: a page, not a chapter. 45 lines until the fourth read
-        // (#481), which put three things there that a reader needs before
-        // they begin (the package list, the disk chosen after the units are
-        // listed, and where to look when nobody is left to ask); 52 until the
-        // fifth (read4-fixes), which added what a reader needs to start
-        // right: which RESTORE.sh a survey takes, the newest tape the drive
-        // reads, a key checked without a cover sheet, and two units of one
-        // name in different directories; 60 until the fifth read's fixes
-        // (#481), which named the script step 3 saved, put `$TMPDIR` before
-        // the first listing that fills it, and pointed `--all` at its check;
-        // 64 until the fresh read of a span (#478 m4), which told step 6
-        // where a unit across tapes restores from.
-        assert!(guide_section(&g, "Start here").lines().count() <= 67);
-    }
-
-    /// S1: with the escrow or operator key the first envelope that opens is a
-    /// tenant's; the manual path and rung 3 say to take the operator envelope.
-    #[test]
-    fn reread2_s1_the_escrow_key_takes_the_operator_envelope_not_the_first_that_opens() {
-        let g = guide17();
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        for needle in [
-            "Which one to open depends on your key",
-            "A tenant's key opens that tenant's `tenant_envelope` and no other, so the first that decrypts is yours",
-            "The operator key and the escrow key open EVERY envelope, and the tenant envelopes come first: the first that decrypts is then one tenant's, and its MANIFEST.toml lists that tenant's units and no one else's",
-            "For all the units on the tape open the `operator_envelope` instead, whose MANIFEST.toml lists every unit",
-            "With a tenant's key the first that decrypts is yours; with the operator or escrow key you choose, as above",
-            "`env/MANIFEST.toml` describes the units of the envelope you opened",
-            "grep -E '^(name|uuid|snapshot_version) =' env/MANIFEST.toml",
-        ] {
-            assert!(manual.contains(needle), "{needle:?}: {manual}");
-        }
-        assert!(
-            !manual.contains("The first that decrypts is yours."),
-            "the unconditional claim is gone"
-        );
-        assert!(!manual.contains("describes your units"));
-        let ladder = flat_text(guide_section(&g, "If All Else Fails"));
-        for needle in [
-            "With the operator or escrow key do not stop there: the tenants' envelopes come first and each lists only one tenant's units, so keep going to the operator envelope, the one whose tar also lists `PLAN.toml` (the operator envelope's plan of the tape: its units, each with its uuid, slice count and size; a tenant's envelope never has one), and whose MANIFEST.toml lists every unit on the tape",
-            "Once the envelope you want decrypts, unpack it",
-            "every slice belonging to the units it lists",
-        ] {
-            assert!(ladder.contains(needle), "{needle:?}: {ladder}");
-        }
-        assert!(
-            !ladder.contains("belonging to your unit(s)"),
-            "rung 3 no longer assumes your envelope is the whole tape"
-        );
-        // The slice-table hint of the verdict section already says the same.
-        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
-        assert!(
-            verdict.contains("decrypt the operator envelope by hand"),
-            "{verdict}"
-        );
-    }
-
-    /// S2: the per-tape checks say they are per tape, and the automated recipe
-    /// warns that `--all` is for one tape and that a second one is refused.
-    #[test]
-    fn reread2_s2_the_checks_are_for_one_tape_and_the_box_is_complete_only_by_its_procedure() {
-        let g = guide17();
-        let done = flat_text(guide_section(&g, "Did the restore get everything?"));
-        for needle in [
-            "These checks are for ONE restore, of one unit or one tape's worth, from one tape",
-            "They say nothing about the other tapes and units of a box",
-            "a box is complete only when the procedure in \"The rest of the box\" has been followed to its end",
-        ] {
-            assert!(done.contains(needle), "{needle:?}: {done}");
-        }
-        let auto =
-            flat_text(guide_section(&g, "Automated Recovery (recommended)")).replace(" # ", " ");
-        for needle in [
-            "Full restore of THIS tape to an EMPTY directory",
-            "With other tapes in the box, read \"The rest of the box\" before this: a second --all into the same /destination is refused",
-            "finishes a restore that stopped part way, never one over an older version",
-            "(a single unit goes straight into /destination)",
-        ] {
-            assert!(auto.contains(needle), "{needle:?}: {auto}");
-        }
-        let bx = flat_text(guide_section(
-            &g,
-            "The rest of the box: other tapes, copies and the index",
-        ));
-        for needle in [
-            "`--to` must be empty or new (a directory that is not empty is refused), which is why each unit has its own directory under /destination and not /destination itself",
-            "Do not restore an older version first and then a newer one into the same directory: it is refused as not empty, and `--overwrite` would keep the files that only the older version had",
-            "If a directory already holds an older version, move it aside and restore the newer version into an empty one",
-        ] {
-            assert!(bx.contains(needle), "{needle:?}: {bx}");
-        }
-    }
 
     /// S3: nothing can name a tape written later; the index does list units
     /// held only elsewhere; the box can be compared against the newest index;
@@ -15315,98 +4914,6 @@ sha256_encrypted = \"bbb\"
         assert!(words.contains("It records the archive as of the day it was made, which may be before the newest tape was written"), "{words}");
     }
 
-    /// S4: one rule for disk space, no contradiction between "no more than
-    /// the capacity" and "about twice".
-    #[test]
-    fn reread2_s4_disk_space_is_one_rule() {
-        let g = guide17();
-        let disk = flat_text(guide_section(&g, "Disk space"));
-        for needle in [
-            "so everything stored on it takes at most that on the tape. A unit stored uncompressed restores to about that size; a unit stored compressed restores larger, and the capacity is no ceiling for it",
-            "`--to` needs room for about the size of the units you restore",
-            "`--find-envelope` lists each unit with its size, and so does `--where`",
-            "need more room, for a unit's slices beside its restored files",
-            "the older-dar fallback above (all of the unit's slices), `--path` (only the few slices that hold the path), and asking for a replacement slice",
-            "Doing it by hand (\"Manual Recovery Steps\") is the same: the decrypted slices (the unit's size) beside the restored files (the unit's size, more if it was stored compressed); delete a unit's slices once it is restored",
-            "For a whole box, the destination needs the sum of the sizes of the units you restore, whichever tapes they come from; the extra room for slices is needed for one unit at a time",
-            "**Compressed units.**",
-            "The dar catalogue cannot tell you",
-            "\"Three times\" is a rule of thumb for mixed files, not a ceiling: text, source code, logs and database dumps compress ten times or more, so a compressed unit of mostly such files can need far more than three times its slices' size, and nothing on the tape says how much more",
-        ] {
-            assert!(disk.contains(needle), "{needle:?}: {disk}");
-        }
-        assert!(!disk.contains("need no more than that"), "{disk}");
-        assert!(!disk.contains("As a ceiling"), "{disk}");
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains("unit's decrypted slices at once (about the unit's size) and for step 8's restored files beside them (the unit's size again, more if it was stored compressed"),
-            "{manual}"
-        );
-        // The unknown-generation ceiling says the same.
-        let unknown = flat_text(&generate_system_guide_v2_for_media("U", 30, "DLT-IV"));
-        assert!(
-            unknown.contains("so everything stored on it takes at most that on the tape. A unit stored uncompressed restores to about that size; a unit stored compressed restores larger"),
-            "{unknown}"
-        );
-    }
-
-    /// S5: a damaged only copy has commands, by RESTORE.sh and by hand, and
-    /// says what tapectl is. The dar behaviour is run in heir_restore_sh.rs.
-    #[test]
-    fn reread2_s5_a_damaged_only_copy_has_commands_and_says_what_tapectl_is() {
-        let g = guide17();
-        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
-        assert!(
-            verdict.contains("the files that lie wholly inside them can still be restored: RESTORE.sh does it (`--swap-tapes`, then type `done`), and \"No other copy\", in \"If a slice or a file is damaged\", has that and the commands by hand"),
-            "{verdict}"
-        );
-        assert!(
-            !verdict.contains("but nothing here promises it"),
-            "{verdict}"
-        );
-        let sec = guide_section(&g, "If a slice or a file is damaged");
-        let f = flat_text(sec);
-        for needle in [
-            "**No other copy.**",
-            "RESTORE.sh does this for you: run the `--swap-tapes` restore above and type `done` when it asks for another cartridge",
-            "lists the others in `.tapectl-damaged-files.txt`",
-            "By hand, without RESTORE.sh, do the steps of \"Manual Recovery Steps\" for the unit, but leave the failed slices out",
-            "this is the one time a gap in the numbering is right",
-            "dar does not stop at the gap",
-            "For each of the others it prints `PATH not restored (user choice)`",
-            "If the failed slice is the LAST one, dar stops at once (\"The last file of the set is not present\", exit status 4) and restores nothing; add `-0` (sequential read)",
-            "tapectl is the program that wrote this tape (File 0 names its release in `tapectl_version`); it is open-source software",
-            "reads around a damaged 64 KiB piece of a slice",
-            "the `age` program stops at the first damaged piece",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        assert!(
-            sec.lines()
-                .any(|l| l.trim() == "dar -x restore -R /destination -O -Q -N > dar.log 2>&1"),
-            "{sec}"
-        );
-        assert!(
-            sec.lines()
-                .any(|l| l.trim() == "grep 'not restored (user choice)' dar.log"),
-            "{sec}"
-        );
-        assert!(!f.contains("http"), "no URL: {f}");
-        // The manual path points here at the slice that fails its hash, and
-        // its "no gaps" rule has the one exception.
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains("With no other copy, leave that slice out and go on"),
-            "{manual}"
-        );
-        assert!(
-            manual.contains("and no gaps (but for a slice you must leave out"),
-            "{manual}"
-        );
-        let done = flat_text(guide_section(&g, "Did the restore get everything?"));
-        assert!(done.contains("\"Ignored (excluded by filters)\" above 0 in a whole-unit restore means dar skipped files"), "{done}");
-    }
-
     /// M7: the drive table is `Generation::can_read`, row by row, and the
     /// sentence on one drive for a box holds.
     #[test]
@@ -15416,7 +4923,7 @@ sha256_encrypted = \"bbb\"
         let sec = guide_section(&g, "The tape drive");
         let rows: Vec<(String, String)> = sec
             .lines()
-            .filter(|l| l.starts_with("    LTO-"))
+            .filter(|l| l.starts_with("  LTO-"))
             .map(|l| {
                 let l = l.trim();
                 let at = l.find("  ").expect("two columns");
@@ -15531,122 +5038,6 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// M10, M11: the terms the guide uses are defined, "File 0's commands" is
-    /// one of them, and the tools are listed for what they are needed for.
-    #[test]
-    fn reread2_m10_m11_the_glossary_and_the_tool_list() {
-        let g = guide17();
-        let words = flat_text(guide_section(&g, "Words this guide uses"));
-        for needle in [
-            "**ID thunk (File 0)**: the first tape file, plain text, that says which tape this is: its `label`, `uuid`, `media_type` (the LTO generation), `cartridge_serial` and `tapectl_version`",
-            "\"File 0's commands\" in this guide means those",
-            "**`requires`**: a line in File 0 and in the seal marker that lists the features a reader must understand to read the tape correctly. A tape written by tapectl 1.6.0 or later states `requires = [\"short-seal\"]`: the tape may end before the last file the front index plans, and its seal marker says where (\"Where the tape ended\"). Older tapes state it empty (`requires = []`, from 1.1.0 to 1.5.0) or have no such line",
-            "A version is also called a snapshot: MANIFEST.toml states it as `snapshot_version`, RECOVERY.md as \"snapshot v2\" and RESTORE.sh as \"snapshot version\"",
-            "so the highest number is the newest",
-            "A unit is identified by its `uuid`",
-            "**Installation**: one tapectl setup, with its own catalogue (its database of tapes, units and where the tapes are kept) and its own keys",
-            "**Heir Kit, cover sheet**: the papers and files the operator prepares for the person who inherits the archive",
-            "`catalog.db.age`, the Heir Kit's catalogue (the whole database), encrypted to the escrow key",
-        ] {
-            assert!(words.contains(needle), "{needle:?}: {words}");
-        }
-        let tools = flat_text(guide_section(&g, "Tools Required"));
-        for needle in [
-            "Only for finding the drive and checking a key, never for the restore itself: `ls`, `lsscsi` (package lsscsi), `lspci` (pciutils), `dmesg` (util-linux), `lsmod` and `modprobe` (kmod), `sudo` (sudo) and `usermod` (passwd)",
-            "`age-keygen`, which comes with `age` (\"Which file is your key\")",
-            "`wc`, `tail`, `od`",
-        ] {
-            assert!(tools.contains(needle), "{needle:?}: {tools}");
-        }
-        // Everything those lines name is something the guide says to run.
-        let all = flat_text(&g);
-        for tool in [
-            "lsscsi",
-            "lspci",
-            "dmesg",
-            "lsmod",
-            "modprobe",
-            "usermod",
-            "age-keygen",
-        ] {
-            assert!(
-                all.matches(tool).count() >= 2,
-                "{tool} is named where it is used"
-            );
-        }
-    }
-
-    /// M12: the manual path takes one version of one unit into a directory of
-    /// its own, the highest `snapshot_version`.
-    #[test]
-    fn reread2_m12_manual_steps_take_one_unit_one_version_a_directory() {
-        let g = guide17();
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        for needle in [
-            "Restore ONE version of ONE unit at a time, each in a directory of its own: the slices of every unit are named `restore.N.dar`, so two units in one directory would overwrite each other",
-            "If the manifest lists the unit more than once, take the block with the highest `snapshot_version`, the newest, unless you want an older one",
-            "A unit stored in several versions has a `[[units]]` block, with its own slices, for each version",
-            "With several units, give each its own directory (`/destination/UNIT`)",
-            "add `-w` (overwrite); never use it to restore a newer version over an older one",
-            "Delete the unit's `restore.N.dar` files once it is restored and checked",
-        ] {
-            assert!(manual.contains(needle), "{needle:?}: {manual}");
-        }
-    }
-
-    /// M13: the retired-or-erased wording agrees with itself, an erased and
-    /// reused cartridge is described, and two tapes are copies only with the
-    /// same unit uuid.
-    #[test]
-    fn reread2_m13_states_erased_cartridges_and_the_uuid() {
-        let g = guide17();
-        let bx = flat_text(guide_section(
-            &g,
-            "The rest of the box: other tapes, copies and the index",
-        ));
-        for needle in [
-            "A tape that was already retired or erased when the index was written is not listed, and one that is listed may have been retired or erased since",
-            "A cartridge that was erased and written again carries a NEW volume: File 0 then shows another label and another `uuid` on the same `cartridge_serial`, and the index row for the old volume names data that is gone",
-            "So match a tape to an index row by its label AND its uuid (`--where` prints the uuid; File 0 shows it)",
-            "dd if=/dev/nst0 bs=512k | tr -d '\\0' | grep -E '^(label|uuid|media_type|cartridge_serial|created_at|tapectl_version) ='",
-            "A unit that appears at the same version AND with the same unit uuid on two tapes has two copies",
-            "A name and a version number alone prove nothing",
-        ] {
-            assert!(bx.contains(needle), "{needle:?}: {bx}");
-        }
-        assert!(
-            !bx.contains("A retired or erased tape is not listed."),
-            "{bx}"
-        );
-        // The File 0 line has `mt -f` and does not trip the tr-for-plain-text count.
-        assert!(
-            !g.contains("tr -d '\\0' | grep")
-                || g.lines().filter(|l| l.contains("| tr -d '\\0' >")).count() == 4
-        );
-    }
-
-    /// M6: which RESTORE.sh to use for the survey and for the restore, how to
-    /// get another tape's, and whether the WRONG TAPE box matters.
-    #[test]
-    fn reread2_m6_which_restore_sh_for_which_job() {
-        let g = guide17();
-        let bx = flat_text(guide_section(
-            &g,
-            "The rest of the box: other tapes, copies and the index",
-        ));
-        for needle in [
-            "(any copy of RESTORE.sh will do for this: see \"The modes that only read the tape\", after this list)",
-            "The modes that only read the tape (`--info`, `--verify`, `--find-envelope`, `--list`, `--where`, `--find`) describe the tape that is in the drive, whichever tape's RESTORE.sh runs them (`--where` and `--find` need the script of a tape written by tapectl 1.3.0 or later; an older one answers `Unknown mode`)",
-            "it is only a reminder that the script was written for another volume",
-            "the `Tape identifies as:` line, which every mode prints, is that tape's own label; the heading `--verify` prints names the script's volume, but it checks the tape in the drive",
-            "For a restore use the loaded tape's own RESTORE.sh, which was written for that tape's format",
-            "take \"WRONG TAPE?\" during a restore as a sign that the script or the tape is the wrong one",
-            "To get a tape's own script, load that tape and run the four commands at the start of \"Automated Recovery (recommended)\"",
-        ] {
-            assert!(bx.contains(needle), "{needle:?}: {bx}");
-        }
-    }
-
     /// M14: the device named for `mt` and `dd` is the one RESTORE.sh reads.
     #[test]
     fn reread2_m14_the_device_is_set_once_for_the_restore_lines() {
@@ -15672,146 +5063,12 @@ sha256_encrypted = \"bbb\"
         );
     }
 
-    /// RECOVERY.md repeats the staleness rule honestly and carries the
-    /// no-other-copy paragraph, without naming a dar catalogue (#449).
-    #[test]
-    fn reread2_recovery_md_says_the_newest_tape_may_not_be_the_newest_ever() {
-        let r = generate_recovery_md("LAB01", "alice", &[], &[]);
-        let f = flat_text(&r);
-        for needle in [
-            "Nothing on a tape can name tapes written after it, so the newest tape you hold may not be the newest ever written",
-            "With no other copy, leave the failed slice out of the steps above: do not decrypt it, and do not put an empty file in its place",
-            "(`dar -x restore -R /destination -O -Q -N > dar.log 2>&1`)",
-            "`PATH not restored (user choice)` (`grep 'not restored (user choice)' dar.log` lists them)",
-            "leaves an EMPTY or short file of that name, which is not the real file; its exit status is still 0",
-            "If the failed slice is the last one, dar stops (\"The last file of the set is not present\"); add `-0`",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        assert!(!r.contains("catalogs/") && !r.contains("dar -l"), "{r}");
-    }
-
     // ---- the third fresh-reader read of File 1 (2026-10-19, ADR-0012 item 81, #477) ----
     //
     // Two serious gaps about restoring a whole box (the box could not be
     // enumerated; "done" could be reached without opening a tape) and five cheap
     // ones. The commands are run against the fake tape in tests/heir_restore_sh.rs;
     // here are the words.
-
-    /// S1: every place that tells the reader how to list the box names
-    /// `--where --all`, nothing tells them to ask for a name the index lacks,
-    /// and the script's own `--help` has the mode.
-    #[test]
-    fn reread3_s1_the_box_is_listed_by_where_all_with_no_cap() {
-        let g = guide17();
-        let all = flat_text(&g);
-        for gone in ["the first 40", "for a name it does not have"] {
-            assert!(!all.contains(gone), "{gone:?} is gone from File 1");
-        }
-        let start = flat_text(guide_section(&g, "Start here"));
-        for needle in [
-            "`./RESTORE.sh --where --all --key YOUR_KEY.age.key` lists EVERY unit the archive's index names, with its newest version and the tapes that hold it",
-            "`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` shows, for a unit, every version and every tape that holds it",
-            "`--find-envelope` lists the units on this tape",
-        ] {
-            assert!(start.contains(needle), "{needle:?}: {start}");
-        }
-        let auto = guide_section(&g, "Automated Recovery (recommended)");
-        assert!(
-            auto.lines()
-                .any(|l| l.trim() == "./RESTORE.sh --where --all --key YOUR_KEY.age.key"),
-            "{auto}"
-        );
-        let raw = guide_section(&g, "The rest of the box: other tapes, copies and the index");
-        assert!(
-            raw.lines()
-                .any(|l| l.trim() == "./RESTORE.sh --where --all --key YOUR_KEY.age.key"),
-            "{raw}"
-        );
-        let bx = flat_text(raw);
-        for needle in [
-            "`./RESTORE.sh --where --all --key YOUR_KEY.age.key` prints all of them, with no limit: for each unit its newest version, whether the tape in the drive holds it, and every version with each tape that holds it (label, uuid, cartridge serial, generation, state); the units whose newest version is not on that tape are named first",
-            "List the units the newest index you can read has and the tapes that hold them, and set that against the tapes in the box",
-            "2. Start from the newest tape. `./RESTORE.sh --where --all --key YOUR_KEY.age.key` lists every unit its index names, each with its newest version and the tapes that hold it",
-        ] {
-            assert!(bx.contains(needle), "{needle:?}: {bx}");
-        }
-        // RECOVERY.md names it too, in the section that reads the index.
-        let r = flat_text(&generate_recovery_md("LAB01", "alice", &[], &[]));
-        assert!(
-            r.contains("`--where --all` (every unit the index names, with no limit"),
-            "{r}"
-        );
-        // And the script: the mode is in --help and the header usage comment.
-        let script = generate_restore_script_v2("S3-1", 20);
-        for needle in [
-            "echo \"  $0 --where --all --key KEYFILE [--key K2 ...]\"",
-            "EVERY unit the index names, with no limit",
-            "#   ./RESTORE.sh --where --all --key KEYFILE [--key K2 ...]      Every unit the index names, no limit",
-        ] {
-            assert!(script.contains(needle), "{needle:?}");
-        }
-    }
-
-    /// S2: "done" needs every tape opened with a key, every unit the newest
-    /// readable index names restored, an unopenable tape named and not counted,
-    /// the no-index and unsealed cases, and the plain statement about what the
-    /// newest version holds.
-    #[test]
-    fn reread3_s2_done_needs_every_tape_opened_and_every_listed_unit_restored() {
-        let g = guide17();
-        let all = flat_text(&g);
-        assert!(
-            !all.contains("has been looked at"),
-            "the old rule (a tape merely looked at) is gone"
-        );
-        assert!(!all.contains("(or the best you could reach)"), "{all}");
-        let bx = flat_text(guide_section(
-            &g,
-            "The rest of the box: other tapes, copies and the index",
-        ));
-        for needle in [
-            "6. You are done only when ALL of these hold; fewer is not done:",
-            "Every tape in the box has had its envelopes opened with your key (`./RESTORE.sh --find-envelope --key YOUR_KEY.age.key`), and the newest version of every unit any of them lists is restored: the highest version number among the versions with that unit's `uuid`",
-            "Every unit the newest readable index names (`--where --all`) is restored at its newest version, or you have written down that it is held only on tapes you do not have",
-            "A tape your key cannot open is NOT done.",
-            "\"no envelope matched the key provided\" (or \"any of the N keys provided\")",
-            "`--info`, which needs no key, shows only the tape's label, dates and map, never what it holds",
-            "Do not count that tape as looked at: name it (a tape of another installation, or a key you do not have) and try every other key you hold on it. If none opens it, the box is not done, and you say so, by that tape's name",
-            "A tape written before 1.3.0 has no index. It counts by its own envelopes alone, and nothing on it names a tape or a unit but its own",
-            "An unsealed tape (no \"Sealed at\") is ordered by File 0's `created_at`",
-            "If the newest tape in the box will not read, the older tapes' indexes cannot see what was written after them: say that some units may be unknown",
-            "The newest version of a unit holds the files that version had. A file deleted before it was made exists only in an older version, so restore an older version (`--version N`, into a directory of its own) only if you want such files",
-            "(`unknown (tape not sealed)` there means the tape is unsealed: File 0's `created_at`, from the `grep` below, says when it was written)",
-            "grep -E '^(label|uuid|media_type|cartridge_serial|created_at|tapectl_version) ='",
-        ] {
-            assert!(bx.contains(needle), "{needle:?}: {bx}");
-        }
-        // Start here's last step says the same in short, and the glossary says
-        // what "every file" means.
-        let start = flat_text(guide_section(&g, "Start here"));
-        for needle in [
-            "Know when you are done: every tape you hold opened with your key and the newest version of every unit any of them lists restored",
-            "every unit `--where --all` names on the newest readable index, and every unit the Heir Kit's catalogue lists on a sealed tape, restored or named as held only on tapes you do not have",
-            "any tape your key cannot open named, never counted as looked at",
-        ] {
-            assert!(start.contains(needle), "{needle:?}: {start}");
-        }
-        let words = flat_text(guide_section(&g, "Words this guide uses"));
-        assert!(
-            words.contains("\"Every file\" means the files the unit had when that version was made: a file deleted before then exists only in an older version, so restore an older version (`--version N`, into a directory of its own) only if you want such files"),
-            "{words}"
-        );
-        // The pre-1.3.0 and unsealed words agree with what the script prints.
-        let script = generate_restore_script_v2("S3-2", 20);
-        for said in [
-            "Sealed at: ${SEAL_SEALED_AT:-unknown (tape not sealed)}",
-            "no envelope matched $(keys_phrase)",
-            "echo \"any of the ${#KEYS[@]} keys provided\"",
-        ] {
-            assert!(script.contains(said), "{said:?}");
-        }
-    }
 
     /// M-key: the passphrase-protected key is decrypted to a NEW name, and the
     /// original is kept.
@@ -15851,92 +5108,6 @@ sha256_encrypted = \"bbb\"
         ] {
             assert!(load.contains(needle), "{needle:?}: {load}");
         }
-    }
-
-    /// M-paths: the box procedure's directory (`/destination/UNIT`) is the
-    /// one every example uses, and `--all` is one envelope, not the union of
-    /// several keys' envelopes.
-    #[test]
-    fn reread3_m_paths_agree_on_the_unit_directory_and_all_is_one_envelope() {
-        let g = guide17();
-        let dmg = guide_section(&g, "If a slice or a file is damaged");
-        let f = flat_text(dmg);
-        for needle in [
-            "--fill-from /destination/UNIT/.tapectl-damaged-files.txt \\ --to /destination/UNIT",
-            "--slices-from DIR --to /destination/UNIT",
-            "--swap-tapes --to /destination/UNIT",
-            "The box procedure restores each unit with `--to /destination/UNIT`, so its list is `/destination/UNIT/.tapectl-damaged-files.txt`",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        assert!(
-            !dmg.contains("--fill-from /destination/.tapectl-damaged-files.txt"),
-            "{dmg}"
-        );
-        let auto =
-            flat_text(guide_section(&g, "Automated Recovery (recommended)")).replace(" # ", " ");
-        for needle in [
-            "--unit UNIT \\ --path some/file --to /destination/UNIT",
-            "It is always ONE envelope, never the union of several. With several keys (`--key` repeated) it is the biggest envelope any of them opens, and the first on the tape if two tie",
-            "the escrow or operator key, alone or with others, therefore restores every unit on the tape, but two tenants' keys together restore only the tenant with more units",
-            "Restore the other tenant in a run of its own, with that tenant's key, into another empty directory",
-            "Full restore of THIS tape to an EMPTY directory: --all restores every unit of one envelope (below), each into /destination/UNIT",
-        ] {
-            assert!(auto.contains(needle), "{needle:?}: {auto}");
-        }
-        // RECOVERY.md agrees.
-        let r = flat_text(&generate_recovery_md("LAB01", "alice", &[], &[]));
-        for needle in [
-            "--unit UNIT --slices-from DIR --to /destination/UNIT",
-            "--unit UNIT --swap-tapes --to /destination/UNIT",
-            "--fill-from /destination/UNIT/.tapectl-damaged-files.txt --to /destination/UNIT",
-            "with each unit restored into `/destination/UNIT`, that is `/destination/UNIT/.tapectl-damaged-files.txt`",
-        ] {
-            assert!(r.contains(needle), "{needle:?}: {r}");
-        }
-    }
-
-    /// M-script: the first command saves the script under the tape's own name,
-    /// and the guide says what `./RESTORE.sh` means everywhere else.
-    #[test]
-    fn reread3_m_script_is_saved_under_the_tapes_own_name_from_the_first_command() {
-        let g = guide17();
-        let auto = guide_section(&g, "Automated Recovery (recommended)");
-        let fetch: Vec<&str> = auto
-            .lines()
-            .filter(|l| l.contains("| tr -d '\\0' >"))
-            .collect();
-        assert_eq!(
-            fetch,
-            ["    dd if=/dev/nst0 bs=512k | tr -d '\\0' > RESTORE-READ17.sh"]
-        );
-        assert!(
-            auto.lines()
-                .any(|l| l.trim() == "chmod +x RESTORE-READ17.sh"),
-            "{auto}"
-        );
-        assert!(!g.contains("> RESTORE.sh"), "no fetch to the shared name");
-        assert!(!g.contains("chmod +x RESTORE.sh"));
-        let f = flat_text(auto);
-        for needle in [
-            "The script is saved under this tape's own name, `RESTORE-READ17.sh`, because a box has several tapes and each has its own RESTORE.sh: scripts saved under one name overwrite each other",
-            "Everywhere else this guide writes `./RESTORE.sh`, it means the script of the tape that is in the drive: for this tape, `./RESTORE-READ17.sh`; for another tape, the file you saved from it",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        let start = flat_text(guide_section(&g, "Start here"));
-        assert!(
-            start.contains("off the tape into a file named for the tape, `RESTORE-READ17.sh`"),
-            "{start}"
-        );
-        let bx = flat_text(guide_section(
-            &g,
-            "The rest of the box: other tapes, copies and the index",
-        ));
-        assert!(
-            bx.contains("In the last two put THAT tape's label (the `Tape identifies as:` line of `--info`) in place of this tape's, so that each tape's script is kept under its own name, `RESTORE-<label>.sh`"),
-            "{bx}"
-        );
     }
 
     /// M-tape-facts: what File 1 says about the file count, the last file, the
@@ -16086,7 +5257,6 @@ sha256_encrypted = \"bbb\"
             "{tools}"
         );
         assert!(!restore_sh_tools().contains(&"sqlite3"));
-        assert!(!generate_restore_script_v2("S", 20).contains("sqlite3"));
 
         // The queries run on the real schema and answer the question.
         let sqls = guide_sql(raw);
@@ -16244,62 +5414,6 @@ sha256_encrypted = \"bbb\"
             !words.contains("The operator's key opens every tenant's data on every tape that installation wrote"),
             "{words}"
         );
-        // The script says what the text says: a damaged envelope is reported
-        // as DAMAGED and a key that is not a recipient is "did not open".
-        let script = generate_restore_script_v2("K4", 20);
-        for said in ["is DAMAGED", "did not open the envelope at file"] {
-            assert!(script.contains(said), "{said:?}");
-        }
-        // RECOVERY.md repeats it where it names the same error.
-        let r = flat_text(&generate_recovery_md("LAB01", "alice", &[], &[]));
-        for needle in [
-            "`age-keygen -y YOUR_KEY.age.key` shows whether a file is a key at all",
-            "(File 1, \"Which file is your key\") tells a bad key file from a tape of another installation",
-            "or the tape may be another installation's",
-        ] {
-            assert!(r.contains(needle), "{needle:?}: {r}");
-        }
-    }
-
-    /// Item 3: the disk is chosen after the units are listed, on a filesystem
-    /// that keeps what the archive holds, and "allow generously" is a number.
-    #[test]
-    fn reread4_item3_the_disk_is_chosen_after_the_units_are_listed() {
-        let g = guide17();
-        let raw = guide_section(&g, "Start here");
-        let start = flat_text(raw);
-        // Step 2 no longer asks for a disk; step 5 does, after the listings.
-        let step2 = start.split("3. Load the tape").next().unwrap();
-        assert!(
-            !step2.contains("disk") && !step2.contains("Disk space"),
-            "{step2}"
-        );
-        let at_listing = start
-            .find("lists EVERY unit the archive's index names")
-            .unwrap();
-        let at_disk = start
-            .find("Those listings give each unit's size, so choose the disk now: a Linux filesystem (ext4 or xfs; not FAT, exFAT or NTFS) with room for the units you will restore: \"Disk space\"")
-            .expect("the disk is chosen in step 5");
-        let at_restore = start.find("6. Restore.").unwrap();
-        assert!(at_listing < at_disk && at_disk < at_restore, "{start}");
-        let disk = flat_text(guide_section(&g, "Disk space"));
-        for needle in [
-            "Choose the disk once you have listed the units you will restore (`--find-envelope` and `--where --all` print each unit's size), not before",
-            "The disk needs a filesystem that keeps what the archive holds: file names exactly as they were, files of 4 GiB and more, symbolic links and Unix permissions. A Linux filesystem does (ext4 and xfs are the usual ones)",
-            "FAT, exFAT and NTFS do not keep all of that (FAT cannot hold a file of 4 GiB or more, and none of the three keeps Unix permissions and symbolic links as Linux does)",
-            "three times that, and more for mostly text, when you cannot tell that a unit was stored uncompressed (\"Compressed units\", below), and watch `df` while it runs",
-            "With no `dar_command` line, or a compressed unit, restore to a disk you can add room to and watch `df`. RESTORE.sh names a full disk when it happens, and `--overwrite` finishes the restore once you have made room",
-        ] {
-            assert!(disk.contains(needle), "{needle:?}: {disk}");
-        }
-        assert!(!disk.contains("Choose it before you start"), "{disk}");
-        assert!(!disk.contains("allow generously"), "{disk}");
-        // Both listings do print sizes: the script's own usage says so.
-        let script = generate_restore_script_v2("D4", 20);
-        assert!(
-            script.contains("human(val(f, h, \"version_bytes\"))"),
-            "--where prints sizes"
-        );
     }
 
     /// Item 4: IR and IT are defined, reflashing is conditional, internal and
@@ -16339,10 +5453,11 @@ sha256_encrypted = \"bbb\"
         assert!(drive[at..].contains("Check that the drive shows up (`ls -l /dev/tape/by-id/`"));
     }
 
-    /// Item 5: the package for each tool, an install line, and the oldest dar
-    /// and age.
+    /// Item 5: the package for each tool, the oldest age, and no dar, no gpg
+    /// and no `dar_version` line (T4.13: the L3-pending test is this one; a
+    /// Layout 3 MANIFEST block states no dar, `volume-format-v3.md` §1.9).
     #[test]
-    fn reread4_item5_packages_and_the_oldest_dar_and_age() {
+    fn reread4_item5_packages_and_the_oldest_age() {
         let g = guide17();
         let tools = flat_text(guide_section(&g, "Tools Required"));
         for needle in [
@@ -16350,219 +5465,390 @@ sha256_encrypted = \"bbb\"
             "`dd` — reading raw data from tape (coreutils)",
             "`age` — decryption (age-encryption.org; package age on Debian 11 and later and on Ubuntu 22.04 and later, none on Debian 10, where a release from github.com/FiloSottile/age/releases does)",
             "any age from 1.0.0-rc.1 (March 2021) on opens them, the oldest tried",
-            "`dar` — archive extraction (package dar; dar.linux.free.fr)",
-            "`tar` — unpacking your decrypted envelope (it is a tar archive; package tar)",
+            "`tar` — unpacking your decrypted envelope, and restoring a unit",
+            "`truncate` (coreutils) — only the manual steps use it",
+            "`gzip`, `xz` (package xz-utils) or `zstd` — only for a unit that states `compression`",
             "Packages: bash; mawk or gawk (either is `awk`); coreutils; sed; grep",
-            "`gpg` (package gnupg)",
-            "The oldest dar that reads a unit is the one that wrote it, or any newer one: dar reads every archive format that existed when it was released (its own documentation says so), and an older dar may refuse a format it does not know",
-            "MANIFEST.toml records the dar that wrote each unit, in its `dar_version` line (unpacked envelope: `grep '^dar_version' env/MANIFEST.toml`",
-            "If your dar is older than a unit's `dar_version`, install that version or a newer one before you give the unit up. 2.6 is the oldest dar tapectl writes with, not a promise that every dar from 2.6 on reads every unit",
             "`lsscsi` (package lsscsi), `lspci` (pciutils), `dmesg` (util-linux), `lsmod` and `modprobe` (kmod), `sudo` (sudo) and `usermod` (passwd)",
             "Debian 10 has every one of those packages but `age`",
         ] {
             assert!(tools.contains(needle), "{needle:?}: {tools}");
         }
-        // The one install line names the package of every tool the section
-        // lists (the RESTORE.sh tools come from coreutils, tar, age, dar and
-        // mt-st; gpg from gnupg; the rest as the section says).
-        let section = guide_section(&g, "Tools Required");
-        let install = section
-            .lines()
-            .find(|l| l.trim_start().starts_with("sudo apt install"))
-            .expect("an install line");
-        let packages: Vec<&str> = install.split_whitespace().skip(3).collect();
-        assert_eq!(
-            packages,
-            [
-                "mt-st",
-                "coreutils",
-                "tar",
-                "age",
-                "dar",
-                "gnupg",
-                "sqlite3",
-                "lsscsi",
-                "pciutils",
-                "kmod",
-                "sg3-utils"
-            ]
-        );
-        // The dar floor the text states is the one tapectl enforces.
-        assert_eq!(crate::dar::version::MIN_VERSION, (2, 6));
-        // The MANIFEST line the text greps for is the one the writer emits.
+        // The packages, as one sentence in the order the section lists the tools.
+        let sentence = "mt-st, coreutils, tar, age, gzip, xz-utils, zstd, sqlite3, lsscsi, pciutils, kmod and, for tapectl itself, sg3-utils";
+        assert!(tools.contains(sentence), "{tools}");
+        for gone in ["dar", "gpg", "gnupg", "dar_version", "mkfifo", "tee"] {
+            assert!(
+                !tools
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|w| w == gone),
+                "Layout 3's tools do not name {gone}: {tools}"
+            );
+        }
+        // No MANIFEST block of Layout 3 states a dar: nothing for File 1 to grep.
         let m = ManifestUnit {
             name: "u".into(),
             uuid: "11111111-2222-3333-4444-555555555555".into(),
             snapshot_version: 1,
             stage_set_id: 7,
-            may_span: false,
-            dar_version: Some("2.7.20".into()),
-            dar_command: None,
+            payload: "tar".to_string(),
+            stream_bytes: 0,
+            file_table: None,
+            id_map: None,
+            tar_version: None,
+            compression: None,
             slices: vec![],
         };
         let manifest = generate_manifest_toml("L", "t", std::slice::from_ref(&m));
-        assert!(
-            manifest.lines().any(|l| l == "dar_version = \"2.7.20\""),
-            "{manifest}"
-        );
+        assert!(!manifest.contains("dar_"), "{manifest}");
     }
 
-    /// Item 6: where tapectl comes from and the steps that use it. Every
-    /// command line shown parses as the real CLI, and the key rule is stated.
+    /// File 1's tool list, its opening sentence and `--info`'s line are drawn
+    /// from the one table, and the table is the script's own: the sets
+    /// `RESTORE.sh` checks for each mode, read out of it, are the table's.
     #[test]
-    fn reread4_item6_tapectl_itself_says_where_it_comes_from_and_what_to_run() {
-        use clap::Parser;
-        let g = guide17();
-        let raw = guide_section(&g, "tapectl itself");
-        let f = flat_text(raw);
-        for needle in [
-            "tapectl is open-source software, and its source is at https://github.com/mikmorg/tapectl: one place to look, and a web address may move over decades, so search for the name if it is gone",
-            "File 0's `tapectl_version` names the release that wrote this tape; the repository tags each release `v` followed by that number (such as `v1.5.0`); use that release or a newer one",
-            "the Rust toolchain the repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs, installs it on the first `cargo` run, or when you run `rustup toolchain install` in the checkout; a distribution's own cargo may be too old)",
-            "`dar`, `mt-st` and `sg3-utils` installed (\"Tools Required\")",
-            "`init` makes the home and registers the escrow PUBLIC key, which decrypts nothing; run it once",
-            "`catalog rebuild` reads the loaded tape and puts what it says into tapectl's own catalogue (its database, in the new home); run it once for each tape",
-            "`restore unit` restores the newest version of a unit on the loaded tape into an empty directory (`--version N` for another)",
-            "The repository's `docs/keys-and-recovery.md` (runbook C) is the long form",
-            "`--key` names a key file for that one command and nothing more: tapectl does not copy it into its home or register it, and the escrow secret is never stored on the machine. Give it on each command, and once for each key file if the units need more than one (`--key` repeats)",
-            "With the escrow key this route does what RESTORE.sh cannot: it reads around a damaged 64 KiB piece of a slice, loses only the files in that piece and names them",
-            "The alternative, with the operator's key file: adopt it at `init` with `--operator-key OPERATOR.age.key` beside `--escrow-public-key`, and leave `--key` off the restore, which then reads the key from its home's `keys/`",
-            "`init` refuses the escrow secret as `--operator-key` (that secret is kept on paper, apart from every machine); `--key` is how the escrow key is used",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        // File 0 carries the package version, which is what the tags spell.
-        assert_eq!(crate::build_info::PKG_VERSION, env!("CARGO_PKG_VERSION"));
-        // The commands are the real CLI's.
-        let cmds: Vec<&str> = raw
-            .lines()
-            .filter(|l| l.starts_with("    tapectl "))
-            .map(str::trim)
-            .collect();
-        assert_eq!(cmds.len(), 3, "{cmds:?}");
-        for cmd in &cmds {
-            // `restore unit|file|volume` take `--key FILE` (ADR-0012 item 107):
-            // every command is parsed as File 1 prints it.
-            let argv: Vec<&str> = cmd.split_whitespace().collect();
-            crate::cli::Cli::try_parse_from(&argv)
-                .unwrap_or_else(|e| panic!("File 1 shows a command the CLI refuses: {cmd}: {e}"));
-        }
+    fn the_tool_table_is_the_scripts_own_sets() {
         assert_eq!(
-            cmds[0],
-            "tapectl init --operator OPERATOR_NAME --escrow-public-key ESCROW_PUBLIC"
+            restore_sh_tools(),
+            ["dd", "age", "sha256sum", "head", "tar", "tail"]
         );
-        assert!(cmds[1]
-            .contains("catalog rebuild --from-volume --device /dev/nst0 --key YOUR_KEY.age.key"));
-        assert!(cmds[2].contains(
-            "restore unit --unit UNIT --device /dev/nst0 --to /destination/UNIT --key YOUR_KEY.age.key"
-        ));
-        // The one-line query for the operator's name runs on the kit's schema.
-        let query = "SELECT name FROM tenants WHERE is_operator = 1;";
-        assert!(f.contains(query), "{f}");
-        let conn = kit_catalogue();
-        conn.execute(
-            "INSERT INTO tenants (name, is_operator, status) VALUES ('mike', 1, 'active')",
-            [],
-        )
-        .unwrap();
-        let name: String = conn.query_row(query, [], |r| r.get(0)).unwrap();
-        assert_eq!(name, "mike");
-        // The escrow public key is what `init` registers, and the CLI says so.
-        let argv = [
-            "tapectl",
-            "init",
-            "--operator",
-            "NAME",
-            "--escrow-public-key",
-            "age1x",
-        ];
-        crate::cli::Cli::try_parse_from(argv).unwrap();
-        for cmd in [
-            "git clone https://github.com/mikmorg/tapectl",
-            "cargo build --release",
-        ] {
+        let script = crate::volume::heir::RESTORE_SH;
+        let set = |name: &str| -> Vec<String> {
+            let line = script
+                .lines()
+                .find(|l| l.starts_with(&format!("{name}=(")))
+                .unwrap_or_else(|| panic!("the script has no {name}"));
+            line.trim_start_matches(&format!("{name}=("))
+                .split(')')
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        let table = |modes: u8| sorted(tools_for(modes).into_iter().map(str::to_string).collect());
+        assert_eq!(sorted(set("TOOLS_READ")), table(MODE_READ));
+        assert_eq!(sorted(set("TOOLS_ENVELOPE")), table(MODE_ENVELOPE));
+        assert_eq!(sorted(set("TOOLS_LIST")), table(MODE_LIST));
+        assert_eq!(sorted(set("TOOLS_INDEX")), table(MODE_INDEX));
+        assert_eq!(sorted(set("TOOLS_RESTORE")), table(MODE_RESTORE));
+        // What a path restore and the repair add: `tail`, once.
+        let mut with_paths = set("TOOLS_RESTORE");
+        with_paths.extend(set("TOOLS_PATHS"));
+        assert_eq!(sorted(with_paths), table(MODE_PATH));
+
+        let g = generate_system_guide_v2_for_media("TOOLS2", 20, "LTO-6");
+        let intro = g
+            .split_once("All you need is:")
+            .and_then(|(_, rest)| rest.split_once("\n\n"))
+            .map(|(list, _)| flat_text(list))
+            .expect("the guide states its tool list up front");
+        assert_eq!(intro, "mt, dd, age, sha256sum, head, tar, and tail.");
+        let section = g
+            .split_once("## Tools Required")
+            .and_then(|(_, rest)| rest.split_once("\n## "))
+            .map(|(body, _)| body)
+            .expect("a Tools Required section");
+        for tool in restore_sh_tools() {
             assert!(
-                raw.lines().any(|l| l.trim().starts_with(cmd)),
-                "{cmd}: {raw}"
+                section
+                    .lines()
+                    .any(|l| l.starts_with(&format!("- `{tool}`"))),
+                "Tools Required lacks a bullet for {tool}:\n{section}"
             );
         }
-        // The damaged-slice section points here and promises no more than this.
-        let dmg = flat_text(guide_section(&g, "If a slice or a file is damaged"));
-        for needle in [
-            "tapectl is the program that wrote this tape (File 0 names its release in `tapectl_version`); it is open-source software",
-            "reads around a damaged 64 KiB piece of a slice, loses only the files in that piece and names them, and fills files from another copy of the same version",
-            "\"tapectl itself\", next, says where to get it and what to run",
-        ] {
-            assert!(dmg.contains(needle), "{needle:?}: {dmg}");
-        }
+        let flat = flat_text(section);
+        assert!(flat.contains("`mt` (mt-st package)"), "{flat}");
+        assert!(flat.contains("cannot set it"), "GNU cpio mt: {flat}");
         assert!(
-            !dmg.contains("http"),
-            "the address lives in one place: {dmg}"
-        );
-        // And the URL is in no other section than this one.
-        assert_eq!(g.matches("https://github.com/mikmorg/tapectl").count(), 2);
-        let start = flat_text(guide_section(&g, "Start here"));
-        assert!(
-            start.contains("A slice damaged in the middle, which RESTORE.sh cannot read around: \"tapectl itself\""),
-            "{start}"
+            flat.contains("`--info` and `--verify` need only `mt`, `dd`, `sha256sum` and `head`"),
+            "{flat}"
         );
     }
 
-    /// Item 7: a renamed unit — the name to type is the one the tape shows.
+    /// Every full-restore example names what it restores: `--all`, one
+    /// `--unit UNIT`, or the one repair's list. A restore with none of them
+    /// would stop at "multiple units found".
     #[test]
-    fn reread4_item7_a_renamed_unit_takes_the_name_the_tape_shows() {
-        let g = guide17();
-        let bx = guide_section(&g, "The rest of the box: other tapes, copies and the index");
-        let f = flat_text(bx);
+    fn the_guides_restore_examples_name_what_they_restore() {
+        let g = generate_system_guide_v2_for_media("FULL1", 20, "LTO-6");
+        assert!(
+            g.contains("./RESTORE.sh --restore --key YOUR_KEY.age.key --all --to /destination\n"),
+            "{g}"
+        );
+        let mut seen = 0;
+        for line in g
+            .lines()
+            .filter(|l| l.starts_with("    ./RESTORE.sh --restore"))
+        {
+            seen += 1;
+            assert!(
+                line.contains("--all")
+                    || line.contains("--unit UNIT")
+                    || line.contains("--paths-from"),
+                "a restore example names nothing to restore: {line}"
+            );
+        }
+        assert!(seen >= 4, "{seen}");
+        let flat = flat_text(&g);
+        assert!(flat.contains("the sum of them with `--all`"), "{flat}");
+        assert!(
+            flat.contains("`bash`, `awk` and the basic coreutils"),
+            "{flat}"
+        );
+        // One key placeholder throughout (#477).
+        assert!(!g.contains("escrow.age.key") && !g.contains("TENANT.age.key"));
+    }
+
+    /// #523: the tapectl route needs the operator key or the escrow secret
+    /// and says what a tenant-key holder does instead; `age-keygen -y` gives
+    /// the escrow identity only from the escrow secret.
+    #[test]
+    fn file_1_tapectl_route_needs_the_operator_or_escrow_key() {
+        let g = generate_system_guide_v2_for_media("KEY523", 20, "LTO-6");
+        let itself = flat_text(guide_section(&g, "tapectl itself"));
         for needle in [
-            "**A renamed unit.** A unit is the same unit by its `uuid`, but every command takes its NAME, and a tape's envelope knows a unit by the name it had when THAT tape was written",
-            "the newest index lists it under the new name (with the older tape as a holder of an earlier version), and the older tape's envelope still says the old name",
-            "`--unit NEWNAME` finds nothing there: RESTORE.sh says an envelope \"decrypts but does not list\" the name, then ends \"no envelope for unit 'NEWNAME' matched the key provided\". That reads like a wrong key and is not one",
-            "Take the unit's uuid from the newest index (`--where --all` prints it as \"unit uuid\", beside the name), and on the older tape type the name THAT tape shows for the same uuid",
-            "A unit stored without its dar catalogue has no `catalogs/` name to read: `--find-envelope` with a tenant's key prints the whole MANIFEST.toml",
+            "needs the OPERATOR key or the ESCROW secret",
+            "With a tenant's key it is refused",
+            "A holder of only a tenant's key has RESTORE.sh, the manual steps and the one repair from another copy of the tape, and nothing else",
+            "`age-keygen -y` of the ESCROW secret prints it, and of any other key prints a different one",
         ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
+            assert!(itself.contains(needle), "{needle:?}: {itself}");
         }
-        for cmd in [
-            "./RESTORE.sh --list --key YOUR_KEY.age.key | grep '^==='",
-            "./RESTORE.sh --where --all --key YOUR_KEY.age.key",
-        ] {
-            assert!(bx.lines().any(|l| l.trim() == cmd), "{cmd}: {bx}");
-        }
-        // The messages the text quotes are the script's own.
-        let script = generate_restore_script_v2("N4", 20);
-        for said in [
-            "decrypts but does not list '$u'; continuing...",
-            "no envelope for unit '$1' matched $(keys_phrase)",
-            "=== $u, snapshot version $PICKED_VERSION — catalogs/${base##*/} ===",
-            "unit uuid ",
-        ] {
-            assert!(script.contains(said), "{said:?}");
-        }
-        // Start here's step 6 and the glossary point at it, and RECOVERY.md
-        // says it where it describes the index.
-        let start = flat_text(guide_section(&g, "Start here"));
+        let keys = flat_text(guide_section(&g, "Which file is your key"));
         assert!(
-            start.contains(
-                "(\"The rest of the box\" says how to do both). A renamed unit has the name each tape shows."
-            ),
-            "{start}"
+            keys.contains("Which key gives which route"),
+            "the key section says what each key gives: {keys}"
         );
         assert!(
-            f.contains("it lists every file too, so it can take a while")
-                || bx.contains("it lists every file too, so it can take a while"),
-            "{bx}"
+            keys.contains("A tenant's key opens that tenant's envelope and slices only"),
+            "{keys}"
         );
+        // The mention of tapectl's own restore in the damage section names the key.
+        let damaged = flat_text(guide_section(&g, "If a slice or a file is damaged"));
+        assert!(
+            damaged.contains("for the operator or escrow key"),
+            "{damaged}"
+        );
+        assert!(
+            !g.contains("the escrow key's included"),
+            "the old sentence that sent every key to tapectl is gone"
+        );
+    }
+
+    /// #526: only messages `age` itself prints (age 1.1.1), and a slice's
+    /// size on tape is `encrypted_bytes`, never the manifest's plain
+    /// `size_bytes`.
+    #[test]
+    fn the_texts_name_only_messages_age_prints_and_the_right_size() {
+        let g = generate_system_guide_v2_for_media("AGE526", 20, "LTO-6");
+        let md = generate_recovery_md("L", "t", &[], &[]);
+        for (what, text) in [("File 1", flat_text(&g)), ("RECOVERY.md", flat_text(&md))] {
+            assert!(
+                text.contains("failed to decrypt and authenticate payload chunk"),
+                "{what}"
+            );
+            assert!(!text.contains("unexpected data"), "{what}");
+            assert!(
+                text.contains("no identity matched any of the recipients"),
+                "{what}"
+            );
+        }
+        let flat = flat_text(&g);
+        assert!(
+            flat.contains("MANIFEST.toml's `encrypted_bytes` for a slice"),
+            "{flat}"
+        );
+        assert!(
+            flat.contains("A slice's `size_bytes` in MANIFEST.toml is something else: the length of its PLAIN cut"),
+            "{flat}"
+        );
+        assert!(
+            !flat.contains("exact tape position and byte size"),
+            "{flat}"
+        );
+        let md = flat_text(&md);
+        assert!(
+            md.contains("`size_bytes` in MANIFEST.toml is its PLAIN length"),
+            "{md}"
+        );
+    }
+
+    /// #563: what a restore on another computer does with an owner or an ACL
+    /// entry, and that the id map says who the ids were and is never acted on.
+    #[test]
+    fn file_1_says_what_a_restore_on_another_computer_does() {
+        let g = generate_system_guide_v2_for_media("HOST563", 20, "LTO-6");
+        let sec = flat_text(guide_section(&g, "What a restore on another computer does"));
+        for needle in [
+            "stores the owner and group of every file by NUMBER only",
+            "tar restores every file as yours (owner and group are set only by root)",
+            "On another computer those numbers are other accounts, or none",
+            "Nothing is remapped",
+            "An ACL entry",
+            "is stored by number the same way",
+            "the entry follows the number, and on another computer it names whoever has that number, or nobody",
+            "BusyBox's tar restores neither the owner, the ACL nor any extended attribute, and does not say so",
+            "The ID MAP says who the numbers were",
+            "\"Who the ids were\"",
+            "a restore shows it and never acts on it",
+            "never by tar's exit status",
+        ] {
+            assert!(sec.contains(needle), "{needle:?}: {sec}");
+        }
+        // The id map is named where the glossary defines it.
         let words = flat_text(guide_section(&g, "Words this guide uses"));
-        assert!(
-            words.contains("A tape's envelope names a unit by the name it had when THAT tape was written, so a renamed unit has different names on different tapes: every command takes a name, and the name to type is the one that tape shows (\"A renamed unit\", in \"The rest of the box\")"),
-            "{words}"
+        assert!(words.contains("**Id map**"), "{words}");
+        assert!(words.contains("**File table**"), "{words}");
+    }
+
+    /// A unit's slice list for RECOVERY.md tests: `(number, tape position,
+    /// continues)`.
+    fn unit_with(
+        name: &str,
+        uuid: &str,
+        compression: Option<&str>,
+        slices: &[(i64, Option<i64>, bool)],
+    ) -> ManifestUnit {
+        ManifestUnit {
+            name: name.into(),
+            uuid: uuid.into(),
+            snapshot_version: 1,
+            stage_set_id: 7,
+            payload: "tar".to_string(),
+            stream_bytes: 1000,
+            file_table: Some("tables/11111111_v1_s7.tsv".to_string()),
+            id_map: Some("tables/11111111_v1_s7.ids.tsv".to_string()),
+            tar_version: None,
+            compression: compression.map(str::to_string),
+            slices: slices
+                .iter()
+                .map(|(number, position, continues)| ManifestSlice {
+                    number: *number,
+                    tape_position: *position,
+                    size_bytes: 100 + number,
+                    encrypted_bytes: 200 + number,
+                    sha256_plain: format!("{number:064x}"),
+                    sha256_encrypted: format!("{:064x}", number + 100),
+                    continues: *continues,
+                })
+                .collect(),
+        }
+    }
+
+    /// #522: each unit's block names a work directory and a destination of
+    /// its own, nothing is shared between two blocks, and a tape that holds
+    /// only part of a unit reads the slices it holds: a leading slice that
+    /// continues a file begun elsewhere is not read, a slice on another tape
+    /// is named and never read, and a compressed unit pipes each slice through
+    /// its decompressor.
+    #[test]
+    fn recovery_md_blocks_have_their_own_directories_and_read_what_this_tape_holds() {
+        let a = unit_with(
+            "photos/2019",
+            "aaaaaaaa-0000-0000-0000-000000000001",
+            None,
+            &[(1, Some(10), false), (2, Some(11), false)],
         );
-        let r = flat_text(&generate_recovery_md("LAB01", "alice", &[], &[]));
-        assert!(
-            r.contains("A unit that was renamed after this tape was written is listed here under the name it had then, and a newer tape's index lists it under its newer name. They are one unit when their `unit_uuid` is the same, so match units by `unit_uuid`, and on each tape give RESTORE.sh the name that tape shows"),
-            "{r}"
+        // A range of a compressed unit: slice 1 is on another tape, slice 2
+        // continues a file begun there, slices 3 and 4 are whole files.
+        let b = unit_with(
+            "music",
+            "bbbbbbbb-0000-0000-0000-000000000002",
+            Some("xz"),
+            &[
+                (1, None, false),
+                (2, Some(20), true),
+                (3, Some(21), false),
+                (4, Some(22), false),
+            ],
         );
+        let md = generate_recovery_md("LAB", "alice", &[a.clone(), b.clone()], &[]);
+        let sec_a = guide_section_of(&md, "photos/2019");
+        let sec_b = guide_section_of(&md, "music");
+        assert!(
+            sec_a.contains("mkdir -p work/aaaaaaaa_v1 /destination/aaaaaaaa_v1"),
+            "{sec_a}"
+        );
+        assert!(
+            sec_b.contains("mkdir -p work/bbbbbbbb_v1 /destination/bbbbbbbb_v1"),
+            "{sec_b}"
+        );
+        assert!(
+            !sec_a.contains("bbbbbbbb") && !sec_b.contains("aaaaaaaa"),
+            "no block names another's directory"
+        );
+        for sec in [&sec_a, &sec_b] {
+            assert!(
+                !sec.contains("restore.") && !sec.contains("mkdir /destination\n"),
+                "{sec}"
+            );
+            assert!(
+                sec.contains("rm -r work/"),
+                "the work directory is removed: {sec}"
+            );
+            assert!(
+                sec.contains(
+                    "LC_ALL=C tar -x --numeric-owner -p --xattrs --acls -f - -C /destination/"
+                ),
+                "{sec}"
+            );
+        }
+        // The whole unit: both slices, in order, joined.
+        assert!(
+            sec_a.contains(
+                "cat work/aaaaaaaa_v1/slice.1.tar work/aaaaaaaa_v1/slice.2.tar | LC_ALL=C tar"
+            ),
+            "{sec_a}"
+        );
+        // The range: slice 1 named, never read; slice 2 not read; 3 and 4 are.
+        assert!(sec_b.contains("# Slice 1 — on another tape"), "{sec_b}");
+        assert!(
+            sec_b.contains("# Slice 2 — tape file 20: it continues a file that begins on"),
+            "{sec_b}"
+        );
+        assert!(
+            !sec_b.contains("slice.1.age") && !sec_b.contains("slice.2.age"),
+            "{sec_b}"
+        );
+        assert!(
+            sec_b.contains("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 21\n"),
+            "the tape is wound to the first slice it reads: {sec_b}"
+        );
+        assert!(
+            sec_b.contains("work/bbbbbbbb_v1/slice.3.age | xz -dc > work/bbbbbbbb_v1/slice.3.tar"),
+            "{sec_b}"
+        );
+        assert!(
+            sec_b.contains(
+                "cat work/bbbbbbbb_v1/slice.3.tar work/bbbbbbbb_v1/slice.4.tar | LC_ALL=C tar"
+            ),
+            "{sec_b}"
+        );
+        // The length and the hash are of the decompressed (plain) slice.
+        assert!(
+            sec_b.contains("test $(wc -c < work/bbbbbbbb_v1/slice.3.tar) -eq 103"),
+            "{sec_b}"
+        );
+        assert!(
+            sec_b.contains(&format!("{:064x}  work/bbbbbbbb_v1/slice.3.tar", 3)),
+            "{sec_b}"
+        );
+        // The section on a unit across tapes is there for a range, and only then.
+        assert!(md.contains("## A unit across tapes"), "{md}");
+        let whole = generate_recovery_md("LAB", "alice", std::slice::from_ref(&a), &[]);
+        assert!(!whole.contains("## A unit across tapes"), "{whole}");
+        // Each unit's check names its own table's name.
+        assert!(sec_a.contains("env/tables/11111111_v1_s7.tsv"), "{sec_a}");
+    }
+
+    /// The section of a RECOVERY.md that begins `## {title}`.
+    fn guide_section_of(md: &str, title: &str) -> String {
+        guide_section(md, title).to_string()
     }
 
     // ---- the fifth read of File 1 (round 4 of #481: read4-fixes.md) ----
@@ -16576,56 +5862,6 @@ sha256_encrypted = \"bbb\"
             g,
             "The rest of the box: other tapes, copies and the index",
         ))
-    }
-
-    /// S1: two units of one name (different uuids) never share a directory.
-    #[test]
-    fn reread5_s1_two_units_of_one_name_take_different_directories() {
-        let g = guide17();
-        let bx = box_section(&g);
-        for needle in [
-            "**Two units of one name.** A name is unique inside one installation's catalogue, but it can recur across tapes: a unit renamed and its old name used again, or tapes of two installations",
-            "They are different units when their uuids differ (`--where --all` prints each as an entry of its own, with its uuid)",
-            "RESTORE.sh refuses a `--to` that is not empty, but the manual dar path keeps what is already there and exits 0, so it merges them without a word",
-            "Restore each into a directory of its own, `/destination/UNIT-` followed by the first 8 characters of its uuid, and with the manual path always into a new, empty directory",
-        ] {
-            assert!(bx.contains(needle), "{needle:?}: {bx}");
-        }
-        let start = flat_text(guide_section(&g, "Start here"));
-        assert!(
-            start.contains("Two units of one name (compare the uuids `--where --all` prints) go in different directories: `/destination/UNIT-` and the first 8 characters of the uuid"),
-            "{start}"
-        );
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains("two units of one name (different uuids) take `/destination/UNIT-` and the first 8 characters of the uuid, each a new directory, or dar would merge them without a word"),
-            "{manual}"
-        );
-        // The facts it rests on: names are unique inside one catalogue; the
-        // script refuses a destination that is not empty; --where --all keys
-        // a unit by tenant, name AND uuid, so two such units are two entries.
-        let conn = crate::db::open_memory().unwrap();
-        conn.execute(
-            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
-            [],
-        )
-        .unwrap();
-        let add = |uuid: &str| {
-            conn.execute(
-                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
-                 VALUES (?1, 'photos', 1, 'mtime_size', 1, 'active')",
-                rusqlite::params![uuid],
-            )
-        };
-        add("11111111-2222-3333-4444-555555555555").unwrap();
-        assert!(add("66666666-2222-3333-4444-555555555555").is_err());
-        assert!(generate_restore_script_v2("S1", 20).contains("is not empty"));
-        assert!(AWK_INDEX_ALL.contains("g = unesc(t) SUBSEP unesc(val(f, h, \"unit\")) SUBSEP id"));
-        let r = flat_text(&generate_recovery_md("LAB01", "alice", &[], &[]));
-        assert!(
-            r.contains("Two units of one name but different `unit_uuid` are different units: restore each into a directory of its own, such as `/destination/UNIT-` and the first 8 characters of the uuid"),
-            "{r}"
-        );
     }
 
     /// M2: with no envelope copy readable, no false promise.
@@ -16651,100 +5887,6 @@ sha256_encrypted = \"bbb\"
             .unwrap();
         conn.prepare("SELECT position, stage_slice_id FROM write_positions")
             .unwrap();
-    }
-
-    /// M3: `--all` uses ONE envelope, and the heir is told to check which.
-    #[test]
-    fn reread5_m3_all_uses_one_envelope_so_check_which() {
-        let g = guide17();
-        let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"));
-        for needle in [
-            "If the operator envelope and its backup will not read, the biggest envelope that does read may be a tenant's, and --all then restores only that tenant's units, with the DAMAGED warnings the script printed as the only sign",
-            "The script names the file it used (\"Decrypted envelope at file N\"). Item 4 of \"Did the restore get everything?\" is the check, and what to do when it fails",
-        ] {
-            assert!(auto.contains(needle), "{needle:?}: {auto}");
-        }
-        // The fifth fresh read (#481): the check is in the checklist itself,
-        // where an heir who believes the restore finished will look.
-        let check = flat_text(guide_section(&g, "Did the restore get everything?"));
-        for needle in [
-            "4. After `--all`, every unit of the tape was restored, not only one envelope's",
-            "when the operator envelope and its backup will not read it is a tenant's, and only that tenant's units are restored, while items 1 to 3 still pass",
-            "Every unit that `./RESTORE.sh --find-envelope --key YOUR_KEY.age.key` lists, under any envelope, must be a directory of the `--all` destination",
-            "`./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to /destination/UNIT` (the script finds the envelope that lists it)",
-        ] {
-            assert!(check.contains(needle), "{needle:?}: {check}");
-        }
-        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
-        assert!(
-            verdict.contains("`--all` restores the units in their order on the tape, so it stops there too: the units before that one are restored, that unit and every unit after it are not"),
-            "{verdict}"
-        );
-        let script = generate_restore_script_v2("M3", 20);
-        for said in [
-            "info \"Decrypted envelope at file $CHOSEN_POS\"",
-            "it is DAMAGED",
-            "info \"Decrypted envelope at file $pos${who:+ (tenant: $who)}\"",
-        ] {
-            assert!(script.contains(said), "{said:?}");
-        }
-    }
-
-    /// M4: ADR-0012 item 107, tapectl's restore and rebuild take `--key`.
-    #[test]
-    fn reread5_m4_an_escrow_only_heir_can_use_tapectl() {
-        let g = guide17();
-        let raw = guide_section(&g, "tapectl itself");
-        let f = flat_text(raw);
-        assert!(!f.contains("never the escrow key:"), "{f}");
-        assert!(!f.contains("cannot decrypt"), "{f}");
-        assert!(
-            !f.contains("this route needs the operator's key file"),
-            "{f}"
-        );
-        for line in [
-            "tapectl init --operator OPERATOR_NAME --escrow-public-key ESCROW_PUBLIC",
-            "tapectl catalog rebuild --from-volume --device /dev/nst0 --key YOUR_KEY.age.key",
-            "tapectl restore unit --unit UNIT --device /dev/nst0 --to /destination/UNIT --key YOUR_KEY.age.key",
-        ] {
-            assert!(raw.lines().any(|l| l.trim() == line), "{line}: {raw}");
-        }
-        for needle in [
-            "YOUR_KEY.age.key is your key file, the escrow key's included",
-            "otherwise give any name, your own say, because the rebuild takes the tenants' names from the tape. (Run as an ordinary user, `init` without `--operator` names the operator after your login; run as root, under `sudo`, it refuses without one.)",
-            "The alternative, with the operator's key file",
-        ] {
-            assert!(f.contains(needle), "{needle:?}: {f}");
-        }
-        // The operator-key route is still real: the CLI parses it.
-        use clap::Parser;
-        crate::cli::Cli::try_parse_from([
-            "tapectl",
-            "init",
-            "--operator",
-            "NAME",
-            "--operator-key",
-            "OPERATOR.age.key",
-            "--escrow-public-key",
-            "age1x",
-        ])
-        .unwrap();
-    }
-
-    /// M5: which RESTORE.sh a survey takes, said up front.
-    #[test]
-    fn reread5_m5_any_scripts_for_the_survey_and_the_tapes_own_for_a_restore() {
-        let g = guide17();
-        let start = flat_text(guide_section(&g, "Start here"));
-        assert!(
-            start.contains("Any tape's script reads the tape in the drive for `--info` and `--find-envelope`, one from a tape written by 1.3.0 or later for `--where`; a restore needs the script of the tape it reads"),
-            "{start}"
-        );
-        let bx = box_section(&g);
-        assert!(
-            bx.contains("(any copy of RESTORE.sh will do for this: see \"The modes that only read the tape\", after this list)"),
-            "{bx}"
-        );
     }
 
     /// M6: the drive that reads the most, and the newest tape.
@@ -16783,181 +5925,6 @@ sha256_encrypted = \"bbb\"
         assert!(!r.contains("`location`") && !r.contains("`place`"), "{r}");
     }
 
-    /// M8: one disk-size rule, the capacity not a ceiling for a compressed unit.
-    #[test]
-    fn reread5_m8_the_disk_size_rule_is_stated_once() {
-        let g = guide17();
-        let disk = flat_text(guide_section(&g, "Disk space"));
-        for needle in [
-            "**How much room, in one place:** the sum of the sizes of the units you restore, as `--find-envelope` and `--where` print them (each unit's slices as stored on tape); three times that, and more for mostly text, when you cannot tell that a unit was stored uncompressed (\"Compressed units\", below), and watch `df` while it runs; and, for the ways of restoring that keep its slices on disk as well (below), one more unit's size, for the slices of the unit being restored",
-            "The tape's capacity bounds what is stored on it, not what a restore writes",
-            "a unit stored compressed restores larger, and the capacity is no ceiling for it (\"Compressed units\", below)",
-            "\"Three times\" is a rule of thumb for mixed files, not a ceiling",
-        ] {
-            assert!(disk.contains(needle), "{needle:?}: {disk}");
-        }
-        // #485 item 4: the factor is stated twice, once as the rule and once
-        // as what it is not; "take the three times above (more for mostly
-        // text)" is gone, because it read as a bound.
-        assert_eq!(disk.matches("three times").count(), 2, "{disk}");
-        assert!(!disk.contains("take the three times above"), "{disk}");
-        assert!(!disk.contains("As a ceiling"), "{disk}");
-        let unknown = flat_text(guide_section(
-            &generate_system_guide_v2_for_media("U", 30, "DLT-IV"),
-            "Disk space",
-        ));
-        assert!(
-            unknown.contains("the capacity is no ceiling for it (\"Compressed units\", below)"),
-            "{unknown}"
-        );
-    }
-
-    /// M9: a lone unit lands directly in `--to`, so the list is there.
-    #[test]
-    fn reread5_m9_a_lone_unit_lands_in_to_and_so_does_its_damaged_list() {
-        let g = guide17();
-        let dmg = flat_text(guide_section(&g, "If a slice or a file is damaged"));
-        for needle in [
-            "to `.tapectl-damaged-files.txt` in the unit's directory: `--to` itself when the restore had one unit (a lone unit goes straight into `--to`, `--all` included), `--to/UNIT` when it had several",
-            "A tape that holds ONE unit, restored with `--all --to /destination`, puts the files straight into `/destination`: its list is `/destination/.tapectl-damaged-files.txt`, and that directory is the `--to` below",
-        ] {
-            assert!(dmg.contains(needle), "{needle:?}: {dmg}");
-        }
-        let auto =
-            flat_text(guide_section(&g, "Automated Recovery (recommended)")).replace(" # ", " ");
-        assert!(
-            auto.contains(
-                "each into /destination/UNIT (a lone unit goes straight into /destination)"
-            ),
-            "{auto}"
-        );
-        // The script does it: one unit straight into --to, several to --to/UNIT.
-        let script = generate_restore_script_v2("M9", 20);
-        assert!(script.contains("if [ ${#targets[@]} -eq 1 ]; then\n      dest_i=$destdir"));
-        let r = flat_text(&generate_recovery_md("LAB01", "alice", &[], &[]));
-        assert!(
-            r.contains("a restore of one unit with `--all` puts the files straight into `--to`, and the list is `--to/.tapectl-damaged-files.txt`"),
-            "{r}"
-        );
-    }
-
-    /// M10: an escrow-only heir reads dar_command / dar_version / uuid.
-    #[test]
-    fn reread5_m10_an_escrow_key_reads_the_manifest_by_unpacking_the_operator_envelope() {
-        let g = guide17();
-        let tools = flat_text(guide_section(&g, "Tools Required"));
-        assert!(
-            tools.contains("`--find-envelope` with a tenant's key prints the whole MANIFEST.toml, but with an escrow or operator key it prints only a table of units: then unpack the operator envelope by hand (steps 5 and 6 of \"Manual Recovery Steps\") and read `env/MANIFEST.toml` (the unit's uuid alone is in `--where --all`)"),
-            "{tools}"
-        );
-        let disk = flat_text(guide_section(&g, "Disk space"));
-        assert!(
-            disk.contains("with an escrow or operator key `--find-envelope` prints only a table of units, so unpack the operator envelope by hand, as under \"Tools Required\""),
-            "{disk}"
-        );
-        let bx = box_section(&g);
-        assert!(
-            bx.contains("with an escrow or operator key `--find-envelope` prints only a table of units (see \"Tools Required\"), so take the uuid from `--where --all`, or print the operator envelope's MANIFEST.toml (\"The short way\", in \"Compressed units\")"),
-            "{bx}"
-        );
-        // The script: more than one envelope opened prints the table only.
-        let script = generate_restore_script_v2("M10", 20);
-        assert!(script.contains("units_table \"$m\""));
-        assert!(script.contains("--- MANIFEST.toml ---"));
-    }
-
-    /// M11: what to do when the installed dar is older than the unit's.
-    #[test]
-    fn reread5_m11_an_older_dar_than_the_units_is_replaced() {
-        let g = guide17();
-        let tools = flat_text(guide_section(&g, "Tools Required"));
-        assert!(
-            tools.contains("If your dar is older than a unit's `dar_version`, install that version or a newer one before you give the unit up. 2.6 is the oldest dar tapectl writes with, not a promise that every dar from 2.6 on reads every unit"),
-            "{tools}"
-        );
-        assert!(!tools.contains("so no unit asks for less"), "{tools}");
-    }
-
-    /// M13: the manual tool list names `truncate`.
-    #[test]
-    fn reread5_m13_the_manual_tool_list_names_truncate() {
-        let g = guide17();
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains("follow these steps with `mt`, `dd`, `truncate`, `age`, `tar`, `sha256sum` and `dar`"),
-            "{manual}"
-        );
-        // Every tool a step runs by name is in that list.
-        let raw = guide_section(&g, "Manual Recovery Steps");
-        let used: std::collections::BTreeSet<&str> = raw
-            .lines()
-            .map(str::trim)
-            .filter(|l| {
-                l.starts_with("mt ")
-                    || l.starts_with("dd ")
-                    || l.starts_with("truncate ")
-                    || l.starts_with("age ")
-                    || l.starts_with("tar ")
-                    || l.starts_with("sha256sum ")
-                    || l.starts_with("dar ")
-            })
-            .filter_map(|l| l.split_whitespace().next())
-            .collect();
-        for tool in used {
-            assert!(manual.contains(&format!("`{tool}`")), "{tool}");
-        }
-    }
-
-    /// M12: the manual slice command stops at a failed hash.
-    #[test]
-    fn reread5_m12_the_manual_slice_line_stops_at_a_failed_hash() {
-        let g = guide17();
-        let manual = guide_section(&g, "Manual Recovery Steps");
-        let line = manual
-            .lines()
-            .map(str::trim)
-            .find(|l| l.starts_with("echo \"SHA256_ENCRYPTED"))
-            .expect("the hash line");
-        assert_eq!(
-            line,
-            "echo \"SHA256_ENCRYPTED  restore.NUMBER.dar.age\" | sha256sum -c - && age -d -i YOUR_KEY.age.key restore.NUMBER.dar.age > restore.NUMBER.dar && rm restore.NUMBER.dar.age"
-        );
-        assert!(
-            !manual
-                .lines()
-                .any(|l| l.trim() == "rm restore.NUMBER.dar.age"),
-            "rm is never a line of its own"
-        );
-        let f = flat_text(manual);
-        assert!(
-            f.contains("The last line is one command on purpose: each `&&` stops it at the first step that fails, so a slice whose hash is wrong is never decrypted, and its encrypted copy is deleted only after it decrypted"),
-            "{f}"
-        );
-        // RECOVERY.md has the same chain.
-        let unit = ManifestUnit {
-            name: "u".into(),
-            uuid: "11111111-2222-3333-4444-555555555555".into(),
-            snapshot_version: 1,
-            stage_set_id: 1,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![ManifestSlice {
-                number: 1,
-                tape_position: Some(4),
-                size_bytes: 10,
-                encrypted_bytes: 20,
-                sha256_plain: "aa".into(),
-                sha256_encrypted: "bb".into(),
-            }],
-        };
-        let r = generate_recovery_md("LAB01", "alice", &[unit], &[]);
-        assert!(
-            r.lines().any(|l| l == "echo \"bb  restore.1.dar.age\" | sha256sum -c - && age -d -i YOUR_KEY.age.key restore.1.dar.age > restore.1.dar && rm restore.1.dar.age"),
-            "{r}"
-        );
-    }
-
     /// M14: units.tsv and PLAN.toml are defined where they are first used.
     #[test]
     fn reread5_m14_units_tsv_and_plan_toml_are_defined_where_first_used() {
@@ -16982,86 +5949,9 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// M15: a key checked without a cover sheet.
-    #[test]
-    fn reread5_m15_a_key_is_checked_without_a_cover_sheet_by_opening_an_envelope() {
-        let g = guide17();
-        let start = flat_text(guide_section(&g, "Start here"));
-        assert!(
-            start.contains("Check your key: \"Which file is your key\". A tenant's key opens that tenant's units only; the operator key and the escrow key open every tenant's. With `age` installed (step 2), check it against the cover sheet's `age1...` line (`age-keygen -y`); with only a key file, the check is that it opens an envelope (`--find-envelope`, step 5)"),
-            "{start}"
-        );
-    }
-
     // ---- The sixth read's fixes (#485, ADR-0012 item 109, tapectl 1.5.0) ----
     // File 1 and RECOVERY.md text only; the commands they show are run
     // against the fake tape and a real dar in tests/heir_restore_sh.rs.
-
-    /// #485 item 1: "done" is said in step 8 itself to hold over the tapes you
-    /// hold, with the two reasons, and Start here still fits its page.
-    #[test]
-    fn reread6_i1_step_8_says_done_is_over_the_tapes_you_hold() {
-        let g = guide17();
-        let start = flat_text(guide_section(&g, "Start here"));
-        let step8 = &start[start.find("8. Know when you are done").unwrap()..];
-        for needle in [
-            "No tape names one written after it, and a tape from before 1.3.0 has no index: a kit made later can name such tapes (\"The Heir Kit's catalogue\")",
-            "\"The rest of the box\" has the whole rule, a damaged unit's place in it, and what a box cannot show",
-        ] {
-            assert!(step8.contains(needle), "{needle:?}: {step8}");
-        }
-        // The caveat's source, "Is the box complete?", is still where it was.
-        assert!(
-            box_section(&g).contains("Nothing on a tape can name tapes written after it"),
-            "the full rule stays in the box section"
-        );
-        // 67 since the fresh read of a span (#478 m4); the history is in
-        // reread2_s2_start_here_comes_first_and_names_sections_that_exist.
-        assert!(guide_section(&g, "Start here").lines().count() <= 67);
-    }
-
-    /// #485 item 2: a way to see the files only an older version has, with
-    /// the options RESTORE.sh really takes (`--list` and `--restore` both
-    /// take `--version`; `--restore` takes `--path`).
-    #[test]
-    fn reread6_i2_files_deleted_before_the_newest_version_can_be_listed() {
-        let g = guide17();
-        let bx = box_section(&g);
-        for needle in [
-            "**Files deleted before the newest version.** Nothing says which files exist only in an older version, but you can see: list the paths of two versions and print those the older one has and the newer one lacks. `--list` takes `--version`",
-            "needs both versions on the tape in the drive and their dar catalogues in its envelope (a version without one prints \"no dar catalogue\")",
-            "./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT --version 3 | grep -E '^\\[.{5}\\]\\[.\\] ' | awk -F'\\t' '{ print $NF }' > newer.paths",
-            "./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT --version 2 | grep -E '^\\[.{5}\\]\\[.\\] ' | awk -F'\\t' '{ print $NF }' > older.paths",
-            "awk 'NR == FNR { seen[$0]; next } !($0 in seen)' newer.paths older.paths",
-            "Nothing printed means version 3 has every path version 2 had",
-            "./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --version 2 \\ --path PATH --to /destination/UNIT-v2",
-        ] {
-            assert!(bx.contains(needle), "{needle:?}: {bx}");
-        }
-        let words = flat_text(guide_section(&g, "Words this guide uses"));
-        assert!(
-            words.contains("(\"Files deleted before the newest version\", in \"The rest of the box\", finds them)"),
-            "{words}"
-        );
-        // Only tools the guide lists: no comm, no diff.
-        let block = guide_section(&g, "The rest of the box: other tapes, copies and the index");
-        assert!(
-            !block.contains("comm ") && !block.contains("diff "),
-            "{block}"
-        );
-        // The options are the script's.
-        let script = generate_restore_script_v2("I2", 20);
-        assert!(script.contains("--list --key KEYFILE [--unit U] [--version N]"));
-        assert!(
-            script.contains("--restore --key KEYFILE --to DIR [--unit U | --all] [--version N]")
-        );
-        // RECOVERY.md has the same question for one envelope.
-        let r = flat_text(&generate_recovery_md("LAB01", "alice", &[], &[]));
-        assert!(
-            r.contains("a file deleted before it was made exists only in an older version. In a tenant's envelope this prints the paths version `OLD` of a unit has and version `NEW` lacks"),
-            "{r}"
-        );
-    }
 
     /// RECOVERY.md's line for the same question runs, under every awk, on a
     /// paths.tsv of two versions, and says so when the newer version has no
@@ -17117,78 +6007,6 @@ sha256_encrypted = \"bbb\"
                 "{awk}: {o:?}"
             );
         }
-    }
-
-    /// #485 item 3: a newer dar has somewhere to come from.
-    #[test]
-    fn reread6_i3_a_newer_dar_has_a_source() {
-        let g = guide17();
-        let tools = flat_text(guide_section(&g, "Tools Required"));
-        for needle in [
-            "Where to get a newer dar: a newer release of your distribution may package one (`apt-cache policy dar` says which version it offers); otherwise dar's own site, dar.linux.free.fr (release notes and source tarballs), and its project at sourceforge.net/projects/dar (the same releases)",
-            "A source tarball builds with the commands in its INSTALL and README files (for most releases `./configure`, `make` and `make install`, which name the libraries it needs)",
-            "These addresses may move over decades: search for \"dar\" and its author, Denis Corbin, if they are gone",
-        ] {
-            assert!(tools.contains(needle), "{needle:?}: {tools}");
-        }
-    }
-
-    /// #485 item 4: an escrow-only heir has a short way to a unit's
-    /// `dar_command` (the commands are run on the fake tape in
-    /// tests/heir_restore_sh.rs), and "three times" is not offered as a bound.
-    #[test]
-    fn reread6_i4_the_dar_command_has_a_short_way_and_three_times_is_no_ceiling() {
-        let g = guide17();
-        let disk = flat_text(guide_section(&g, "Disk space"));
-        for needle in [
-            "The short way to the `dar_command` lines, with an escrow or operator key and no unpacking of the whole envelope. `--find-envelope` prints \"Decrypted envelope at file N (tenant: operator)\" for the operator envelope, the one that lists every unit; call that N POSITION below. Read File 3 into `front_index.toml` (step 3 of \"Manual Recovery Steps\") and run `grep -A3 '^position = POSITION$' front_index.toml`: the entry it prints has the `size_bytes` that is SIZE below",
-            "mt -f /dev/nst0 rewind mt -f /dev/nst0 fsf POSITION dd if=/dev/nst0 bs=512k of=envelope.raw truncate -s SIZE envelope.raw age -d -i YOUR_KEY.age.key envelope.raw | tar -xOf - MANIFEST.toml | grep -E '^(name|snapshot_version|dar_command) ='",
-            "It prints each unit's name and version with its `dar_command`. Without the last `grep` it prints the whole MANIFEST.toml",
-            "If the envelope will not read, use its backup (step 5 of \"Manual Recovery Steps\")",
-            "text, source code, logs and database dumps compress ten times or more",
-            "and nothing on the tape says how much more",
-        ] {
-            assert!(disk.contains(needle), "{needle:?}: {disk}");
-        }
-        let tools = flat_text(guide_section(&g, "Tools Required"));
-        assert!(
-            tools.contains("(\"Compressed units\", in \"Disk space\", has the short way to one unit's `dar_command`.)"),
-            "{tools}"
-        );
-        // The script's own line is what the guide quotes.
-        let script = generate_restore_script_v2("I4", 20);
-        assert!(script.contains("info \"Decrypted envelope at file $pos${who:+ (tenant: $who)}\""));
-    }
-
-    /// #485 item 5, File 1's half: the Heir Kit's copy is the first place
-    /// to look for tapectl, before the repository, and the glossary says a
-    /// kit may hold one.
-    #[test]
-    fn reread6_i5_tapectl_itself_looks_in_the_heir_kit_first() {
-        let g = guide17();
-        let sec = flat_text(guide_section(&g, "tapectl itself"));
-        let kit = sec
-            .find("Look in the Heir Kit first.")
-            .expect("the kit comes first");
-        let repo = sec
-            .find("tapectl is open-source software, and its source is at")
-            .unwrap();
-        assert!(kit < repo, "{sec}");
-        for needle in [
-            "A kit made by tapectl 1.5.0 or later holds a copy of the program that made it, in the folder with `catalog.db.age`: a file named `tapectl-` and its version, `tapectl-X.Y.Z` below (such as `tapectl-1.5.0`)",
-            "The cover sheet names it with its size and sha256 (check the file against the sheet with `sha256sum`) and says it is for Linux on one machine type (`uname -m` says yours)",
-            "It needs no building: run it as `./tapectl-X.Y.Z` wherever this section says `tapectl`, after `./tapectl-X.Y.Z --version` has shown it starts",
-            "Copy it to a Linux disk first and run `chmod +x` on it: from a USB stick formatted FAT or exFAT, or mounted `noexec`, it answers \"Permission denied\"",
-            "Its release must be File 0's `tapectl_version` or newer (the `grep` of File 0 in \"The rest of the box\" prints it); a kit made before the tape was written can hold an older one",
-            "With no kit, a copy that is too old, or one that will not run on your machine, read on",
-        ] {
-            assert!(sec.contains(needle), "{needle:?}: {sec}");
-        }
-        let words = flat_text(guide_section(&g, "Words this guide uses"));
-        assert!(
-            words.contains("A kit made by tapectl 1.5.0 or later also holds a copy of the tapectl program that made it, a file named `tapectl-` and its version (\"tapectl itself\")"),
-            "{words}"
-        );
     }
 
     /// #485 item 6: a working setup for this tape's generation, and where
@@ -17267,10 +6085,14 @@ sha256_encrypted = \"bbb\"
             uuid: "uuid-a".into(),
             snapshot_version: 2,
             stage_set_id: 7,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
+            payload: "tar".to_string(),
+            stream_bytes: 0,
+            file_table: None,
+            id_map: None,
+            tar_version: None,
+            compression: None,
             slices: vec![ManifestSlice {
+                continues: false,
                 number: 1,
                 tape_position: Some(4),
                 size_bytes: 1_048_576,
@@ -17286,175 +6108,5 @@ sha256_encrypted = \"bbb\"
         );
     }
 
-    /// #485 item 8: "catalogue" is never bare, the two `NAME`s are two names,
-    /// and the position placeholders follow the manifest's field.
-    #[test]
-    fn reread6_i8_the_overloaded_words_are_told_apart() {
-        let g = guide17();
-        let words = flat_text(guide_section(&g, "Words this guide uses"));
-        for needle in [
-            "**Index**: two different things. The FRONT index is File 3 (the seal marker, the last file, carries a copy): a plain-text map of THIS tape, with every tape file's position, type, size and hash. The index, with no \"front\", is the directory `index/` in an envelope of a tape written by tapectl 1.3.0 or later: which units, versions and paths the archive had when that tape was written, and which tapes hold them",
-            "**Catalogue**: this guide never uses the word bare, because it names three different things. The Heir Kit's catalogue is the archive's database, as of the day the kit was made, kept as `catalog.db.age` (\"The Heir Kit's catalogue\"); an installation's own catalogue is the live database it was copied from. A dar catalogue (the next entry) is a small file that lists one version of one unit. `catalogs/` is the directory of an envelope that holds the dar catalogues",
-        ] {
-            assert!(words.contains(needle), "{needle:?}: {words}");
-        }
-        let start = flat_text(guide_section(&g, "Start here"));
-        assert!(
-            start.contains(
-                "Unit, envelope, index, cover sheet: \"Words this guide uses\" says what each is"
-            ),
-            "{start}"
-        );
-        assert!(
-            start
-                .find("\"Words this guide uses\" says what each is")
-                .unwrap()
-                < start.find("1. Check your key").unwrap(),
-            "the pointer comes before the first word is used"
-        );
-        // No bare "catalogue": each use follows one of the qualifiers this
-        // guide defines (or is the word being defined, or a plural).
-        let flat = flat_text(&g);
-        let mut at = 0;
-        while let Some(i) = flat[at..].find("catalogue") {
-            let i = at + i;
-            // The 24 characters before it (not bytes: the guide has dashes).
-            let before: String = {
-                let mut v: Vec<char> = flat[..i].chars().rev().take(24).collect();
-                v.reverse();
-                v.into_iter().collect()
-            };
-            let after: String = flat[i + 9..].chars().take(40).collect();
-            let ok = [
-                "dar ",
-                "Kit's ",
-                "installation's ",
-                "installation's own ",
-                "tapectl's own ",
-                "its own ",
-                "dar-",
-                "Catalogue** ",
-                "archive this ",
-            ]
-            .iter()
-            .any(|p| before.ends_with(p))
-                || flat[i..].starts_with("catalogues");
-            assert!(ok, "a bare 'catalogue': ...{before}[catalogue]{after}");
-            at = i + 9;
-        }
-        // The operator's name and the dar catalogue's stem are not both NAME.
-        let itself = guide_section(&g, "tapectl itself");
-        assert!(itself.contains("--operator OPERATOR_NAME"), "{itself}");
-        assert!(!itself.contains("--operator NAME"), "{itself}");
-        assert!(
-            flat_text(itself).contains("OPERATOR_NAME is the operator's name where you know it"),
-            "{itself}"
-        );
-        // The position placeholders: the front index's `position` is POSITION,
-        // the manifest's `tape_position` is FIRST_TAPE_POSITION.
-        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(
-            manual.contains("with POSITION (the entry's `position`) and SIZE (its `size_bytes`)"),
-            "{manual}"
-        );
-        assert!(manual.contains("FIRST_TAPE_POSITION") && !manual.contains("FIRST_POSITION"));
-        let dmg = flat_text(guide_section(&g, "If a slice or a file is damaged"));
-        assert!(
-            dmg.contains("by its sha256 (the entry's `position` is POSITION), then:"),
-            "{dmg}"
-        );
-        // RECOVERY.md says "dar catalogue" for the envelope's copy and names
-        // the other one by where it lies.
-        let unit = ManifestUnit {
-            name: "alpha".into(),
-            uuid: "aaaaaaaa-0000-0000-0000-000000000000".into(),
-            snapshot_version: 2,
-            stage_set_id: 1,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
-            slices: vec![],
-        };
-        let r = flat_text(&generate_recovery_md(
-            "LAB01",
-            "alice",
-            &[unit],
-            &["aaaaaaaa_v2.1.dar".to_string()],
-        ));
-        assert!(
-            r.contains("If dar cannot read the catalogue at the end of the last slice, `-A catalogs/aaaaaaaa_v2` gives it this envelope's dar catalogue instead"),
-            "{r}"
-        );
-    }
-
     // ---- The sixth read (1.5.0, #485, ADR-0012 item 109): what it found ----
-
-    /// S1: "done" checks the Heir Kit's catalogue, the one thing an heir holds
-    /// that can name a tape written after the newest in the box; S2: a unit
-    /// whose every copy is damaged has a done state; and the minors that
-    /// changed what an heir types or where they look.
-    #[test]
-    fn reread7_done_checks_the_kit_and_has_a_place_for_a_damaged_unit() {
-        let g = guide17();
-        let bx = box_section(&g);
-        for needle in [
-            "With a Heir Kit: every unit the Heir Kit's catalogue lists on a tape whose status is `sealed` (\"Which tapes hold which units\", in \"The Heir Kit's catalogue\") is restored at the newest version the kit names, or you have written down that it is held only on tapes you do not have",
-            "A unit whose every copy in the box is damaged counts once it is restored as far as its copies allow",
-            "its `.tapectl-damaged-files.txt` is kept beside it, and you have written down that the files on that list are lost",
-            "|tapectl_version) =",
-        ] {
-            assert!(bx.contains(needle), "{needle:?}: {bx}");
-        }
-        let start = flat_text(guide_section(&g, "Start here"));
-        assert!(
-            start.contains(
-                "With `age` installed (step 2), check it against the cover sheet's `age1...` line"
-            ),
-            "{start}"
-        );
-        // 67 since the fresh read of a span (#478 m4); the history is in
-        // reread2_s2_start_here_comes_first_and_names_sections_that_exist.
-        assert!(guide_section(&g, "Start here").lines().count() <= 67);
-        let kit = flat_text(guide_section(&g, "The Heir Kit's catalogue"));
-        assert!(
-            kit.contains("SELECT u.name AS unit, u.uuid, s.version"),
-            "{kit}"
-        );
-        assert!(kit.contains("match a unit by its uuid"), "{kit}");
-        let check = flat_text(guide_section(&g, "Did the restore get everything?"));
-        for needle in [
-            "(a tape of one unit puts that unit's files in the destination itself, and that is the unit's directory)",
-            "A unit stored without its dar catalogue has no listing",
-            "`--fill-from` restores only the files on its list, and a `--swap-tapes` restore where you typed `done` leaves out the files of the missing slices",
-        ] {
-            assert!(check.contains(needle), "{needle:?}: {check}");
-        }
-        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
-        assert!(
-            verdict.contains("Restore each unit after it in a run of its own, `--unit UNIT --to /destination/UNIT`"),
-            "{verdict}"
-        );
-        let words = flat_text(guide_section(&g, "Which file is your key"));
-        assert!(
-            words.contains(
-                "After `AGE-SECRET-KEY-1` the letters B, I, O and the digit 1 never occur"
-            ),
-            "{words}"
-        );
-        let itself = flat_text(guide_section(&g, "tapectl itself"));
-        for needle in [
-            "under `sudo`, which drops the variable, give `--home DIR`",
-            "`age-keygen -y YOUR_KEY.age.key` prints it",
-            "run as root, under `sudo`, it refuses without one",
-            "from a USB stick formatted FAT or exFAT, or mounted `noexec`, it answers \"Permission denied\"",
-        ] {
-            assert!(itself.contains(needle), "{needle:?}: {itself}");
-        }
-        assert!(!itself.contains("escrow.key"), "one name for the key file");
-        let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"));
-        assert!(
-            auto.contains("a full LTO-6 tape reads in about four and a half hours"),
-            "{auto}"
-        );
-    }
 }

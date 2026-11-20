@@ -397,6 +397,16 @@ const CHECKS: &[Check] = &[
         },
     },
     Check {
+        // #548 (D18, ADR-0012 item 247): the heir path is proven by a drill,
+        // and a drill is a recorded event (`drill record`). None recorded, or
+        // the newest older than `[defaults] drill_interval_days`, is a
+        // warning; a catalog whose volumes hold no written bytes has nothing to drill.
+        name: "drill_age",
+        scope: Scope::Archive {
+            run: check_drill_age,
+        },
+    },
+    Check {
         name: "no_full_verify",
         scope: Scope::Archive {
             run: check_no_full_verify,
@@ -430,11 +440,11 @@ const CHECKS: &[Check] = &[
         },
     },
     Check {
-        // #420 (layout-session.md, `volumes.ended_after`): the two
-        // invariants of a short-sealed volume's rows, and (#478, X27) the
-        // four of a `range` row. Umbrella name for one function
-        // (`short_seal_findings`) that emits `cut_without_ending`,
-        // `completed_past_ending`, `range_without_may_span`,
+        // #420 (layout-session.md, `volumes.ended_after`): the invariants of
+        // a short-sealed volume's rows, and (#478, X27; ADR-0012 item 288)
+        // those of a `range` row and of a `completed` one. Umbrella name for
+        // one function (`short_seal_findings`) that emits
+        // `completed_past_ending`, `completed_without_every_slice`,
         // `range_written_past_ending`, `range_not_one_run` or
         // `range_without_written_slice`, one finding per volume and kind.
         name: "short_seal",
@@ -643,7 +653,7 @@ fn collect_findings(
 //     recipient list `escrow_coverage`/`encryption` flag) -> `read-slices`
 //     is never offered, because it reproduces the exact bytes the finding
 //     says are wrong; only a genuine `stage create <unit> --version <n>`
-//     (which re-runs dar against the unit's source path) produces new
+//     (which re-runs tar against the unit's source path) produces new
 //     ciphertext, preceded by `stage clean` when a live stage set would
 //     otherwise block it (`cli/stage.rs`'s re-stage arm refuses while any
 //     live slices exist for that version).
@@ -1017,19 +1027,6 @@ fn check_location_presence(
         .filter(|s| s.copies == 0)
         .map(|s| s.location.as_str())
         .collect();
-    if missing.is_empty() && !short.is_empty() {
-        let dest = Dest::at(&short[0].location);
-        f.violations.push(AuditFinding {
-            unit: unit.name.clone(),
-            check: "location_presence".into(),
-            message: format!(
-                "has {}{} (policy requires {requires})",
-                policy::coverage::describe_short_locations(&short),
-                policy::coverage::tape_only_note(ctx.config, &unit.status),
-            ),
-            action: additional_copy_action(ctx.conn, unit, &dest)?,
-        });
-    }
     if !missing.is_empty() {
         let location_count = location_count_for_unit(ctx.conn, unit.id)?;
         // The remedy's last step says where the new copy goes. One copy can
@@ -1059,6 +1056,24 @@ fn check_location_presence(
                 },
                 missing.join(", "),
                 crate::render::plural(location_count, "location", "locations"),
+            ),
+            action: additional_copy_action(ctx.conn, unit, &dest)?,
+        });
+    }
+    // The locations that hold some copies but too few are named whether or
+    // not another location holds none: one finding each, so neither speaks
+    // for the other.
+    let thin: Vec<policy::coverage::LocationShort> =
+        short.iter().filter(|s| s.copies > 0).cloned().collect();
+    if !thin.is_empty() {
+        let dest = Dest::at(&thin[0].location);
+        f.violations.push(AuditFinding {
+            unit: unit.name.clone(),
+            check: "location_presence".into(),
+            message: format!(
+                "has {}{} (policy requires {requires})",
+                policy::coverage::describe_short_locations(&thin),
+                policy::coverage::tape_only_note(ctx.config, &unit.status),
             ),
             action: additional_copy_action(ctx.conn, unit, &dest)?,
         });
@@ -1839,17 +1854,15 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
     // is confirm's too, with its `completed_at` set in the same statement, so
     // a volume holding only ranges is dated the same way.
     //
-    // A NULL `completed_at` counts as STALE. `session.rs` sets it in the same
-    // statement that sets `status = 'completed'`, so production rows always
-    // have one; but a legacy or hand-edited row without a timestamp cannot be
-    // *proven* to predate the kit, and for a custody check the safe direction
-    // is to warn. Excluding it instead would make the one case nobody can
-    // verify also the one case nobody is told about.
+    // Every `completed` or `range` row has a `completed_at`: confirm sets it in
+    // the statement that sets the status, and `catalog rebuild` stamps the
+    // rows it records. Only a 1.x catalog could hold one without, and 2.x
+    // does not open those (ADR-0012 item 258).
     let stale_count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(DISTINCT v.id) FROM volumes v
              JOIN writes w ON w.volume_id = v.id AND w.status IN ('completed', 'range')
-             WHERE {} AND (w.completed_at IS NULL OR w.completed_at > ?1)",
+             WHERE {} AND w.completed_at > ?1",
             crate::policy::coverage::eligible("v")
         ),
         rusqlite::params![last_kit],
@@ -1963,6 +1976,9 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 /// compaction-candidates` prints — measured over slice data only, never
 /// `volumes.bytes_written` (which includes the fixed per-volume metadata
 /// and made every small fresh volume look half dead).
+///
+/// A volume holding a `range` is a candidate like any other, sized by the
+/// slices it holds (T5.3; ADR-0012 item 288 over item 133).
 ///
 /// The caller keeps the `unit_filter.is_none()` gate: this is a volume-level
 /// check and must not start firing for `audit --unit X`.
@@ -2105,6 +2121,57 @@ fn check_collection_unsynced(ctx: &Ctx<'_>) -> Result<Findings> {
     Ok(f)
 }
 
+fn check_drill_age(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: drill_age_findings(ctx.conn, ctx.config.defaults.drill_interval_days())?,
+    })
+}
+
+/// One warning when no heir drill is recorded, or the newest is older than
+/// `interval_days`. Silent when no volume holds written bytes: nothing
+/// could be drilled yet. A warning, never a violation (ADR-0004).
+fn drill_age_findings(conn: &Connection, interval_days: i64) -> Result<Vec<AuditFinding>> {
+    // `coverage` owns every `volumes.status` predicate: a volume that holds
+    // bytes a verify could read is one an heir could drill.
+    let drillable: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM volumes v WHERE {})",
+            policy::coverage::holds_bytes_to_verify("v")
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if !drillable {
+        return Ok(Vec::new());
+    }
+    let (newest, age): (Option<String>, Option<i64>) = conn.query_row(
+        "SELECT MAX(recorded_at),
+                CAST(julianday('now') - julianday(MAX(recorded_at)) AS INTEGER)
+         FROM drills",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let message = match (newest, age) {
+        (Some(when), Some(days)) if days > interval_days => format!(
+            "the newest recorded heir drill is from {when}, {days} days ago (more than the \
+             {interval_days} days of drill_interval_days)"
+        ),
+        (Some(_), _) => return Ok(Vec::new()),
+        (None, _) => "no heir drill is recorded: nothing shows that RESTORE.sh restores \
+                      a tape with the stock tools alone"
+            .to_string(),
+    };
+    Ok(vec![AuditFinding {
+        unit: "archive".into(),
+        check: "drill_age".into(),
+        message,
+        action: "run RESTORE.sh from a sealed tape as an heir would (docs/handoff.md), then \
+                 tapectl drill record LABEL"
+            .into(),
+    }])
+}
+
 fn check_no_full_verify(ctx: &Ctx<'_>) -> Result<Findings> {
     Ok(Findings {
         violations: Vec::new(),
@@ -2219,24 +2286,23 @@ fn check_tape_alert(ctx: &Ctx<'_>) -> Result<Findings> {
     })
 }
 
-// SHORT SEAL (#420; ADR-0012 item 112; layout-session.md, "volumes.ended_after").
+// SHORT SEAL (#420; ADR-0012 items 112 and 288; layout-session.md, "volumes.ended_after").
 //
-// The invariants `audit` checks of a tape that ended early, and of a range:
+// The invariants `audit` checks of a tape that ended early, of a `completed`
+// row and of a range:
 //
-// - `cut_without_ending`: a `cut` row exists only on a volume with
-//   `ended_after` set. A cut row elsewhere means the catalog does not record
-//   where that tape ended, so `volume verify` would look for its seal at the
-//   planned position.
 // - `completed_past_ending`: every `completed` row on a volume with
 //   `ended_after` set has all its slices at positions at or before it. One
 //   past it is a unit the tape does not hold whole counted as a copy.
+// - `completed_without_every_slice` (ADR-0012 item 288): a `completed` row
+//   holds a `written` position of every slice of its set, 1 to N. A
+//   `completed` row is a copy of the whole set, and one that lacks a slice
+//   counts copies that do not exist.
 //
 // From 1.7.0 (#478, coordinator fork X27; ADR-0012 items 121 and 122,
-// `volume-format-v2.md` §4.4), four of a `range` row:
+// `volume-format-v3.md` §5.3), three of a `range` row, which every unit's
+// write may now leave (item 288):
 //
-// - `range_without_may_span`: only a write planned as spannable is ever a
-//   range. Migration 039's row CHECK refuses the row, so it exists only where
-//   someone edited around the CHECK.
 // - `range_written_past_ending`: on a volume with `ended_after` set, a range's
 //   `written` positions are at or before it (confirm turns the ones after it
 //   `pending`). One past it is a slice the tape does not hold counted as a
@@ -2245,7 +2311,7 @@ fn check_tape_alert(ctx: &Ctx<'_>) -> Result<Findings> {
 //   slice order (item 122). A gap means the catalog does not say which slices
 //   the tape holds.
 // - `range_without_written_slice`: a range holds at least one slice; a write
-//   whose tape holds none of its set is `cut`.
+//   whose tape holds none of its set has no row at all.
 //
 // Confirm, `catalog rebuild` and the adoption of a lost write all keep every
 // one of them, so any finding is a catalog someone edited, or a bug. Warnings,
@@ -2274,12 +2340,7 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
         )
     };
     let mut stmt = conn.prepare(&format!(
-        "SELECT 'cut_without_ending', v.label, NULL, COUNT(*), NULL
-           FROM volumes v JOIN writes w ON w.volume_id = v.id
-          WHERE w.status = 'cut' AND v.ended_after IS NULL
-          GROUP BY v.id
-         UNION ALL
-         SELECT 'completed_past_ending', v.label, v.ended_after,
+        "SELECT 'completed_past_ending', v.label, v.ended_after,
                 COUNT(DISTINCT w.id), MAX(CAST(wp.position AS INTEGER))
            -- CROSS JOIN fixes the order (SQLite's rule): the short-sealed
            -- volumes first, their writes and positions by index, so no pass
@@ -2291,9 +2352,15 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
             AND CAST(wp.position AS INTEGER) > v.ended_after
           GROUP BY v.id
          UNION ALL
-         SELECT 'range_without_may_span', v.label, NULL, COUNT(*), NULL
+         SELECT 'completed_without_every_slice', v.label, NULL, COUNT(*), NULL
            FROM volumes v JOIN writes w ON w.volume_id = v.id
-          WHERE w.status = 'range' AND w.may_span = 0
+          WHERE w.status = 'completed'
+            AND EXISTS (SELECT 1 FROM stage_slices xs
+                         WHERE xs.stage_set_id = w.stage_set_id
+                           AND NOT EXISTS (SELECT 1 FROM write_positions xq
+                                            WHERE xq.write_id = w.id
+                                              AND xq.stage_slice_id = xs.id
+                                              AND xq.status = 'written'))
           GROUP BY v.id
          UNION ALL
          SELECT 'range_written_past_ending', v.label, v.ended_after,
@@ -2337,11 +2404,6 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
         .map(|(check, label, ended_after, writes, last)| {
             let writes = crate::render::plural(writes, "write", "writes");
             let message = match check.as_str() {
-                "cut_without_ending" => format!(
-                    "volume \"{label}\" has {writes} recorded `cut` but no \
-                     `ended_after`: a cut row exists only on a volume that sealed short, so this \
-                     catalog does not say where that tape ended"
-                ),
                 "completed_past_ending" => format!(
                     "volume \"{label}\" ended after tape file {}, but {writes} on it \
                      recorded `completed` have a slice past that (up to file {}): those units \
@@ -2349,10 +2411,10 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                     ended_after.unwrap_or_default(),
                     last.unwrap_or_default()
                 ),
-                "range_without_may_span" => format!(
-                    "volume \"{label}\" has {writes} recorded `range` with `may_span` \
-                     unset: only a write planned as spannable is ever a range, and the schema \
-                     refuses this row, so the catalog was edited around it"
+                "completed_without_every_slice" => format!(
+                    "volume \"{label}\" has {writes} recorded `completed` that lack a `written` \
+                     position of some slice of their set: a `completed` write is a copy of every \
+                     slice, 1 to N, so those units count copies that do not exist"
                 ),
                 "range_written_past_ending" => format!(
                     "volume \"{label}\" ended after tape file {}, but {writes} recorded `range` on \
@@ -2369,7 +2431,7 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                 _ => format!(
                     "volume \"{label}\" has {writes} recorded `range` with no slice \
                      `written`: a range is the slices the tape holds, and a write whose tape \
-                     holds none of its set is `cut`"
+                     holds none of its set has no row"
                 ),
             };
             AuditFinding {
@@ -2614,6 +2676,23 @@ struct AuditFinding {
     check: String,
     message: String,
     action: String,
+}
+
+/// The checks that fired, as `(severity, check, unit)`, for the tests of
+/// other modules that pin what `audit` says of a catalog (T5.2, #550).
+#[cfg(test)]
+pub(crate) fn fired_for_test(
+    conn: &Connection,
+    config: &Config,
+) -> Result<Vec<(&'static str, String, String)>> {
+    let (violations, warnings) = collect_findings(conn, config, None)?;
+    let mut out = Vec::new();
+    for (severity, list) in [("violation", violations), ("warning", warnings)] {
+        for f in list {
+            out.push((severity, f.check, f.unit));
+        }
+    }
+    Ok(out)
 }
 
 fn finding_json(f: &AuditFinding, severity: &str) -> serde_json::Value {
@@ -3297,9 +3376,7 @@ mod tests {
         fn escrow_kit_check_is_silent_when_the_kit_is_newer_than_the_tapes() {
             let (conn, unit_id) = setup();
             seed_written_volume(&conn, unit_id, "SEALK2", "sealed", 1000, 900, 100);
-            // The fixture leaves `completed_at` NULL, which now counts as
-            // stale by design; stamp a real completion so this test measures
-            // the timeline rather than the NULL rule.
+            // Stamp the completion two days before the kit.
             conn.execute(
                 "UPDATE writes SET completed_at = datetime('now', '-2 day')",
                 [],
@@ -3365,34 +3442,6 @@ mod tests {
                 "the secret opens every tape; only the catalog is stale: {message}"
             );
             assert_eq!(findings[0].action, "tapectl key escrow-kit <DIR>");
-        }
-
-        /// A sealed volume whose write carries NO completion timestamp
-        /// cannot be proven to predate the kit, so it warns. `session.rs`
-        /// sets `completed_at` in the same statement as
-        /// `status = 'completed'`, so this is a legacy/hand-edited row —
-        /// exactly the case where silence would be worst, because it is the
-        /// one nobody can verify by other means.
-        #[test]
-        fn escrow_kit_check_treats_an_undated_write_as_stale_rather_than_covered() {
-            let (conn, unit_id) = setup();
-            conn.execute(
-                "INSERT INTO events (entity_type, entity_id, action, timestamp)
-                 VALUES ('system', 0, 'escrow_kit_generated', datetime('now', '+1 day'))",
-                [],
-            )
-            .unwrap();
-            // Kit is dated in the FUTURE, so a dated write would be covered.
-            seed_written_volume(&conn, unit_id, "SEALK4", "sealed", 1000, 900, 100);
-            // seed leaves completed_at NULL — that is the condition under test.
-
-            let findings = escrow_kit_findings(&conn).unwrap();
-            assert_eq!(
-                findings.len(),
-                1,
-                "an undated completed write must warn, not be silently treated as covered"
-            );
-            assert_eq!(findings[0].check, "escrow_kit_stale");
         }
 
         // --- Heir Kit staleness: a tape that MOVED (issue #448 item 5) ----
@@ -4659,6 +4708,106 @@ mod tests {
         );
     }
 
+    /// #548 (D18): `drill_age` against the exit code `run` returns: a sealed
+    /// volume and no drill is a warning (1); a drill older than the interval
+    /// is one; a fresh drill is quiet (0); the interval is `[defaults]
+    /// drill_interval_days`; and a catalog with nothing sealed has nothing to
+    /// drill.
+    #[test]
+    fn drill_age_warns_with_none_and_with_an_old_one_and_is_quiet_after_a_fresh_one() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut config = Config::default();
+        let exit =
+            |conn: &Connection, config: &Config| run(conn, config, None, false, false).unwrap();
+        let drill_warnings = |conn: &Connection, config: &Config| {
+            collect_findings(conn, config, None)
+                .unwrap()
+                .1
+                .into_iter()
+                .filter(|f| f.check == "drill_age")
+                .count()
+        };
+
+        // Nothing sealed: nothing to drill, quiet.
+        assert_eq!(exit(&conn, &config), 0);
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'lto0', 1000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        // No drill recorded.
+        assert_eq!(drill_warnings(&conn, &config), 1);
+        assert_eq!(
+            collect_findings(&conn, &config, None).unwrap().0.len(),
+            0,
+            "a warning, never a violation"
+        );
+
+        // A drill 400 days old is past the 365 default.
+        conn.execute(
+            "INSERT INTO drills (recorded_at, volume_id) VALUES (datetime('now', '-400 days'), 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(drill_warnings(&conn, &config), 1);
+
+        // Past a longer interval it is not; a bad (zero) one is `config check`'s.
+        config.defaults.drill_interval_days = Some(500);
+        assert_eq!(drill_warnings(&conn, &config), 0);
+        config.defaults.drill_interval_days = None;
+
+        // A fresh drill.
+        conn.execute("INSERT INTO drills (volume_id) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(drill_warnings(&conn, &config), 0);
+    }
+
+    /// The exit code the operator sees: 1 (warn) with no drill, 0 after.
+    /// The control for the test above, which reads the findings.
+    #[test]
+    fn drill_age_sets_the_exit_code() {
+        let conn = crate::db::open_memory().unwrap();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'lto0', 1000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome, completed_at)
+             VALUES (1, 'full', 'passed', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (entity_type, entity_id, action, timestamp)
+             VALUES ('system', 0, 'escrow_kit_generated', datetime('now', '+1 day'))",
+            [],
+        )
+        .unwrap();
+        let only_drill_warns = |conn: &Connection| {
+            let (v, w) = collect_findings(conn, &config, None).unwrap();
+            v.is_empty() && w.iter().all(|f| f.check == "drill_age")
+        };
+        assert!(
+            only_drill_warns(&conn),
+            "fixture: nothing else fires: {:?}",
+            collect_findings(&conn, &config, None)
+                .unwrap()
+                .1
+                .iter()
+                .map(|f| (f.check.clone(), f.message.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(run(&conn, &config, None, false, false).unwrap(), 1);
+        conn.execute("INSERT INTO drills (volume_id) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(run(&conn, &config, None, false, false).unwrap(), 0);
+    }
+
     /// The summary line is part of the human-readable contract and must
     /// survive — the fix for the above must not delete it outright.
     #[test]
@@ -5279,6 +5428,31 @@ mod tests {
             );
         }
 
+        /// With one location at no copy and another short but holding some,
+        /// `location_presence` names both: the thin one is not left out for
+        /// the empty one to speak alone.
+        #[test]
+        fn location_presence_names_a_thin_location_beside_an_empty_one() {
+            let conn = setup(&["home-rack", "offsite"]);
+            conn.execute(
+                "UPDATE units SET copies_at_frozen = '{\"garage\":1,\"offsite\":2}'",
+                [],
+            )
+            .unwrap();
+            let findings = location_findings(&conn);
+            let said: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
+            assert!(
+                said.iter()
+                    .any(|m| m.contains("no copy at required location garage")),
+                "{said:?}"
+            );
+            assert!(
+                said.iter()
+                    .any(|m| m.starts_with("has 1 copy at required location offsite, needs 2")),
+                "{said:?}"
+            );
+        }
+
         /// #493 (ADR-0012 items 149, 156 and 160): `location_presence` judges
         /// the resolved `copies_at` map. A dotfile map (frozen in the
         /// catalog: the unit has no path) of `garage = 1, offsite = 2`
@@ -5297,11 +5471,17 @@ mod tests {
             .unwrap();
 
             let findings = location_findings(&conn);
-            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(findings.len(), 2, "{findings:?}");
             assert_eq!(
                 findings[0].message,
                 "no copy at required location garage (policy requires 1 at garage, \
                  2 at offsite; copies are in 2 locations)"
+            );
+            assert_eq!(
+                findings[1].message,
+                "has 1 copy at required location offsite, needs 2 \
+                 (policy requires 1 at garage, 2 at offsite)",
+                "the thin location is named beside the empty one"
             );
             assert!(
                 findings[0]
@@ -6502,9 +6682,8 @@ mod tests {
             "volume_verify_age",
             "tape_alert",
             "collection_unsynced",
-            "cut_without_ending",
             "completed_past_ending",
-            "range_without_may_span",
+            "completed_without_every_slice",
             "range_written_past_ending",
             "range_not_one_run",
             "range_without_written_slice",
@@ -6524,16 +6703,16 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 10 per-unit checks + 10 archive-wide checks (#534 added
-            // `collection_unsynced`). `policy_unresolvable`
+            // 10 per-unit checks + 11 archive-wide checks (#534 added
+            // `collection_unsynced`, #548 `drill_age`). `policy_unresolvable`
             // is not one of them (see below), `escrow_kit_missing`/
             // `escrow_kit_stale` share one row, and so do
-            // `cut_without_ending`/`completed_past_ending` (#420) and the
+            // `completed_past_ending` (#420) and the
             // four range invariants (#478, X27).
             assert_eq!(
                 names.len(),
-                20,
-                "expected 10 per-unit + 10 archive-wide CHECKS rows, got: {names:?}"
+                21,
+                "expected 10 per-unit + 11 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {
@@ -6550,9 +6729,8 @@ mod tests {
                     // The two invariants of a short-sealed volume's rows,
                     // and the four of a range (#478, X27): one `short_seal`
                     // row, one statement (#420).
-                    "cut_without_ending"
-                    | "completed_past_ending"
-                    | "range_without_may_span"
+                    "completed_past_ending"
+                    | "completed_without_every_slice"
                     | "range_written_past_ending"
                     | "range_not_one_run"
                     | "range_without_written_slice" => "short_seal",
@@ -6832,9 +7010,8 @@ mod tests {
                     // The two invariants of a short-sealed volume's rows,
                     // and the four of a range (#478, X27): one `short_seal`
                     // row, one statement (#420).
-                    "cut_without_ending"
-                    | "completed_past_ending"
-                    | "range_without_may_span"
+                    "completed_past_ending"
+                    | "completed_without_every_slice"
                     | "range_written_past_ending"
                     | "range_not_one_run"
                     | "range_without_written_slice" => "short_seal",
@@ -7026,19 +7203,20 @@ mod tests {
     /// (layout-session.md, `volumes.ended_after`), on the shared fixture.
     mod short_seal {
         use super::*;
-        use crate::volume::restore::short_tape::{self, LABEL};
+        use crate::volume::restore::short_tape;
 
         fn short_seal_warnings(conn: &Connection) -> Vec<AuditFinding> {
             let (violations, warnings) = collect_findings(conn, &Config::default(), None).unwrap();
             assert!(
-                violations
-                    .iter()
-                    .all(|f| f.check != "cut_without_ending" && f.check != "completed_past_ending"),
+                violations.iter().all(|f| f.check != "completed_past_ending"
+                    && f.check != "completed_without_every_slice"),
                 "{violations:?}"
             );
             warnings
                 .into_iter()
-                .filter(|f| f.check == "cut_without_ending" || f.check == "completed_past_ending")
+                .filter(|f| {
+                    f.check == "completed_past_ending" || f.check == "completed_without_every_slice"
+                })
                 .collect()
         }
 
@@ -7072,24 +7250,6 @@ mod tests {
         }
 
         #[test]
-        fn a_cut_row_on_a_volume_with_no_ending_is_named() {
-            let t = short_tape::short_tape();
-            t.conn
-                .execute("UPDATE volumes SET ended_after = NULL", [])
-                .unwrap();
-            let found = short_seal_warnings(&t.conn);
-            assert_eq!(found.len(), 1, "{found:?}");
-            assert_eq!(found[0].check, "cut_without_ending");
-            assert_eq!(found[0].unit, format!("volume:{LABEL}"));
-            assert!(
-                found[0].message.contains("2 writes recorded `cut`"),
-                "{}",
-                found[0].message
-            );
-            assert_eq!(found[0].action, format!("tapectl volume verify {LABEL}"));
-        }
-
-        #[test]
         fn a_completed_row_past_the_end_is_named() {
             let t = short_tape::short_tape();
             let k = t.ended_after;
@@ -7103,7 +7263,13 @@ mod tests {
                 )
                 .unwrap();
             let found = short_seal_warnings(&t.conn);
-            assert_eq!(found.len(), 1, "{found:?}");
+            // bravo's second slice is past the end, so its `completed` row
+            // is also one that lacks a `written` position of every slice.
+            assert_eq!(found.len(), 2, "{found:?}");
+            let found: Vec<AuditFinding> = found
+                .into_iter()
+                .filter(|f| f.check == "completed_past_ending")
+                .collect();
             assert_eq!(found[0].check, "completed_past_ending");
             assert!(
                 found[0]
@@ -7129,7 +7295,7 @@ mod tests {
         use crate::policy::coverage::tests::SpanCatalog;
 
         const RANGE_CHECKS: [&str; 4] = [
-            "range_without_may_span",
+            "completed_without_every_slice",
             "range_written_past_ending",
             "range_not_one_run",
             "range_without_written_slice",
@@ -7196,18 +7362,28 @@ mod tests {
             assert!(short_seal_findings(&c.conn).unwrap().is_empty());
         }
 
+        /// Item 288's new invariant: a `completed` row holds a `written`
+        /// position of every slice of its set.
         #[test]
-        fn a_range_without_may_span_is_named() {
-            let (c, w1, _) = item_93();
-            // Migration 039's row CHECK refuses this row; only an edit around
-            // it makes one.
+        fn a_completed_row_lacking_a_written_slice_is_named() {
+            let (c, _, _) = item_93();
             c.conn
-                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .execute(
+                    "UPDATE write_positions SET status = 'pending'
+                      WHERE write_id = (SELECT id FROM writes WHERE status = 'completed')
+                        AND id = (SELECT MIN(id) FROM write_positions
+                                   WHERE write_id = (SELECT id FROM writes
+                                                      WHERE status = 'completed'))",
+                    [],
+                )
                 .unwrap();
-            c.conn
-                .execute("UPDATE writes SET may_span = 0 WHERE id = ?1", params![w1])
-                .unwrap();
-            assert_eq!(found(&c), one("range_without_may_span", "SPAN-1"));
+            assert_eq!(found(&c), one("completed_without_every_slice", "SPAN-2"));
+            let f = short_seal_findings(&c.conn).unwrap();
+            assert!(
+                f[0].message.contains("1 writes") || f[0].message.contains("1 write"),
+                "{}",
+                f[0].message
+            );
         }
 
         #[test]
