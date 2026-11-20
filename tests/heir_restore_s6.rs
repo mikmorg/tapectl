@@ -250,7 +250,11 @@ fn a_refused_cartridge_does_not_cost_the_run_its_home_tape() {
         );
         let all = o.all();
         assert_eq!(o.code, 1, "enter_first={enter_first}: {all}");
-        assert_eq!(heir::tree(&dest), want_tree, "enter_first={enter_first}: {all}");
+        assert_eq!(
+            heir::tree(&dest),
+            want_tree,
+            "enter_first={enter_first}: {all}"
+        );
         assert_eq!(damaged_list(&dest), want_list, "enter_first={enter_first}");
         assert!(
             !all.contains("NOT ON THIS CARTRIDGE: slices 2"),
