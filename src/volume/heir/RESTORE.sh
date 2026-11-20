@@ -119,10 +119,14 @@ NO_FILE_CHECK=0
 WORK=""
 WORK_MADE_IN=""
 # The cartridge in the drive, as far as this run knows: it is the one the run
-# started on until a cartridge is taken (HOME_CART 0), and nothing known after
-# one was offered and refused.
+# started on until a cartridge is taken (HOME_CART 0). A cartridge offered and
+# refused changes none of this (FOREIGN_LOADED, below).
 HOME_CART=1
 LOADED_UUID=""
+# 1 while the cartridge in the drive is one a probe refused: the facts above
+# and below still describe the last cartridge taken (or the one the run
+# started on), which is not in the drive now (#576).
+FOREIGN_LOADED=0
 GAVE_UP=0        # 1 once the heir said "I do not have it" for this unit
 QUIT=0           # 1 once the heir typed quit
 TO_HELD_LIST=0   # 1 when --to held an earlier run's damaged-file list
@@ -1330,6 +1334,8 @@ probe_cartridge() { # <dir> <slice>
     exit 2
   fi
   if [ -n "$uuid" ] && [ "$uuid" = "$LOADED_UUID" ]; then
+    # The cartridge the facts describe, back in the drive after a refusal.
+    if [ "$FOREIGN_LOADED" = 1 ]; then exit 4; fi
     echo "NOTE: this is the same cartridge as the one already in the drive (label $(safe_str "$label")), which does not hold slice $k. Eject it and load the cartridge that does." >&2
     exit 3
   fi
@@ -1388,18 +1394,29 @@ accept_cartridge() { # <slice>
   if [ "$rc" = 3 ]; then
     return 1
   fi
+  if [ "$rc" = 4 ]; then
+    # The cartridge the run's facts describe is back in the drive.
+    FOREIGN_LOADED=0
+    locate_here
+    if [ -n "${SL_HERE[$k]:-}" ]; then
+      echo "This is the cartridge the run had before ($(safe_str "$LABEL")): it gives slice $k." >&2
+      return 0
+    fi
+    echo "NOTE: this is the cartridge the run had before, and it does not hold slice $k. Eject it and load the cartridge that does." >&2
+    return 1
+  fi
   if [ "$rc" != 0 ] || [ ! -f "$sub/vars" ]; then
-    # Another cartridge is in the drive now, one this run cannot use.
-    HOME_CART=0
-    FILES_TXT=""
-    ENDED_AFTER=""
-    LOADED_UUID=""
+    # Another cartridge is in the drive now, one this run cannot use. What the
+    # run knows of the cartridge it took last is kept: that one may come back
+    # (a refusal never costs the run its tape, #576).
+    FOREIGN_LOADED=1
     SL_HERE=()
     return 1
   fi
   # shellcheck disable=SC1090
   . "$sub/vars"
   HOME_CART=0
+  FOREIGN_LOADED=0
   LOADED_UUID=$UUID
   locate_here
   [ -n "${SL_HERE[$k]:-}" ] || return 1
@@ -1419,6 +1436,24 @@ accept_cartridge() { # <slice>
 # tape device is open while it waits (every mt and dd opens it by itself).
 # done, or the end of the input, is "I do not have it": the restore goes on
 # with what it has. quit ends the restore.
+# After a refusal and "done": is the cartridge the run's facts describe in the
+# drive again (the heir reloaded it without pressing ENTER)? Then what it holds
+# is restored. Anything else is left as it is: nothing is read from it.
+recheck_drive() {
+  local sub rc=0
+  CART_SEQ=$((CART_SEQ + 1))
+  sub="$WORK/cart.$CART_SEQ"
+  mkdir -p "$sub" || return 0
+  CUR=""
+  (probe_cartridge "$sub" 1) 2>/dev/null || rc=$?
+  CUR=""
+  if [ "$rc" = 4 ]; then
+    FOREIGN_LOADED=0
+    locate_here
+  fi
+  return 0
+}
+
 swap_for() { # <slice>: 0 when the cartridge in the drive now holds it
   [ "$GAVE_UP" = 0 ] || return 1
   local reply
@@ -1429,6 +1464,7 @@ swap_for() { # <slice>: 0 when the cartridge in the drive now holds it
     case $reply in
     done | Done | DONE)
       GAVE_UP=1
+      if [ "$FOREIGN_LOADED" = 1 ]; then recheck_drive; fi
       echo "NOTE: going on without it: what the cartridges read so far hold is restored, and the rest is listed with the tapes that hold it." >&2
       return 1
       ;;
@@ -1451,6 +1487,7 @@ SL_HERE=()
 locate_here() {
   local k p num pos
   SL_HERE=()
+  [ "$FOREIGN_LOADED" = 0 ] || return 0
   if [ "$HOME_CART" = 1 ]; then
     for ((k = 1; k <= NSL; k++)); do
       p=${SL_POS[$k]:-}

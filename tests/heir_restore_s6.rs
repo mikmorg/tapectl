@@ -207,3 +207,55 @@ fn span2() -> &'static [Tape] {
     })
 }
 
+// ---- #576 ----
+
+/// #576: a refused cartridge at the prompt does not cost the run the tape it
+/// started on. Start on the tape of slices 2 to 8, refuse at slice 1's prompt
+/// (a blank cartridge), reload the start tape, and answer `done` (or ENTER
+/// first): what that tape holds is restored.
+#[test]
+fn a_refused_cartridge_does_not_cost_the_run_its_home_tape() {
+    let t = span2();
+    // What the start tape alone gives, with `done` at once.
+    let base = Heir::of_series(&[&t[1], &t[0]]);
+    let want_dest = base.dest("out");
+    let ka = key(&base, Who::TenantA);
+    let o = base.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&want_dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let want_tree = heir::tree(&want_dest);
+    let want_list = damaged_list(&want_dest);
+    assert!(!want_tree.is_empty() && !want_list.is_empty());
+    for enter_first in [false, true] {
+        let h = Heir::of_series(&[&t[1], &t[0]]);
+        h.shelve_blank("BLANK");
+        let dest = h.dest("out");
+        let o = h.run_prompted(
+            &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+            |k, _| match (k, enter_first) {
+                (1, _) => {
+                    h.load("BLANK");
+                    Some(String::new())
+                }
+                (2, false) => {
+                    h.load("HEIR02");
+                    Some("done".into())
+                }
+                (2, true) => {
+                    h.load("HEIR02");
+                    Some(String::new())
+                }
+                (3, true) => Some("done".into()),
+                _ => panic!("asked {k} times"),
+            },
+        );
+        let all = o.all();
+        assert_eq!(o.code, 1, "enter_first={enter_first}: {all}");
+        assert_eq!(heir::tree(&dest), want_tree, "enter_first={enter_first}: {all}");
+        assert_eq!(damaged_list(&dest), want_list, "enter_first={enter_first}");
+        assert!(
+            !all.contains("NOT ON THIS CARTRIDGE: slices 2"),
+            "enter_first={enter_first}: {all}"
+        );
+    }
+}
+
