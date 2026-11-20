@@ -255,9 +255,9 @@ fn measure(slice_size: &str, compression: &str, sizes: &[usize]) -> Measured {
 /// (see the module doc), plus [`FIXED`] for everything that is not the cut.
 fn prove(what: &str, compression: &str, sizes: &[usize], k_lo: f64, k_hi: f64) {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-    let small = measure("8M", compression, sizes);
-    let large = measure("32M", compression, sizes);
-    for (size, m) in [("8M", &small), ("32M", &large)] {
+    let small = measure("2M", compression, sizes);
+    let large = measure("8M", compression, sizes);
+    for (size, m) in [("2M", &small), ("8M", &large)] {
         eprintln!(
             "restore peak | {what} | {compression} | slice_size {size} | {} slices | largest cut \
              {:.2} MiB | peak {:.2} MiB | k = {:.2}",
@@ -281,14 +281,15 @@ fn prove(what: &str, compression: &str, sizes: &[usize], k_lo: f64, k_hi: f64) {
             m.max_cut
         );
     }
-    // Scaling: what 24 MiB more slice costs.
+    // Scaling: what 6 MiB more slice costs. This is the real check; the absolute
+    // bound above (with its constant) only keeps the figures sane.
     let d_peak = large.peak as f64 - small.peak as f64;
     let d_cut = large.max_cut as f64 - small.max_cut as f64;
     let k = d_peak / d_cut;
     eprintln!("restore scaling | {what} | {compression} | d_peak/d_cut = {k:.2}");
     assert!(
-        d_cut > 16.0 * MIB as f64,
-        "the two sizes differ by about 24 MiB of cut"
+        d_cut > 5.0 * MIB as f64,
+        "the two sizes differ by about 6 MiB of cut"
     );
     assert!(
         k >= k_lo - 0.05 && k <= k_hi + 0.05,
@@ -323,11 +324,11 @@ fn the_counter_sees_an_allocation_inside_the_window() {
 }
 
 fn many_small() -> Vec<usize> {
-    vec![MIB; 66]
+    vec![MIB; 16]
 }
 
 fn one_long() -> Vec<usize> {
-    vec![70 * MIB, 4 * MIB]
+    vec![12 * MIB, 4 * MIB]
 }
 
 /// Uncompressed: the plaintext Vec is the cut (moved, no copy). One slice,
