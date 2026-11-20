@@ -2653,20 +2653,21 @@ files that tape holds whole, ask for each further cartridge by label, sticker an
 chip serial, and feed the members to one `tar` run. The answer "skip" at the
 prompt (I do not have it), or nobody at the terminal, restores the files this tape
 holds whole and lists the rest with the tapes that hold them. `catalog locate
-<unit>` shows which tapes hold which slices (its `Holds` column). Two refusals
-come before any slice is read.
+<unit>` shows which tapes hold which slices (its `Holds` column).
 
-A slice no live volume holds:
+A slice no live volume holds is not a refusal (ADR-0012 item 266 and D17): the
+restore takes the files the live tapes hold whole and lists every file in that
+slice in its INCOMPLETE report, each with the reason:
 
 ```text
-error: unit "<unit>" version <n> cannot be restored: slices <a> to <b> of it are on no live volume, and a
-restore of a version held across cartridges needs every slice, in slice order. Where the catalog saw them:
-"<label>" is given up (retired or erased) (slices <a> to <b>). A tape this catalog does not know that holds
-them is brought into it by `tapectl catalog rebuild --from-volume`. Nothing was read from tape.
+unit "<unit>" version <n>: slices <a> to <b> of it are on no live volume, so the files in them are left out.
+Where the catalog saw them: "<label>" is given up, retired or erased for slices <a> to <b>. A tape this catalog
+does not know that holds them is brought into it by `tapectl catalog rebuild --from-volume`.
 ```
 
-When those slices are still staged, the message says so instead: an ordinary
-`tapectl volume write` writes them onto another cartridge first.
+When those slices are still staged, the reason says so instead: an ordinary
+`tapectl volume write` writes them onto another cartridge, and a later restore
+can then read them. One refusal comes before any slice is read:
 
 No one at the terminal (a script, a timer, a pipe on stdin), where the version is
 held across cartridges:
@@ -2677,9 +2678,9 @@ the terminal, and --yes cannot load one: run it from a terminal and it asks for 
 ```
 
 Run it from a terminal. A version a single tape holds whole restores from that
-tape alone, with no prompt. `restore volume` restores only the units a tape holds
-whole, and names each unit it holds only a range of with the `restore unit`
-command that reads it across cartridges. RESTORE.sh has the same prompt: press
+tape alone, with no prompt. `restore volume` plans each unit it holds a range of
+as `restore unit` does: across cartridges at a terminal, and otherwise the files
+this tape holds whole, with the rest listed. RESTORE.sh has the same prompt: press
 ENTER when the cartridge is loaded, type `done` and ENTER if you do not have it,
 `quit` to stop.
 
@@ -2731,9 +2732,12 @@ copy if the tape is damaged; `catalog locate` lists them).
 With `--fail-fast` the first failure ends the pass, and the units after it
 are reported `not attempted`.
 
-Before it opens the drive, `restore volume` refuses the whole set when any one
-unit would be refused (see the sections above), and also when one unit's
-directory would lie inside another's:
+A unit that cannot be planned at all (see the sections above) is listed
+`FAILED` with its reason before the drive is opened, is never read, and the
+other units are restored (#573). With units named by `--unit`, one that would be
+refused refuses the whole set instead: each was asked for. Before it opens the
+drive, `restore volume` also refuses the whole set when one unit's directory
+would lie inside another's:
 
 ```text
 error: unit "<a/b>" would be restored inside unit "<a>"'s destination (<dir>/a/b is inside <dir>/a). Restore them
