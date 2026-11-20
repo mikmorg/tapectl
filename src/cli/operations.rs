@@ -152,10 +152,9 @@ impl IntegrityReport {
 
 /// The exit code of a `unit check-integrity` whose only finding is CHANGED
 /// files (edited since the baseline was snapshotted). The one place it is
-/// decided: the CTO's question Q40. This is the coordinator's
-/// recommendation, 0 with a one-line note naming `snapshot create`, since an
-/// edit is not damage; the CTO's answer is a change to this line (and its
-/// pin, `changed_exit_code_is_q40s_recommendation`).
+/// decided: ADR-0012 item 223 (2026-11-09, Q40) ruled 0, with a one-line note
+/// naming `snapshot create`, since an edit is not damage (pinned by
+/// `changed_exit_code_is_item_223s_ruling`).
 pub fn changed_exit_code() -> i32 {
     crate::error::EXIT_SUCCESS
 }
@@ -5970,12 +5969,11 @@ mod tests {
         assert!(serde_json::to_string(&json).is_ok());
     }
 
-    /// Q40, with the CTO: the exit of a check whose only finding is CHANGED
-    /// is ONE decision, `changed_exit_code()`. This pins the coordinator's
-    /// recommendation (0, with the note); the CTO's answer changes the
-    /// function and this pin. Damage beside a CHANGED file still exits 1.
+    /// ADR-0012 item 223 (Q40): the exit of a check whose only finding is
+    /// CHANGED is ONE decision, `changed_exit_code()`, ruled 0 (with the
+    /// note). Damage beside a CHANGED file still exits 1.
     #[test]
-    fn changed_exit_code_is_q40s_recommendation() {
+    fn changed_exit_code_is_item_223s_ruling() {
         assert_eq!(changed_exit_code(), crate::error::EXIT_SUCCESS);
         let changed_only = IntegrityReport {
             changed: 2,
