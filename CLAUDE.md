@@ -10,14 +10,16 @@ are in `docs/design/v3-implementation-plan.md`.
 
 ## Project Overview
 
-tapectl is a Rust CLI tool for managing long-term archival storage across LTO tape and exportable encrypted directories (Blu-ray, USB). It wraps `dar` for archive creation/extraction, uses the `age` crate (from the rage project) for age encryption, and SQLite for catalog/inventory/policy/audit.
+tapectl is a Rust CLI tool for managing long-term archival storage across LTO tape and exportable encrypted directories (Blu-ray, USB). It archives with GNU tar (a pax stream cut into slices of whole members, each compressed alone when asked and age-encrypted), uses the `age` crate (from the rage project) for age encryption, and SQLite for catalog/inventory/policy/audit.
 
-**The on-tape format is Layout Version 2** (ADR-0007). For anything touching tape
-bytes or the write path, the normative set is, in authority order:
-`docs/design/volume-format-v2.md` (the byte format) → `docs/design/layout-session.md`
-(session state machine) → `docs/design/v2-open-questions.md` (resolved decisions,
-§§1–11) → `docs/design/v2-implementation-plan.md` (the T0–T11 build playbook).
-`docs/adr/0001`–`0007` govern all of them.
+**The on-tape format is Layout Version 3** (tapectl 2.0.0; ADR-0014, which gathers ADR-0012
+items 239 onward). For anything touching tape bytes or the write path, the normative set is,
+in authority order: `docs/design/volume-format-v3.md` (the byte format) → the "Layout 3"
+section of `docs/design/layout-session.md` → ADR-0012 items 239 onward (a later item amends
+an earlier one) → `docs/design/v3-implementation-plan.md` (the build plan). Layout 2's texts
+(`volume-format-v2.md`, `v2-open-questions.md`, `v2-implementation-plan.md`) are history:
+2.0.0 neither reads nor writes Layout 2 (item 242). This file is rewritten for the release
+by T6.7; until then, where a line below disagrees with that set, the set wins.
 
 `tapectl-design-v4_0.md` remains the reference for everything those do NOT cover,
 read **together with `docs/design-errata.md`** (the complete list of
@@ -71,7 +73,7 @@ cargo fmt --check
 ```
 
 CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, `cargo test`
-(with dar installed), a `docs/man` drift check and a non-blocking `cargo audit` — but only
+(with GNU tar and the decompressors), a `docs/man` drift check and a non-blocking `cargo audit` — but only
 on pushes and PRs to `master`. Run `clippy`, `fmt --check`, and `cargo test` locally
 before committing; nothing checks a push to any other branch.
 
@@ -96,20 +98,11 @@ control). Run it with clippy/fmt before committing a docs or CLI change.
 Default `cargo test` runs unit + integration + tenant-isolation + failure-mode tests;
 none need tape hardware or mhvtl.
 
-**`dar` must be on `PATH` (issue #43).** The ungated suite is *not* hermetic: 49
-tests need a working dar (counted 2026-09-29 by stubbing dar out) — the staging
-pipeline, `stage create`/`quick-archive`/collection batches, the dar wrapper,
-`config check`'s dar probe, the restore record, and three `cli_smoke` tests.
-Without dar, plain `cargo test` runs the whole lib test binary first — dozens of
-dar-dependent tests fail with cryptic panics — and then stops (cargo's fail-fast is
-per test binary), never reaching the named check in `tests/test_dependencies.rs`; run
-`cargo test --test test_dependencies` for its instructions. Its by-name list
-(`DAR_DEPENDENT_TESTS`) names only 13 of the 49, so do not read it as complete. dar is
-a hard *runtime* dependency anyway, so testing needs nothing extra. The ungated tests
-that run dar resolve it as plain `"dar"` via `PATH` — never hardcode `/usr/bin/dar`,
-which is wrong on any distro installing to `/usr/local/bin`. The two
-`binary = "/usr/bin/dar"` fixtures in `tests/integration.rs` are inert only because
-no test using them reaches dar; do not copy them.
+**GNU tar and `gzip`, `xz` and `zstd` must be on `PATH` (issue #43).** The ungated suite is
+*not* hermetic: staging runs the real GNU tar (the writer's floor is 1.35 built with ACL
+support, ADR-0012 item 274), and the tests that read a slice back run each carried
+decompressor. `tests/test_dependencies.rs` names each tool once, loudly; run
+`cargo test --test test_dependencies` when the suite fails in ways that look unrelated.
 
 ```bash
 cargo test                              # everything ungated
@@ -195,34 +188,32 @@ TAPECTL_MHVTL=1 bash scripts/upgrade-mhvtl.sh \
 **The heir path's only test with real tools is the mhvtl gate** (ADR-0012 item 70,
 #457). `tests/heir_restore_sh.rs` runs RESTORE.sh with `mt`, `dd` and `age` faked (CI
 has no age CLI); only the gate's RESTORE.sh legs (`heir_*`) and home2's real-drive
-proof run it with the real `age`, `dar`, `mt` and `tar`. A release is not proven on
+proof run it with the real `age`, `mt`, `tar` and decompressors. A release is not proven on
 the heir path until the gate has run; each run record names the age version it used
-(`age --version`). Since 1.3.0 the gate's heir legs also run RESTORE.sh's index modes
-(`heir_where`, `heir_find`), its slice replacement (`heir_slice_from_copy`) and its per-file
-sha256 check (`heir_file_check`) with the real tools, and since 1.8.0 its one stream into dar
-(`heir_slice_boundary_read`) and its note on damage dar never needed (`heir_late_damage`). The gate's Rust legs pass only when every test they name ran and
+(`age --version`). The gate has one heir leg per RESTORE.sh mode (`heir_*`), each
+compression included (`heir_gzip_*`, `heir_xz_*`, `heir_zstd_*`). The gate's Rust legs pass only when every test they name ran and
 said `ok`, and a gate run turns an on-media skip into a failure (#471).
 
 ## Architecture
 
-**Three-phase pipeline:** `snapshot create` (fast metadata) → `stage create` (dar + sha256 + encrypt) → `volume write` (tape I/O)
+**Three-phase pipeline:** `snapshot create` (fast metadata) → `stage create` (tar + sha256 + compress + encrypt) → `volume write` (tape I/O)
 
 **Key subsystems:**
 - **CLI layer** (`src/cli/`): clap derive-based subcommands (tenant, unit, snapshot, stage, volume, catalog, restore, audit, etc.)
 - **Database** (`src/db/`): SQLite with WAL mode, forward-only numbered migrations, full audit trail; `ontape_catalog.rs` is the operator envelope's `catalog.db` — schema, generation probe, read and write in one place
 - **Unit management** (`src/unit/`): archival entities tracked via `.tapectl-unit.toml` dotfiles in each directory
-- **dar integration** (`src/dar/`): subprocess wrapper for create, restore and the version check; minimum dar 2.6.x
-- **Staging** (`src/staging/`): sha256 validation beside dar's single read of the source, `dar -c -` cut into dar slices and age-encrypted in memory (no plaintext on the staging device, #370), ephemeral slices; `release.rs` is the policy gate in front of `clean_staging`, shared by `collection run`, `volume write` and `volume resume` (#440)
-- **Volume management** (`src/volume/`): Layout-v2 self-describing layout (`volume-format-v2.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal/ID-thunk parsers (`format.rs`), `MANIFEST.toml` in both directions (`manifest.rs`), envelope read-back (`envelope.rs`), RESTORE.sh from named awk fragments (`restore_script.rs`), catalog rebuild (`rebuild.rs`), raw dump (`raw.rs`), verify, read-slices
+- **tar** (`src/tar/`): the GNU tar writer (`writer.rs`), the pax stream reader and its checks (`pax.rs`, `stream.rs`), the version probe (`probe.rs`)
+- **Staging** (`src/staging/`): sha256 beside tar's single read of the source; the stream cut at member starts into slices (`cut.rs`), each compressed alone (`pack.rs`) and age-encrypted in memory (no plaintext on the staging device, #370); the file table and id map (`files.rs`); `release.rs` is the policy gate in front of `clean_staging`, shared by `collection run`, `volume write` and `volume resume` (#440)
+- **Volume management** (`src/volume/`): Layout 3's self-describing layout (`volume-format-v3.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal/ID-thunk parsers (`format.rs`), `MANIFEST.toml` in both directions (`manifest.rs`), envelope read-back (`envelope.rs`), the heir's RESTORE.sh (`src/volume/heir/`), tapectl's one restore reader (`restore/`), catalog rebuild (`rebuild.rs`), raw dump (`raw.rs`), verify, read-slices
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
 - **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit; `coverage.rs` owns the copy/location SQL and every `volumes.status` predicate, `escrow.rs` owns escrow coverage (verdict AND query) — never inline either again. A copy floor is always `copy_floor(config, resolved.copy_floor_base(), status)`, never `min_copies` read directly (1.7.1)
 - **Store trait** (`src/store.rs`): built (ADR-0006) — `capacity`/`execute`/`confirm`/`read_file`, streaming so RAM tracks block size not slice size. `TapeStore` and `MemStore` share one chain-walk implementation, so MemStore-based tests exercise the real confirm path. `WarehouseStore`/`ExportStore` stay ADR-0006 peers but are unbuilt and untracked: #72 (closed) rescoped warehouse copies to a documented rclone/aws-cli procedure over sealed volumes (`docs/design-errata.md`), #73 (closed) is the warehouse-location model, and no issue tracks an `ExportStore` — `export` does not go through the trait
-- **Cross-volume index** (`src/volume/index.rs`, `policy::coverage::index_versions`): `index/units.tsv` and `index/paths.tsv` built in the home work dir, streamed into each envelope by `build()` after `catalogs/`; RESTORE.sh's `--where`/`--find` read it; `catalog rebuild` reads the operator map as a to-do list and never imports it (`volume-format-v2.md` §1.5)
+- **Cross-volume index** (`src/volume/index.rs`, `policy::coverage::index_versions`): `index/units.tsv` and `index/paths.tsv` built in the home work dir, streamed into each envelope by `build()` after `catalogs/`; RESTORE.sh's `--where`/`--find` read it; `catalog rebuild` reads the operator map as a to-do list and never imports it (`volume-format-v3.md` §1.5)
 - **Collection** (`src/collection/`): `[[collections]]` config → `collection sync|status|plan|run`; folder-per-unit registration, alphabetical next-fit batch selector, stage-once/write-N-copies/release
 
 **Design principles:**
-- Volumes are self-describing — full data restore without the database or tapectl, and catalog rebuild with the operator/escrow key; what that does and does not promise is defined in `docs/design/volume-format-v2.md` ("Self-describing — what that promises")
+- Volumes are self-describing — full data restore without the database or tapectl, and catalog rebuild with the operator/escrow key; what that does and does not promise is defined in `docs/design/volume-format-v3.md` §2 ("Self-describing: what that promises")
 - Strict tenant isolation — zero content metadata in plaintext on tape; tenant envelopes use age trial-decryption
 - Multi-tenant bin-packing on shared volumes
 - Physical cartridges tracked separately from logical volumes (cartridges can be erased/reused)
@@ -230,14 +221,14 @@ said `ok`, and a gate run turns an on-media skip into a failure (#471).
 
 ## External Dependencies
 
-- `dar` ≥2.6 (recommended 2.7.20+) — archive creation/extraction
+- GNU `tar` ≥ 1.35 built with ACL support on every host that writes (ADR-0012 item 274); `gzip`, `xz`, `zstd` for the heir and the tests (tapectl compresses in-process)
 - `sg3-utils` — drive health pages (`sg_logs`), the cartridge's MAM (`sg_read_attr`), drive identity (`sg_inq`), and since 1.7.2 the Control Data Protection mode page that arms and clears Logical Block Protection (`sg_modes` reads it, `sg_wr_mode` writes it; `src/tape/lbp.rs`, #388)
 - `mhvtl` — virtual tape library for development/testing
 - `lsscsi`, `mt-st` — the binary never calls them (device discovery and debugging), but
   `scripts/first-run.sh` step 2 requires both, along with `acl` (`setfacl`) and `python3`
-- the `age` and `tar` CLIs — not used by the binary (it uses the `age` and `tar`
-  crates), but the on-tape RESTORE.sh (the heir path) refuses to run without them or `mt`,
-  and names `gpg` up front when the dar it finds needs it (ADR-0012 2026-10-06 item 21)
+- the `age` CLI — not used by the binary (it uses the `age` crate), but the on-tape
+  RESTORE.sh (the heir path) refuses to run without it, `tar` or `mt`, and needs the
+  decompressor of a compressed staging
 
 ## Key Rust Dependencies
 
@@ -245,7 +236,7 @@ said `ok`, and a gate run turns an on-media skip into a failure (#471).
 
 ## Configuration
 
-- System config: `~/.tapectl/config.toml` (dar path, backends, defaults incl. exclusions and copy policy, archive sets, staging, collections, host check); locations are catalog rows from `location add`, not config — a `[locations]` table is refused
+- System config: `~/.tapectl/config.toml` (`[tar] binary`, backends, defaults incl. exclusions and copy policy, archive sets, staging, collections, host check); locations are catalog rows from `location add`, not config — a `[locations]` table is refused
 - Database: `~/.tapectl/tapectl.db`
 - Session logs: `~/.tapectl/logs/<UTC>-<command>-<pid>.log`, one per long operation
   (issue #386, `src/progress.rs`): phases, waits over 5 s, stalls, and the INFO tracing
