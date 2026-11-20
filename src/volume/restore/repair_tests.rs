@@ -633,7 +633,10 @@ pub(crate) mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome, "failed");
         assert!(
-            rows[0].tar_argv.as_deref().is_some_and(|a| a.contains("--extract")),
+            rows[0]
+                .tar_argv
+                .as_deref()
+                .is_some_and(|a| a.contains("--extract")),
             "tar ran over slices 1 and 2: {:?}",
             rows[0].tar_argv
         );

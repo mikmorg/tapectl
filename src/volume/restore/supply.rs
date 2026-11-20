@@ -1140,7 +1140,10 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
     /// restore's account. The members in it are left out and listed by the
     /// reader, and the restore goes on (item 264).
     fn note_bad(&mut self, wp: &WritePositionInfo, why: &str) {
-        warn!(slice = wp.slice_number, "{why}: the files in the slice are left out");
+        warn!(
+            slice = wp.slice_number,
+            "{why}: the files in the slice are left out"
+        );
         progress::log(&format!("slice {}: left out, {why}", wp.slice_number));
         self.note_here(format!("slice {} could not be read", wp.slice_number));
     }

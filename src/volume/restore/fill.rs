@@ -556,16 +556,22 @@ mod tests {
         assert!(!root.join("d/x").exists());
 
         // A folder that is not there is made, empty: its files come later.
-        fs::set_permissions(&out.join("d"), std::os::unix::fs::PermissionsExt::from_mode(0o555))
-            .unwrap();
+        fs::set_permissions(
+            &out.join("d"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o555),
+        )
+        .unwrap();
         install(&out.join("d"), &root.join("e")).expect("a missing folder is made");
         assert!(root.join("e").is_dir());
         assert_eq!(fs::read_dir(root.join("e")).unwrap().count(), 0);
         fs::write(&out.join("f"), b"file").unwrap();
         install(&out.join("f"), &root.join("e/f")).expect("a file goes in the made folder");
         assert_eq!(fs::read(root.join("e/f")).unwrap(), b"file");
-        fs::set_permissions(&out.join("d"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        fs::set_permissions(
+            &out.join("d"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
     }
 
     /// A verified file replaces only the damaged path, and a path under a
