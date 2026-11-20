@@ -264,6 +264,26 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# --to and --work as absolute paths, once: the per-file check runs inside the
+# destination (cd), where a path as typed (./out) would name something else.
+# Only a path not already absolute is prefixed, with the directory the script
+# was started in, so that no tool needs to resolve a directory that does not
+# exist yet (#575).
+absolute_path() { # <path>: the path, from the root
+  case $1 in
+  /*) REPLY=$1 ;;
+  *) REPLY="$PWD/$1" ;;
+  esac
+}
+if [ -n "$TO" ]; then
+  absolute_path "$TO"
+  TO=$REPLY
+fi
+if [ -n "$WORK_ARG" ]; then
+  absolute_path "$WORK_ARG"
+  WORK_ARG=$REPLY
+fi
+
 [ -n "$MODE" ] || die_usage "no mode given (--info, --verify, --find-envelope, --list, --restore, --where or --find)"
 case $MODE in
 find-envelope | list | restore | where | find) [ ${#KEYS[@]} -gt 0 ] || die_usage "--$MODE needs your age key file: --key FILE" ;;
