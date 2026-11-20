@@ -616,6 +616,34 @@ pub(crate) mod tests {
             .contains("swaps no cartridge"));
     }
 
+    /// #585: a restore that fails inside the reader still ran tar over the
+    /// slices before it, so its `restores` row carries tar's last run (argv
+    /// and exit), as `RestoreTrace`'s contract says, and not NULLs that read
+    /// as "tar never ran".
+    #[test]
+    fn a_restore_that_fails_inside_the_reader_still_records_tars_last_run() {
+        let mut h = copies("256K", None, &[A, B]);
+        damage(&mut h, A, 3, 0);
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        bay.attended = false;
+        let (r, _dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("swaps no cartridge"), "{err}");
+        let rows = crate::volume::restore_record::rows(&h.conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "failed");
+        assert!(
+            rows[0].tar_argv.as_deref().is_some_and(|a| a.contains("--extract")),
+            "tar ran over slices 1 and 2: {:?}",
+            rows[0].tar_argv
+        );
+        assert_eq!(rows[0].tar_exit_code, Some(0), "tar's own exit is recorded");
+        assert!(
+            rows[0].tar_version.is_some(),
+            "tar's version is read once it has run"
+        );
+    }
+
     /// The operator declines the swap: the slice is read from the cartridge in
     /// the drive with a hole where its chunk fails to authenticate. The
     /// restore names exactly the files the hole touches and fails; every
