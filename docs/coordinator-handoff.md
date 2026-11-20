@@ -134,7 +134,7 @@ an older item, an issue body or a paragraph of `CLAUDE.md` misleads when read al
 - `CONTEXT.md` is the glossary: Slice, Range, Spanning, Stage set, Volume, Cartridge.
 - **D1 to D22**: the plan's Stage 1, "What Stage 1 writes down".
 - **W1 to W9**, the writer at the early warning, and the **fill ceiling**:
-  `docs/design/volume-format-v2.md` §4.3. They are carried to Layout 3 word for word.
+  `docs/design/volume-format-v3.md` §5.2, carried from Layout 2's §4.3 word for word.
 - **An owed slice, an owed run, the bound**: the plan's T5.1, "The plan, exactly".
 - **The cut** is where the stream is divided into slices (D3). **`cut`** in code font is
   a write status of Layout 2 that item 288 removes. They are two things.
