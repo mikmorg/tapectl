@@ -2990,6 +2990,67 @@ fn volume_write_in_contact<'c>(
     Ok(layout_snapshot)
 }
 
+/// Test seam for integration tests (tests/restore_memory.rs, #571): `volume init` over any
+/// Store. Production code goes through volume_init / volume_init_barcoded.
+#[doc(hidden)]
+pub fn volume_init_over_store_for_tests(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    barcode: Option<&str>,
+    store: &mut dyn Store,
+) -> Result<()> {
+    let mut slot = ContactSlot::empty();
+    let r = volume_init_contacted_barcoded(
+        conn,
+        config,
+        label,
+        device,
+        block_size,
+        false,
+        None,
+        barcode,
+        None,
+        &mut slot,
+        ContactStore::Injected(store),
+    );
+    slot.finish_result(r).map(|_| ())
+}
+
+/// Test seam for integration tests (tests/restore_memory.rs, #571): `volume write` over any
+/// Store. Production code goes through volume_write / volume_write_scoped.
+#[doc(hidden)]
+pub fn volume_write_over_store_for_tests(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    store: &mut dyn Store,
+) -> Result<()> {
+    let mut slot = ContactSlot::empty();
+    let r = volume_write_contacted(
+        conn,
+        paths,
+        config,
+        label,
+        device,
+        block_size,
+        false,
+        false,
+        false,
+        false,
+        true,
+        &mut slot,
+        ContactStore::Injected(store),
+        None,
+    );
+    slot.finish_result(r).map(|_| ())
+}
+
 /// Resume an interrupted write session for `label` — the cross-process half
 /// of `docs/design/layout-session.md`'s Resume rule (issue #25, playbook T8
 /// remainder). Mirrors [`volume_write`]'s shape, with three deliberate
