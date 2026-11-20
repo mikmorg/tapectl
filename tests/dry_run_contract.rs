@@ -166,6 +166,9 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // `drive add`, `backend add` before 1.9.0: the dry run plans the edit
     // and writes nothing (`config.toml` byte-for-byte unchanged), proven in
     // `tests/dry_run_global.rs`.
+    // D18 (#548): `--dry-run` reports the row it would write; proven by
+    // `cli::drill::tests::a_dry_run_reports_and_writes_nothing`.
+    (&["drill", "record"], Verdict::Honours),
     (&["drive", "add"], Verdict::Honours),
     (&["drive", "cleaned"], Verdict::Honours),
     (&["drive", "cleaning-cartridge", "add"], Verdict::Honours),

@@ -18348,7 +18348,11 @@ mod tests {
         };
         record_write_bookkeeping(&conn, 1, &layout, 4096).unwrap();
         let got: Option<String> = conn
-            .query_row("SELECT restore_sh_sha256 FROM volumes WHERE id = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT restore_sh_sha256 FROM volumes WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(got, Some("ab".repeat(32)));
     }

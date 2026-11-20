@@ -871,3 +871,23 @@ CREATE INDEX idx_events_entity ON events(entity_type, entity_id);
 CREATE INDEX idx_events_timestamp ON events(timestamp);
 CREATE INDEX idx_events_tenant ON events(tenant_id);
 CREATE INDEX idx_events_action_timestamp ON events(action, timestamp);
+
+-- ---------------------------------------------------------------------------
+-- Heir drills (D18, ADR-0012 item 247): `drill record LABEL` writes one row,
+-- and `audit`'s `drill_age` reads the newest. `script_sha256` is the volume's
+-- own `restore_sh_sha256` (NULL when the catalog never learned it);
+-- `tar_version` and `age_version` are the first lines of `tar --version` and
+-- `age --version` on the host that ran the command (NULL when absent).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE drills (
+    id            INTEGER PRIMARY KEY,
+    recorded_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    volume_id     INTEGER NOT NULL REFERENCES volumes(id),
+    script_sha256 TEXT,
+    tar_version   TEXT,
+    age_version   TEXT,
+    note          TEXT
+);
+
+CREATE INDEX idx_drills_volume ON drills(volume_id);

@@ -7,6 +7,7 @@ pub mod collection;
 pub mod config;
 pub mod consent;
 pub mod db;
+pub mod drill;
 pub mod drive;
 pub mod host;
 pub mod key;
@@ -392,6 +393,12 @@ pub enum Commands {
     Location {
         #[command(subcommand)]
         command: location::LocationCommands,
+    },
+
+    /// Record heir drills (RESTORE.sh run with the stock tools)
+    Drill {
+        #[command(subcommand)]
+        command: drill::DrillCommands,
     },
 
     /// Generate reports

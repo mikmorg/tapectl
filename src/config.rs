@@ -930,6 +930,39 @@ pub struct DefaultsConfig {
     /// serialized `[defaults]` puts the table after the plain keys.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub copies_at: BTreeMap<String, i64>,
+    /// How many days may pass after the newest recorded heir drill
+    /// (`drill record`) before `audit` warns (`drill_age`; D18, ADR-0012
+    /// item 247). Absent means [`DEFAULT_DRILL_INTERVAL_DAYS`]; at least 1
+    /// ([`validate_drill_interval_days`]). Not written back when absent, so
+    /// `init`'s file is unchanged. Read it through [`Defaults::drill_interval_days`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill_interval_days: Option<i64>,
+}
+
+/// The `[defaults] drill_interval_days` in force when the key is absent: a
+/// year (D18).
+pub const DEFAULT_DRILL_INTERVAL_DAYS: i64 = 365;
+
+impl DefaultsConfig {
+    /// The drill interval in force: the key, or [`DEFAULT_DRILL_INTERVAL_DAYS`].
+    pub fn drill_interval_days(&self) -> i64 {
+        self.drill_interval_days
+            .unwrap_or(DEFAULT_DRILL_INTERVAL_DAYS)
+    }
+}
+
+/// A `drill_interval_days`: at least one day. At 0 or below every drill is
+/// always overdue, an off switch wearing an interval's clothes.
+pub fn validate_drill_interval_days(days: i64) -> std::result::Result<(), String> {
+    if days >= 1 {
+        Ok(())
+    } else {
+        Err(
+            "must be >= 1 (how many days may pass after the newest recorded heir drill \
+             before `audit` warns that one is due)"
+                .to_string(),
+        )
+    }
 }
 
 /// The `[defaults] verify_interval_days` in force when the key is absent: a
@@ -990,6 +1023,7 @@ impl Default for DefaultsConfig {
             warehouse_copies: 0,
             verify_interval_days: DEFAULT_VERIFY_INTERVAL_DAYS,
             copies_at: BTreeMap::new(),
+            drill_interval_days: None,
         }
     }
 }
@@ -1811,6 +1845,15 @@ impl Config {
             if let Err(e) = validate_verify_interval_days(days) {
                 problems.push(format!(
                     "{}: defaults.verify_interval_days = {days} {e}",
+                    path.display()
+                ));
+            }
+        }
+        // D18: the drill clock's interval.
+        if let Some(days) = self.defaults.drill_interval_days {
+            if let Err(e) = validate_drill_interval_days(days) {
+                problems.push(format!(
+                    "{}: defaults.drill_interval_days = {days} {e}",
                     path.display()
                 ));
             }
@@ -4678,6 +4721,47 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&path).expect("one day is a legitimate interval");
         assert_eq!(cfg.archive_sets[0].verify_interval_days, Some(1));
+    }
+
+    /// D18 (#548): `[defaults] drill_interval_days` resolves to 365 when
+    /// absent (and is not written back), loads as a day count, and is refused
+    /// below one day by name at load and by `config check`.
+    #[test]
+    fn drill_interval_days_resolves_and_a_bad_value_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        assert_eq!(Config::default().defaults.drill_interval_days(), 365);
+        std::fs::write(&path, "[defaults]\nmin_copies = 2\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.drill_interval_days(),
+            365
+        );
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!written.contains("drill_interval_days"), "{written}");
+        std::fs::write(&path, "[defaults]\ndrill_interval_days = 90\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.drill_interval_days(),
+            90
+        );
+        for days in [0, -7] {
+            let body = format!("[defaults]\ndrill_interval_days = {days}\n");
+            std::fs::write(&path, &body).unwrap();
+            let msg = Config::load(&path).unwrap_err().to_string();
+            assert!(
+                msg.contains(&format!("defaults.drill_interval_days = {days}")),
+                "{msg}"
+            );
+            let report = crate::policy::lenient_config::check(&body, &path);
+            assert!(!report.valid);
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("defaults.drill_interval_days")),
+                "{:?}",
+                report.problems
+            );
+        }
     }
 
     /// Issue #453 (ADR-0012 2026-10-15 later, item 66): `[defaults]

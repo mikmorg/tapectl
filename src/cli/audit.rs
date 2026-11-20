@@ -397,6 +397,16 @@ const CHECKS: &[Check] = &[
         },
     },
     Check {
+        // #548 (D18, ADR-0012 item 247): the heir path is proven by a drill,
+        // and a drill is a recorded event (`drill record`). None recorded, or
+        // the newest older than `[defaults] drill_interval_days`, is a
+        // warning; a catalog with no sealed volume has nothing to drill.
+        name: "drill_age",
+        scope: Scope::Archive {
+            run: check_drill_age,
+        },
+    },
+    Check {
         name: "no_full_verify",
         scope: Scope::Archive {
             run: check_no_full_verify,
@@ -2109,6 +2119,52 @@ fn check_collection_unsynced(ctx: &Ctx<'_>) -> Result<Findings> {
         });
     }
     Ok(f)
+}
+
+fn check_drill_age(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: drill_age_findings(ctx.conn, ctx.config.defaults.drill_interval_days())?,
+    })
+}
+
+/// One warning when no heir drill is recorded, or the newest is older than
+/// `interval_days`. Silent when no sealed volume exists: nothing could be
+/// drilled yet. A warning, never a violation (ADR-0004).
+fn drill_age_findings(conn: &Connection, interval_days: i64) -> Result<Vec<AuditFinding>> {
+    let sealed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM volumes WHERE status = 'sealed')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !sealed {
+        return Ok(Vec::new());
+    }
+    let (newest, age): (Option<String>, Option<i64>) = conn.query_row(
+        "SELECT MAX(recorded_at),
+                CAST(julianday('now') - julianday(MAX(recorded_at)) AS INTEGER)
+         FROM drills",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let message = match (newest, age) {
+        (Some(when), Some(days)) if days > interval_days => format!(
+            "the newest recorded heir drill is from {when}, {days} days ago (more than the \
+             {interval_days} days of drill_interval_days)"
+        ),
+        (Some(_), _) => return Ok(Vec::new()),
+        (None, _) => "no heir drill is recorded: nothing shows that RESTORE.sh restores \
+                      a tape with the stock tools alone"
+            .to_string(),
+    };
+    Ok(vec![AuditFinding {
+        unit: "archive".into(),
+        check: "drill_age".into(),
+        message,
+        action: "run RESTORE.sh from a sealed tape as an heir would (docs/handoff.md), then \
+                 tapectl drill record LABEL"
+            .into(),
+    }])
 }
 
 fn check_no_full_verify(ctx: &Ctx<'_>) -> Result<Findings> {
@@ -4645,6 +4701,106 @@ mod tests {
             !out.contains("audit: 1 violation"),
             "the human-readable summary line must not appear in JSON mode, got: {out}"
         );
+    }
+
+    /// #548 (D18): `drill_age` against the exit code `run` returns: a sealed
+    /// volume and no drill is a warning (1); a drill older than the interval
+    /// is one; a fresh drill is quiet (0); the interval is `[defaults]
+    /// drill_interval_days`; and a catalog with nothing sealed has nothing to
+    /// drill.
+    #[test]
+    fn drill_age_warns_with_none_and_with_an_old_one_and_is_quiet_after_a_fresh_one() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut config = Config::default();
+        let exit =
+            |conn: &Connection, config: &Config| run(conn, config, None, false, false).unwrap();
+        let drill_warnings = |conn: &Connection, config: &Config| {
+            collect_findings(conn, config, None)
+                .unwrap()
+                .1
+                .into_iter()
+                .filter(|f| f.check == "drill_age")
+                .count()
+        };
+
+        // Nothing sealed: nothing to drill, quiet.
+        assert_eq!(exit(&conn, &config), 0);
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'lto0', 1000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        // No drill recorded.
+        assert_eq!(drill_warnings(&conn, &config), 1);
+        assert_eq!(
+            collect_findings(&conn, &config, None).unwrap().0.len(),
+            0,
+            "a warning, never a violation"
+        );
+
+        // A drill 400 days old is past the 365 default.
+        conn.execute(
+            "INSERT INTO drills (recorded_at, volume_id) VALUES (datetime('now', '-400 days'), 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(drill_warnings(&conn, &config), 1);
+
+        // Past a longer interval it is not; a bad (zero) one is `config check`'s.
+        config.defaults.drill_interval_days = Some(500);
+        assert_eq!(drill_warnings(&conn, &config), 0);
+        config.defaults.drill_interval_days = None;
+
+        // A fresh drill.
+        conn.execute("INSERT INTO drills (volume_id) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(drill_warnings(&conn, &config), 0);
+    }
+
+    /// The exit code the operator sees: 1 (warn) with no drill, 0 after.
+    /// The control for the test above, which reads the findings.
+    #[test]
+    fn drill_age_sets_the_exit_code() {
+        let conn = crate::db::open_memory().unwrap();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'lto0', 1000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome, completed_at)
+             VALUES (1, 'full', 'passed', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (entity_type, entity_id, action, timestamp)
+             VALUES ('system', 0, 'escrow_kit_generated', datetime('now', '+1 day'))",
+            [],
+        )
+        .unwrap();
+        let only_drill_warns = |conn: &Connection| {
+            let (v, w) = collect_findings(conn, &config, None).unwrap();
+            v.is_empty() && w.iter().all(|f| f.check == "drill_age")
+        };
+        assert!(
+            only_drill_warns(&conn),
+            "fixture: nothing else fires: {:?}",
+            collect_findings(&conn, &config, None)
+                .unwrap()
+                .1
+                .iter()
+                .map(|f| (f.check.clone(), f.message.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(run(&conn, &config, None, false, false).unwrap(), 1);
+        conn.execute("INSERT INTO drills (volume_id) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(run(&conn, &config, None, false, false).unwrap(), 0);
     }
 
     /// The summary line is part of the human-readable contract and must
