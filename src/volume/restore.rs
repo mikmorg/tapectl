@@ -3197,11 +3197,16 @@ mod tests {
         let guard = site.open(&conn, None);
         let mut bay = FixedBay(store);
         let mut supply = Supply::start(&conn, &mut bay, guard, None, "TEST", site);
-        let r = supply.read_slice(wp, identities, None).map(|read| {
+        let r = supply.read_slice(wp, identities, None).and_then(|read| {
+            // A slice nothing could read is a bad slice, not an error of the
+            // restore (item 264, #583): a test of the read itself sees it so.
+            if let Some(why) = read.bad {
+                return Err(TapectlError::Other(why));
+            }
             assert!(read.holes.is_empty(), "a clean read has no hole");
             assert!(read.unavailable.is_none());
             assert_eq!(read.authentic_bytes, read.bytes.len() as u64);
-            read.bytes
+            Ok(read.bytes)
         });
         supply.finish(r.as_ref().err());
         r
