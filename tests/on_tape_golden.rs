@@ -394,7 +394,9 @@
 //! text shows the format in the test; one that holds a sha256 writes the generated text to
 //! a file under the target directory when it fails and names that file.
 
-use tapectl::volume::layout::{generate_id_thunk_v2, IdThunkV2Params};
+use tapectl::volume::layout::{
+    generate_front_index, generate_id_thunk_v2, FrontIndexFile, IdThunkV2Params,
+};
 use tapectl::volume::manifest::{Manifest, ManifestSlice, ManifestUnit};
 
 /// Compare a generated document with its pinned text. On a difference the generated text
@@ -825,5 +827,135 @@ fn layout3_manifest_operator_envelope() {
         "manifest-operator-envelope",
         &manifest.to_toml(),
         MANIFEST_OPERATOR_ENVELOPE,
+    );
+}
+
+fn file(
+    position: i32,
+    type_label: &'static str,
+    size_bytes: Option<u64>,
+    hash_digit: Option<&str>,
+) -> FrontIndexFile {
+    FrontIndexFile {
+        position,
+        type_label,
+        size_bytes,
+        sha256_encrypted: hash_digit.map(|d| d.repeat(64)),
+    }
+}
+
+/// The plan of an eleven-file tape: File 0 to the seal marker at 10, one of each kind of
+/// file the format lists (volume-format-v3.md section 4). File 3 (the index itself) and the
+/// seal marker carry no `size_bytes` and no `sha256_encrypted`. Used by the front-index and
+/// the seal-marker pins.
+fn eleven_file_plan() -> Vec<FrontIndexFile> {
+    vec![
+        file(0, "id_thunk", Some(1_996), Some("0")),
+        file(1, "system_guide", Some(41_212), Some("1")),
+        file(2, "restore_sh", Some(180_000), Some("2")),
+        file(3, "front_index", None, None),
+        file(4, "operator_envelope", Some(30_720), Some("4")),
+        file(5, "operator_envelope_backup", Some(30_720), Some("5")),
+        file(6, "tenant_envelope", Some(20_480), Some("6")),
+        file(7, "tenant_envelope_backup", Some(20_480), Some("7")),
+        file(8, "data_slice", Some(20_512), Some("8")),
+        file(9, "data_slice", Some(2_300), Some("9")),
+        file(10, "seal_marker", None, None),
+    ]
+}
+
+const FRONT_INDEX: &str = r##"================================================================
+                    TAPECTL FRONT INDEX
+================================================================
+
+Volume: L8-0001
+This file maps every tape position to its type, on-tape byte size, and
+the sha256 of its on-tape (encrypted) bytes. It contains NO content
+metadata: no filenames, no plaintext checksums, no tenant or unit names.
+The trailing seal marker binds this index by hash; see the system guide.
+
+This tape may end early. The list below is the plan: every file the
+write meant to put on the tape. The seal marker, the LAST file on the
+tape, says where the tape really ended (its ended_after). A file listed
+after that position is not on this tape.
+
+================================================================
+              MACHINE-READABLE DATA (TOML)
+================================================================
+
+[index]
+volume = "L8-0001"
+layout_version = 3
+may_end_early = true
+
+[[files]]
+position = 0
+type = "id_thunk"
+size_bytes = 1996
+sha256_encrypted = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[files]]
+position = 1
+type = "system_guide"
+size_bytes = 41212
+sha256_encrypted = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[files]]
+position = 2
+type = "restore_sh"
+size_bytes = 180000
+sha256_encrypted = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[files]]
+position = 3
+type = "front_index"
+
+[[files]]
+position = 4
+type = "operator_envelope"
+size_bytes = 30720
+sha256_encrypted = "4444444444444444444444444444444444444444444444444444444444444444"
+
+[[files]]
+position = 5
+type = "operator_envelope_backup"
+size_bytes = 30720
+sha256_encrypted = "5555555555555555555555555555555555555555555555555555555555555555"
+
+[[files]]
+position = 6
+type = "tenant_envelope"
+size_bytes = 20480
+sha256_encrypted = "6666666666666666666666666666666666666666666666666666666666666666"
+
+[[files]]
+position = 7
+type = "tenant_envelope_backup"
+size_bytes = 20480
+sha256_encrypted = "7777777777777777777777777777777777777777777777777777777777777777"
+
+[[files]]
+position = 8
+type = "data_slice"
+size_bytes = 20512
+sha256_encrypted = "8888888888888888888888888888888888888888888888888888888888888888"
+
+[[files]]
+position = 9
+type = "data_slice"
+size_bytes = 2300
+sha256_encrypted = "9999999999999999999999999999999999999999999999999999999999999999"
+
+[[files]]
+position = 10
+type = "seal_marker"
+"##;
+
+#[test]
+fn layout3_front_index() {
+    assert_pinned_text(
+        "front-index",
+        &generate_front_index("L8-0001", &eleven_file_plan()),
+        FRONT_INDEX,
     );
 }
