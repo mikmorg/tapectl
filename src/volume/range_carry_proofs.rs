@@ -1291,3 +1291,51 @@ fn staged_slices_the_write_would_not_plan_do_not_refuse_a_rewrite() {
         "the run the source held, and only it"
     );
 }
+
+const HEAD8: &str = "kumquat-alpha-hhh";
+const TAIL8: &str = "kumquat-bravo-ttt";
+const ORDER_TAPES: [&str; 3] = ["ORD-T1", "ORD-T2", "ORD-T3"];
+
+/// 8-3: a rewrite lays the stagings in the order the source held them
+/// (`volume-format-v3.md` §5.4: "the stagings keep the source's order"). Tape
+/// 2 holds `TAIL8`'s tail (3), then `HEAD8`'s head (1-2), though `HEAD8`
+/// sorts first by name: the destination is laid out the same, owed runs both,
+/// in the source's order and not in unit-name order.
+#[test]
+fn a_rewrite_lays_the_carried_stagings_in_the_order_the_source_held_them() {
+    let mut h = Home::new(None, 1, "64K");
+    h.unit(TENANT_ONE, TAIL8, files("tail-reel", &[50_000; 3], 21));
+    h.stage(TAIL8);
+    for label in ORDER_TAPES {
+        h.volume(label);
+    }
+    write_full(&mut h, ORDER_TAPES[0], Warn::InSlice(TAIL8, 2));
+    h.unit(TENANT_TWO, HEAD8, files("head-reel", &[50_000; 3], 22));
+    h.stage(HEAD8);
+    write_full(&mut h, ORDER_TAPES[1], Warn::InSlice(HEAD8, 2));
+    write_full(&mut h, ORDER_TAPES[2], Warn::Never);
+    assert_eq!(
+        write::recorded_ranges(&h.conn, ORDER_TAPES[1]).unwrap(),
+        [range(TAIL8, 3, 3), range(HEAD8, 1, 2)],
+        "tape 2 holds the tail first, then the head"
+    );
+    let ran = rewrite_with(&mut h, ORDER_TAPES[1], "ORD-T2R", false);
+    ran.result.unwrap_or_else(|e| panic!("{e}\n{:?}", ran.log));
+    let [(_, rehearsal), (_, written)] = &ran.planned[..] else {
+        panic!("{:?}", ran.planned)
+    };
+    assert_eq!(rehearsal, written);
+    assert_eq!(
+        rehearsal,
+        &[
+            (TAIL8.to_string(), 3),
+            (HEAD8.to_string(), 1),
+            (HEAD8.to_string(), 2)
+        ],
+        "the source's order, not the unit names'"
+    );
+    assert_eq!(
+        write::recorded_ranges(&h.conn, "ORD-T2R").unwrap(),
+        [range(TAIL8, 3, 3), range(HEAD8, 1, 2)]
+    );
+}

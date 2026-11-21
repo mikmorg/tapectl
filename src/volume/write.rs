@@ -9645,7 +9645,7 @@ fn plan_span_set(
     unit: &crate::db::models::Unit,
     min_copies: i64,
     version: i64,
-) -> Result<(Vec<BuildSlice>, UnitSpan, PlanClass)> {
+) -> Result<(Vec<BuildSlice>, UnitSpan, PlanClass, Option<(String, i64)>)> {
     let rows: Vec<SpanRow> = conn
         .prepare(
             "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
@@ -9741,7 +9741,36 @@ fn plan_span_set(
     let span = UnitSpan {
         slices: rows.into_iter().map(|r| r.slice).collect(),
     };
-    Ok((planned, span, class))
+    let source_order = carried_order_key(conn, &sources, stage_set_id)?;
+    Ok((planned, span, class, source_order))
+}
+
+/// Where a carried set sat on the volume it is carried from: `(label, the
+/// lowest file position of its slices there)`, for the first source (by
+/// label) that holds any; `None` for a set nothing carries. [`find_staged_data`]
+/// orders the carried sets by it, so a rewrite or compaction keeps the
+/// stagings in the order the source held them (`volume-format-v3.md` §5.4;
+/// #598 8-3).
+fn carried_order_key(
+    conn: &Connection,
+    sources: &[(i64, String)],
+    stage_set_id: i64,
+) -> Result<Option<(String, i64)>> {
+    for (volume_id, label) in sources {
+        let first: Option<i64> = conn.query_row(
+            "SELECT MIN(CAST(wp.position AS INTEGER)) FROM write_positions wp
+               JOIN writes w ON w.id = wp.write_id
+               JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+              WHERE w.volume_id = ?1 AND sl.stage_set_id = ?2 AND wp.status = 'written'
+                AND w.status IN ('completed', 'range')",
+            params![volume_id, stage_set_id],
+            |r| r.get(0),
+        )?;
+        if let Some(first) = first {
+            return Ok(Some((label.clone(), first)));
+        }
+    }
+    Ok(None)
 }
 
 /// The volumes a staged set is being carried from: the label of each
@@ -9896,6 +9925,7 @@ fn find_staged_data(
     }
 
     let mut batch = StagedBatch::default();
+    let mut order_keys: Vec<Option<(String, i64)>> = Vec::new();
     for (ss_id, snap_id, name, uuid, tenant_id, tar_version, stream_bytes, compression, snap_ver) in
         rows
     {
@@ -9905,7 +9935,7 @@ fn find_staged_data(
         let unit = queries::get_unit_by_uuid(conn, &uuid)?
             .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
         let policy = crate::policy::resolve(conn, config, &unit)?;
-        let (slices, span, class) = plan_span_set(
+        let (slices, span, class, source_order) = plan_span_set(
             conn,
             config,
             ss_id,
@@ -9928,7 +9958,19 @@ fn find_staged_data(
                 span: Some(span),
             });
             batch.classes.push(class);
+            order_keys.push(source_order);
         }
+    }
+    // A carried set goes where the source held it: the carried sets in the
+    // source's order, ahead of the sets nothing carries, which keep the
+    // name order the query gave (a stable sort; only a rewrite or a
+    // compaction has carried sets). The plan order then takes owed runs
+    // before the queue, within each class in this order.
+    if order_keys.iter().any(Option::is_some) {
+        let mut at: Vec<usize> = (0..order_keys.len()).collect();
+        at.sort_by_key(|&i| (order_keys[i].is_none(), order_keys[i].clone()));
+        batch.units = at.iter().map(|&i| batch.units[i].clone()).collect();
+        batch.classes = at.iter().map(|&i| batch.classes[i]).collect();
     }
     Ok(batch)
 }
