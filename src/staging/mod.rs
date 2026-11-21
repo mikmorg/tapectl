@@ -47,6 +47,10 @@ pub struct SnapshotOutcome {
     /// apart on the `minted: false` path, where none of that is obvious
     /// from `snapshot_id`/`version` alone.
     pub status: String,
+    /// What THIS walk left out (patterns and the socket rule), whether or not
+    /// a version was minted: a run that mints nothing still reports what it
+    /// saw (#542, ADR-0012 item 252; #592 C2-1).
+    pub walk_left_out: Vec<crate::db::snapshot_left_out::LeftOut>,
 }
 
 /// Create a snapshot: fast directory walk, manifest, files table — unless
@@ -187,6 +191,7 @@ pub fn snapshot_create_detailed_reading(
                         version: latest_version,
                         minted: false,
                         status: latest_status,
+                        walk_left_out: left_out,
                     });
                 }
                 // reclaimable/purged: a dead row. Content
@@ -285,6 +290,7 @@ pub fn snapshot_create_detailed_reading(
         version: next_version,
         minted: true,
         status: "created".to_string(),
+        walk_left_out: left_out,
     })
 }
 
@@ -1019,7 +1025,7 @@ fn stage_create_inner(
     let list_dir = home_work_dir(paths, ".tar-list-")?;
     let list = crate::tar::write_list(list_dir.path(), &scan.paths())?;
     let params = crate::tar::CreateParams {
-        binary: &config.tar.binary,
+        binary: &tar_run_binary(&config.tar.binary, &tar_check.path),
         root: Path::new(&read_root),
         list: &list,
         xattrs: resolved.preserve_xattrs,
@@ -1437,8 +1443,18 @@ fn stream_refused(
     e: crate::tar::StreamError,
     finish: Option<&crate::tar::TarFinish>,
 ) -> TapectlError {
+    // tar that died of SIGPIPE was stopped by this refusal closing the pipe,
+    // not a failure of its own (#591 1-3): it is not blamed.
+    const SIGPIPE: i32 = 13;
+    let sigpipe = matches!(
+        finish,
+        Some(crate::tar::TarFinish::Failed {
+            signal: Some(SIGPIPE),
+            ..
+        })
+    );
     let tar_said = match finish {
-        Some(f) if !f.is_clean() => format!(
+        Some(f) if !f.is_clean() && !sigpipe => format!(
             " tar exited {}: {}",
             f.code()
                 .map_or_else(|| "by a signal".to_string(), |c| c.to_string()),
@@ -1478,6 +1494,17 @@ fn tar_failed(unit: &str, finish: &crate::tar::TarFinish) -> TapectlError {
                 .code()
                 .map_or_else(|| "by a signal".to_string(), |c| c.to_string()),
         )),
+    }
+}
+
+/// The program name tar is run by. A name with a `/` is run as the probe
+/// resolved it (#591 1-C1): the probe looks where tapectl stands, the writer
+/// runs tar in the unit's root, and a relative name would mean two files. A
+/// bare name is left to `PATH`, as it was probed.
+fn tar_run_binary(configured: &str, resolved: &Path) -> String {
+    match resolved.to_str() {
+        Some(p) if configured.contains('/') => p.to_string(),
+        _ => configured.to_string(),
     }
 }
 
@@ -1523,7 +1550,7 @@ fn write_left_out(
     }
     if rows.len() > LEFT_OUT_NAMED {
         out.push_str(&format!(
-            "\n  and {} more left out; `tapectl snapshot create --json` lists them all",
+            "\n  and {} more left out, all recorded with v{version} of unit \"{unit}\"",
             rows.len() - LEFT_OUT_NAMED
         ));
     }
@@ -2874,7 +2901,19 @@ fn walk_directory_reporting(path: &str, global_excludes: &[String]) -> Result<Wa
             // #542: said, with the pattern, instead of dropped without a
             // word. A pattern is the operator's rule and is named before the
             // socket rule (item 270), which holds for every unit.
-            let reported = if let Some(pattern) = exclude_compiled.file_pattern(entry.path()) {
+            // The unit's dotfile is the one entry a pattern cannot leave
+            // out: the stage archives it whatever a pattern says
+            // (`volume-format-v3.md` §3.1, "the unit's dotfile included"), so
+            // it is not reported as left out (#592 2-3).
+            let is_dotfile = rel
+                .to_str()
+                .is_some_and(crate::unit::dotfile::is_unit_dotfile);
+            let reported = if is_dotfile {
+                if exclude_compiled.file_pattern(entry.path()).is_some() {
+                    continue;
+                }
+                None
+            } else if let Some(pattern) = exclude_compiled.file_pattern(entry.path()) {
                 Some((Reason::Pattern, Some(pattern.to_string())))
             } else if entry.file_type().is_socket() {
                 Some((Reason::Socket, None))
@@ -3173,6 +3212,28 @@ mod tests {
 
     // ── issue #542, ADR-0012 items 252 and 270: what a snapshot left out ──
 
+    /// #592 2-4: the overflow line of `stage create`'s notice offers no
+    /// command that can mint a version and list another one's entries.
+    #[test]
+    fn the_left_out_overflow_line_offers_no_command_that_can_mint() {
+        let rows: Vec<crate::db::snapshot_left_out::LeftOut> = (0..25)
+            .map(|i| crate::db::snapshot_left_out::LeftOut {
+                reason: crate::db::snapshot_left_out::Reason::Pattern,
+                pattern: Some("*.tmp".into()),
+                path: format!("f{i:02}.tmp"),
+                folder: false,
+                files: 1,
+                bytes: 3,
+            })
+            .collect();
+        let mut out = Vec::new();
+        write_left_out(&mut out, "u", 2, &rows);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("and 5 more left out"), "{text}");
+        assert!(!text.contains("snapshot create"), "{text}");
+        assert!(text.contains("v2"), "{text}");
+    }
+
     /// What `snapshot_left_out` holds for `snapshot_id`, in `seq` order:
     /// (reason, pattern, path, kind, files, bytes).
     type LeftOutRow = (String, Option<String>, String, String, i64, i64);
@@ -3261,6 +3322,86 @@ mod tests {
                 "{kept} must be in the file list"
             );
         }
+    }
+
+    /// #592 2-3: the stage archives the unit's dotfile whatever a pattern
+    /// says (`volume-format-v3.md` §3.1), so a snapshot does not report it
+    /// as left out.
+    #[test]
+    fn a_pattern_matching_the_unit_dotfile_does_not_report_it_left_out() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![".*".to_string()]);
+        fs::write(src.join("keep.txt"), b"kept").unwrap();
+        fs::write(src.join(".hidden"), b"left").unwrap();
+        assert!(src.join(crate::unit::dotfile::UNIT_DOTFILE).exists());
+
+        let outcome = snapshot_create_detailed(&conn, "unit1", &config).unwrap();
+        let rows = left_out_rows(&conn, outcome.snapshot_id);
+        let paths: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(paths, vec![".hidden"], "{rows:?}");
+    }
+
+    /// #592 1-2: `scan` lists the snapshot's own entries (`volume-format-v3.md`
+    /// §3.2: path, kind and size), so a file whose size is not the recorded one
+    /// when `scan` reaches it is refused, not listed at its new size.
+    #[test]
+    fn scan_refuses_a_file_whose_size_is_not_the_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("a"), vec![1u8; 10]).unwrap();
+        let outcome = snapshot_create_detailed(&conn, "unit1", &config).unwrap();
+
+        // Unchanged: scan lists it.
+        let scan = archive::scan(&conn, outcome.snapshot_id, &src, "unit1").unwrap();
+        assert!(scan.entries.iter().any(|e| e.listed.path == "a"));
+
+        // Appended to, after the source check and before scan.
+        fs::write(src.join("a"), vec![1u8; 20]).unwrap();
+        let err = archive::scan(&conn, outcome.snapshot_id, &src, "unit1")
+            .err()
+            .expect("a size that is not the snapshot's is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("DIRTY") && msg.contains("a"), "{msg}");
+        assert!(msg.contains("10") && msg.contains("20"), "{msg}");
+    }
+
+    /// #592 1-3: when tapectl refuses mid-stream it closes the pipe and tar
+    /// dies of SIGPIPE; the refusal does not blame tar for that. A tar that
+    /// failed on its own is still named.
+    #[test]
+    fn a_refusal_does_not_blame_tar_for_the_sigpipe_it_caused() {
+        let refusal = || {
+            crate::tar::StreamError::Refused(crate::tar::stream::Refusal {
+                rule: crate::tar::stream::Rule::AclLost,
+                path: Some("x".into()),
+                offset: 512,
+                detail: "a file's ACL is missing".into(),
+            })
+        };
+        let died = |signal| crate::tar::TarFinish::Failed {
+            code: None,
+            signal: Some(signal),
+            stderr: crate::tar::Stderr::default(),
+        };
+        let piped = stream_refused("u", refusal(), Some(&died(13))).to_string();
+        assert!(piped.contains("is refused at byte 512"), "{piped}");
+        assert!(!piped.contains("tar exited"), "{piped}");
+        let killed = stream_refused("u", refusal(), Some(&died(9))).to_string();
+        assert!(killed.contains("tar exited by a signal"), "{killed}");
+    }
+
+    /// #591 1-C1: the writer runs the file the probe checked, not a second
+    /// reading of a relative name in the unit's root.
+    #[test]
+    fn a_slashed_tar_binary_runs_as_the_probe_resolved_it() {
+        let resolved = Path::new("/work/sub/tar");
+        assert_eq!(tar_run_binary("sub/tar", resolved), "/work/sub/tar");
+        assert_eq!(
+            tar_run_binary("/opt/tar", Path::new("/opt/tar")),
+            "/opt/tar"
+        );
+        // A bare name is still looked up on PATH when tar runs.
+        assert_eq!(tar_run_binary("tar", Path::new("/usr/bin/tar")), "tar");
     }
 
     #[test]

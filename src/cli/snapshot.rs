@@ -218,9 +218,10 @@ fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created>
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
 
-    // #542: what the version left out (the newest version's, when nothing
-    // was minted), so a file on no tape is never silent.
-    let left_out = crate::db::snapshot_left_out::load(conn, outcome.snapshot_id)?;
+    // #542: what this walk left out, minted or not (item 252: every snapshot
+    // reports it), so a file on no tape is never silent. A run that mints
+    // nothing reports its own walk, not the older version's stored list.
+    let left_out = outcome.walk_left_out;
 
     let json = serde_json::json!({
         "snapshot_id": outcome.snapshot_id,
@@ -857,6 +858,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #542 with ADR-0012 item 252 ("every snapshot reports what a pattern
+    /// left out"), #592 C2-1: a run that mints nothing reports what THIS
+    /// walk left out, not the older version's stored list. A file made
+    /// since, which a pattern leaves out, is named.
+    #[test]
+    fn an_unchanged_run_names_what_this_walk_left_out() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = two_units(tmp.path());
+        let dir = tmp.path().join("unit1");
+        let mut config = Config::default();
+        config.defaults.global_excludes = vec!["*.tmp".into()];
+
+        let first = create_one(&conn, &config, "unit1").unwrap();
+        assert_eq!(first.json["minted"], true);
+        assert!(!first.line.contains("b.tmp"));
+
+        std::fs::write(dir.join("b.tmp"), b"scratch").unwrap();
+        let second = create_one(&conn, &config, "unit1").unwrap();
+        assert_eq!(
+            second.json["minted"], false,
+            "a left-out file is not content"
+        );
+        assert!(
+            second.line.contains("b.tmp"),
+            "the walk left b.tmp out and must say so: {}",
+            second.line
+        );
+        let left = second.json["left_out"].as_array().unwrap();
+        assert!(left.iter().any(|r| r["path"] == "b.tmp"), "{}", second.json);
     }
 
     /// Issue #404 with ADR-0012 item 210: a signal stops a `snapshot create`
