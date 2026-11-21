@@ -951,31 +951,10 @@ fn tar_lines(said: &[String]) -> Vec<String> {
     said.iter().map(|l| format!("tar: {l}")).collect()
 }
 
-/// The staging's id map (item 278), as lines: what each user and group
-/// number in the restored unit was called by the host that wrote the tape.
-/// Shown, never acted on: a restore is by number and no owner is changed by
-/// name.
+/// The staging's id map (item 278), as lines (see
+/// [`volume::restore::id_map_lines`]).
 fn id_map_lines(map: &[crate::idmap::IdRow]) -> Vec<String> {
-    if map.is_empty() {
-        return Vec::new();
-    }
-    let mut lines = vec![
-        "owners are restored by number, as the stream has them; the host that wrote them \
-         called them:"
-            .to_string(),
-    ];
-    for row in map {
-        let kind = match row.kind {
-            crate::idmap::IdKind::User => "user",
-            crate::idmap::IdKind::Group => "group",
-        };
-        lines.push(format!(
-            "  {kind} {} = {}",
-            row.id,
-            row.name.as_deref().unwrap_or("(no name)")
-        ));
-    }
-    lines
+    volume::restore::id_map_lines(map)
 }
 
 /// `--json`'s `id_map`: one object for each id.

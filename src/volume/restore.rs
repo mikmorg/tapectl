@@ -1335,7 +1335,14 @@ fn restore_unit_contacted(
         supply,
         trace,
     )
-    .map_err(|e| name_keys_given(e, &options.keys))?;
+    .map_err(|e| name_keys_given(e, &options.keys))
+    .map_err(|e| {
+        if trace.tar.is_some() {
+            with_id_map(e, &id_map_of(conn, plan.stage_set_id))
+        } else {
+            e
+        }
+    })?;
 
     info!(unit = unit_name, volume = volume_label, "restore complete");
 
@@ -1687,6 +1694,33 @@ pub(crate) fn plan_restore(
     })
 }
 
+/// The staging's id map (item 278), as lines: what each user and group
+/// number in the restored unit was called by the host that wrote the tape.
+/// Shown, never acted on: a restore is by number and no owner is changed by
+/// name.
+pub fn id_map_lines(map: &[crate::idmap::IdRow]) -> Vec<String> {
+    if map.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "owners are restored by number, as the stream has them; the host that wrote them \
+         called them:"
+            .to_string(),
+    ];
+    for row in map {
+        let kind = match row.kind {
+            crate::idmap::IdKind::User => "user",
+            crate::idmap::IdKind::Group => "group",
+        };
+        lines.push(format!(
+            "  {kind} {} = {}",
+            row.id,
+            row.name.as_deref().unwrap_or("(no name)")
+        ));
+    }
+    lines
+}
+
 /// The id map of `stage_set_id`, to be shown with the restore (item 278): a
 /// restore is by number, and this is what the numbers were called when the
 /// stream was written.
@@ -1695,6 +1729,25 @@ fn id_map_of(conn: &Connection, stage_set_id: i64) -> Vec<IdRow> {
         warn!(error = %e, "the staging's id map could not be read");
         Vec::new()
     })
+}
+
+/// A restore of one unit or file that ended in an error after tar had
+/// extracted part of it still tells what the owner numbers it restored were
+/// called (item 278, #594 4-5): an INCOMPLETE restore is the normal end of a
+/// range, and its files carry numeric owners all the same. The words go with
+/// the error, which is all a failed restore reports (`--json` carries it as
+/// the error's text). `restore volume` reports the map per unit itself.
+fn with_id_map(e: TapectlError, map: &[IdRow]) -> TapectlError {
+    let lines = id_map_lines(map);
+    if lines.is_empty() {
+        return e;
+    }
+    let add = |text: String| format!("{text}\n{}", lines.join("\n"));
+    match e {
+        TapectlError::Other(text) => TapectlError::Other(add(text)),
+        TapectlError::Interrupted(text) => TapectlError::Interrupted(add(text)),
+        other => other,
+    }
 }
 
 /// `tar --version`'s first line, for the `restores` row.

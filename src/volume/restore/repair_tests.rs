@@ -690,6 +690,27 @@ pub(crate) mod tests {
         );
     }
 
+    /// #594 4-5, item 278: a restore that ends INCOMPLETE restored files with
+    /// numeric owners all the same, so its error carries the id map that names
+    /// them, as a restore that succeeds shows it.
+    #[test]
+    fn an_incomplete_restore_still_shows_the_id_map() {
+        let mut h = copies("256K", None, &[A, B]);
+        damage(&mut h, A, 3, 0);
+        let mut bay = h.bay(A, &[Reply::Skip]);
+        let (r, _dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        let err = r.expect_err("a hole nobody fills").to_string();
+        assert!(err.contains("INCOMPLETE"), "{err}");
+        assert!(
+            err.contains("owners are restored by number"),
+            "the map is shown: {err}"
+        );
+        assert!(
+            err.lines().any(|l| l.starts_with("  user ")),
+            "a user row: {err}"
+        );
+    }
+
     /// #594 4-10: the INCOMPLETE text's remedy names only what tapectl has.
     /// tapectl's restore writes no list file and no command takes a list of
     /// paths, so "give the list to another copy" was advice with nothing
