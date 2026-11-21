@@ -68,13 +68,14 @@ pub enum RestoreCommands {
         /// refused, naming the ones it does
         #[arg(long)]
         version: Option<i64>,
-        /// Where a repair from another copy keeps what it reads (default: inside --to).
+        /// Not used by a restore of a unit: only `restore file` extracts into a scratch directory.
         ///
-        /// Where the scratch directory is made (removed when the restore
-        /// ends); defaults to inside --to, never the system temp directory.
         /// A restore of a unit writes no slice to disk: each member goes to
-        /// tar as its slice is read. Only the repair of a damaged file from
-        /// another copy of the version extracts there first
+        /// tar as its slice is read. A repair of a damaged file from another
+        /// copy of the version builds in a hidden directory inside --to,
+        /// on the destination's own filesystem so that the file keeps its
+        /// owner, times, extended attributes and ACL, and removes it when it
+        /// ends. Only `restore file` puts anything in --scratch
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Restore into a destination that already holds files, replacing any that collide.
@@ -154,12 +155,11 @@ pub enum RestoreCommands {
         /// is configured.
         #[arg(long)]
         device: Option<String>,
-        /// Where a repair from another copy keeps what it reads (default: inside each unit's directory).
+        /// Not used by a restore of units: only `restore file` extracts into a scratch directory.
         ///
-        /// Where each unit's scratch directory is made, one at a time
-        /// (removed when that unit ends); defaults to inside the unit's own
-        /// directory, never the system temp directory. See `restore unit
-        /// --scratch`
+        /// A repair from another copy builds in a hidden directory inside
+        /// each unit's own directory, on its filesystem, and removes it when
+        /// that unit ends. See `restore unit --scratch`
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Restore into unit directories that already hold files, replacing any that collide.

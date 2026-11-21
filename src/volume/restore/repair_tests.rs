@@ -2116,4 +2116,196 @@ pub(crate) mod tests {
             assert_restored(&h, UNIT, dest.path(), &[]);
         }
     }
+    // ── ADR-0012 item 304 (#594 4-6): the repair stages on the destination ──
+
+    /// A directory on another filesystem than the temp directory the
+    /// destination is in, or `None` (said) where the host has none.
+    fn other_filesystem() -> Option<TempDir> {
+        use std::os::unix::fs::MetadataExt;
+        let shm = Path::new("/dev/shm");
+        let here = TempDir::new().unwrap();
+        let dev = fs::metadata(here.path()).unwrap().dev();
+        let there = TempDir::new_in(shm).ok();
+        match there {
+            Some(t) if fs::metadata(t.path()).unwrap().dev() != dev => Some(t),
+            _ => {
+                eprintln!(
+                    "SKIPPING item 304's cross-filesystem test: /dev/shm is not another \
+                     filesystem than the temp directory on this host"
+                );
+                None
+            }
+        }
+    }
+
+    /// Two stagings of the unit (A holds the first, B the second), every source file given a mode, an old
+    /// mtime and (where the host allows) an extended attribute before it is
+    /// staged; slice 3's chunk 1 of the first staging is damaged on A. Returns the home, the files
+    /// that chunk costs, and whether the xattr could be set.
+    fn marked_copies() -> (Home, BTreeSet<String>, bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut h = Home::new("256K", None, 2);
+        h.unit(TENANT, UNIT, &tree());
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let mut xattr = true;
+        for item in tree() {
+            if let Item::File(path, _) = item {
+                let at = h.source(UNIT).join(&path);
+                fs::set_permissions(&at, fs::Permissions::from_mode(0o640)).unwrap();
+                xattr &= std::process::Command::new("setfattr")
+                    .args(["-n", "user.repair-mark", "-v", "kept"])
+                    .arg(&at)
+                    .status()
+                    .is_ok_and(|s| s.success());
+                fs::File::open(&at).unwrap().set_modified(old).unwrap();
+            }
+        }
+        if !xattr {
+            eprintln!("SKIPPING the xattr half of item 304's test: setfattr failed on this host");
+        }
+        h.stage(UNIT);
+        h.volume(A);
+        h.volume(B);
+        h.write(A);
+        let one = h.stage_set(UNIT, 1);
+        restage(&mut h, "192K");
+        h.write(B);
+        damage_in(&mut h, A, one, 3, 1);
+        let lost = lost_in_chunk(&h, one, SLICE_256K, 3, 1);
+        assert!(!lost.is_empty());
+        (h, lost, xattr)
+    }
+
+    /// The repair's hidden directories in `dir`.
+    fn hidden_in(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tapectl-repair"))
+            .collect()
+    }
+
+    /// A repair given `--scratch` on another filesystem still installs by
+    /// rename: the file keeps its recorded mode, mtime and extended attribute
+    /// (a copy across filesystems drops times and attributes), and nothing
+    /// is left in the destination or in `--scratch`.
+    #[test]
+    fn a_repair_given_scratch_elsewhere_installs_by_rename_and_keeps_mode_and_mtime() {
+        use std::os::unix::fs::MetadataExt;
+        let Some(other) = other_filesystem() else {
+            return;
+        };
+        let (h, lost, xattr) = marked_copies();
+        let options = RestoreOptions {
+            scratch: Some(other.path().to_path_buf()),
+            ..RestoreOptions::default()
+        };
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let (r, dest) = restore_unit(&h, A, &options, &mut bay);
+        let report = r.unwrap_or_else(|e| panic!("{e}"));
+        assert_restored(&h, UNIT, dest.path(), &[]);
+        let filled: BTreeSet<String> = report.filled.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(filled, lost, "positive control: the repair filled these");
+        for path in &lost {
+            let at = dest.path().join(path);
+            let m = fs::metadata(&at).unwrap();
+            assert_eq!(m.mtime(), 1_000_000_000, "{path}: the recorded mtime");
+            assert_eq!(m.mode() & 0o7777, 0o640, "{path}: the recorded mode");
+            if xattr {
+                let got = std::process::Command::new("getfattr")
+                    .args(["-n", "user.repair-mark", "--only-values"])
+                    .arg(&at)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&got.stdout),
+                    "kept",
+                    "{path}: the recorded extended attribute"
+                );
+            }
+        }
+        assert!(
+            hidden_in(dest.path()).is_empty(),
+            "{:?}",
+            hidden_in(dest.path())
+        );
+        assert_eq!(
+            fs::read_dir(other.path()).unwrap().count(),
+            0,
+            "nothing is built under --scratch"
+        );
+    }
+
+    /// The hidden directory the repair builds in is gone after a success
+    /// (here, with no `--scratch`) and after a repair that fails.
+    #[test]
+    fn the_repairs_hidden_directory_is_gone_after_success_and_after_failure() {
+        let (h, _lost, _) = marked_copies();
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let (r, dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        r.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            hidden_in(dest.path()).is_empty(),
+            "{:?}",
+            hidden_in(dest.path())
+        );
+
+        // A repair that fails: a folder stands where a lost file belongs, the
+        // repair will not put a file over it, and the restore is INCOMPLETE.
+        let (h, lost, _) = marked_copies();
+        let dest = TempDir::new().unwrap();
+        let first = lost.iter().next().unwrap();
+        fs::create_dir(dest.path().join(first)).unwrap();
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let r = h.restore_into(
+            UNIT,
+            What::Unit,
+            A,
+            &RestoreOptions::default(),
+            &mut bay,
+            &dest.path().to_string_lossy(),
+        );
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("INCOMPLETE"), "{err}");
+        assert!(err.contains(first.as_str()), "{err}");
+        assert!(dest.path().join(first).is_dir(), "the folder is untouched");
+        assert!(
+            hidden_in(dest.path()).is_empty(),
+            "{:?}",
+            hidden_in(dest.path())
+        );
+    }
+
+    /// A restored member named like the hidden directory is not harmed: the
+    /// directory's name is chosen to be neither a path of the version's table
+    /// nor anything in the destination, so what the repair makes and removes
+    /// is never a member's. Checked at the name: a table whose first member
+    /// is the name the repair would take first gets another.
+    #[test]
+    fn the_hidden_directorys_name_is_never_a_members() {
+        use super::super::fill::{make_repair_dir, repair_dir_name};
+        use std::collections::HashSet;
+        let taken: HashSet<String> = [
+            repair_dir_name(0),
+            repair_dir_name(1),
+            "other.bin".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let dest = TempDir::new().unwrap();
+        fs::create_dir(dest.path().join(repair_dir_name(2))).unwrap();
+        let (made, name) = make_repair_dir(dest.path(), &taken).unwrap();
+        assert!(!taken.contains(&name));
+        assert_ne!(
+            name,
+            repair_dir_name(2),
+            "an entry already there is not taken"
+        );
+        assert!(made.is_dir());
+        assert_eq!(
+            fs::read_dir(dest.path()).unwrap().count(),
+            2,
+            "the entry that was there stays beside the new one"
+        );
+    }
 }

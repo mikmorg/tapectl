@@ -2814,8 +2814,8 @@ a unit has no such way, because it writes no slice to disk and `--scratch` chang
   into place, so it needs the file's size on the scratch disk and in `--to`. Only the
   slices that hold it are read.
 
-A repair of a damaged file from another copy extracts that copy's file in the scratch
-directory first, inside `--to` or inside `--scratch DIR` when you name one. RESTORE.sh,
+A repair of a damaged file from another copy extracts that copy's file in a hidden
+directory inside `--to` first (on its filesystem, whatever `--scratch` says). RESTORE.sh,
 the heir's path, asks for the units' size plus about two slices in its work directory
 (`--work DIR`).
 

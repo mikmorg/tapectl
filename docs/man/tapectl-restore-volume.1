@@ -29,9 +29,9 @@ Tape device (by\-id path).
 Defaults to the only configured drive; required when more than one is configured.
 .TP
 \fB\-\-scratch\fR \fI<DIR>\fR
-Where a repair from another copy keeps what it reads (default: inside each unit\*(Aqs directory).
+Not used by a restore of units: only `restore file` extracts into a scratch directory.
 
-Where each unit\*(Aqs scratch directory is made, one at a time (removed when that unit ends); defaults to inside the unit\*(Aqs own directory, never the system temp directory. See `restore unit \-\-scratch`
+A repair from another copy builds in a hidden directory inside each unit\*(Aqs own directory, on its filesystem, and removes it when that unit ends. See `restore unit \-\-scratch`
 .TP
 \fB\-\-overwrite\fR
 Restore into unit directories that already hold files, replacing any that collide.

@@ -33,9 +33,9 @@ Snapshot version to restore.
 Defaults to the newest version of the unit on this volume (the same rule RESTORE.sh applies); a version the volume does not carry is refused, naming the ones it does
 .TP
 \fB\-\-scratch\fR \fI<DIR>\fR
-Where a repair from another copy keeps what it reads (default: inside \-\-to).
+Not used by a restore of a unit: only `restore file` extracts into a scratch directory.
 
-Where the scratch directory is made (removed when the restore ends); defaults to inside \-\-to, never the system temp directory. A restore of a unit writes no slice to disk: each member goes to tar as its slice is read. Only the repair of a damaged file from another copy of the version extracts there first
+A restore of a unit writes no slice to disk: each member goes to tar as its slice is read. A repair of a damaged file from another copy of the version builds in a hidden directory inside \-\-to, on the destination\*(Aqs own filesystem so that the file keeps its owner, times, extended attributes and ACL, and removes it when it ends. Only `restore file` puts anything in \-\-scratch
 .TP
 \fB\-\-overwrite\fR
 Restore into a destination that already holds files, replacing any that collide.

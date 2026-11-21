@@ -234,13 +234,44 @@ impl Drop for RestoreScratch {
         if !self.0.exists() {
             return;
         }
-        if let Err(e) = fs::remove_dir_all(&self.0) {
+        // A folder a repair built with a mode that forbids writing (0555)
+        // cannot be emptied: give each folder under the directory its
+        // owner's bits back, then remove it (the directory may be inside the
+        // destination, ADR-0012 item 304, and is never left behind).
+        let mut result = fs::remove_dir_all(&self.0);
+        if result.is_err() {
+            make_removable(&self.0);
+            result = fs::remove_dir_all(&self.0);
+        }
+        if let Err(e) = result {
             warn!(
                 path = %self.0.display(),
                 error = %e,
                 "could not remove the restore scratch directory — it may still \
                  contain DECRYPTED archive slices; remove it by hand",
             );
+        }
+    }
+}
+
+/// Give `dir` and every folder under it the owner's read, write and search
+/// bits, so [`fs::remove_dir_all`] can empty it. A symbolic link is not
+/// followed.
+fn make_removable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let _ = fs::set_permissions(
+        dir,
+        fs::Permissions::from_mode(meta.permissions().mode() | 0o700),
+    );
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            make_removable(&entry.path());
         }
     }
 }

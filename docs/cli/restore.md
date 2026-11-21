@@ -44,9 +44,9 @@ tapectl restore unit [OPTIONS] --to <TO> <UNIT|--unit <UNIT>>
 - `--version <VERSION>` — Snapshot version to restore.
   
     Defaults to the newest version of the unit on this volume (the same rule RESTORE.sh applies); a version the volume does not carry is refused, naming the ones it does
-- `--scratch <DIR>` — Where a repair from another copy keeps what it reads (default: inside --to).
+- `--scratch <DIR>` — Not used by a restore of a unit: only `restore file` extracts into a scratch directory.
   
-    Where the scratch directory is made (removed when the restore ends); defaults to inside --to, never the system temp directory. A restore of a unit writes no slice to disk: each member goes to tar as its slice is read. Only the repair of a damaged file from another copy of the version extracts there first
+    A restore of a unit writes no slice to disk: each member goes to tar as its slice is read. A repair of a damaged file from another copy of the version builds in a hidden directory inside --to, on the destination's own filesystem so that the file keeps its owner, times, extended attributes and ACL, and removes it when it ends. Only `restore file` puts anything in --scratch
 - `--overwrite` — Restore into a destination that already holds files, replacing any that collide.
   
     Without it a destination that is not empty is refused before the tape is touched
@@ -101,9 +101,9 @@ tapectl restore volume [OPTIONS] --to <DIR> [LABEL]
 - `--device <DEVICE>` — Tape device (by-id path).
   
     Defaults to the only configured drive; required when more than one is configured.
-- `--scratch <DIR>` — Where a repair from another copy keeps what it reads (default: inside each unit's directory).
+- `--scratch <DIR>` — Not used by a restore of units: only `restore file` extracts into a scratch directory.
   
-    Where each unit's scratch directory is made, one at a time (removed when that unit ends); defaults to inside the unit's own directory, never the system temp directory. See `restore unit --scratch`
+    A repair from another copy builds in a hidden directory inside each unit's own directory, on its filesystem, and removes it when that unit ends. See `restore unit --scratch`
 - `--overwrite` — Restore into unit directories that already hold files, replacing any that collide.
   
     Without it a unit directory that is not empty is refused before the tape is touched

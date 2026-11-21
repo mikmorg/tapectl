@@ -285,16 +285,14 @@ fn fill_from(
     }
 
     // Read the slices that hold the lost paths through that copy's table
-    // into a directory of their own, and keep what verifies.
-    let scratch = super::scratch_dir(
-        Path::new(ctx.target.destination()),
-        ctx.options.scratch.as_deref(),
-    );
-    // A restore of a unit makes no scratch directory: this one is made for
-    // the fill and removed with it. `restore file`'s is its own.
-    let _scratch = (!scratch.exists()).then(|| super::RestoreScratch(scratch.clone()));
-    let dir = scratch.join(format!("fill-{}", copy.stage_set_id));
-    fs::create_dir_all(&dir)?;
+    // into a directory of their own, and keep what verifies. The directory
+    // is hidden, under the destination root and so on the destination's own
+    // filesystem (ADR-0012 item 304, #594 4-6): installing from it is a
+    // rename, which keeps owner, times, extended attributes and ACL, and no
+    // copy across filesystems ever installs a repaired file. `--scratch` is
+    // not used: it is for `restore file`'s extraction alone. Removed when
+    // the repair ends, whichever way it ends.
+    let (dir, _name) = make_repair_dir(&ex.root, &member_names(ctx.rows))?;
     let _dir = super::RestoreScratch(dir.clone());
     supply.set_subject(format!(
         "unit \"{}\" v{} (the copy of stage set {})",
@@ -341,10 +339,17 @@ fn fill_from(
     let by_path: HashMap<&str, &Row> = ctx.rows.iter().map(|r| (r.path.as_str(), r)).collect();
     // Folders the copy gave, `(copy's folder, destination)`: their recorded
     // metadata is applied once everything under them is in (restore-6).
-    let mut folders: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut folders: Vec<(fs::Metadata, PathBuf)> = Vec::new();
     // Hard links the copy gave, `(destination of the name, destination of its
     // target)`: each is made a link again once every path is in (#594 4-6).
     let mut links: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Moving a file out of a folder needs that folder writable, and the copy's
+    // tar made each with its recorded mode (a 0555 folder holds files it
+    // cannot give up): the folders' recorded metadata is taken first, the
+    // folders are opened to their owner, and the recorded metadata is what
+    // the destination's folders are given at the end.
+    let folder_meta = folder_metadata(&out);
+    super::make_removable(&out);
     for path in &wanted {
         let source = out.join(crate::volume::index::on_disk(path));
         if read.lost.contains_key(*path) || fs::symlink_metadata(&source).is_err() {
@@ -367,7 +372,11 @@ fn fill_from(
                 }
                 if let Some(row) = by_path.get(*path) {
                     match (&row.kind, row.link.as_deref()) {
-                        (Kind::Folder, _) => folders.push((source.clone(), dest)),
+                        (Kind::Folder, _) => {
+                            if let Some(m) = folder_meta.get(&source) {
+                                folders.push((m.clone(), dest));
+                            }
+                        }
                         (Kind::HardLink, Some(target)) => {
                             links.push((dest, ex.root.join(crate::volume::index::on_disk(target))))
                         }
@@ -405,22 +414,42 @@ fn fill_from(
     // The folders last, the deepest first, so a folder whose mode forbids
     // writing has received its files and its own time is not moved by them.
     folders.sort_by_key(|(_, dest)| std::cmp::Reverse(dest.components().count()));
-    for (source, dest) in &folders {
-        if let Err(e) = apply_folder_metadata(source, dest) {
+    for (meta, dest) in &folders {
+        if let Err(e) = apply_folder_metadata(meta, dest) {
             warn!(folder = %dest.display(), "the copy's metadata could not be set on the folder: {e}");
         }
     }
     Ok(())
 }
 
-/// Give the folder `dest` the mode, owner and modification time of the
-/// copy's `source` (restore-6): what tar would have set had the folder's own
+/// The metadata of every folder under `root`, as the copy's tar made them.
+fn folder_metadata(root: &Path) -> HashMap<PathBuf, fs::Metadata> {
+    let mut out = HashMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(m) = fs::symlink_metadata(&path) {
+                if m.is_dir() {
+                    out.insert(path.clone(), m);
+                    pending.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Give the folder `dest` the mode, owner and modification time the copy
+/// recorded for it, `meta` (restore-6): what tar would have set had the folder's own
 /// member come through. The owner is set where the process may (a failed
 /// chown for want of permission is not an error), then the mode, since a
 /// chown can clear bits.
-fn apply_folder_metadata(source: &Path, dest: &Path) -> Result<()> {
+fn apply_folder_metadata(meta: &fs::Metadata, dest: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = fs::symlink_metadata(source)?;
     match std::os::unix::fs::chown(dest, Some(meta.uid()), Some(meta.gid())) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
@@ -556,11 +585,62 @@ fn install(source: &Path, dest: &Path) -> Result<()> {
         }
         fs::remove_file(dest)?;
     }
-    if fs::rename(source, dest).is_err() {
-        let meta = fs::symlink_metadata(source)?;
-        super::place_restored_entry(source, &meta, dest)?;
+    // Always a rename: the repair builds on the destination's filesystem
+    // (item 304). A rename that fails is a failure of this path, said, never
+    // a copy that would drop the file's owner, times and attributes.
+    fs::rename(source, dest).map_err(|e| {
+        TapectlError::Other(format!(
+            "cannot move the repaired file into place ({e}); the repair builds on the \
+             destination's own filesystem, so this is not a cross-filesystem move"
+        ))
+    })
+}
+
+/// The hidden directory's name stem; `-N` follows ([`repair_dir_name`]).
+const REPAIR_DIR: &str = ".tapectl-repair-tmp";
+
+/// The `n`th name the repair's hidden directory may take.
+pub(super) fn repair_dir_name(n: u32) -> String {
+    format!("{REPAIR_DIR}-{n}")
+}
+
+/// The first path component of every path of the version's table: the names a
+/// restored member may take in the destination's root.
+fn member_names(rows: &[Row]) -> std::collections::HashSet<String> {
+    rows.iter()
+        .map(|r| r.path.split('/').next().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Make the repair's hidden directory in `root`, mode 0700, and return it with
+/// its name. The name is the first of [`repair_dir_name`] that is neither a
+/// first component of a path of the version (`members`: no member can be
+/// named like it, so nothing the repair installs later lands in it or
+/// replaces it) nor anything already in `root` (`create_dir` is atomic: an
+/// entry that is there is never taken, never removed).
+pub(super) fn make_repair_dir(
+    root: &Path,
+    members: &std::collections::HashSet<String>,
+) -> Result<(PathBuf, String)> {
+    use std::os::unix::fs::DirBuilderExt;
+    for n in 0.. {
+        let name = repair_dir_name(n);
+        if members.contains(&name) {
+            continue;
+        }
+        let at = root.join(&name);
+        match fs::DirBuilder::new().mode(0o700).create(&at) {
+            Ok(()) => return Ok((at, name)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(TapectlError::Other(format!(
+                    "cannot make the repair's directory {} on the destination's filesystem: {e}",
+                    at.display()
+                )))
+            }
+        }
     }
-    Ok(())
+    unreachable!("the names are endless")
 }
 
 /// The error for a restore that is still short of files.

@@ -1583,10 +1583,6 @@ tapectl restore file family/letters 1998-letter-to-mum.txt --from L8-0002 --to /
 # Dry run
 tapectl restore unit family/letters --from L8-0002 --to /tmp/restore/unit --dry-run
 
-# A repair from another copy keeps what it reads on another disk
-tapectl restore unit family/letters --from L8-0002 --to /srv/restore/letters \
-  --scratch /mnt/big
-
 # Into a directory that already holds an older copy, replacing what collides
 tapectl restore unit family/letters --from L8-0002 --to /srv/restore/letters \
   --overwrite
@@ -1674,9 +1670,9 @@ tape, and refuses with nothing read
   (and decompressed) in memory off the tape and its members are fed to `tar`,
   so `--to` needs about the unit's size free (its "bytes of stream", compressed or
   not) and the drive keeps reading while `tar` extracts. Only the repair of a
-  damaged file from another copy extracts first, into a scratch directory inside
-  `--to`, or inside `--scratch DIR` when you name one, never in the system temp
-  directory. `restore volume` checks the set as a whole: every restored unit.
+  damaged file from another copy extracts first, into a hidden directory inside
+  `--to` (on its own filesystem, so the repaired file keeps its owner, times and
+  attributes), never in the system temp directory. `restore volume` checks the set as a whole: every restored unit.
   `restore file` needs the slices it reads plus the one file. Pick a `--to` with
   room: `/tmp`, used in these small examples, is often RAM or the root filesystem.
   `--no-space-check` skips the check, for a compressed or thin-provisioned
