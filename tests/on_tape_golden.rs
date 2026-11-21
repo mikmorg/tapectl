@@ -395,7 +395,8 @@
 //! a file under the target directory when it fails and names that file.
 
 use tapectl::volume::layout::{
-    generate_front_index, generate_id_thunk_v2, FrontIndexFile, IdThunkV2Params,
+    generate_front_index, generate_id_thunk_v2, generate_seal_marker_requiring_at, FrontIndexFile,
+    IdThunkV2Params, REQUIRES,
 };
 use tapectl::volume::manifest::{Manifest, ManifestSlice, ManifestUnit};
 
@@ -958,4 +959,129 @@ fn layout3_front_index() {
         &generate_front_index("L8-0001", &eleven_file_plan()),
         FRONT_INDEX,
     );
+}
+
+/// The plan's entries as the seal's embedded copy has them (section 5): File 3's own entry
+/// is filled in with its size and hash (the seal is written after File 3 is known); the
+/// seal marker's own entry stays bare.
+fn seal_copy(through: i32) -> Vec<FrontIndexFile> {
+    eleven_file_plan()
+        .into_iter()
+        .filter(|f| f.position <= through)
+        .map(|mut f| {
+            if f.position == 3 {
+                f.size_bytes = Some(3_100);
+                f.sha256_encrypted = Some("3".repeat(64));
+            }
+            f
+        })
+        .collect()
+}
+
+const SEAL_MARKER_FULL: &str = r##"================================================================
+                    TAPECTL SEAL MARKER
+================================================================
+
+Volume: L8-0001
+This file seals the tape: its presence means every file before it is
+present. Its absence means the tape is unsealed (interrupted or aborted).
+The tape may end before the last file the front index plans:
+ended_after below is the last file before this one, and a file the
+front index lists after it is not on this tape. It binds the front
+index by the sha256 below. The [[files]] entries are a copy of the
+front index (File 3) up to this file, usable if File 3 is damaged —
+verify any entry by hashing the file it describes.
+
+================================================================
+              MACHINE-READABLE DATA (TOML)
+================================================================
+
+[seal]
+volume = "L8-0001"
+layout_version = 3
+requires = []
+file_count = 11
+ended_after = 9
+sealed_at = "2026-11-21T10:05:00Z"
+front_index_sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+[[files]]
+position = 0
+type = "id_thunk"
+size_bytes = 1996
+sha256_encrypted = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[files]]
+position = 1
+type = "system_guide"
+size_bytes = 41212
+sha256_encrypted = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[files]]
+position = 2
+type = "restore_sh"
+size_bytes = 180000
+sha256_encrypted = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[files]]
+position = 3
+type = "front_index"
+size_bytes = 3100
+sha256_encrypted = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[files]]
+position = 4
+type = "operator_envelope"
+size_bytes = 30720
+sha256_encrypted = "4444444444444444444444444444444444444444444444444444444444444444"
+
+[[files]]
+position = 5
+type = "operator_envelope_backup"
+size_bytes = 30720
+sha256_encrypted = "5555555555555555555555555555555555555555555555555555555555555555"
+
+[[files]]
+position = 6
+type = "tenant_envelope"
+size_bytes = 20480
+sha256_encrypted = "6666666666666666666666666666666666666666666666666666666666666666"
+
+[[files]]
+position = 7
+type = "tenant_envelope_backup"
+size_bytes = 20480
+sha256_encrypted = "7777777777777777777777777777777777777777777777777777777777777777"
+
+[[files]]
+position = 8
+type = "data_slice"
+size_bytes = 20512
+sha256_encrypted = "8888888888888888888888888888888888888888888888888888888888888888"
+
+[[files]]
+position = 9
+type = "data_slice"
+size_bytes = 2300
+sha256_encrypted = "9999999999999999999999999999999999999999999999999999999999999999"
+
+[[files]]
+position = 10
+type = "seal_marker"
+"##;
+
+/// A full seal (volume-format-v3.md section 5): `ended_after` is the last data slice, and
+/// the copy runs to the seal's own bare entry. `sealed_at` is passed in
+/// (`generate_seal_marker_requiring_at`, the seam the clock-reading generator calls).
+#[test]
+fn layout3_seal_marker_full() {
+    let text = generate_seal_marker_requiring_at(
+        "L8-0001",
+        11,
+        &"f".repeat(64),
+        &seal_copy(10),
+        REQUIRES,
+        "2026-11-21T10:05:00Z",
+    );
+    assert_pinned_text("seal-marker-full", &text, SEAL_MARKER_FULL);
 }

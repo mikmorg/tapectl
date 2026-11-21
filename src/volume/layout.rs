@@ -2522,12 +2522,36 @@ pub fn generate_seal_marker_requiring(
     files: &[FrontIndexFile],
     features: &[&str],
 ) -> String {
+    generate_seal_marker_requiring_at(
+        label,
+        file_count,
+        front_index_sha256,
+        files,
+        features,
+        &seal_time(),
+    )
+}
+
+/// [`generate_seal_marker_requiring`] with `sealed_at` given instead of read from the
+/// clock: a seam for the Layout 3 byte pin (`tests/on_tape_golden.rs`, ADR-0012 item
+/// 243). Production callers go through [`generate_seal_marker_requiring`], which passes
+/// the clock's time rendered at the fixed width of [`seal_time`]; every other byte is the
+/// same.
+pub fn generate_seal_marker_requiring_at(
+    label: &str,
+    file_count: i32,
+    front_index_sha256: &str,
+    files: &[FrontIndexFile],
+    features: &[&str],
+    sealed_at: &str,
+) -> String {
     let mut s = seal_document(
         label,
         file_count,
         i64::from(file_count) - 2,
         front_index_sha256,
         features,
+        sealed_at,
     );
     append_files_entries(&mut s, files);
     s
@@ -2572,6 +2596,26 @@ pub fn generate_short_seal_marker_requiring(
     files_through_k: &[FrontIndexFile],
     features: &[&str],
 ) -> String {
+    generate_short_seal_marker_requiring_at(
+        label,
+        ended_after,
+        front_index_sha256,
+        files_through_k,
+        features,
+        &seal_time(),
+    )
+}
+
+/// [`generate_short_seal_marker_requiring`] with `sealed_at` given, the seam for the
+/// short seal's byte pin, on the terms of [`generate_seal_marker_requiring_at`].
+pub fn generate_short_seal_marker_requiring_at(
+    label: &str,
+    ended_after: i32,
+    front_index_sha256: &str,
+    files_through_k: &[FrontIndexFile],
+    features: &[&str],
+    sealed_at: &str,
+) -> String {
     debug_assert!(
         files_through_k
             .last()
@@ -2584,6 +2628,7 @@ pub fn generate_short_seal_marker_requiring(
         i64::from(ended_after),
         front_index_sha256,
         features,
+        sealed_at,
     );
     append_files_entries(&mut s, files_through_k);
     append_files_entries(
@@ -2598,6 +2643,24 @@ pub fn generate_short_seal_marker_requiring(
     s
 }
 
+/// The time a seal is stamped with, from the clock, at the FIXED width its sizing needs.
+/// FIXED-WIDTH timestamp, deliberately: the build step sizes the seal
+/// marker with a placeholder and the seal step regenerates it with the
+/// real `sealed_at`, which is only sound if both render at identical
+/// byte length (`v2-open-questions.md` §9). `to_rfc3339()` does NOT
+/// guarantee that — it is `SecondsFormat::AutoSi`, which drops
+/// trailing-zero fractional digits, so it emits 25/29/32/35-byte strings
+/// depending on the nanosecond value (measured on this VM: ~99.89% at
+/// 35 bytes, ~0.11% at 32, ~0.0002% at 29). Under that format a real
+/// reseal would land on a different width roughly once per ~900 writes
+/// and fail its own length-identity check. `SecondsFormat::Secs` with
+/// `use_z = true` renders exactly 20 bytes ("2026-07-22T20:09:00Z"),
+/// always — second precision is ample for an audit timestamp, and
+/// fixed width is what the sizing trick actually requires.
+fn seal_time() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// The seal marker's human header and `[seal]` table, the same for a full
 /// and a short seal (`volume-format-v3.md` §5, "Grammar" and "The
 /// human-readable header"), so the two kinds cannot drift apart in anything
@@ -2608,22 +2671,9 @@ fn seal_document(
     ended_after: i64,
     front_index_sha256: &str,
     features: &[&str],
+    now: &str,
 ) -> String {
     let requires = requires_value(features);
-    // FIXED-WIDTH timestamp, deliberately: the build step sizes the seal
-    // marker with a placeholder and the seal step regenerates it with the
-    // real `sealed_at`, which is only sound if both render at identical
-    // byte length (`v2-open-questions.md` §9). `to_rfc3339()` does NOT
-    // guarantee that — it is `SecondsFormat::AutoSi`, which drops
-    // trailing-zero fractional digits, so it emits 25/29/32/35-byte strings
-    // depending on the nanosecond value (measured on this VM: ~99.89% at
-    // 35 bytes, ~0.11% at 32, ~0.0002% at 29). Under that format a real
-    // reseal would land on a different width roughly once per ~900 writes
-    // and fail its own length-identity check. `SecondsFormat::Secs` with
-    // `use_z = true` renders exactly 20 bytes ("2026-07-22T20:09:00Z"),
-    // always — second precision is ample for an audit timestamp, and
-    // fixed width is what the sizing trick actually requires.
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let t_label = crate::volume::format::toml_string(label);
     format!(
         r#"================================================================
