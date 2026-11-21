@@ -725,19 +725,35 @@ try_front_index() {
 # two filemarks; GNU mt spells end of data eom), else File 0's pointer. It is
 # found by filemarks, never by READ POSITION or LOCATE. Sets SEAL_* and leaves
 # the seal's copy of the map in $WORK/files_from_seal.txt on success.
+# The most a seal read takes of the last tape file: 64 MiB, 128 blocks. A seal is
+# a short header and one entry of about 170 bytes for each tape file, and
+# tapectl holds it to 16 MiB (volume-format-v3.md 5.2 W8: a slice and the seal
+# fit in half the room past the early warning; 98,000 entries); the cap is four
+# times that. The last file of an unsealed tape is its last data slice, up to
+# GiBs, and no more of it than this is read.
+SEAL_MAX_BLOCKS=128
+SEAL_MAX_BYTES=$((SEAL_MAX_BLOCKS * BLOCK))
+
 read_seal() {
   local ok=0
   CUR=""
+  rm -f "$WORK/seal.raw" "$WORK/seal.stripped"
   if { "$MT" -f "$DEVICE" eod 2>/dev/null || "$MT" -f "$DEVICE" eom 2>/dev/null; } &&
     "$MT" -f "$DEVICE" bsfm 2 2>/dev/null; then
-    if { dd if="$DEVICE" of="$WORK/seal.raw" bs="$BLOCK" 2>"$WORK/dd.err"; } && [ -s "$WORK/seal.raw" ]; then ok=1; fi
+    # What is read is stripped of its zero padding as it comes: one copy, of at
+    # most the cap.
+    if dd if="$DEVICE" bs="$BLOCK" count="$SEAL_MAX_BLOCKS" 2>"$WORK/dd.err" | tr -d '\0' >"$WORK/seal.stripped" &&
+      [ -s "$WORK/seal.stripped" ]; then ok=1; fi
   fi
   if [ "$ok" = 0 ] && [ -n "$SEAL_MARKER" ]; then
-    if fetch "$SEAL_MARKER" "$WORK/seal.raw"; then ok=1; fi
+    if fetch "$SEAL_MARKER" "$WORK/seal.raw" "$SEAL_MAX_BYTES"; then
+      tr -d '\0' <"$WORK/seal.raw" >"$WORK/seal.stripped"
+      rm -f "$WORK/seal.raw"
+      ok=1
+    fi
   fi
   CUR=""
   [ "$ok" = 1 ] || return 1
-  tr -d '\0' <"$WORK/seal.raw" >"$WORK/seal.stripped"
   grep '^\[seal\]' "$WORK/seal.stripped" >/dev/null 2>&1 || return 1
   sed -n '/^\[seal\]/,$p' "$WORK/seal.stripped" >"$WORK/seal.toml"
   return 0

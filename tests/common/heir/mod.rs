@@ -890,13 +890,20 @@ const FAKE_DD: &str = r#"#!/bin/sh
 T="$FAKE_TAPE"
 D="$FAKE_FILES"
 of=""
+bs=""
+count=""
 for a in "$@"; do
   case "$a" in
     of=*) of=${a#of=} ;;
+    bs=*) bs=${a#bs=} ;;
+    count=*) count=${a#count=} ;;
   esac
 done
 pos=$(cat "$T/pos")
 echo "dd $pos" >>"$T/ops"
+# The read of a tape file with a count (#596 C-2) stops after that many blocks,
+# as dd does; what was asked is written to dd.counts, "<file> <count>".
+if [ -n "$count" ]; then echo "$pos $count" >>"$T/dd.counts"; fi
 case "$pos" in
   *[!0-9]*)
     echo "fake dd: the head is not at the start of a file ($pos)" >&2
@@ -920,6 +927,16 @@ if [ "${FAKE_DD_FAIL:-none}" = "$pos" ]; then
 fi
 f="$D/$pos"
 if [ ! -f "$f" ]; then echo "?" >"$T/pos"; exit 0; fi
+if [ -n "$count" ]; then
+  # A part of the file was read: the head is inside it, at no file start.
+  if [ -n "$of" ]; then
+    head -c $((bs * count)) "$f" >"$of" || { echo "?" >"$T/pos"; exit 1; }
+  else
+    head -c $((bs * count)) "$f" || { echo "?" >"$T/pos"; exit 1; }
+  fi
+  echo "$pos+" >"$T/pos"
+  exit 0
+fi
 if [ -n "$of" ]; then
   cat "$f" >"$of" || { echo "?" >"$T/pos"; exit 1; }
 elif ! cat "$f"; then

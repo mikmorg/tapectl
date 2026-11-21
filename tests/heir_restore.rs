@@ -562,6 +562,37 @@ fn info_on_a_short_tape_says_where_it_ended_and_names_the_planned_files_not_on_i
     );
 }
 
+/// #596 C-2: an unsealed tape's last file is a data slice, up to GiBs. The
+/// seal read of it is capped at 64 MiB, four times what the seal is allowed
+/// (SEAL_ALLOWANCE_BYTES, 16 MiB; volume-format-v3.md 5.2 W8): `dd` is asked
+/// for no more blocks than that, and the stripped copy is made from that read
+/// alone.
+#[test]
+fn the_seal_read_of_an_unsealed_tape_is_capped() {
+    let t = two();
+    let h = Heir::of(t);
+    let last = t.files.len() - 1;
+    h.cut_after(last);
+    // The last file is now a slice of 20 MiB (a real one is GiBs).
+    h.replace(last - 1, &vec![b'A'; 20 * 1024 * 1024]);
+    let o = h.run(&["--info"]);
+    assert!(o.stderr.contains("read as unsealed"), "{}", o.all());
+    let counts = std::fs::read_to_string(h.root.path().join("state/dd.counts"))
+        .unwrap_or_else(|_| panic!("the seal read was not capped: {}", o.all()));
+    let asked: Vec<usize> = counts
+        .lines()
+        .filter_map(|l| l.strip_prefix(&format!("{} ", last - 1)))
+        .map(|n| n.parse().unwrap())
+        .collect();
+    assert!(!asked.is_empty(), "no capped read of the last file: {counts}");
+    for n in asked {
+        assert!(
+            n * 524_288 <= 64 * 1024 * 1024,
+            "{n} blocks is more than a seal can be"
+        );
+    }
+}
+
 #[test]
 fn a_tape_with_no_seal_reads_as_unsealed() {
     let t = two();
