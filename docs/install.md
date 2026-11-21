@@ -86,8 +86,10 @@ make -j"$(nproc)" && sudo make install
 /usr/local/bin/tar --version        # tar (GNU tar) 1.35
 ```
 
-Keep the two `--with-` switches: with them a missing `libacl1-dev` fails `configure`
-instead of building a tar with no ACL support. The version number alone is not the
+The two `--with-` switches are tar's defaults, so they do not make a missing `libacl1-dev`
+fail `configure` (tar 1.35's `configure.ac` sets `with_posix_acls=no` when `sys/acl.h` or an
+`acl_*` function is missing, switch or not): it builds a tar with no ACL support. Check
+`ldd /usr/local/bin/tar | grep libacl`. The version number alone is not the
 proof; the proof is that ACL entries are written by number. On a file with
 `setfacl -m u:1:r,g:2:r f`, `/usr/local/bin/tar --format=pax --numeric-owner --xattrs --acls
 --xattrs-exclude='system.posix_acl_*' -cf t.tar f` stores `user:1:r--` and `group:2:r--` and

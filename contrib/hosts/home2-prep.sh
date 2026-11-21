@@ -191,8 +191,9 @@ elif part "Download, verify, build and install GNU tar $TAR_VER (a few minutes)?
   fi
   run rm -rf "$WORK/tar-$TAR_VER"
   run tar -xJf "$WORK/tar-$TAR_VER.tar.xz" -C "$WORK"
-  # The two --with- switches make a missing libacl-dev fail configure rather
-  # than build a tar with no ACL support. /usr/local leaves /bin/tar (1.30)
+  # The --with- switches are tar's defaults: a missing libacl-dev does NOT fail
+  # configure (tar 1.35 configure.ac sets with_posix_acls=no), so the ldd check
+  # and the ACL proof below are what catch it. /usr/local leaves /bin/tar (1.30)
   # alone: the system keeps its own tar, tapectl's [tar] binary names this one.
   run bash -c "cd '$WORK/tar-$TAR_VER' && FORCE_UNSAFE_CONFIGURE=1 ./configure --prefix=/usr/local --with-posix-acls --with-xattrs --with-selinux=no"
   run make -C "$WORK/tar-$TAR_VER" -j"$(nproc)"

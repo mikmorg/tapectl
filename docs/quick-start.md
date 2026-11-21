@@ -42,7 +42,9 @@ missing.
 On Debian 12 or Ubuntu 22.04 (or any host whose `tar --version` says 1.34 or older), build
 GNU tar 1.35 from the upstream release into `/usr/local`, which leaves the system's tar
 alone. The build needs the ACL headers: without `libacl1-dev` a plain `./configure` quietly
-builds a tar with no ACL support, so the two `--with-` switches below make it fail instead.
+builds a tar with no ACL support, and so does one with the `--with-` switches below (they are
+tar's defaults: a missing header only turns the support off, `configure` still succeeds). The
+`ldd` line after the install is the check.
 
 ```bash
 sudo apt install build-essential libacl1-dev libattr1-dev xz-utils acl curl
@@ -52,9 +54,12 @@ tar -xf tar-1.35.tar.xz && cd tar-1.35
 ./configure --prefix=/usr/local --with-posix-acls --with-xattrs --with-selinux=no
 make -j"$(nproc)" && sudo make install
 /usr/local/bin/tar --version
+ldd /usr/local/bin/tar | grep libacl
 ```
 
-The last line should say `tar (GNU tar) 1.35`. Run `tapectl setup` from a shell where
+The `--version` line should say `tar (GNU tar) 1.35`, and the `ldd` line should print a
+`libacl` line; if it prints nothing the tar has no ACL support, so install `libacl1-dev` and
+build again. Run `tapectl setup` from a shell where
 `/usr/local/bin` comes before `/usr/bin` in `PATH` (it does on a stock Debian or Ubuntu;
 `echo "$PATH"` shows it), or point tapectl at the new tar once it has a home:
 
