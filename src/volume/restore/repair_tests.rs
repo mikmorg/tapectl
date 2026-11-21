@@ -335,14 +335,39 @@ pub(crate) mod tests {
         encrypted - 16 - size - 16 * chunks
     }
 
-    /// Whether `encrypt_data_with_header_len` reaches a header of `len` bytes
-    /// with near certainty: age 0.11's grease stanza is 13 to 190 bytes, each
-    /// size from 41 to 148 drawn about 0.7% of the time, so 10,000 tries miss
-    /// one of those with probability below e^-70, and a rarer size by much
-    /// more (the extremes are drawn 6e-8 of the time, #489). The header is
-    /// 168 bytes and the grease stanza (ONE_RECIPIENT_HEADER_LEN is 168 + 100).
-    fn header_len_is_reachable(len: usize) -> bool {
-        (168 + 41..=168 + 148).contains(&len)
+    /// Whether `encrypt_data_with_header_len` reaches every header length of
+    /// `lens` for the recipients of `h`'s staging with near certainty. age
+    /// 0.11 adds a grease stanza of random size to every header (13 to 190
+    /// bytes, each size from 41 to 148 drawn about 0.7% of the time and the
+    /// extremes as rarely as 6e-8, #489), so 10,000 tries miss a common
+    /// length with probability below e^-40 and a rare one almost surely. The
+    /// header's fixed part depends on the recipients, so the lengths are
+    /// measured: a length counts only if 2,000 fresh headers drew it at least
+    /// 8 times.
+    fn header_lens_are_reachable(h: &Home, lens: &[usize]) -> bool {
+        let set = h.stage_set(UNIT, 1);
+        let recipients: Vec<String> = serde_json::from_str(
+            &h.conn
+                .query_row(
+                    "SELECT key_fingerprints FROM stage_sets WHERE id = ?1",
+                    params![set],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let mut seen: BTreeMap<usize, usize> = BTreeMap::new();
+        for _ in 0..2_000 {
+            let out = crate::staging::build_encryptor(&recipients)
+                .unwrap()
+                .wrap_output(Vec::new())
+                .unwrap()
+                .finish()
+                .unwrap();
+            // The header, the 16-byte nonce, and the empty last chunk's tag.
+            *seen.entry(out.len() - 32).or_default() += 1;
+        }
+        lens.iter().all(|l| seen.get(l).copied().unwrap_or(0) >= 8)
     }
 
     /// Build a fixture with `build` until the age headers of slices 2 and 3 are
@@ -351,12 +376,13 @@ pub(crate) mod tests {
     /// test that replaces a slice must match what it drew.
     fn redraw_until_replaceable(
         mut build: impl FnMut() -> Home,
-        reachable: impl Fn(usize) -> bool,
+        reachable: impl Fn(&Home, &[usize]) -> bool,
     ) -> Home {
         for _ in 0..200 {
             let h = build();
             let set = h.stage_set(UNIT, 1);
-            if [2, 3].iter().all(|&n| reachable(header_len_of(&h, set, n))) {
+            let lens = [header_len_of(&h, set, 2), header_len_of(&h, set, 3)];
+            if reachable(&h, &lens) {
                 return h;
             }
         }
@@ -366,7 +392,7 @@ pub(crate) mod tests {
     /// [`copies`], for a test that replaces slice 2 or 3 with an age file of
     /// the recorded length.
     fn replaceable_copies(labels: &[&str]) -> Home {
-        redraw_until_replaceable(|| copies("256K", None, labels), header_len_is_reachable)
+        redraw_until_replaceable(|| copies("256K", None, labels), header_lens_are_reachable)
     }
 
     /// A rare original header no longer fails a replacing test: the fixture is
@@ -374,9 +400,14 @@ pub(crate) mod tests {
     /// the recorded length.
     #[test]
     fn a_rare_original_header_is_drawn_again_and_the_replacement_matches() {
-        assert!(!header_len_is_reachable(168 + 13));
-        assert!(!header_len_is_reachable(168 + 190));
-        assert!(header_len_is_reachable(268));
+        {
+            let h = copies("256K", None, &[A]);
+            let set = h.stage_set(UNIT, 1);
+            let common = header_len_of(&h, set, 3);
+            // A length no header has is never reachable.
+            assert!(!header_lens_are_reachable(&h, &[common + 1000]));
+            assert!(!header_lens_are_reachable(&h, &[0]));
+        }
         // Treat the first fixture as having drawn a rare header.
         let builds = std::cell::Cell::new(0);
         let mut h = redraw_until_replaceable(
@@ -384,7 +415,7 @@ pub(crate) mod tests {
                 builds.set(builds.get() + 1);
                 copies("256K", None, &[A])
             },
-            |_| builds.get() > 1,
+            |_, _| builds.get() > 1,
         );
         assert_eq!(
             builds.get(),
