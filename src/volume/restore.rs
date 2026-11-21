@@ -1176,6 +1176,45 @@ pub fn restore_unit_from_store_for_tests(
     )
 }
 
+/// Test seam for integration tests (tests/recorded_tape.rs, #552): a one-file restore over
+/// any Store. Production code goes through restore_file.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn restore_file_from_store_for_tests(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    file_path: &str,
+    volume_label: &str,
+    version: i64,
+    dest_dir: &Path,
+    options: &RestoreOptions,
+    store: &mut dyn Store,
+) -> Result<RestoreReport> {
+    let dest = dest_dir.to_string_lossy().into_owned();
+    restore_unit_from_bay(
+        conn,
+        paths,
+        config,
+        unit_name,
+        volume_label,
+        version,
+        RestoreTarget::File {
+            file_path,
+            dest_dir: &dest,
+        },
+        options,
+        &mut FixedBay(store),
+        ContactSite::new(
+            config,
+            Operation::RestoreUnit,
+            "memstore",
+            contact::Medium::NoBackend,
+        ),
+    )
+}
+
 /// [`restore_unit_from_store`] over a [`Bay`] — the drive that can also be
 /// asked for another cartridge when a slice is damaged (issue #480).
 #[allow(clippy::too_many_arguments)]

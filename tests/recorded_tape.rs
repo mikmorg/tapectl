@@ -18,13 +18,6 @@
 //! unit under the heir harness, `mt` and `dd` standing in for the drive and serving the
 //! fixture's tape files.
 //!
-//! NOT COVERED HERE: `restore file` (issue #552 names it). tapectl's one-file restore has no
-//! seam over a store: `restore_file` opens the drive and `RestoreTarget` is crate-private,
-//! so an integration test cannot hand it the fixture's files. The seam would be a
-//! `restore_file_from_store_for_tests` beside `restore_unit_from_store_for_tests` in
-//! `src/volume/restore.rs`, outside this task's fence; until it lands, the one-file
-//! restore is covered here only by the tape's own RESTORE.sh for whole units.
-//!
 //! THE RULE. This fixture is never re-recorded to make a test pass. A later build that
 //! cannot read it has broken the format, and that is the CTO's decision, as a change to a
 //! byte pin (`tests/on_tape_golden.rs`) is. A failure here names the fixture file it
@@ -47,7 +40,9 @@ use tapectl::db;
 use tapectl::store::{MemStore, Tier};
 use tapectl::tape::contact::{ContactSite, Medium, Operation};
 use tapectl::volume::rebuild;
-use tapectl::volume::restore::{restore_unit_from_store_for_tests, RestoreOptions};
+use tapectl::volume::restore::{
+    restore_file_from_store_for_tests, restore_unit_from_store_for_tests, RestoreOptions,
+};
 use tapectl::volume::write::volume_verify_with_store;
 
 use heir::Heir;
@@ -499,6 +494,57 @@ fn restore_unit_of_every_recorded_unit_gives_what_expected_says() {
             report.tar_said
         );
         assert_unit_restored(u, &dir, "tapectl restore unit");
+    }
+}
+
+/// `restore file` of a nested file and of the hard link's second name, over the fixture's files:
+/// each comes back as a regular file with its recorded size and sha256.
+#[test]
+fn restore_file_of_one_recorded_file_gives_what_expected_says() {
+    let want = expected();
+    let (home, mut tape, _report) = rebuilt();
+    let u = want.unit.iter().find(|u| u.name == "alpha-main").unwrap();
+    for name in ["docs/deep/er/leaf.txt", "hard-b.txt"] {
+        let e = u.path.iter().find(|e| e.path == name).unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let options = RestoreOptions {
+            keys: vec![key_file(key_name_of(&u.tenant))],
+            ..RestoreOptions::default()
+        };
+        let report = restore_file_from_store_for_tests(
+            &home.conn,
+            &home.paths,
+            &home.config,
+            &u.name,
+            name,
+            &want.tape.label,
+            u.version,
+            dest.path(),
+            &options,
+            &mut tape,
+        )
+        .unwrap_or_else(|er| {
+            panic!(
+                "{}: restore file {name} failed: {er}",
+                fixture_dir().display()
+            )
+        });
+        assert!(
+            report.success,
+            "{}: restore file {name}",
+            fixture_dir().display()
+        );
+        // `restore file` places the last component directly in the destination.
+        let got = dest.path().join(name.rsplit('/').next().unwrap());
+        let ctx = format!("{} (restore file): {name}", fixture_dir().display());
+        let meta = fs::symlink_metadata(&got).unwrap_or_else(|er| panic!("{ctx}: {er}"));
+        assert!(meta.is_file(), "{ctx}: expected a regular file");
+        assert_eq!(meta.len(), e.size, "{ctx}: size");
+        assert_eq!(
+            Some(sha256_hex(&fs::read(&got).unwrap()).as_str()),
+            e.sha256.as_deref(),
+            "{ctx}: sha256"
+        );
     }
 }
 
