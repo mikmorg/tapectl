@@ -2477,6 +2477,7 @@ fn check_span_in_progress(ctx: &Ctx<'_>) -> Result<Findings> {
 /// One span in progress, as [`span_in_progress_findings`] gathers it.
 #[derive(Default)]
 struct SpanInProgress {
+    set: i64,
     unit: String,
     version: i64,
     slices: i64,
@@ -2569,6 +2570,7 @@ fn span_in_progress_findings(conn: &Connection, config: &Config) -> Result<Vec<A
     let mut spans: BTreeMap<i64, SpanInProgress> = BTreeMap::new();
     for (set, unit, version, slices, kind, label, first, last) in rows {
         let span = spans.entry(set).or_default();
+        span.set = set;
         span.unit = unit;
         span.version = version;
         span.slices = slices;
@@ -2592,7 +2594,7 @@ fn span_in_progress_findings(conn: &Connection, config: &Config) -> Result<Vec<A
     spans.sort_by(|a, b| (&a.unit, a.version).cmp(&(&b.unit, b.version)));
     let mut findings: Vec<((String, i64), AuditFinding)> = spans
         .into_iter()
-        .map(|span| {
+        .map(|span| -> Result<((String, i64), AuditFinding)> {
             let holders = span
                 .holders
                 .iter()
@@ -2629,17 +2631,76 @@ fn span_in_progress_findings(conn: &Connection, config: &Config) -> Result<Vec<A
                 ),
                 // The next write plans the slices the span still owes first
                 // (layout-session.md, "The plan order").
-                action: "load a fresh cartridge and run tapectl volume write <NEW-LABEL> --init \
-                         --full-confirm --move-to <location>: it writes the slices the span \
-                         still owes first"
-                    .to_string(),
+                action: next_cartridge_action(
+                    continuation_generation(
+                        conn,
+                        span.set,
+                        span.missing.first().copied().unwrap_or(1),
+                        span.missing.last().copied().unwrap_or(1),
+                    )?
+                    .as_ref(),
+                ),
             };
-            ((span.unit.clone(), span.version), finding)
+            Ok(((span.unit.clone(), span.version), finding))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     findings.extend(owed_by_copy_count(conn, config, &named)?);
     findings.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(findings.into_iter().map(|(_, f)| f).collect())
+}
+
+/// The generation the next cartridge of a continuing write must be (#597
+/// 7-C2): that of the sealed volume holding the range that ends just before
+/// the owed run (`first - 1`) or begins just after it (`last + 1`), which is
+/// the join `volume::write::continuation_generation_refusal` holds the write
+/// to (ADR-0012 items 86 and 300; One copy's span stays on one LTO
+/// generation). The volume's label and media type; `None` when the catalog
+/// knows no such range or records no media type for it.
+fn continuation_generation(
+    conn: &Connection,
+    set: i64,
+    first: i64,
+    last: i64,
+) -> Result<Option<(String, String)>> {
+    let joined = |aggregate: &str, edge: i64| -> Result<Option<(String, String)>> {
+        Ok(conn
+            .prepare(&format!(
+                "SELECT v.label, v.media_type FROM writes w
+                   JOIN volumes v ON v.id = w.volume_id
+                  WHERE w.stage_set_id = ?1 AND w.status = 'range' AND v.status = 'sealed'
+                    AND v.media_type IS NOT NULL
+                    AND (SELECT {aggregate}(sl.slice_number) FROM write_positions wp
+                           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                          WHERE wp.write_id = w.id AND wp.status = 'written') = ?2
+                  ORDER BY w.id"
+            ))?
+            .query_map(params![set, edge], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .next())
+    };
+    if first > 1 {
+        if let Some(found) = joined("MAX", first - 1)? {
+            return Ok(Some(found));
+        }
+    }
+    joined("MIN", last + 1)
+}
+
+/// What `span_in_progress` tells the operator to do: load a cartridge, of
+/// the generation the catalog knows the write must continue on.
+fn next_cartridge_action(joined: Option<&(String, String)>) -> String {
+    let cartridge = match joined {
+        Some((label, media)) => format!(
+            "a fresh cartridge of {media} (the generation of {label}, whose range the \
+             continuing write joins; one copy's span stays on one generation)"
+        ),
+        None => "a fresh cartridge".to_string(),
+    };
+    format!(
+        "load {cartridge} and run tapectl volume write <NEW-LABEL> --init --full-confirm \
+         --move-to <location>: it writes the slices the span still owes first"
+    )
 }
 
 /// #589 (T5.1 Build item 5): the versions whose slices are owed in the
@@ -2706,10 +2767,9 @@ fn owed_by_copy_count(
                     "v{version} is a span still in progress: {run} on fewer sealed volumes \
                      than its copy floor of {floor}, and the continuing write is owed"
                 ),
-                action: "load a fresh cartridge and run tapectl volume write <NEW-LABEL> --init \
-                         --full-confirm --move-to <location>: it writes the slices the span \
-                         still owes first"
-                    .to_string(),
+                action: next_cartridge_action(
+                    continuation_generation(conn, set, first, last)?.as_ref(),
+                ),
             },
         ));
     }
@@ -7579,6 +7639,14 @@ mod tests {
                 "{}",
                 found[0].action
             );
+            // #597 7-C2: the generation the next cartridge must be, from the
+            // range the continuing write joins (item 86).
+            assert!(
+                found[0].action.contains("cartridge of LTO-6")
+                    && found[0].action.contains("SPAN-1"),
+                "{}",
+                found[0].action
+            );
         }
 
         /// The span's last tape seals: every slice is on a sealed volume, and
@@ -7649,6 +7717,12 @@ mod tests {
             );
             assert!(
                 found[0].action.contains("tapectl volume write <NEW-LABEL>"),
+                "{}",
+                found[0].action
+            );
+            assert!(
+                found[0].action.contains("cartridge of LTO-6")
+                    && found[0].action.contains("SPAN-1"),
                 "{}",
                 found[0].action
             );
