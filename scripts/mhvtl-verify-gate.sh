@@ -2798,7 +2798,7 @@ cz_restore() { # cz_restore <algorithm>
     cz_prepare || return 1
     # The envelope says the unit is compressed with $a (tests/heir_restore.rs a_decompressor_is_needed_only_by_a_unit_that_states_one).
     out="$(cz_sh --find-envelope --key "$key" 2>&1)" || { printf '%s\n' "$out"; return 1; }
-    grep -E "^  $u  version 1  [0-9]+ slice\(s\)  [0-9]+ bytes  compressed with $a\$" >/dev/null <<<"$out" \
+    grep -E "^  $u  version 1  [0-9]+ slice\(s\)  [0-9]+ bytes  compressed with $a  \(envelopes? at files? [0-9]+(, [0-9]+)*\)\$" >/dev/null <<<"$out" \
         || { printf '%s\n' "$out"; echo "the envelope does not say $u is compressed with $a"; return 1; }
     # The control first: a decompressor that fails, first on PATH, must not give a complete restore.
     printf '#!/bin/sh\nexit 99\n' >"$CZ/stub/$a"; chmod +x "$CZ/stub/$a"
