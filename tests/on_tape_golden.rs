@@ -394,6 +394,7 @@
 //! text shows the format in the test; one that holds a sha256 writes the generated text to
 //! a file under the target directory when it fails and names that file.
 
+use tapectl::idmap::{self, IdKind, IdRow};
 use tapectl::volume::filetable::{self, Kind, Row};
 use tapectl::volume::layout::{
     generate_front_index, generate_id_thunk_v2, generate_seal_marker_requiring_at,
@@ -1303,4 +1304,39 @@ fn layout3_file_table_text() {
         filetable::write(w, 12_800 + 10_240, rows.into_iter().map(Ok)).unwrap();
     });
     assert_pinned_text("file-table", &text, FILE_TABLE);
+}
+
+/// Tab-separated text: each TAB is written `\t` here so no editor can change it.
+const ID_MAP: &str = concat!(
+    "#tapectl-id-map 1\n",
+    "u\t0\troot\n",
+    "u\t1000\tmike\n",
+    "u\t4242\t\n",
+    "u\t65534\ta\\tb\n",
+    "g\t0\troot\n",
+    "g\t100\tusers\n",
+    "g\t4242\t\n",
+);
+
+/// A staging's id map (volume-format-v3.md section 1.6): users before groups, each by
+/// number; a name the host did not know written as an empty field; a name holding a TAB
+/// written escaped (`\t`).
+#[test]
+fn layout3_id_map_text() {
+    let row = |kind, id, name: Option<&str>| IdRow {
+        kind,
+        id,
+        name: name.map(str::to_string),
+    };
+    let rows = vec![
+        row(IdKind::User, 0, Some("root")),
+        row(IdKind::User, 1000, Some("mike")),
+        row(IdKind::User, 4242, None),
+        row(IdKind::User, 65534, Some("a\\tb")),
+        row(IdKind::Group, 0, Some("root")),
+        row(IdKind::Group, 100, Some("users")),
+        row(IdKind::Group, 4242, None),
+    ];
+    let text = text_of(|w| idmap::write(w, &rows).unwrap());
+    assert_pinned_text("id-map", &text, ID_MAP);
 }
