@@ -1174,7 +1174,16 @@ do_find_envelope() {
   collect_units
   collect_ranges
   say "Units in the envelope(s) your key opened (unit, version, slices, bytes of stream, compression):"
-  awk -F'|' '{ printf "  %s  version %s  %s slice(s)  %s bytes%s\n", $3, $4, $11, $8, ($7 != "" ? "  compressed with " $7 : "") }' "$WORK/units.txt"
+  # One line per unit and version, though each envelope that lists it (the
+  # tenant's, the operator's) gives a row: the line names those envelopes.
+  awk -F'|' '
+    {
+      k = ($6 != "" ? $6 : $3) SUBSEP $4
+      if (!(k in at)) { order[++n] = k; line[k] = sprintf("  %s  version %s  %s slice(s)  %s bytes%s", $3, $4, $11, $8, ($7 != "" ? "  compressed with " $7 : "")); at[k] = $1; cnt[k] = 1 }
+      else { at[k] = at[k] ", " $1; cnt[k]++ }
+    }
+    END { for (i = 1; i <= n; i++) { k = order[i]; printf "%s  (%s at file%s %s)\n", line[k], (cnt[k] > 1 ? "envelopes" : "envelope"), (cnt[k] > 1 ? "s" : ""), at[k] } }
+  ' "$WORK/units.txt"
   local row r name ver uuid ft
   while IFS= read -r row <&3; do
     IFS='|' read -r _ _ name ver _ uuid _ _ ft _ <<<"$row"

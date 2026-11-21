@@ -1771,8 +1771,10 @@ A restore went right only if all of these hold:
    with any record of your own.
 4. After `--all`, every unit your key opens was restored: "RESTORE COMPLETE:
    N unit(s) restored" names N, and every unit that `./RESTORE.sh
-   --find-envelope --key YOUR_KEY.age.key` lists must be a directory of the
-   `--all` destination (a tape of one unit puts that unit's files in the
+   --find-envelope --key YOUR_KEY.age.key` lists (once for each unit and
+   version, with the envelopes that list it named on its line: a key that
+   opens both the operator's and a tenant's envelope sees the same unit in
+   both) must be a directory of the `--all` destination (a tape of one unit puts that unit's files in the
    destination itself, and that is the unit's directory). Restore each one
    that is not in a run of its own, `./RESTORE.sh --restore --key
    YOUR_KEY.age.key --unit UNIT --to /destination/UNIT`, and check that run
@@ -4743,6 +4745,19 @@ verify any entry by hashing the file it describes.
         ] {
             assert!(f.contains(needle), "{needle:?}: {f}");
         }
+    }
+
+    /// #548 T6.2-2: the unit is listed once, so "Did the restore get
+    /// everything?" says each listed unit is one, and why a line names more
+    /// than one envelope.
+    #[test]
+    fn t62_2_file_1_says_find_envelope_lists_a_unit_once_with_its_envelopes() {
+        let g = generate_system_guide_v2_for_media("DEV1", 12, "LTO-6");
+        let f = flat_text(guide_section(&g, "Did the restore get everything?"));
+        assert!(
+            f.contains("lists (once for each unit and version, with the envelopes that list it named on its line"),
+            "{f}"
+        );
     }
 
     /// #477 item 6: `eod` and `bsfm 2` explained, and which file is last.

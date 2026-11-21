@@ -2251,9 +2251,9 @@ sha256_encrypted = "eb1"
 }
 
 /// A unit that two envelopes list (the escrow key opens the operator's and
-/// the tenant's): `--find-envelope` shows it in both, and `--list` and
-/// `--restore` pick ONE block: the one with the file table, the tenant
-/// envelope's, version 1 (the only version staged).
+/// the tenant's): `--find-envelope` shows it ONCE, naming both envelopes
+/// (#548 T6.2-2), and `--list` and `--restore` pick ONE block: the one with
+/// the file table, the tenant envelope's, version 1 (the only version staged).
 #[test]
 fn a_unit_listed_by_two_envelopes_is_picked_once_from_the_one_with_the_file_table() {
     let t = two();
@@ -2266,10 +2266,15 @@ fn a_unit_listed_by_two_envelopes_is_picked_once_from_the_one_with_the_file_tabl
         .lines()
         .filter(|l| l.contains(&format!("  {UNIT_A}  version 1")))
         .count();
-    assert_eq!(
-        rows, 2,
-        "the operator's and the tenant's envelope: {}",
-        o.stdout
+    assert_eq!(rows, 1, "one line per unit and version: {}", o.stdout);
+    let line = o
+        .stdout
+        .lines()
+        .find(|l| l.contains(&format!("  {UNIT_A}  version 1")))
+        .unwrap();
+    assert!(
+        line.contains("envelopes at files ") && line.contains(", "),
+        "the line names both envelopes: {line}"
     );
     let o = h.run(&["--list", "--key", &esc, "--unit", UNIT_A]);
     assert_eq!(o.code, 0, "{}", o.all());
