@@ -300,6 +300,19 @@ fn fill_from(
         "unit \"{}\" v{} (the copy of stage set {})",
         ctx.unit_name, ctx.version, copy.stage_set_id
     ));
+    // Item 298: the warning covers every slice the restore reads, and this
+    // copy's slices may be larger than the restoring staging's (#594 C-3).
+    if let Some(line) = restore_memory_warning(
+        subset
+            .iter()
+            .map(|wp| wp.size_bytes.max(0) as u64)
+            .max()
+            .unwrap_or(0),
+        facts.compression.is_some(),
+        crate::staging::jobs::mem_available(),
+    ) {
+        progress::say(&line);
+    }
     let damage_before = supply.damage.len();
     let out = dir.join("out");
     let job = reader::Job {

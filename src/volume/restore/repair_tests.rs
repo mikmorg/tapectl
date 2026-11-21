@@ -789,6 +789,28 @@ pub(crate) mod tests {
         );
     }
 
+    /// #594 C-3, item 298: the memory warning covers the slices the repair
+    /// reads from another staging as well as the restoring staging's own: it
+    /// is said before the fill reads that copy, in the same words.
+    #[test]
+    fn the_repair_warns_about_memory_before_it_reads_another_staging() {
+        let (mut h, one, _two) = two_stagings();
+        damage_in(&mut h, A, one, 3, 1);
+        crate::staging::jobs::MEMORY_OVERRIDE.with(|m| m.set(Some(100 * 1024)));
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let ((r, _dest), heard) = crate::progress::heard::during(|| {
+            restore_unit(&h, A, &RestoreOptions::default(), &mut bay)
+        });
+        crate::staging::jobs::MEMORY_OVERRIDE.with(|m| m.set(None));
+        r.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            heard.count("holds up to").0,
+            2,
+            "one warning for the restoring staging, one for the copy the fill reads: {:?}",
+            heard.stderr
+        );
+    }
+
     /// #594 4-5, item 278: a restore that ends INCOMPLETE restored files with
     /// numeric owners all the same, so its error carries the id map that names
     /// them, as a restore that succeeds shows it.
