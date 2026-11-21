@@ -1909,13 +1909,13 @@ fn restore_planned(
         stage_set_id: plan.stage_set_id,
         rows: &rows,
     };
-    let (filled, filled_root) = fill::finish(&ctx, supply, &ex)?;
-    trace.filled = filled;
+    let filled = fill::finish(&ctx, supply, &ex)?;
+    trace.filled = filled.files;
     // The destination's own root, last: the repair's hidden directory and
     // the files it installed have moved the root's times, and the restore
     // is whole (ADR-0012 item 303). The first run's root member, or, when
     // that was lost, the copy's.
-    if let Some(member) = root_member.or(filled_root) {
+    if let Some(member) = root_member.or(filled.root) {
         for line in reader::apply_root(&config.tar.binary, &extract, &member) {
             warn!("tar: {line}");
             progress::log(&format!("tar: {line}"));

@@ -79,6 +79,15 @@ struct Notes {
     root: Option<Vec<u8>>,
 }
 
+/// What [`finish`] filled.
+#[derive(Default)]
+pub(super) struct Filled {
+    /// The files taken from another copy: path, and where from and how.
+    pub files: Vec<(String, String)>,
+    /// The unit's root member's bytes, when the root was among them.
+    pub root: Option<Vec<u8>>,
+}
+
 /// The restore's end: nothing lost, or the loss filled from another copy, or
 /// an error naming what is still lost. Returns the files filled, and the
 /// root member's bytes when the root was among them.
@@ -86,7 +95,7 @@ pub(super) fn finish(
     ctx: &Finish<'_>,
     supply: &mut Supply<'_, '_, '_>,
     ex: &Extracted,
-) -> Result<(Vec<(String, String)>, Option<Vec<u8>>)> {
+) -> Result<Filled> {
     let mut lost = ex.lost.clone();
     progress::log(&format!(
         "restore of unit \"{}\" v{}: {} file(s) damaged or missing after the extract; {} slice(s) \
@@ -104,7 +113,7 @@ pub(super) fn finish(
                  restore is whole"
             );
         }
-        return Ok((Vec::new(), None));
+        return Ok(Filled::default());
     }
 
     let mut notes = Notes::default();
@@ -113,7 +122,10 @@ pub(super) fn finish(
     supply.set_subject(subject);
     outcome?;
     if lost.is_empty() {
-        return Ok((notes.filled, notes.root));
+        return Ok(Filled {
+            files: notes.filled,
+            root: notes.root,
+        });
     }
     Err(incomplete(ctx, ex, &lost, &notes))
 }
