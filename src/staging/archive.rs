@@ -199,9 +199,54 @@ pub(crate) fn scan(conn: &Connection, snapshot_id: i64, root: &Path, unit: &str)
             seen: Seen::of(&meta),
         });
     }
+    // ADR-0012 item 306: the list begins with the unit's own root, ahead of
+    // the sorted entries (a name like `#x` sorts before `.`, and the root is
+    // not sorted among them). tar is given `./.` and writes the root folder
+    // as `././` with its own mode, owner, times, attributes and ACLs.
+    entries.insert(0, root_entry(root, unit)?);
     Ok(Scan {
         entries,
         started_ns,
+    })
+}
+
+/// The unit's root as the list's first entry: path `.`, a folder, looked at
+/// on disk as every entry is. The root is not in the snapshot (its walk
+/// begins below it), so it is never compared with a recorded kind; tapectl's
+/// own writes into it (the dotfile) move its mtime, which the recheck, like
+/// every folder's, does not compare.
+fn root_entry(root: &Path, unit: &str) -> Result<Entry> {
+    let meta = std::fs::metadata(root).map_err(|e| {
+        TapectlError::Other(format!(
+            "cannot stat the root of unit \"{unit}\": {} ({e})",
+            root.display()
+        ))
+    })?;
+    if !meta.is_dir() {
+        return Err(TapectlError::Other(format!(
+            "DIRTY: the root of unit \"{unit}\", {}, is no longer a folder. Take a new \
+             snapshot (`tapectl snapshot create {unit}`) and stage that.",
+            root.display()
+        )));
+    }
+    let c = CString::new(root.as_os_str().as_bytes()).map_err(|_| {
+        TapectlError::Other(format!(
+            "a source path holds a NUL byte: {}",
+            root.display()
+        ))
+    })?;
+    Ok(Entry {
+        listed: Listed {
+            path: ".".to_string(),
+            kind: Kind::Folder,
+            size: 0,
+            acl: AclOnDisk {
+                access: has_attribute(&c, "system.posix_acl_access"),
+                default: has_attribute(&c, "system.posix_acl_default"),
+            },
+            linked: false,
+        },
+        seen: Seen::of(&meta),
     })
 }
 

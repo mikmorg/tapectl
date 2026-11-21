@@ -1901,7 +1901,16 @@ fn stream_estimate(
         ))
     })?;
     let root = Path::new(root);
-    let mut bytes: u64 = 0;
+    // The unit's root is a member too (ADR-0012 item 306): a folder named
+    // `.`, with its own attributes where it has any.
+    let mut bytes: u64 = ENTRY_HEADER_BYTES.saturating_add(round_up_512(2));
+    // SAFETY: a NUL-terminated string; a null buffer of length 0 asks only
+    // for the attribute list's size.
+    if std::ffi::CString::new(root.as_os_str().as_bytes())
+        .is_ok_and(|c| unsafe { nix::libc::llistxattr(c.as_ptr(), std::ptr::null_mut(), 0) > 0 })
+    {
+        bytes = bytes.saturating_add(ENTRY_XATTR_BYTES);
+    }
     for row in rows {
         let (path, kind, size) = row?;
         if kind == crate::db::files::FileKind::Regular {

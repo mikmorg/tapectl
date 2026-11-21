@@ -1028,7 +1028,8 @@ mod tests {
         let dotfile = fs::metadata(src.join(".tapectl-unit.toml")).unwrap().len();
         let entry = |path: &str| 2560 + (2 * path.len() as u64).div_ceil(512) * 512;
         let mut bytes = 1000 + 2000 + dotfile;
-        for p in [".tapectl-unit.toml", "d", "d/a.txt", "d/bb.txt"] {
+        // The unit's root is a member too (item 306).
+        for p in [".", ".tapectl-unit.toml", "d", "d/a.txt", "d/bb.txt"] {
             bytes += entry(p);
         }
         bytes += 4096;
@@ -1043,5 +1044,119 @@ mod tests {
         let packed =
             super::super::stream_estimate(&conn, snap, src.to_str().unwrap(), s, p).unwrap();
         assert!(packed > got, "never counts on compression to make room");
+    }
+
+    // ---------- the unit's root is a member (ADR-0012 item 306, #594 C-1) ----------
+
+    /// Set an extended attribute with `setfattr`, or say loudly that the
+    /// host cannot (the suite's ACL tests skip the same way).
+    fn try_setfattr(p: &Path) -> bool {
+        run_ok(
+            "setfattr",
+            &[
+                std::ffi::OsStr::new("-n"),
+                std::ffi::OsStr::new("user.root-mark"),
+                std::ffi::OsStr::new("-v"),
+                std::ffi::OsStr::new("kept"),
+                p.as_os_str(),
+            ],
+        )
+    }
+
+    fn try_setfacl(p: &Path, args: &[&str]) -> bool {
+        let mut a: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+        a.push(p.as_os_str());
+        run_ok("setfacl", &a)
+    }
+
+    /// The staged stream's bytes, whole, of stage set `id`.
+    fn stream_of(conn: &Connection, paths: &TapectlPaths, id: i64) -> Vec<u8> {
+        slices_of(conn, id)
+            .iter()
+            .map(|s| decrypt(conn, paths, &s.path))
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    /// Item 306: the stream's first member is the unit's root folder, with
+    /// its own mode, times, extended attribute and ACLs (a default ACL
+    /// included), and the file table's first row is `.`.
+    #[test]
+    fn the_unit_root_is_the_streams_first_member_and_the_tables_first_row() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("a.txt"), b"a").unwrap();
+        fs::create_dir_all(src.join("d")).unwrap();
+        fs::write(src.join("d/b.txt"), b"b").unwrap();
+        let xattr = try_setfattr(&src);
+        let acl = try_setfacl(&src, &["-m", "u:12345:r-x"]);
+        let default_acl = try_setfacl(&src, &["-d", "-m", "u:12346:r-x"]);
+        for (what, ok) in [("xattr", xattr), ("ACL", acl), ("default ACL", default_acl)] {
+            if !ok {
+                eprintln!(
+                    "SKIPPING the root's {what} half of item 306's test: the host refuses it"
+                );
+            }
+        }
+        // chmod after setfacl: an ACL's mask rides on the group bits.
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o750)).unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(981_173_106);
+        fs::File::open(&src).unwrap().set_modified(when).unwrap();
+
+        let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+        let id = stage_create(&conn, &paths, &config, snap, false).unwrap();
+        let rows = crate::db::stage_files::load(&conn, id).unwrap();
+        let first = &rows[0];
+        assert_eq!((first.path.as_str(), first.kind), (".", Kind::Folder));
+        assert_eq!(first.start, 0, "the root is the stream's first member");
+        assert_eq!(
+            rows.iter().filter(|r| r.path == ".").count(),
+            1,
+            "one root row"
+        );
+        let stream = stream_of(&conn, &paths, id);
+        let member = &stream[..first.end as usize];
+        let text = String::from_utf8_lossy(member);
+        assert!(text.contains("SCHILY.acl.access=") == acl, "{text}");
+        assert!(
+            text.contains("SCHILY.acl.default=") == default_acl,
+            "{text}"
+        );
+        assert!(
+            text.contains("SCHILY.xattr.user.root-mark=kept") == xattr,
+            "{text}"
+        );
+        // The header: the name, then the mode (octal) in its own field.
+        let header = &member[member.len() - 512..];
+        assert_eq!(&header[..4], b"././", "the root's name as tar gives it");
+        assert_eq!(&header[100..107], b"0000750", "the root's own mode");
+        assert_eq!(
+            &header[136..147],
+            format!("{:011o}", 981_173_106).as_bytes(),
+            "the root's own mtime (a whole second: no pax record)"
+        );
+        assert_eq!(header[156], b'5', "a folder");
+        // The second row is the first of the snapshot's own entries, and
+        // the root's range ends where it begins.
+        assert_eq!(rows[1].start, first.end);
+        // Slice 1 holds it.
+        let first_slice = decrypt(&conn, &paths, &slices_of(&conn, id)[0].path);
+        assert_eq!(&first_slice[..first.end as usize], member);
+    }
+
+    /// Item 306: the root is first even when a name sorts before `.`: it
+    /// heads the list, it is not sorted among the entries.
+    #[test]
+    fn the_unit_root_is_first_though_a_name_sorts_before_the_dot() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("#x"), b"x").unwrap();
+        fs::write(src.join("!a"), b"a").unwrap();
+        let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+        let id = stage_create(&conn, &paths, &config, snap, false).unwrap();
+        let rows = crate::db::stage_files::load(&conn, id).unwrap();
+        let paths_in_order: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths_in_order, [".", "!a", "#x", ".tapectl-unit.toml"]);
     }
 }
