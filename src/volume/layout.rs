@@ -1622,9 +1622,10 @@ BY`; for one tape, add `AND v.label = 'TAPE'`:
 `holds` is `completed` for a tape that holds that version whole and `range`
 for one that holds only the run `slices` names, of the version's
 `of_slices` (a unit on more than one cartridge:
-"A unit on more than one cartridge"). A `range` tape is not a copy on its own: the version restores only
+"A unit on more than one cartridge"). A `range` tape is not a copy on its own: the whole version restores only
 with every slice, 1 to `of_slices`, from the tapes that hold them, and its
-rows together say which tapes those are.
+rows together say which tapes those are. Alone it restores the files whose
+slices it holds, whole, and lists the rest.
 
 A tape holds a good copy when its `status` is `sealed` and its `condition`
 is `ok`. `erased` is a wiped tape and `retired` one taken out of service:
@@ -3530,6 +3531,17 @@ mod tests {
         );
         assert!(
             after.contains("A `range` tape is not a copy on its own"),
+            "{after}"
+        );
+        // Layout 3's rule, not Layout 2's (D17, ADR-0012 item 266; #596): the
+        // WHOLE version needs every slice; a range tape alone gives the files
+        // whose slices it holds, whole.
+        assert!(
+            after.contains("the whole version restores only with every slice, 1 to `of_slices`"),
+            "{after}"
+        );
+        assert!(
+            after.contains("Alone it restores the files whose slices it holds, whole, and lists the rest"),
             "{after}"
         );
     }

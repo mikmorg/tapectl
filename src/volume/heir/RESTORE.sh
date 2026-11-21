@@ -3325,7 +3325,8 @@ note_range_versions() { # <envelope dir>
 note_range_holders() {
   [ -s "$WORK/partial.flag" ] || return 0
   say "A holder marked 'a range' holds only the slices it names of that version, and is not a copy of it"
-  say "on its own: a restore needs every slice, 1 to the last, in slice order, from the tapes that hold them."
+  say "on its own: a restore of the whole version needs every slice, 1 to the last, in slice order, from the"
+  say "tapes that hold them. That tape alone restores the files whose slices it holds whole and lists the rest."
 }
 
 index_banner() {

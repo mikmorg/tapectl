@@ -3975,6 +3975,34 @@ fn where_and_find_on_a_range_tape_mark_this_tape_a_range_and_not_a_whole_copy() 
     assert!(!o.stdout.contains("a range"), "{}", o.stdout);
 }
 
+/// #596 (the "every slice, 1 to the last" concern): a tape that holds part of a
+/// unit gives the files it holds whole and lists the rest (D17, ADR-0012 item
+/// 266). The line after a range holder says that of the tape, and says the
+/// whole VERSION is what needs every slice, in the words of Layout 3 and not
+/// Layout 2's "a restore needs every slice".
+#[test]
+fn the_line_after_a_range_holder_does_not_state_layout_2s_rule() {
+    let range = &whole_and_range()[1];
+    let h = Heir::of(range);
+    let kb = key(&h, Who::TenantB);
+    let o = h.run(&["--where", UNIT_B, "--key", &kb]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let flat = o.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("a restore of the whole version needs every slice, 1 to the last"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        flat.contains(
+            "That tape alone restores the files whose slices it holds whole and lists the rest"
+        ),
+        "{}",
+        o.stdout
+    );
+    assert!(!flat.contains("a restore needs every slice"), "{}", o.stdout);
+}
+
 /// BusyBox tar takes a member given whole, as the heir's path restore gives
 /// it, and does not take a named folder with all that lies under it: a file,
 /// a hard link with its first name, a folder and a long member's run all come
