@@ -1169,7 +1169,7 @@ read `/dev/nst0`, which may be another drive or another tape.
     chmod +x RESTORE.sh
 
 File 2 is the same file on every tape, so the one copy reads any tape of
-the box. (A tapectl volume of another layout has another File 2 and says
+the box. (A volume written by tapectl in another layout has another File 2 and says
 so: read it with the RESTORE.sh in its own File 2.)
 
 The first line sets the drive to the tape's 512 KiB blocks. Repeating it
@@ -1898,7 +1898,7 @@ documentation (`docs/keys-and-recovery.md`, runbook C) gives the commands.
 **Which key it needs.** tapectl's own restore starts from `tapectl catalog
 rebuild --from-volume`, which reads the tape's operator envelope: it needs
 the OPERATOR key or the ESCROW secret. With a tenant's key it is refused ("cannot
-open the operator envelope"), and no tapectl restore runs without the
+open the operator envelope"), and tapectl's own restore cannot run without the
 rebuilt catalogue. A holder of only a tenant's key has RESTORE.sh, the
 manual steps and the one repair from another copy of the tape, and
 nothing else; they do not read around a damaged piece of a slice, and
