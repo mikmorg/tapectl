@@ -1918,13 +1918,14 @@ pub(crate) fn plan_preview(
     if batch.is_empty() {
         return Ok(None);
     }
-    let order = take_in_plan_order(&batch.classes);
+    let plan_classes = batch.plan_classes();
+    let order = take_in_plan_order(&plan_classes);
     let units: Vec<BuildUnit> = order.iter().map(|&i| batch.units[i].clone()).collect();
     let classes: Vec<PlanClass> = order.iter().map(|&i| batch.classes[i]).collect();
     let items: Vec<PlanItem> = units
         .iter()
-        .zip(&classes)
-        .map(|(u, &class)| PlanItem {
+        .zip(order.iter().map(|&i| plan_classes[i]))
+        .map(|(u, class)| PlanItem {
             class,
             bytes: padded_slice_bytes(u, block_size),
         })
@@ -1978,7 +1979,8 @@ fn build_span_layout(
 ) -> Result<(build::BuiltLayout, BuildInputs, SpanPlan)> {
     let label = w.label;
     let block_size = w.block_size;
-    let StagedBatch { units, classes } = batch;
+    let classes = batch.plan_classes();
+    let StagedBatch { units, .. } = batch;
 
     // 1. The probe, owed runs first (the caller's order within each class).
     let grouped = take_in_plan_order(&classes);
@@ -9607,9 +9609,29 @@ pub(crate) mod shared_place_log {
 pub(crate) struct StagedBatch {
     pub units: Vec<BuildUnit>,
     pub classes: Vec<PlanClass>,
+    /// `carried[i]`: `units[i]` is carried from a source volume (a `volume
+    /// rewrite`'s, a compaction's), owed or queued. Every carried set keeps
+    /// the source's order (ADR-0012 item 305), ahead of the sets the write
+    /// adds.
+    pub carried: Vec<bool>,
 }
 
 impl StagedBatch {
+    /// What each unit is to the plan's ORDER: a carried set is laid with the
+    /// owed runs, in the batch's order (which [`find_staged_data`] made the
+    /// source's), so the planner's owed-then-queued order keeps the source's
+    /// order across both classes and puts the sets the write adds after
+    /// them, owed first (item 305; item 289 among the added). Only the order
+    /// reads this: [`Self::classes`] stays what each set is to the
+    /// continuation checks.
+    fn plan_classes(&self) -> Vec<PlanClass> {
+        self.classes
+            .iter()
+            .zip(&self.carried)
+            .map(|(&class, &carried)| if carried { PlanClass::Owed } else { class })
+            .collect()
+    }
+
     fn is_empty(&self) -> bool {
         self.units.is_empty()
     }
@@ -9962,19 +9984,22 @@ fn find_staged_data(
                 span: Some(span),
             });
             batch.classes.push(class);
+            batch.carried.push(source_order.is_some());
             order_keys.push(source_order);
         }
     }
     // A carried set goes where the source held it: the carried sets in the
     // source's order, ahead of the sets nothing carries, which keep the
     // name order the query gave (a stable sort; only a rewrite or a
-    // compaction has carried sets). The plan order then takes owed runs
-    // before the queue, within each class in this order.
+    // compaction has carried sets). The plan order then lays every carried
+    // set first, owed or queued alike ([`StagedBatch::plan_classes`], item
+    // 305), and the sets added after them owed runs before the queue.
     if order_keys.iter().any(Option::is_some) {
         let mut at: Vec<usize> = (0..order_keys.len()).collect();
         at.sort_by_key(|&i| (order_keys[i].is_none(), order_keys[i].clone()));
         batch.units = at.iter().map(|&i| batch.units[i].clone()).collect();
         batch.classes = at.iter().map(|&i| batch.classes[i]).collect();
+        batch.carried = at.iter().map(|&i| batch.carried[i]).collect();
     }
     Ok(batch)
 }

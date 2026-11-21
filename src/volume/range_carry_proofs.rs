@@ -1339,3 +1339,120 @@ fn a_rewrite_lays_the_carried_stagings_in_the_order_the_source_held_them() {
         [range(TAIL8, 3, 3), range(HEAD8, 1, 2)]
     );
 }
+
+const MID9: &str = "kumquat-mmm-whole";
+const HEAD9: &str = "kumquat-zzz-head";
+const TAIL9: &str = "kumquat-aaa-tail";
+const ADDED9: &str = "kumquat-000-added";
+const OWED9: &str = "kumquat-yyy-owed";
+const ABC_TAPES: [&str; 3] = ["ABC-T1", "ABC-T2", "ABC-T3"];
+
+/// A source holding A's tail (owed), C whole (queued) and B's head at its end
+/// (owed): tape 2 of three. By name the order is A (`TAIL9`), C (`MID9`), B
+/// (`HEAD9`), so a plain write laid tape 2 so; a rewrite that took the
+/// carried owed runs first would lay A, B, C.
+fn tail_whole_head_home() -> Home {
+    let mut h = Home::new(None, 1, "64K");
+    h.unit(TENANT_ONE, TAIL9, files("tail-nine", &[50_000; 3], 31));
+    h.stage(TAIL9);
+    for label in ABC_TAPES {
+        h.volume(label);
+    }
+    write_full(&mut h, ABC_TAPES[0], Warn::InSlice(TAIL9, 2));
+    h.unit(TENANT_ONE, MID9, files("mid-nine", &[20_000], 32));
+    h.stage(MID9);
+    h.unit(TENANT_TWO, HEAD9, files("head-nine", &[50_000; 3], 33));
+    h.stage(HEAD9);
+    write_full(&mut h, ABC_TAPES[1], Warn::InSlice(HEAD9, 2));
+    write_full(&mut h, ABC_TAPES[2], Warn::Never);
+    assert_eq!(
+        write::recorded_ranges(&h.conn, ABC_TAPES[1]).unwrap(),
+        [range(TAIL9, 3, 3), range(HEAD9, 1, 2)],
+        "tape 2 holds A's tail, C whole, B's head"
+    );
+    h
+}
+
+/// The slices a volume holds in tape order: `(unit, slice number)`.
+fn laid_on(h: &Home, label: &str) -> Vec<(String, i64)> {
+    let mut stmt = h
+        .conn
+        .prepare(
+            "SELECT u.name, sl.slice_number
+               FROM write_positions wp
+               JOIN writes w ON w.id = wp.write_id
+               JOIN volumes v ON v.id = w.volume_id
+               JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+               JOIN stage_sets ss ON ss.id = sl.stage_set_id
+               JOIN snapshots s ON s.id = ss.snapshot_id
+               JOIN units u ON u.id = s.unit_id
+              WHERE v.label = ?1 AND wp.status = 'written'
+                AND w.status IN ('completed', 'range')
+              ORDER BY CAST(wp.position AS INTEGER)",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map(params![label], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+fn a_c_b() -> Vec<(String, i64)> {
+    vec![
+        (TAIL9.to_string(), 3),
+        (MID9.to_string(), 1),
+        (HEAD9.to_string(), 1),
+        (HEAD9.to_string(), 2),
+    ]
+}
+
+/// Item 305: a rewrite keeps the source's order for every set it carries,
+/// owed or queued alike. The source holds A's tail, C whole and B's head;
+/// the destination is laid A, C, B, not A, B, C.
+#[test]
+fn a_rewrite_lays_an_owed_and_a_queued_carried_set_in_the_sources_order() {
+    let mut h = tail_whole_head_home();
+    assert_eq!(laid_on(&h, ABC_TAPES[1]), a_c_b(), "the source");
+    let ran = rewrite_with(&mut h, ABC_TAPES[1], "ABC-T2R", false);
+    ran.result.unwrap_or_else(|e| panic!("{e}\n{:?}", ran.log));
+    assert_eq!(laid_on(&h, "ABC-T2R"), a_c_b(), "the destination");
+}
+
+/// Item 305 for a compaction: the same source, `compact-read` and
+/// `compact-write`.
+#[test]
+fn a_compaction_lays_an_owed_and_a_queued_carried_set_in_the_sources_order() {
+    let mut h = tail_whole_head_home();
+    h.volume("ABC-C");
+    compact_read_from(&h, ABC_TAPES[1]).unwrap_or_else(|e| panic!("{e}"));
+    compact_write_to(&mut h, "ABC-C");
+    assert_eq!(laid_on(&h, "ABC-C"), a_c_b());
+}
+
+/// Item 305: the sets `--with-staged` adds follow every carried set, owed
+/// first (item 289's order among them): an added set with its tail owed
+/// (`OWED9`, a range on another tape) before an added set queued (`ADDED9`,
+/// first by name).
+#[test]
+fn the_sets_a_rewrite_adds_follow_every_carried_set_owed_first() {
+    let mut h = tail_whole_head_home();
+    h.volume("ABC-T4");
+    h.unit(TENANT_ONE, OWED9, files("owed-nine", &[50_000; 3], 34));
+    h.stage(OWED9);
+    write_full(&mut h, "ABC-T4", Warn::InSlice(OWED9, 2));
+    h.unit(TENANT_TWO, ADDED9, files("added-nine", &[20_000], 35));
+    h.stage(ADDED9);
+    let steps = MemSteps::new(&mut h, ABC_TAPES[1]);
+    let mut o = options(ABC_TAPES[1], "ABC-T2R");
+    o.with_staged = true;
+    let result = rewrite::rewrite(&steps.h.conn, &steps.h.config, &steps, &o);
+    let log = steps.log.borrow().clone();
+    h.tapes = steps.tapes.into_inner();
+    result.unwrap_or_else(|e| panic!("{e}\n{log:?}"));
+    let mut expected = a_c_b();
+    expected.push((OWED9.to_string(), 3));
+    expected.push((ADDED9.to_string(), 1));
+    assert_eq!(laid_on(&h, "ABC-T2R"), expected);
+}
