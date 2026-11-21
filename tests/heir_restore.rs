@@ -1899,8 +1899,12 @@ fn a_restore_prints_the_id_map_the_damaged_list_and_the_tar_it_used() {
     }
 }
 
-/// #525 A9: a file check that checked nothing never says the files match. A
-/// `sha256sum` that prints nothing and exits 0 leaves every file damaged.
+/// #525 A9, as T6.4-1 (#552) changed it: a `sha256sum -c` that checked nothing
+/// (it prints nothing and exits 0) is never taken for a pass, and no name is
+/// read back from it. Every file is then hashed alone, so the restore is whole
+/// only because each file's own hash matched; a file the disk damaged is still
+/// the one listed. The old assertion (every file damaged) held only because
+/// the check read names back from `-c`'s output.
 #[test]
 fn a_file_check_that_checked_nothing_does_not_say_the_files_match() {
     let t = two();
@@ -1915,11 +1919,13 @@ fn a_file_check_that_checked_nothing_does_not_say_the_files_match() {
             real.display()
         ),
     );
+    let tar = heir::host_tool("tar").unwrap();
+    h.put_tool("tar", &heir::corrupting_tar(&tar, "notes.txt"));
     let dest = h.dest("out");
     let o = h.run(&[
         "--restore",
         "--key",
-        &key(&h, Who::TenantA),
+        &key(&h, Who::TenantB),
         "--to",
         dest.to_str().unwrap(),
     ]);
@@ -1927,7 +1933,11 @@ fn a_file_check_that_checked_nothing_does_not_say_the_files_match() {
     assert!(!o.stdout.contains("match the sha256"), "{}", o.stdout);
     assert!(o.stdout.contains("RESTORE INCOMPLETE"), "{}", o.stdout);
     let list = std::fs::read_to_string(dest.join(".tapectl-damaged-files.txt")).unwrap();
-    assert!(list.lines().count() > 3, "{list}");
+    assert_eq!(
+        list.lines().skip(1).collect::<Vec<_>>(),
+        ["notes.txt"],
+        "{list}"
+    );
 }
 
 /// Ctrl-C, a hangup or a kill leave no work directory behind.
@@ -3187,10 +3197,12 @@ fn a_repair_whose_files_still_fail_leaves_a_list_with_just_those() {
     );
 }
 
-/// With a `sha256sum` that quotes names the repair still counts a file as
-/// whole only when `sha256sum` said it matched.
+/// With a `sha256sum -c` that checks nothing (T6.4-1, #552: no name is read
+/// back from it) the repair counts a file as whole only when the file's own
+/// hash, taken alone, matched: the repaired file leaves the list, and the run
+/// is whole because the hash said so.
 #[test]
-fn a_repair_with_a_sha256sum_that_checks_nothing_leaves_every_path_listed() {
+fn a_repair_with_a_sha256sum_that_checks_nothing_still_hashes_each_file_alone() {
     let (t1, t2) = (&copies()[0], &copies()[1]);
     let h1 = Heir::of(t1);
     let kb = key(&h1, Who::TenantB);
@@ -3220,17 +3232,8 @@ fn a_repair_with_a_sha256sum_that_checks_nothing_leaves_every_path_listed() {
         "--paths-from",
         dest.join(".tapectl-damaged-files.txt").to_str().unwrap(),
     ]);
-    assert_eq!(o.code, 1, "{}", o.all());
-    let after = damaged_list(&dest);
-    for p in before
-        .iter()
-        .filter(|p| row_esc(&rows, p).0 != "d" && !p.contains('\\'))
-    {
-        // (A folder is restored and cannot be checked; a path with a backslash
-        // is checked by its own sha256sum call, not through `-c`; every other
-        // file stays.)
-        assert!(after.contains(p), "{p} stays listed: {after:?}");
-    }
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(damaged_list(&dest).is_empty(), "{}", o.all());
 }
 
 /// Another version, another unit (same name, other uuid) and a list that is
