@@ -1345,7 +1345,10 @@ pub(crate) mod tests {
     fn a_hard_link_the_repair_fills_is_a_link_to_its_restored_target() {
         use std::os::unix::fs::MetadataExt;
         let mut items = tree();
-        items.push(Item::Hard("alpha-zz-link.bin".into(), "alpha-01.bin".into()));
+        items.push(Item::Hard(
+            "alpha-zz-link.bin".into(),
+            "alpha-01.bin".into(),
+        ));
         let (mut h, one, _two) = two_stagings_of(&items);
         let rows = stage_files::load(&h.conn, one).unwrap();
         let link = rows

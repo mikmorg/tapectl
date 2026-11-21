@@ -355,10 +355,9 @@ fn fill_from(
                 if let Some(row) = by_path.get(*path) {
                     match (&row.kind, row.link.as_deref()) {
                         (Kind::Folder, _) => folders.push((source.clone(), dest)),
-                        (Kind::HardLink, Some(target)) => links.push((
-                            dest,
-                            ex.root.join(crate::volume::index::on_disk(target)),
-                        )),
+                        (Kind::HardLink, Some(target)) => {
+                            links.push((dest, ex.root.join(crate::volume::index::on_disk(target))))
+                        }
                         _ => {}
                     }
                 }

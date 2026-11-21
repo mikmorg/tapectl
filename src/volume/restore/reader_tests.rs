@@ -820,12 +820,20 @@ fn a_slice_whose_recorded_size_cannot_be_held_is_bad(
 
 #[test]
 fn an_uncompressed_slice_whose_recorded_size_cannot_be_held_is_bad() {
-    a_slice_whose_recorded_size_cannot_be_held_is_bad(None, "size_bytes", "cannot be held in memory");
+    a_slice_whose_recorded_size_cannot_be_held_is_bad(
+        None,
+        "size_bytes",
+        "cannot be held in memory",
+    );
 }
 
 #[test]
 fn a_compressed_slice_whose_recorded_cut_cannot_be_held_is_bad() {
-    a_slice_whose_recorded_size_cannot_be_held_is_bad(Some("zstd"), "size_bytes", "cannot be held in memory");
+    a_slice_whose_recorded_size_cannot_be_held_is_bad(
+        Some("zstd"),
+        "size_bytes",
+        "cannot be held in memory",
+    );
 }
 
 #[test]
