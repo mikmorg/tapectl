@@ -3882,3 +3882,42 @@ both.
      produced: the rule "`catalog rebuild` never changes a status it finds" (#158, #360)
      stands for every other row. This narrows #277's principle to its purpose: an unreadable
      seal never means "unsealed", and a seal read later finishes the record the rebuild began.
+
+## Amendment, 2026-11-21: three questions from the T6.1 fixes
+
+Ruled 2026-11-21. The fixes of the T6.1 findings left three points no item decides, and the
+coordinator put them to the CTO as questions 50 to 52, each with a recommendation and the
+reading "ratify" would get (yes to all three, as recommended, and nothing else). The CTO
+ratified all three.
+
+303. **A restore into an empty destination gives the unit's root its recorded metadata**
+     (question 50, #594 C-1). Without `--overwrite`, GNU tar 1.35's `--keep-old-files` finds
+     the destination directory already there (tapectl made it, or found it empty) and skips the
+     `./` member's mode, owner, times, extended attributes and ACL, with exit 0 and no message
+     (measured). volume-format-v3.md §7.1's flags stand. After tar exits 0, tapectl applies the
+     `./` member's recorded metadata to the destination root when the destination was empty at
+     the preflight (tapectl made it, or it was empty), and never to the root of a destination
+     that was not empty. RESTORE.sh, which runs tar with the same flags, does the same.
+304. **The repair stages on the destination's filesystem** (question 51, #594 4-6). The
+     repair builds what it installs in a scratch directory on the destination's own
+     filesystem (a hidden directory under the destination root), so that installing it is a
+     rename and keeps owner, times, extended attributes and ACL. `--scratch` on another
+     filesystem is used only for the restore's own range work. No copy across filesystems
+     installs a repaired file.
+305. **A rewrite or compaction keeps the source's order for every set it carries** (question
+     52, #598 8-3). volume-format-v3.md §5.4's "stagings keep the source's order" governs
+     every carried set, owed or queued: a source holding A's tail, C whole and B's head is
+     laid A, C, B. Only the sets the write adds (`--with-staged`) follow the carried ones, owed
+     first (item 289's order). Owed-first exists so owed slices land before the warning; a
+     rewrite's rehearsal already proves every carried slice fits.
+
+**Determinations, not rulings, said so that they can be corrected** (the coordinator's, from
+the same fixes):
+- #594 C-2: an unattended restore refuses by name a slice that another identical copy holds
+  (#480's pinned behaviour) and names `--from`; it does not leave it out. Item 266's "goes on
+  and lists the rest" is the attended answer, at the prompt.
+- #594 C-3: item 298's memory warning covers every slice the restore reads, the repair's reads
+  of other stagings included ("warns from what it reads").
+- #598 8-A1: `stage for-location`'s planner applies item 159's location rule, not item 300's
+  generation rule; a set planned for a destination of the wrong generation is refused at the
+  write, by name (`continuation_generation_refusal`).
