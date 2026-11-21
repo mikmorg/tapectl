@@ -732,11 +732,13 @@ mod tests {
         );
         // Positive control: a real folder is installed into, and the link
         // itself is replaced by a folder's own turn.
+        fs::write(&from, b"good").unwrap();
         install_under(&root, &from, &root.join("x/ok")).unwrap();
         assert_eq!(fs::read(root.join("x/ok")).unwrap(), b"good");
         fs::create_dir(dir.path().join("dirsrc")).unwrap();
         install_under(&root, &dir.path().join("dirsrc"), &root.join("a")).unwrap();
         assert!(fs::symlink_metadata(root.join("a")).unwrap().is_dir());
+        fs::write(&from, b"good").unwrap();
         install_under(&root, &from, &root.join("a/b")).unwrap();
         assert_eq!(fs::read(root.join("a/b")).unwrap(), b"good");
     }
