@@ -6976,30 +6976,149 @@ fn volume_write_and_resume_refuse_a_volume_whose_seal_could_not_be_read() {
     }
 }
 
-/// The issue's own sequence: the seal fails to read, then a rebuild into the
-/// same catalog reads it. The rows are not edited (#158); the row stays one
-/// `volume resume` refuses, and the message says what is true there: it does
-/// not send the operator to `volume write` over the sealed tape.
+/// The issue's own sequence (ADR-0012 item 302, #582): the seal fails to read,
+/// then a rebuild into the same catalog reads it and finishes the record: the
+/// tape is `sealed`, its quarantine cleared, its writes `completed` and its
+/// positions `written`, it counts as a copy, an event says so, and `volume
+/// resume` and `volume write` no longer give the unreadable-seal refusal.
 #[test]
-fn a_later_clean_read_edits_no_row_of_the_earlier_rebuild() {
+fn a_later_clean_read_finishes_the_record_an_unreadable_seal_began() {
     let mut vol = build_sealed_volume(true);
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     let scratch = tempfile::tempdir().unwrap();
     rebuild_with_seal_read(&conn, &mut vol, scratch.path(), true).unwrap();
+    assert_eq!(volume_state(&conn, LABEL).0, "initialized", "premise");
     let second = rebuild_with_seal_read(&conn, &mut vol, scratch.path(), false).unwrap();
     assert_eq!(second.unsealed_reason, None, "{second:?}");
-    assert_eq!(volume_state(&conn, LABEL).0, "initialized", "no promotion");
-    let (aborted, total) = write_counts(&conn, LABEL, "aborted");
-    assert!(total > 0 && aborted == total, "writes are not edited");
+    assert!(second.seal_promoted, "{second:?}");
+    assert_eq!(second.volume_status_mismatch, None, "{second:?}");
+    assert_eq!(second.volume_condition_mismatch, None, "{second:?}");
+    let (status, condition, sealed_at) = volume_state(&conn, LABEL);
+    assert_eq!((status.as_str(), condition.as_str()), ("sealed", "ok"));
+    assert!(sealed_at.is_some(), "the seal's own time is recorded");
+    let (completed, total) = write_counts(&conn, LABEL, "completed");
+    assert!(total > 0 && completed == total, "{completed} of {total}");
+    assert!(written_positions(&conn, LABEL) > 0);
+    assert_eq!(event_count(&conn, "seal_promoted"), 1);
+    assert!(tapectl::policy::coverage::counts_as_copy(&conn, LABEL).unwrap());
     for (unit_name, _, _) in UNITS {
-        assert_eq!(copies(&conn, unit_name), 0, "{unit_name}");
+        assert_eq!(copies(&conn, unit_name), 1, "{unit_name}");
     }
-    let vid = volume_id_of(&conn, LABEL);
-    assert!(matches!(
-        tapectl::volume::session::resume_admission(&conn, vid).unwrap(),
-        tapectl::volume::session::ResumeAdmission::Aborted(_)
-    ));
+    // What the fresh rebuild of the same tape records, row for row.
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = fresh_db(fresh_dir.path());
+    let fresh_scratch = tempfile::tempdir().unwrap();
+    rebuild_with_seal_read(&fresh, &mut vol, fresh_scratch.path(), false).unwrap();
+    let shape = |c: &rusqlite::Connection| -> (i64, i64, i64, Option<i64>) {
+        c.query_row(
+            "SELECT v.num_data_files,
+                    (SELECT COUNT(*) FROM write_positions wp JOIN writes w ON w.id = wp.write_id
+                      WHERE w.volume_id = v.id AND wp.status = 'written'),
+                    (SELECT COUNT(*) FROM write_positions wp JOIN writes w ON w.id = wp.write_id
+                      WHERE w.volume_id = v.id AND wp.sha256_on_volume IS NOT NULL),
+                    v.ended_after
+             FROM volumes v WHERE v.label = ?1",
+            rusqlite::params![LABEL],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(shape(&conn), shape(&fresh));
+
+    let home = tempfile::tempdir().unwrap();
+    let paths = tapectl::config::TapectlPaths::new(home.path().join("home"));
+    let config = tapectl::config::Config::default();
+    let resume_err = tapectl::volume::write::volume_resume(
+        &conn,
+        &paths,
+        &config,
+        LABEL,
+        "/nonexistent/tapectl-582-nst",
+        512 * 1024,
+        false,
+        false,
+    )
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
+    let write_err = tapectl::volume::write::volume_write(
+        &conn,
+        &paths,
+        &config,
+        LABEL,
+        "/nonexistent/tapectl-582-nst",
+        512 * 1024,
+        false,
+        false,
+        false,
+        false,
+        true,
+    )
+    .unwrap_err()
+    .to_string();
+    for (what, msg) in [("resume", &resume_err), ("write", &write_err)] {
+        assert!(!msg.contains("could not be READ"), "{what}: {msg}");
+        assert!(!msg.contains("ABORTED before its seal"), "{what}: {msg}");
+    }
+}
+
+/// Negative control: a found `initialized` row with NO `seal_unreadable`
+/// event (an operator's, or a lost write's) is not promoted by a clean read:
+/// the rule that a rebuild never changes a status it finds stands (#158, #360).
+#[test]
+fn a_found_initialized_row_without_the_unreadable_mark_is_not_promoted() {
+    let mut vol = build_sealed_volume(true);
+    let seal = vol.store.files.last().cloned().expect("a written tape");
+    let sync = vol.store.syncs.last().cloned().expect("a sync per file");
+    drop_seal_marker(&mut vol);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert_eq!(event_count(&conn, "seal_unreadable"), 0, "premise");
+    // The seal is back (read cleanly) on the second run.
+    vol.store.files.push(seal);
+    vol.store.syncs.push(sync);
+    let second = rebuild_with_seal_read(&conn, &mut vol, scratch.path(), false).unwrap();
+    assert_eq!(second.unsealed_reason, None, "{second:?}");
+    assert!(!second.seal_promoted);
+    assert_eq!(
+        second.volume_status_mismatch.as_deref(),
+        Some("initialized")
+    );
+    assert_eq!(volume_state(&conn, LABEL).0, "initialized");
+    assert_eq!(event_count(&conn, "seal_promoted"), 0);
+    assert!(!tapectl::policy::coverage::counts_as_copy(&conn, LABEL).unwrap());
+}
+
+/// Negative control: a row that qualified and was then changed (here
+/// `volume retire`) is not promoted, and keeps what the operator did.
+#[test]
+fn an_unreadable_seal_row_changed_since_is_not_promoted() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    rebuild_with_seal_read(&conn, &mut vol, scratch.path(), true).unwrap();
+    tapectl::cli::operations::volume_retire(
+        &conn,
+        &tapectl::config::Config::default(),
+        LABEL,
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    let before = volume_state(&conn, LABEL);
+    assert_ne!(before.0, "sealed", "premise: the retire changed the row");
+    let second = rebuild_with_seal_read(&conn, &mut vol, scratch.path(), false).unwrap();
+    assert!(!second.seal_promoted, "{second:?}");
+    assert_eq!(volume_state(&conn, LABEL), before);
+    assert_eq!(event_count(&conn, "seal_promoted"), 0);
+    let (aborted, total) = write_counts(&conn, LABEL, "aborted");
+    assert!(total > 0 && aborted == total);
 }
 
 /// `volume resume` on an unsealed aborted write says what is true: a new

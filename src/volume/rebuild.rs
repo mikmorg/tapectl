@@ -269,6 +269,13 @@ pub struct RebuildReport {
     /// seal read cleanly: what an earlier rebuild that could not read it left
     /// (#582). Report-only.
     pub found_writes_aborted: bool,
+    /// This run FINISHED the record an earlier rebuild began (ADR-0012 item
+    /// 302, #582): the found row was the one a rebuild that could not read the
+    /// seal had recorded ([`SEAL_UNREADABLE_EVENT`]), nothing had changed it
+    /// since, and this run read the seal cleanly, so the volume is now
+    /// `sealed`, its quarantine cleared, its writes and positions a sealed
+    /// tape's. Event [`SEAL_PROMOTED_EVENT`].
+    pub seal_promoted: bool,
     /// The status of the `volumes` row this run FOUND, when it found one.
     /// `None` when the row was inserted here. Report-only: a found row is
     /// never edited (#158), so this is how an unsealed tape under a row the
@@ -681,6 +688,7 @@ impl RebuildReport {
     /// cartridge whole.
     pub fn is_noop(&self) -> bool {
         !self.volume_inserted
+            && !self.seal_promoted
             && self.tenants == 0
             && self.units == 0
             && self.snapshots == 0
@@ -1961,6 +1969,10 @@ struct TapeDates {
 /// the write and resume refusals read to say so.
 pub const SEAL_UNREADABLE_EVENT: &str = "seal_unreadable";
 
+/// The `events.action` a rebuild records when it finishes the record an
+/// earlier rebuild began on a seal it could not read (ADR-0012 item 302, #582).
+pub const SEAL_PROMOTED_EVENT: &str = "seal_promoted";
+
 /// Whether a rebuild recorded `volume_id` as one whose seal it could not read
 /// ([`SEAL_UNREADABLE_EVENT`]).
 pub fn seal_unreadable_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
@@ -1968,6 +1980,54 @@ pub fn seal_unreadable_recorded(conn: &Connection, volume_id: i64) -> Result<boo
         "SELECT EXISTS(SELECT 1 FROM events
                        WHERE entity_type = 'volume' AND entity_id = ?1 AND action = ?2)",
         params![volume_id, SEAL_UNREADABLE_EVENT],
+        |r| r.get(0),
+    )?)
+}
+
+/// ADR-0012 item 302 (#582): whether a found volume row is still exactly what
+/// a rebuild that could not read the tape's seal recorded, so that a rebuild
+/// that reads the seal cleanly may finish it. It is, only when ALL hold:
+///
+/// 1. the row is `initialized` and `quarantined`, as that rebuild left it
+///    (the quarantine is what a clean full `volume verify` clears, and what
+///    `volume retire` and any other command moves the status past);
+/// 2. it carries a [`SEAL_UNREADABLE_EVENT`], the rebuild's own mark that it
+///    wrote the row (an operator's or a write's `initialized` row has none);
+/// 3. no event on the volume came after the last such event except a
+///    `catalog_rebuild`'s (a write, resume, verify, retire, edit or
+///    adoption each log one), so nothing has acted on the row since;
+/// 4. every write on it is still `aborted` and every position of those writes
+///    still `pending`, as `ensure_write` and `ensure_position` left them for
+///    an unsealed reading (a write or an adoption changes them).
+///
+/// Every other found row is never edited (#158, #360).
+fn unreadable_seal_row_unchanged(
+    conn: &Connection,
+    volume_id: i64,
+    status: &str,
+    condition: &str,
+) -> Result<bool> {
+    if status != "initialized" || condition != "quarantined" {
+        return Ok(false);
+    }
+    let last_mark: Option<i64> = conn.query_row(
+        "SELECT MAX(id) FROM events
+         WHERE entity_type = 'volume' AND entity_id = ?1 AND action = ?2",
+        params![volume_id, SEAL_UNREADABLE_EVENT],
+        |r| r.get(0),
+    )?;
+    let Some(last_mark) = last_mark else {
+        return Ok(false);
+    };
+    Ok(conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM events
+                           WHERE entity_type = 'volume' AND entity_id = ?1 AND id > ?2
+                             AND action <> 'catalog_rebuild')
+            AND NOT EXISTS(SELECT 1 FROM writes WHERE volume_id = ?1 AND status <> 'aborted')
+            AND NOT EXISTS(SELECT 1 FROM write_positions wp
+                           JOIN writes w ON w.id = wp.write_id
+                           WHERE w.volume_id = ?1 AND wp.status <> 'pending')",
+        params![volume_id, last_mark],
         |r| r.get(0),
     )?)
 }
@@ -2286,6 +2346,8 @@ fn insert_all(
         .ended_after
         .filter(|_| sealed)
         .and_then(|k| i64::try_from(k).ok());
+    // Item 302: set when this run finishes a row an unreadable seal left.
+    let mut promote = false;
     let volume_id = match existing {
         Some((id, status, condition, recorded_sealed_at, recorded_ended_after)) => {
             report.found_volume_status = Some(status.clone());
@@ -2330,7 +2392,38 @@ fn insert_all(
             // `RebuildReport::volume_status_mismatch`. (For an UNSEALED tape
             // the found row is the report's `found_volume_status` and
             // `unsealed_reason`; the two are not the same question.)
-            if status != "sealed" {
+            // ADR-0012 item 302 (#582): the one found row a rebuild changes.
+            // A row an earlier rebuild recorded from a seal it could not read,
+            // and nothing has touched since, is finished by a rebuild that
+            // reads the seal: `sealed`, as a first rebuild with the seal read
+            // would have recorded it. Every other row is left alone (#158).
+            if sealed && unreadable_seal_row_unchanged(tx, id, &status, &condition)? {
+                tx.execute(
+                    "UPDATE volumes SET status = 'sealed', observed_condition = 'ok',
+                            sealed_at = ?2, last_write = ?2, num_data_files = ?3,
+                            ended_after = ?4
+                     WHERE id = ?1",
+                    params![id, dates.sealed_at, dates.data_files, ended_after],
+                )?;
+                crate::db::events::log_event(
+                    tx,
+                    "volume",
+                    id,
+                    Some(label),
+                    SEAL_PROMOTED_EVENT,
+                    Some("status"),
+                    Some("initialized"),
+                    Some("sealed"),
+                    Some(
+                        "the seal now reads, and the row is still the one an earlier rebuild \
+                         recorded from a seal it could not read (ADR-0012 item 302): sealed, \
+                         quarantine cleared, writes and positions as a sealed tape's",
+                    ),
+                    None,
+                )?;
+                report.seal_promoted = true;
+                promote = true;
+            } else if status != "sealed" {
                 // #582: with the seal read cleanly, a found row that already
                 // holds `aborted` writes is the shape an EARLIER rebuild left
                 // when it could not read the seal. This run does not edit it
@@ -2350,7 +2443,7 @@ fn insert_all(
             // on purpose. Independent of the status check above: since the
             // 2026-09-17 amendment a verify-quarantined row stays `sealed`,
             // so only THIS check catches it.
-            if condition != "ok" {
+            if condition != "ok" && !promote {
                 report.volume_condition_mismatch = Some(condition);
             }
             id
@@ -2505,10 +2598,18 @@ fn insert_all(
         // positions: its slices stay staged for another tape (item 288).
         if written != Written::Unwritten {
             let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, written, report)?;
+            if promote {
+                finish_write(tx, write_id, snapshot_id, written)?;
+            }
             for (slice, slice_id) in slice_ids {
                 let laid_down = sealed && slice_on_tape(slice, ended_after);
-                ensure_position(tx, write_id, slice_id, slice, laid_down, report)?;
+                ensure_position(tx, write_id, slice_id, slice, laid_down, promote, report)?;
             }
+        } else if promote {
+            // The earlier rebuild could not know this tape holds none of the
+            // staging and recorded an `aborted` write; a sealed rebuild has no
+            // row for it (item 288).
+            drop_aborted_write(tx, stage_set_id, volume_id)?;
         }
         // X24: after the positions, which are what the rule reads. The order
         // matters: the volume row is written at the top of this function, so
@@ -3097,7 +3198,21 @@ fn ensure_write(
     // #478 (item 121): a range is terminal like a completed write and gets
     // its completion time as confirm gives it one. It is not a copy on its
     // own: its slices count one by one (item 127).
-    let (status, notes) = match written {
+    let (status, notes) = write_status(written);
+    tx.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified,
+                             completed_at, notes)
+         VALUES (?1, ?2, ?3, ?4, 0,
+                 CASE WHEN ?4 IN ('completed', 'range') THEN datetime('now') END, ?5)",
+        params![stage_set_id, snapshot_id, volume_id, status, notes],
+    )?;
+    report.writes += 1;
+    Ok(tx.last_insert_rowid())
+}
+
+/// The `writes.status` and notes a rebuild gives a block ([`Written`]).
+fn write_status(written: Written) -> (&'static str, &'static str) {
+    match written {
         Written::Completed => (
             "completed",
             "rebuilt from the volume itself; never verified by a read-back",
@@ -3116,16 +3231,47 @@ fn ensure_write(
             "rebuilt from the volume itself; the tape carries no valid seal marker, so the \
              write is recorded as aborted and is not a copy",
         ),
-    };
+    }
+}
+
+/// Item 302 (#582): an `aborted` write an earlier rebuild recorded from a seal
+/// it could not read becomes what a rebuild that read the seal would have
+/// recorded: `completed` or `range`, its completion time and notes. A snapshot
+/// that an unsealed reading left `current` but whose only copy is now a range
+/// is `staged`, as [`ensure_snapshot`] inserts one.
+fn finish_write(tx: &Connection, write_id: i64, snapshot_id: i64, written: Written) -> Result<()> {
+    let (status, notes) = write_status(written);
     tx.execute(
-        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified,
-                             completed_at, notes)
-         VALUES (?1, ?2, ?3, ?4, 0,
-                 CASE WHEN ?4 IN ('completed', 'range') THEN datetime('now') END, ?5)",
-        params![stage_set_id, snapshot_id, volume_id, status, notes],
+        "UPDATE writes SET status = ?2, completed_at = datetime('now'), notes = ?3
+         WHERE id = ?1 AND status = 'aborted'",
+        params![write_id, status, notes],
     )?;
-    report.writes += 1;
-    Ok(tx.last_insert_rowid())
+    if matches!(written, Written::Range { .. }) {
+        tx.execute(
+            "UPDATE snapshots SET status = 'staged'
+             WHERE id = ?1 AND status = 'current'
+               AND NOT EXISTS(SELECT 1 FROM writes WHERE snapshot_id = ?1 AND id <> ?2
+                              AND status = 'completed')",
+            params![snapshot_id, write_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Item 302 (#582): the `aborted` write (and its `pending` positions) an
+/// earlier rebuild gave a staging that this tape, read cleanly, holds none of.
+fn drop_aborted_write(tx: &Connection, stage_set_id: i64, volume_id: i64) -> Result<()> {
+    tx.execute(
+        "DELETE FROM write_positions WHERE write_id IN
+            (SELECT id FROM writes WHERE stage_set_id = ?1 AND volume_id = ?2
+                                     AND status = 'aborted')",
+        params![stage_set_id, volume_id],
+    )?;
+    tx.execute(
+        "DELETE FROM writes WHERE stage_set_id = ?1 AND volume_id = ?2 AND status = 'aborted'",
+        params![stage_set_id, volume_id],
+    )?;
+    Ok(())
 }
 
 /// `laid_down`: the slice is on the tape — the tape is sealed and, on a
@@ -3136,6 +3282,7 @@ fn ensure_position(
     stage_slice_id: i64,
     slice: &envelope::ManifestSlice,
     laid_down: bool,
+    promote: bool,
     report: &mut RebuildReport,
 ) -> Result<()> {
     // A slice this tape does not plan (a range's slice on another tape,
@@ -3151,6 +3298,16 @@ fn ensure_position(
     )?
     .is_some()
     {
+        // Item 302 (#582): a `pending` position an unreadable seal left is
+        // `written` once the seal reads and the slice is on the tape.
+        if promote && laid_down {
+            tx.execute(
+                "UPDATE write_positions SET status = 'written', written_at = datetime('now'),
+                        sha256_on_volume = ?3
+                 WHERE write_id = ?1 AND stage_slice_id = ?2 AND status = 'pending'",
+                params![write_id, stage_slice_id, slice.sha256_encrypted],
+            )?;
+        }
         return Ok(());
     }
     // `position` is the TAPE POSITION, never the slice number: slices begin
