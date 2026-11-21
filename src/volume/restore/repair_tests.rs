@@ -690,6 +690,26 @@ pub(crate) mod tests {
     /// every copy has been tried, the chunk is a hole, the files it fell in are
     /// named, and the restore fails.
     #[test]
+    /// #594 4-10: the INCOMPLETE text's remedy names only what tapectl has.
+    /// tapectl's restore writes no list file and no command takes a list of
+    /// paths, so "give the list to another copy" was advice with nothing
+    /// behind it; the one way through is `restore file` for each path.
+    #[test]
+    fn the_incomplete_remedy_names_a_command_tapectl_has() {
+        let mut h = copies("256K", None, &[A, B]);
+        damage(&mut h, A, 3, 0);
+        let mut bay = h.bay(A, &[Reply::Skip]);
+        let (r, _dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        let err = r.expect_err("a hole nobody fills").to_string();
+        assert!(err.contains("INCOMPLETE"), "{err}");
+        assert!(!err.contains("Give the list"), "{err}");
+        assert!(
+            err.contains("tapectl restore file alpha <path> --from <volume> --version 1"),
+            "{err}"
+        );
+        assert!(err.contains("tapectl catalog locate alpha"), "{err}");
+    }
+
     fn a_chunk_bad_on_every_copy_is_a_hole_after_every_copy_was_tried() {
         let mut h = copies("256K", None, &[A, B]);
         damage(&mut h, A, 3, 1);

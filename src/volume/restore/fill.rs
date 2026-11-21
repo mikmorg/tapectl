@@ -256,9 +256,12 @@ fn fill_from(
                 "{} lost file(s) can be filled from another copy of this version, held by {}, \
                  and tapectl swaps no cartridge without a person at the terminal (--yes cannot \
                  load one): run it from a terminal and it will ask for that cartridge, or \
-                 restore the lost files from it directly",
+                 restore the lost files from it one path at a time with `tapectl restore file \
+                 {} <path> --from <volume> --version {} --to <dir>`",
                 lost.len(),
-                list.join(", ")
+                list.join(", "),
+                ctx.unit_name,
+                ctx.version
             )));
         }
         let why = format!(
@@ -522,12 +525,17 @@ fn incomplete(
             notes.filled.len()
         ));
     }
-    lines.push(
+    lines.push(format!(
         "  Everything else was restored and stays; a file that failed its check is left as it \
          was written, so do not trust it, and the files left out are not in the destination. \
-         Give the list to another copy of the same version to repair it."
-            .to_string(),
-    );
+         tapectl has no command that repairs a restore from a list: a file comes from another \
+         copy of this version with `tapectl restore file {unit} <path> --from <volume> \
+         --version {version} --to <dir>` (one path at a time; the file is placed by its own \
+         name in <dir>), and `tapectl catalog locate {unit}` lists the volumes that hold the \
+         unit.",
+        unit = ctx.unit_name,
+        version = ctx.version,
+    ));
     TapectlError::Other(lines.join("\n"))
 }
 
