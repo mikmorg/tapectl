@@ -2007,9 +2007,12 @@ tar_close() { # [tenths of a second to wait for tar]
 
 # A signal, or a failure, while a unit is being fed: the member tar was
 # extracting may be partial. Every regular member whose slices include the
-# slice being prepared or fed is looked at, and one that is not whole (its
-# length or its sha256 differs from the table) is removed; a file that is
-# whole stays, so a file an earlier run restored and checked is never lost.
+# slice being prepared or fed, or the one before it, is looked at, and one that
+# is not whole (its length or its sha256 differs from the table) is removed; a
+# file that is whole stays, so a file an earlier run restored and checked is
+# never lost. The one before it too: slice k's cat has returned when slice k+1
+# is being prepared, but tar may still hold the last 64 KiB (1 MiB under
+# uutils) of k in its pipe, and a signal kills it inside a member of k.
 scrub_inflight() {
   [ -n "$INFLIGHT_TABLE" ] && [ -f "$INFLIGHT_TABLE" ] && [ -n "$WORK" ] && [ -f "$WORK/slices.off" ] || return 0
   [ "$FEEDING" -gt 0 ] || return 0
@@ -2031,7 +2034,7 @@ $(awk -F'\t' -v at="$FEEDING" '
       if (b > at) next
       last = b
       while (last < n && off[last] + sz[last] < $4 + 0) last++
-      if (last >= at) print $5 "\t" $6 "\t" $7
+      if (last >= (at > 1 ? at - 1 : at)) print $5 "\t" $6 "\t" $7
     }
   ' "$WORK/slices.off" "$INFLIGHT_TABLE")
 EOF

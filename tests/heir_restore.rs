@@ -4914,6 +4914,62 @@ fn a_signal_at_the_prompt_or_mid_slice_leaves_no_work_directory_and_no_partial_f
     }
 }
 
+/// #596 C-1: `prepare_slice` sets the slice being fed to k+1 as soon as slice
+/// k's `cat` has returned, while tar may still be reading the last bytes of k.
+/// A signal then must not leave the last member of slice k on disk short.
+/// The tar stand-in lags a block behind, so that member is cut short when the
+/// slow read of slice k+1 is interrupted; after it, every file that is there
+/// is whole (volume-format-v3.md 7.4: Ctrl-C leaves no partial file).
+#[test]
+fn a_signal_just_after_a_slice_was_fed_leaves_no_partial_file_from_that_slice() {
+    let t = two();
+    let python = heir::host_tool("python3").expect("python3 is needed (first-run.sh needs it too)");
+    let real = heir::host_tool("tar").unwrap();
+    let truth: std::collections::BTreeMap<&str, &[u8]> = t
+        .units
+        .iter()
+        .find(|u| u.name == UNIT_B)
+        .unwrap()
+        .files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    // The slices a plain run of the unit reads, in order.
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let plain = h.dest("plain");
+    let o = h.run(&["--restore", "--key", &kb, "--to", plain.to_str().unwrap(), "--unit", UNIT_B]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let all = t.slice_positions();
+    let read: Vec<usize> = h.dd_reads().into_iter().filter(|p| all.contains(p)).collect();
+    assert!(read.len() > 2, "{read:?}");
+    for slow in &read[1..] {
+        let h = Heir::of(t);
+        let dest = h.dest("out");
+        h.put_tool("tar", &heir::lagging_tar(&real, &python, &dest));
+        let kb = key(&h, Who::TenantB);
+        let spec = format!("{slow}:2");
+        let args = ["--restore", "--key", &kb, "--to", dest.to_str().unwrap(), "--unit", UNIT_B];
+        let mut r = h.spawn(&args, &[("FAKE_DD_SLOW", spec.as_str())]);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !h.root.path().join("state/dd.slow").exists() {
+            assert!(std::time::Instant::now() < until, "{}", r.text());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        r.signal("INT");
+        let o = r.finish();
+        let what = format!("SIGINT in the read of tape file {slow}: {}", o.all());
+        assert_eq!(o.code, 130, "{what}");
+        assert!(no_work_dir_in(&dest), "{what}");
+        // A file the unit's truth does not list (its dotfile) is not judged.
+        for (path, bytes) in heir::tree(&dest) {
+            if let Some(whole) = truth.get(path.as_str()) {
+                assert_eq!(*whole, bytes.as_slice(), "partial {path:?}: {what}");
+            }
+        }
+    }
+}
+
 /// R8: a cartridge is taken only by the sha256 of the slice needed, listed in
 /// its front index at a position its own seal covers. Each wrong cartridge is
 /// named, the prompt asks again, and the right one is taken at the end: the

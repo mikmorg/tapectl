@@ -1547,6 +1547,43 @@ exit $rc
     )
 }
 
+/// A tar stand-in that is slow to read the end of what it is given (#596 C-1):
+/// when it restores into `dest` (`-C dest`) it holds back the last 512-byte
+/// block it has read until the next block arrives, and drops that block when
+/// its input ends. It is the tar that a Ctrl-C finds in the middle of the
+/// last member of a slice whose `cat` has returned: the member is on disk
+/// short. Its other calls (the envelopes) are the real tar's.
+pub fn lagging_tar(real: &Path, python: &Path, dest: &Path) -> String {
+    format!(
+        r#"#!/bin/bash
+restoring=0
+args=("$@")
+for ((i = 0; i < ${{#args[@]}}; i++)); do
+  if [ "${{args[$i]}}" = -C ] && [ "${{args[$((i + 1))]}}" = "{dest}" ]; then restoring=1; fi
+done
+if [ "$restoring" = 0 ]; then exec "{real}" "$@"; fi
+"{python}" -c '
+import sys
+i = sys.stdin.buffer
+o = sys.stdout.buffer
+held = None
+while True:
+    b = i.read(512)
+    if not b:
+        break
+    if held is not None:
+        o.write(held)
+        o.flush()
+    held = b
+' | "{real}" "$@"
+exit "${{PIPESTATUS[1]}}"
+"#,
+        real = real.display(),
+        python = python.display(),
+        dest = dest.display()
+    )
+}
+
 /// A tar stand-in that runs the real tar and, when it was restoring into
 /// `dest` (`-C dest`), exits with status 2, as tar does when it restored what
 /// it could and reports a failure (item 301). Its other calls (the envelopes)
