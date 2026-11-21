@@ -715,6 +715,50 @@ fn what_tar_says_is_repeated_and_recorded() {
         .is_some_and(|v| v.contains("tar")));
 }
 
+/// #594 4-8: tar that dies in the middle of a long member leaves the member's
+/// partial file where tar made it. The member is listed as left out, and the
+/// INCOMPLETE text says the files left out are not in the destination, so the
+/// partial file must be removed as `abort_run` removes it for a run cut at an
+/// unread slice. The stand-in takes the first slice and makes the member's
+/// file, then exits under the feed.
+#[test]
+fn tar_dying_in_the_middle_of_a_long_member_leaves_no_partial_file() {
+    let mut h = home_with(
+        "alpha",
+        &[Item::file("big.bin", super::fixture::noise(400_000, 5))],
+        "64K",
+        None,
+    );
+    assert!(h.num_slices("alpha") >= 4, "the member is a run");
+    let dir = tempfile::TempDir::new().unwrap();
+    let tar = crate::tar::stand_in(
+        dir.path(),
+        "dying-tar",
+        "for a in \"$@\"; do case \"$a\" in\n\
+         --version) echo 'tar (dying stand-in)'; exit 0;;\n\
+         --directory=*) d=${a#--directory=};;\n\
+         esac; done\n\
+         echo partial > \"$d/big.bin\"\nhead -c 65536 > /dev/null\nexit 1",
+    );
+    h.config.tar.binary = tar.to_string_lossy().into_owned();
+    let mut bay = h.bay("RDR-A", &[]);
+    let (r, dest) = h.restore(
+        "alpha",
+        What::Unit,
+        "RDR-A",
+        &RestoreOptions::default(),
+        &mut bay,
+    );
+    let err = r.expect_err("tar died").to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
+    assert!(lost_paths(&err).contains("big.bin"), "{err}");
+    assert!(
+        fs::symlink_metadata(dest.path().join("big.bin")).is_err(),
+        "the partial file is removed: {:?}",
+        listing(dest.path())
+    );
+}
+
 // ── #571: a size that cannot be allocated is a bad slice ──
 
 /// A corrupt catalog row that records a slice's size as more than any host

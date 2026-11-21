@@ -440,6 +440,7 @@ impl<'j, 'a> Reading<'j, 'a> {
             // The run was given up at an earlier piece.
             return Ok(());
         };
+        let run_at = run.at;
         let expected_end = (m.end).min(s + self.job.slice_size);
         let range = (from - s)..(expected_end - s);
         if from != run.at || !cut.holds(&range) {
@@ -459,7 +460,12 @@ impl<'j, 'a> Reading<'j, 'a> {
         }
         let bytes = &cut.bytes[range.start as usize..range.end as usize];
         if !self.put(bytes)? {
+            // tar died in the middle of the member: what it made of it is
+            // removed, as for a run given up (#594 4-8).
             self.run = None;
+            if run_at > m.start {
+                self.abort_run(m);
+            }
             self.lose(m, "tar stopped while it was being fed");
             return Ok(());
         }
