@@ -13,7 +13,8 @@
 #   rec-alpha:  alpha-main  (no compression; several slices at slice_size 64K; the unit's root has
 #                            mode 0750; a nested folder, an empty file and an empty folder, a name
 #                            with a non-ASCII letter, a hard link, a symbolic link)
-#   rec-bravo:  bravo-zstd, bravo-gzip, bravo-xz (one small slice each; each compressed alone)
+#   rec-bravo:  bravo-zstd, bravo-gzip (one small slice each; each compressed alone; xz is left
+#               out: each unit costs a tape file of 512 KiB in the fixture)
 # A short-sealed second tape is NOT made: scripts/short-seal-acceptance.sh needs its own
 # fixture binary (examples/short_seal_filler) and fills the cartridge to the drive's early
 # warning, which is code and drive time this fixture does not carry (T6.4 says to skip it then).
@@ -36,6 +37,7 @@ REPO="$(dirname "$SCRIPT_DIR")"
 
 die() { echo "record-recorded-tape: $*" >&2; exit 2; }
 
+ARGS="$*"
 DEVICE=""; BIN=""; WORK=""; OUT="$REPO/tests/fixtures/recorded-2.0.0"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -77,7 +79,7 @@ OPERATOR="rec-operator"; ALPHA="rec-alpha"; BRAVO="rec-bravo"
 
 # ---- the home, the config, the keys ----
 step "init"
-TCTL init --operator "$OPERATOR" >"$WORK/init.out" 2>>"$LOG"
+TCTL init --operator "$OPERATOR" >"$WORK/init.out" 2>&1
 ESCROW_SECRET="$(grep -o 'AGE-SECRET-KEY-1[A-Z0-9]*' "$WORK/init.out" | head -n 1)"
 [ -n "$ESCROW_SECRET" ] || die "init printed no escrow secret"
 python3 - "$CFG" "$STAGING" "$TAPE_DEV" "$TAR_BIN" <<'PY'
@@ -111,7 +113,6 @@ TCTL tenant add "$ALPHA" >>"$LOG" 2>&1
 TCTL tenant add "$BRAVO" >>"$LOG" 2>&1
 TCTL archive-set create rec-zstd --compression zstd >>"$LOG" 2>&1
 TCTL archive-set create rec-gzip --compression gzip >>"$LOG" 2>&1
-TCTL archive-set create rec-xz --compression xz >>"$LOG" 2>&1
 
 # ---- the source trees: fixed names and contents; EXPECTED.toml is made from these ----
 step "source trees"
@@ -158,7 +159,7 @@ units = []  # (name, tenant, archive_set or None, root mode, root)
 r = os.path.join(src, "alpha-main")
 os.makedirs(r)
 for i in range(4):
-    put(r, f"data/big-{i + 1}.bin", noise(40_000, 100 + i))
+    put(r, f"data/big-{i + 1}.bin", noise(28_000, 100 + i))
 put(r, "docs/notes.txt", text(3_000, 7))
 put(r, "docs/deep/er/leaf.txt", b"the leaf of a nested folder\n")
 put(r, "empty.dat", b"")
@@ -172,7 +173,7 @@ for d, _, _ in os.walk(r):
 os.chmod(r, 0o750)
 units.append(("alpha-main", alpha, None, 0o750, r))
 
-for name, aset, seed in (("bravo-zstd", "rec-zstd", 21), ("bravo-gzip", "rec-gzip", 31), ("bravo-xz", "rec-xz", 41)):
+for name, aset, seed in (("bravo-zstd", "rec-zstd", 21), ("bravo-gzip", "rec-gzip", 31)):
     r = os.path.join(src, name)
     os.makedirs(r)
     put(r, "report.txt", text(20_000, seed))
@@ -200,7 +201,7 @@ lines = [
     "",
 ]
 for name, tenant, aset, mode, root in sorted(units):
-    comp = {None: "none", "rec-zstd": "zstd", "rec-gzip": "gzip", "rec-xz": "xz"}[aset]
+    comp = {None: "none", "rec-zstd": "zstd", "rec-gzip": "gzip"}[aset]
     lines += [
         "[[unit]]",
         f"name = {toml_str(name)}",
@@ -247,13 +248,12 @@ step "units"
 TCTL unit init "$SRC/alpha-main" --tenant "$ALPHA" --name alpha-main >>"$LOG" 2>&1
 TCTL unit init "$SRC/bravo-zstd" --tenant "$BRAVO" --name bravo-zstd --archive-set rec-zstd >>"$LOG" 2>&1
 TCTL unit init "$SRC/bravo-gzip" --tenant "$BRAVO" --name bravo-gzip --archive-set rec-gzip >>"$LOG" 2>&1
-TCTL unit init "$SRC/bravo-xz" --tenant "$BRAVO" --name bravo-xz --archive-set rec-xz >>"$LOG" 2>&1
 # A file written within two seconds of its hash is hashed twice (git's racy case): let the
 # trees age so the staging is the ordinary one.
 sleep 3
 step "snapshot, stage (the real path: GNU tar, cut, pack, age)"
-TCTL snapshot create alpha-main bravo-zstd bravo-gzip bravo-xz >>"$LOG" 2>&1
-TCTL stage create alpha-main bravo-zstd bravo-gzip bravo-xz >>"$LOG" 2>&1
+TCTL snapshot create alpha-main bravo-zstd bravo-gzip >>"$LOG" 2>&1
+TCTL stage create alpha-main bravo-zstd bravo-gzip >>"$LOG" 2>&1
 
 # ---- the tape: a freshly erased cartridge, one volume ----
 step "erase the cartridge, volume init, volume write"
@@ -270,13 +270,22 @@ mt -f "$TAPE_DEV" rewind
 n=0; empty=0
 while [ "$n" -lt 64 ]; do
     f="$OUT/file-$(printf '%03d' "$n")"
-    dd if="$TAPE_DEV" bs=512k of="$f" conv=sparse 2>/dev/null
+    if ! dd if="$TAPE_DEV" bs=512k of="$f" conv=sparse 2>/dev/null; then
+        # The one read that may fail is the one at end of data (a blank check): nothing
+        # was read, and the drive says it is at EOD. Anything else is a failed dump.
+        [ "$(stat -c %s "$f")" -eq 0 ] && mt -f "$TAPE_DEV" status 2>/dev/null | grep -w EOD >/dev/null \
+            || die "reading tape file $n failed"
+        rm -f "$f"
+        break
+    fi
     if [ "$(stat -c %s "$f")" -eq 0 ]; then
         rm -f "$f"
         empty=$((empty + 1))
         [ "$empty" -ge 2 ] && break
     else
         empty=0
+        # The padding is zeros: keep it a hole on this disk (git compresses it either way).
+        cp --sparse=always "$f" "$f.sparse" && mv "$f.sparse" "$f"
     fi
     n=$((n + 1))
 done
@@ -310,7 +319,7 @@ DRIVE_LINE="$(lsscsi 2>/dev/null | grep -F "$(basename "$TAPE_DEV" | sed 's/^n//
     echo "- drive: $DEVICE ($TAPE_DEV), mhvtl: ${DRIVE_LINE:-not reported by lsscsi}"
     echo "- age: the tape is encrypted by the age crate inside tapectl; no age CLI was used to write it"
     echo "- volume label: $LABEL; tape files: $FILES (file-000 to file-$(printf '%03d' $((FILES - 1)))), each as the heir reads it"
-    echo "- command line: \`$0 $*\`"
+    echo "- command line: \`scripts/record-recorded-tape.sh $ARGS\`"
     echo "- keys: test keys, generated by that run for this fixture alone (keys/)"
 } >"$OUT/RECORDED.md"
 echo "recorded $FILES tape files into $OUT" >&2
