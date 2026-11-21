@@ -2470,7 +2470,7 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 fn check_span_in_progress(ctx: &Ctx<'_>) -> Result<Findings> {
     Ok(Findings {
         violations: Vec::new(),
-        warnings: span_in_progress_findings(ctx.conn)?,
+        warnings: span_in_progress_findings(ctx.conn, ctx.config)?,
     })
 }
 
@@ -2506,7 +2506,7 @@ fn slice_runs(numbers: &std::collections::BTreeSet<i64>) -> String {
         .join(", ")
 }
 
-fn span_in_progress_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
+fn span_in_progress_findings(conn: &Connection, config: &Config) -> Result<Vec<AuditFinding>> {
     use std::collections::BTreeMap;
     // The span: a range `w` on a sealed volume `v`, of a set `ss` whose
     // version is neither promoted nor released and which some slice of is on
@@ -2580,12 +2580,17 @@ fn span_in_progress_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
     }
     // A set with no slice rows has nothing to name (and never meets the
     // promotion rule either way).
+    let named: std::collections::BTreeSet<i64> = spans
+        .iter()
+        .filter(|(_, span)| !span.missing.is_empty())
+        .map(|(set, _)| *set)
+        .collect();
     let mut spans: Vec<SpanInProgress> = spans
         .into_values()
         .filter(|span| !span.missing.is_empty())
         .collect();
     spans.sort_by(|a, b| (&a.unit, a.version).cmp(&(&b.unit, b.version)));
-    Ok(spans
+    let mut findings: Vec<((String, i64), AuditFinding)> = spans
         .into_iter()
         .map(|span| {
             let holders = span
@@ -2605,7 +2610,7 @@ fn span_in_progress_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                 1 => format!("{holders} holds the rest"),
                 _ => format!("{holders} hold the rest"),
             };
-            AuditFinding {
+            let finding = AuditFinding {
                 unit: span.unit.clone(),
                 check: "span_in_progress".into(),
                 message: format!(
@@ -2628,9 +2633,87 @@ fn span_in_progress_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                          --full-confirm --move-to <location>: it writes the slices the span \
                          still owes first"
                     .to_string(),
-            }
+            };
+            ((span.unit.clone(), span.version), finding)
         })
-        .collect())
+        .collect();
+    findings.extend(owed_by_copy_count(conn, config, &named)?);
+    findings.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(findings.into_iter().map(|(_, f)| f).collect())
+}
+
+/// #589 (T5.1 Build item 5): the versions whose slices are owed in the
+/// planner's sense and which the statement above does not name: a stage set
+/// with a `range` row on a sealed volume and a slice short of its copy
+/// floor, exactly as `for_location::staged_set_plan` and
+/// `volume::write::plan_span_set` decide it (`coverage::slice_copies` against
+/// `coverage::copy_floor`), whatever the version's status (a `current` one
+/// owed by copy count included; a released one is not planned). `named` are
+/// the sets the statement above named already. One statement finds the sets
+/// with a sealed range; only those pay a policy resolve and a slice count.
+fn owed_by_copy_count(
+    conn: &Connection,
+    config: &Config,
+    named: &std::collections::BTreeSet<i64>,
+) -> Result<Vec<((String, i64), AuditFinding)>> {
+    let sets: Vec<(i64, String, i64, i64)> = conn
+        .prepare(
+            "SELECT DISTINCT ss.id, u.name, s.version,
+                    (SELECT COUNT(*) FROM stage_slices al WHERE al.stage_set_id = ss.id)
+               FROM writes w
+               CROSS JOIN volumes v ON v.id = w.volume_id
+               CROSS JOIN stage_sets ss ON ss.id = w.stage_set_id
+               CROSS JOIN snapshots s ON s.id = ss.snapshot_id
+               CROSS JOIN units u ON u.id = s.unit_id
+              WHERE w.status = 'range' AND v.status = 'sealed'
+                AND s.status NOT IN ('reclaimable', 'purged')
+              ORDER BY ss.id",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut out = Vec::new();
+    for (set, unit_name, version, num_slices) in sets {
+        if named.contains(&set) {
+            continue;
+        }
+        let Some(unit) = crate::db::queries::get_unit_by_name(conn, &unit_name)? else {
+            continue;
+        };
+        // A policy that does not resolve is `audit`'s own finding, per unit.
+        let Ok(resolved) = policy::resolve(conn, config, &unit) else {
+            continue;
+        };
+        let floor = policy::coverage::copy_floor(config, resolved.copy_floor_base(), &unit.status);
+        let owed: Vec<i64> = policy::coverage::slice_copies(conn, set)?
+            .into_iter()
+            .filter(|s| s.copies < floor)
+            .map(|s| s.slice_number)
+            .collect();
+        let (Some(&first), Some(&last)) = (owed.iter().min(), owed.iter().max()) else {
+            continue;
+        };
+        let run = if first == last {
+            format!("slice {first} of {num_slices} is")
+        } else {
+            format!("slices {first}-{last} of {num_slices} are")
+        };
+        out.push((
+            (unit_name.clone(), version),
+            AuditFinding {
+                unit: unit_name,
+                check: "span_in_progress".into(),
+                message: format!(
+                    "v{version} is a span still in progress: {run} on fewer sealed volumes \
+                     than its copy floor of {floor}, and the continuing write is owed"
+                ),
+                action: "load a fresh cartridge and run tapectl volume write <NEW-LABEL> --init \
+                         --full-confirm --move-to <location>: it writes the slices the span \
+                         still owes first"
+                    .to_string(),
+            },
+        ));
+    }
+    Ok(out)
 }
 
 pub(crate) fn copy_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
@@ -7442,8 +7525,14 @@ mod tests {
         use crate::policy::coverage::tests::SpanCatalog;
 
         fn spans(c: &SpanCatalog) -> Vec<AuditFinding> {
-            let (violations, warnings) =
-                collect_findings(&c.conn, &Config::default(), None).unwrap();
+            spans_at(c, 2)
+        }
+
+        /// [`spans`] at copy target `min_copies`.
+        fn spans_at(c: &SpanCatalog, min_copies: i32) -> Vec<AuditFinding> {
+            let mut config = Config::default();
+            config.defaults.min_copies = min_copies;
+            let (violations, warnings) = collect_findings(&c.conn, &config, None).unwrap();
             assert!(
                 violations.iter().all(|f| f.check != "span_in_progress"),
                 "a warning, never a violation: {violations:?}"
@@ -7506,14 +7595,15 @@ mod tests {
             c.range(set, t1, 1, 2, 6);
             assert_eq!(spans(&c).len(), 1, "positive control");
             c.range(set, t3, 3, 6, 6);
-            assert!(spans(&c).is_empty(), "every slice on a sealed volume");
+            // At copy target 1: one sealed copy of every slice owes nothing (#589).
+            assert!(spans_at(&c, 1).is_empty(), "every slice on a sealed volume");
             c.conn
                 .execute(
                     "UPDATE snapshots SET status = 'current' WHERE id = ?1",
                     params![snap],
                 )
                 .unwrap();
-            assert!(spans(&c).is_empty(), "promoted");
+            assert!(spans_at(&c, 1).is_empty(), "promoted");
 
             // A released span is not in progress, whatever it is missing.
             let c = SpanCatalog::new();
@@ -7529,6 +7619,44 @@ mod tests {
                 )
                 .unwrap();
             assert!(spans(&c).is_empty());
+        }
+
+        /// #589 (plan T5.1 Build item 5): a `current` version owed by copy
+        /// count is named too. At copy target 2, after tapes 1 and 2 (each
+        /// holding slices 1-2) and tape 3 (slices 3-6), every slice is on a
+        /// sealed volume and the version is `current`, yet slices 3-6 have 1
+        /// copy against 2: the next write plans them as an owed run, and
+        /// `audit` says so. A second sealed copy of 3-6 ends it.
+        #[test]
+        fn a_current_version_owed_by_copy_count_names_its_owed_run() {
+            let c = SpanCatalog::new();
+            let snap = c.version(1, "current");
+            let set = c.stage_set(snap, 6);
+            let t1 = c.volume("SPAN-1", None);
+            let t2 = c.volume("SPAN-2", None);
+            let t3 = c.volume("SPAN-3", None);
+            c.range(set, t1, 1, 2, 6);
+            c.range(set, t2, 1, 2, 6);
+            c.range(set, t3, 3, 6, 6);
+
+            let found = spans(&c);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].unit, "span");
+            assert_eq!(
+                found[0].message,
+                "v1 is a span still in progress: slices 3-6 of 6 are on fewer sealed volumes \
+                 than its copy floor of 2, and the continuing write is owed"
+            );
+            assert!(
+                found[0].action.contains("tapectl volume write <NEW-LABEL>"),
+                "{}",
+                found[0].action
+            );
+
+            // Negative control: a second sealed copy of 3-6.
+            let t4 = c.volume("SPAN-4", None);
+            c.range(set, t4, 3, 6, 6);
+            assert!(spans(&c).is_empty(), "{:?}", spans(&c));
         }
 
         #[test]
