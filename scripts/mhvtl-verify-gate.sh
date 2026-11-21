@@ -1145,6 +1145,7 @@ for line in open(path, encoding="utf-8", errors="surrogateescape"):
         rows[p[3].split("  -> ")[0]] = (p[0], int(p[2]))
 assert rows, f"no row in {path}"
 want, links = {}, {}
+want["."] = ("d", None)   # the unit's root is a member and the table's first row (ADR-0012 item 306)
 for root, dirs, files in os.walk(src):
     for n in dirs + files:
         full = os.path.join(root, n)
