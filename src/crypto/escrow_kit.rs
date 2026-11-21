@@ -1015,11 +1015,12 @@ are using with `ls -l /dev/tape/by-id/` and use yours everywhere.)
 One key can open only PART of a tape: a tenant's key opens that
 tenant's envelope alone. The escrow key opens every envelope, so
 --all with the escrow key is the way to get everything: it
-restores every unit, each into its own folder under ./out.
-Without --all, RESTORE.sh uses the first envelope the key opens;
-if that lists one unit, only that unit is restored and nothing
-is said of the rest of the tape. --list first shows what the
-tape holds.
+restores every unit. A tape that holds one unit is restored into
+./out itself; a tape that holds several gives each unit its own
+folder under ./out. Without --all, RESTORE.sh restores the one
+unit the key opens if there is only one; if there are several it
+refuses and lists the units: name one with --unit NAME, or give
+--all. --list first shows what the tape holds.
 
 A restore needs free disk space of about the size of the units
 restored, where --to points (all of them together, with --all),
@@ -1046,6 +1047,9 @@ with that list:
     ./RESTORE.sh --restore \\
         --paths-from ./out/UNIT/.tapectl-damaged-files.txt \\
         --key escrow.key --to ./out/UNIT
+
+(UNIT is the unit's folder under ./out. For a tape of one unit
+the list is ./out/.tapectl-damaged-files.txt and --to is ./out.)
 
 After a restore, RESTORE.sh hashes every restored file against
 the unit's file table. That check decides what was restored, not
@@ -1099,7 +1103,7 @@ WHAT TO DO FIRST
    RESTORE.sh checks for its tools before it reads the tape and
    names any that is missing. It needs:
      mt     package mt-st (it can set the tape's block size)
-     dd, head, tail, truncate, tar, sha256sum
+     dd, head, tail, tar, sha256sum
             standard on Linux (coreutils, tar). Any tar reads the
             tape; it need not be GNU tar.
      age    age-encryption.org. The files are in the stable age v1
@@ -2242,6 +2246,37 @@ mod tests {
         ] {
             assert!(prose.contains(required), "missing {required:?}");
         }
+    }
+
+    /// #596 6-7: the sheet stated Layout 2's choice of unit, a folder per unit
+    /// even for one unit, a repair line naming a list that is not there for a
+    /// one-unit tape, and a tool the script never runs. Layout 3's
+    /// RESTORE.sh (`choose_units`, `restore_all`) refuses several units
+    /// without --all or --unit, restores one unit into --to itself and
+    /// several into --to/NAME, and runs no `truncate`.
+    #[test]
+    fn the_sheet_states_what_restore_sh_does_with_units_and_tools() {
+        let prose = flat(&render_cover_text(&facts_for(&[], &[])));
+        assert!(
+            !prose.contains("uses the first envelope the key opens"),
+            "Layout 2's choice of unit"
+        );
+        assert!(
+            !prose.contains("nothing is said of the rest of the tape"),
+            "Layout 2's silence"
+        );
+        for required in [
+            "refuses and lists the units",
+            "tape that holds one unit is restored into ./out itself",
+        ] {
+            assert!(prose.contains(required), "missing {required:?}");
+        }
+        assert!(
+            !prose.contains("each into its own folder under ./out"),
+            "true only of a tape of several units"
+        );
+        assert!(!prose.contains("truncate"), "RESTORE.sh never runs truncate");
+        assert!(prose.contains("dd, head, tail, tar, sha256sum"));
     }
 
     /// Layout 3's restore, as the sheet tells it (T4.14): a slice that fails a
