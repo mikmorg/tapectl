@@ -2793,14 +2793,17 @@ missing or differs.
 
 "##;
 
-/// The directory name of a unit's work and destination: the unit uuid's
-/// first eight characters, `_v` and the version, the stem of its file table
-/// (a unit's name may hold a `/` or a space, so it is never a path).
+/// The directory name of a unit's work and destination: the stem of its file
+/// table, the unit uuid's first eight characters, `_v`, the version, `_s` and
+/// the stage set (a unit's name may hold a `/` or a space, so it is never a
+/// path). Two stagings of one version on one tape are two blocks that never
+/// share a directory (`volume-format-v3.md` 1.6; #596 C-4).
 fn unit_dir_name(unit: &ManifestUnit) -> String {
     format!(
-        "{}_v{}",
+        "{}_v{}_s{}",
         unit.uuid.get(..8).unwrap_or(&unit.uuid),
-        unit.snapshot_version
+        unit.snapshot_version,
+        unit.stage_set_id
     )
 }
 
@@ -5757,6 +5760,31 @@ verify any entry by hashing the file it describes.
         }
     }
 
+    /// #596 C-4: two stagings of one version on one tape (volume-format-v3.md
+    /// 1.6: they never collide) are two blocks of one uuid and version. Each
+    /// gets the stem of its own file table, `{uuid8}_v{version}_s{stage_set}`,
+    /// for its work directory and its destination, so the second tar run does
+    /// not extract over the first's tree.
+    #[test]
+    fn two_stagings_of_one_version_get_work_and_destination_directories_of_their_own() {
+        let uuid = "cccccccc-0000-0000-0000-000000000003";
+        let first = unit_with("shared", uuid, None, &[(1, Some(10), false)]);
+        let mut second = unit_with("shared", uuid, None, &[(1, Some(11), false)]);
+        second.stage_set_id = 8;
+        second.file_table = Some("tables/cccccccc_v1_s8.tsv".to_string());
+        let md = generate_recovery_md("LAB", "alice", &[first, second], &[]);
+        for stem in ["cccccccc_v1_s7", "cccccccc_v1_s8"] {
+            assert!(
+                md.contains(&format!("mkdir -p work/{stem} /destination/{stem}")),
+                "{stem}: {md}"
+            );
+        }
+        assert!(
+            !md.contains("work/cccccccc_v1 ") && !md.contains("/destination/cccccccc_v1\n"),
+            "a directory both blocks share: {md}"
+        );
+    }
+
     /// #522: each unit's block names a work directory and a destination of
     /// its own, nothing is shared between two blocks, and a tape that holds
     /// only part of a unit reads the slices it holds: a leading slice that
@@ -5788,11 +5816,11 @@ verify any entry by hashing the file it describes.
         let sec_a = guide_section_of(&md, "photos/2019");
         let sec_b = guide_section_of(&md, "music");
         assert!(
-            sec_a.contains("mkdir -p work/aaaaaaaa_v1 /destination/aaaaaaaa_v1"),
+            sec_a.contains("mkdir -p work/aaaaaaaa_v1_s7 /destination/aaaaaaaa_v1_s7"),
             "{sec_a}"
         );
         assert!(
-            sec_b.contains("mkdir -p work/bbbbbbbb_v1 /destination/bbbbbbbb_v1"),
+            sec_b.contains("mkdir -p work/bbbbbbbb_v1_s7 /destination/bbbbbbbb_v1_s7"),
             "{sec_b}"
         );
         assert!(
@@ -5818,7 +5846,7 @@ verify any entry by hashing the file it describes.
         // The whole unit: both slices, in order, joined.
         assert!(
             sec_a.contains(
-                "cat work/aaaaaaaa_v1/slice.1.tar work/aaaaaaaa_v1/slice.2.tar | LC_ALL=C tar"
+                "cat work/aaaaaaaa_v1_s7/slice.1.tar work/aaaaaaaa_v1_s7/slice.2.tar | LC_ALL=C tar"
             ),
             "{sec_a}"
         );
@@ -5837,22 +5865,22 @@ verify any entry by hashing the file it describes.
             "the tape is wound to the first slice it reads: {sec_b}"
         );
         assert!(
-            sec_b.contains("work/bbbbbbbb_v1/slice.3.age | xz -dc > work/bbbbbbbb_v1/slice.3.tar"),
+            sec_b.contains("work/bbbbbbbb_v1_s7/slice.3.age | xz -dc > work/bbbbbbbb_v1_s7/slice.3.tar"),
             "{sec_b}"
         );
         assert!(
             sec_b.contains(
-                "cat work/bbbbbbbb_v1/slice.3.tar work/bbbbbbbb_v1/slice.4.tar | LC_ALL=C tar"
+                "cat work/bbbbbbbb_v1_s7/slice.3.tar work/bbbbbbbb_v1_s7/slice.4.tar | LC_ALL=C tar"
             ),
             "{sec_b}"
         );
         // The length and the hash are of the decompressed (plain) slice.
         assert!(
-            sec_b.contains("test $(wc -c < work/bbbbbbbb_v1/slice.3.tar) -eq 103"),
+            sec_b.contains("test $(wc -c < work/bbbbbbbb_v1_s7/slice.3.tar) -eq 103"),
             "{sec_b}"
         );
         assert!(
-            sec_b.contains(&format!("{:064x}  work/bbbbbbbb_v1/slice.3.tar", 3)),
+            sec_b.contains(&format!("{:064x}  work/bbbbbbbb_v1_s7/slice.3.tar", 3)),
             "{sec_b}"
         );
         // The section on a unit across tapes is there for a range, and only then.
