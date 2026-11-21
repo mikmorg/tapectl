@@ -2971,6 +2971,14 @@ function show(s,    out, i, n, c) {
   }
   return out
 }
+# A path as the index writes it, which is as --list writes it and as --path
+# takes it: already escaped (a backslash is \\, a TAB \t, a newline \n, a
+# carriage return \r, a byte that is not UTF-8 \xHH), so it is printed as it
+# stands. Only a control byte that is still raw is not shown.
+function showpath(s) {
+  gsub(/[[:cntrl:]]/, "?", s)
+  return s
+}
 function human(b) {
   if (b !~ /^[0-9]+$/) return "size not known"
   if (b + 0 >= 1073741824) return sprintf("%.1f GiB", b / 1073741824)
@@ -3269,7 +3277,7 @@ NR == 1 {
   if (shown == 1) print "In the index of " who ":"
   us = $(ph["unit"])
   vs = $(ph["version"])
-  printf "  %s  v%s  %s  %s bytes  %s\n", show(us), show(vs), (("kind" in ph) ? show($(ph["kind"])) : "?"), (("size_bytes" in ph) ? show($(ph["size_bytes"])) : "?"), show(p)
+  printf "  %s  v%s  %s  %s bytes  %s\n", show(us), show(vs), (("kind" in ph) ? show($(ph["kind"])) : "?"), (("size_bytes" in ph) ? show($(ph["size_bytes"])) : "?"), showpath(p)
   k = unesc(us) SUBSEP vs
   if (!(k in want)) { want[k] = 1; order[++nord] = k; dunit[k] = show(us); dver[k] = show(vs) }
 }
@@ -3520,8 +3528,8 @@ do_find() {
   fi
   say ""
   say "Paths containing '$(visible_text "$FIND_TEXT")' (unit, version, kind, size, path; kind is d directory,"
-  say "f file, l symlink, s special). A TAB, newline or carriage return in a path is shown as"
-  say "\\t, \\n or \\r, and a byte that is not UTF-8 as \\xHH."
+  say "f file, l symlink, s special). A path is written as --list writes it, which is the form --path"
+  say "takes: a backslash is \\\\, a TAB \\t, a newline \\n, a carriage return \\r, and a byte that is not UTF-8 \\xHH."
   say ""
   cat "$WORK/find.out"
   say ""

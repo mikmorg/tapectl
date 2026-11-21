@@ -3819,8 +3819,8 @@ fn find_prints_matching_paths_with_their_holders() {
     );
 }
 
-/// The match is on the decoded path and a path with a TAB or newline is
-/// printed on one line, escaped for the eye.
+/// The match is on the decoded path and a path is printed on one line, as
+/// --list writes it (escaped, and so the form --path takes).
 #[test]
 fn find_matches_the_decoded_path_and_prints_it_on_one_line() {
     let t = two();
@@ -3841,7 +3841,10 @@ fn find_matches_the_decoded_path_and_prints_it_on_one_line() {
     );
     let o = h.run(&["--find", "odd\\back", "--key", &kb]);
     assert_eq!(o.code, 0, "{}", o.all());
-    assert!(o.stdout.contains("odd\\back name.txt"), "{}", o.stdout);
+    // The path is printed as --list prints it and as --path takes it: a backslash
+    // is \\ (volume-format-v3.md 1.5; #596 6-6).
+    assert!(o.stdout.contains("odd\\\\back name.txt"), "{}", o.stdout);
+    assert!(!o.stdout.contains("odd\\back name.txt"), "{}", o.stdout);
 }
 
 #[test]
