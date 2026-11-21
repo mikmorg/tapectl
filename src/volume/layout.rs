@@ -2714,11 +2714,23 @@ front_index_sha256 = "{front_index_sha256}"
 /// signature, because every call site addresses it as `layout::
 /// generate_manifest_toml`.
 pub fn generate_manifest_toml(label: &str, tenant_name: &str, units: &[ManifestUnit]) -> String {
-    let now = chrono::Utc::now().to_rfc3339();
+    generate_manifest_toml_at(label, tenant_name, units, &chrono::Utc::now().to_rfc3339())
+}
+
+/// [`generate_manifest_toml`] with `created_at` given instead of read from the clock: a
+/// seam for the Layout 3 byte pins (`tests/on_tape_golden.rs`, ADR-0012 item 243).
+/// Production callers go through [`generate_manifest_toml`], which passes the clock's
+/// `to_rfc3339()` as before; every other byte is the same.
+pub fn generate_manifest_toml_at(
+    label: &str,
+    tenant_name: &str,
+    units: &[ManifestUnit],
+    created_at: &str,
+) -> String {
     let manifest = crate::volume::manifest::Manifest {
         volume: label.to_string(),
         tenant: tenant_name.to_string(),
-        created_at: now,
+        created_at: created_at.to_string(),
         // Every envelope of every tape 1.6.0 writes (`volume-format-v3.md`
         // §1.8, ADR-0012 item 111): the tape may end early, and only its seal
         // says whether it did.

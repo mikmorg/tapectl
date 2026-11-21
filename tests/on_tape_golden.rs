@@ -400,10 +400,11 @@
 use tapectl::idmap::{self, IdKind, IdRow};
 use tapectl::volume::filetable::{self, Kind, Row};
 use tapectl::volume::layout::{
-    generate_front_index, generate_id_thunk_v2, generate_seal_marker_requiring_at,
-    generate_short_seal_marker_requiring_at, FrontIndexFile, IdThunkV2Params, REQUIRES,
+    generate_front_index, generate_id_thunk_v2, generate_manifest_toml_at,
+    generate_seal_marker_requiring_at, generate_short_seal_marker_requiring_at, FrontIndexFile,
+    IdThunkV2Params, REQUIRES,
 };
-use tapectl::volume::manifest::{Manifest, ManifestSlice, ManifestUnit};
+use tapectl::volume::manifest::{ManifestSlice, ManifestUnit};
 
 /// Compare a generated document with its pinned text. On a difference the generated text
 /// is written under the target directory and the failure names the file.
@@ -592,54 +593,46 @@ continues = true
 
 /// A tenant envelope's two whole units: every key of a block (the first, uncompressed),
 /// and a compressed staging whose second slice continues a member (the second).
-/// The input is fixed; `Manifest::to_toml` is the writer `generate_manifest_toml` calls.
+/// The input is fixed; `generate_manifest_toml_at` is `generate_manifest_toml` (the call
+/// `build()` makes) with `created_at` given.
 #[test]
 fn layout3_manifest_whole_units() {
-    let manifest = Manifest {
-        volume: "L8-0001".to_string(),
-        tenant: "alpha".to_string(),
-        created_at: "2026-11-21T10:00:00+00:00".to_string(),
-        may_end_early: true,
-        units: vec![
-            ManifestUnit {
-                name: "photos/2019".to_string(),
-                uuid: "11111111-2222-3333-4444-555555555555".to_string(),
-                snapshot_version: 7,
-                stage_set_id: 42,
-                payload: "tar".to_string(),
-                stream_bytes: 40_960,
-                file_table: Some("tables/11111111_v7_s42.tsv".to_string()),
-                id_map: Some("tables/11111111_v7_s42.ids.tsv".to_string()),
-                tar_version: Some("tar (GNU tar) 1.35".to_string()),
-                compression: None,
-                slices: vec![
-                    slice(1, Some(9), (20_480, 20_512), ("a", "b"), false),
-                    slice(2, Some(10), (20_480, 20_512), ("c", "d"), false),
-                ],
-            },
-            ManifestUnit {
-                name: "ledgers/fy24".to_string(),
-                uuid: "66666666-7777-8888-9999-000000000000".to_string(),
-                snapshot_version: 1,
-                stage_set_id: 43,
-                payload: "tar".to_string(),
-                stream_bytes: 31_744,
-                file_table: Some("tables/66666666_v1_s43.tsv".to_string()),
-                id_map: Some("tables/66666666_v1_s43.ids.tsv".to_string()),
-                tar_version: Some("tar (GNU tar) 1.35".to_string()),
-                compression: Some("zstd".to_string()),
-                slices: vec![
-                    slice(1, Some(11), (20_480, 4_100), ("e", "f"), false),
-                    slice(2, Some(12), (11_264, 2_300), ("1", "2"), true),
-                ],
-            },
-        ],
-    };
-    assert_pinned_text(
-        "manifest-whole-units",
-        &manifest.to_toml(),
-        MANIFEST_WHOLE_UNITS,
-    );
+    let units = vec![
+        ManifestUnit {
+            name: "photos/2019".to_string(),
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            snapshot_version: 7,
+            stage_set_id: 42,
+            payload: "tar".to_string(),
+            stream_bytes: 40_960,
+            file_table: Some("tables/11111111_v7_s42.tsv".to_string()),
+            id_map: Some("tables/11111111_v7_s42.ids.tsv".to_string()),
+            tar_version: Some("tar (GNU tar) 1.35".to_string()),
+            compression: None,
+            slices: vec![
+                slice(1, Some(9), (20_480, 20_512), ("a", "b"), false),
+                slice(2, Some(10), (20_480, 20_512), ("c", "d"), false),
+            ],
+        },
+        ManifestUnit {
+            name: "ledgers/fy24".to_string(),
+            uuid: "66666666-7777-8888-9999-000000000000".to_string(),
+            snapshot_version: 1,
+            stage_set_id: 43,
+            payload: "tar".to_string(),
+            stream_bytes: 31_744,
+            file_table: Some("tables/66666666_v1_s43.tsv".to_string()),
+            id_map: Some("tables/66666666_v1_s43.ids.tsv".to_string()),
+            tar_version: Some("tar (GNU tar) 1.35".to_string()),
+            compression: Some("zstd".to_string()),
+            slices: vec![
+                slice(1, Some(11), (20_480, 4_100), ("e", "f"), false),
+                slice(2, Some(12), (11_264, 2_300), ("1", "2"), true),
+            ],
+        },
+    ];
+    let text = generate_manifest_toml_at("L8-0001", "alpha", &units, "2026-11-21T10:00:00+00:00");
+    assert_pinned_text("manifest-whole-units", &text, MANIFEST_WHOLE_UNITS);
 }
 
 const MANIFEST_RANGE_BLOCK: &str = r##"[manifest]
@@ -690,34 +683,25 @@ continues = true
 /// continues a member begun in slice 2, is the run's first slice here.
 #[test]
 fn layout3_manifest_range_block() {
-    let manifest = Manifest {
-        volume: "L8-0002".to_string(),
-        tenant: "alpha".to_string(),
-        created_at: "2026-11-21T10:00:00+00:00".to_string(),
-        may_end_early: true,
-        units: vec![ManifestUnit {
-            name: "photos/2019".to_string(),
-            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
-            snapshot_version: 7,
-            stage_set_id: 42,
-            payload: "tar".to_string(),
-            stream_bytes: 61_440,
-            file_table: Some("tables/11111111_v7_s42.tsv".to_string()),
-            id_map: Some("tables/11111111_v7_s42.ids.tsv".to_string()),
-            tar_version: Some("tar (GNU tar) 1.35".to_string()),
-            compression: Some("xz".to_string()),
-            slices: vec![
-                slice(1, None, (20_480, 9_000), ("1", "4"), false),
-                slice(2, None, (20_480, 9_001), ("2", "5"), false),
-                slice(3, Some(4), (20_480, 9_002), ("3", "6"), true),
-            ],
-        }],
-    };
-    assert_pinned_text(
-        "manifest-range-block",
-        &manifest.to_toml(),
-        MANIFEST_RANGE_BLOCK,
-    );
+    let units = vec![ManifestUnit {
+        name: "photos/2019".to_string(),
+        uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+        snapshot_version: 7,
+        stage_set_id: 42,
+        payload: "tar".to_string(),
+        stream_bytes: 61_440,
+        file_table: Some("tables/11111111_v7_s42.tsv".to_string()),
+        id_map: Some("tables/11111111_v7_s42.ids.tsv".to_string()),
+        tar_version: Some("tar (GNU tar) 1.35".to_string()),
+        compression: Some("xz".to_string()),
+        slices: vec![
+            slice(1, None, (20_480, 9_000), ("1", "4"), false),
+            slice(2, None, (20_480, 9_001), ("2", "5"), false),
+            slice(3, Some(4), (20_480, 9_002), ("3", "6"), true),
+        ],
+    }];
+    let text = generate_manifest_toml_at("L8-0002", "alpha", &units, "2026-11-21T10:00:00+00:00");
+    assert_pinned_text("manifest-range-block", &text, MANIFEST_RANGE_BLOCK);
 }
 
 const MANIFEST_OPERATOR_ENVELOPE: &str = r##"[manifest]
@@ -773,46 +757,42 @@ sha256_encrypted = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 /// `id_map` (the catalog.db carries them), and a block with no `tar_version`.
 #[test]
 fn layout3_manifest_operator_envelope() {
-    let manifest = Manifest {
-        volume: "L8-0001".to_string(),
-        tenant: "operator".to_string(),
-        created_at: "2026-11-21T10:00:00+00:00".to_string(),
-        may_end_early: true,
-        units: vec![
-            ManifestUnit {
-                name: "photos/2019".to_string(),
-                uuid: "11111111-2222-3333-4444-555555555555".to_string(),
-                snapshot_version: 7,
-                stage_set_id: 42,
-                payload: "tar".to_string(),
-                stream_bytes: 40_960,
-                file_table: None,
-                id_map: None,
-                tar_version: Some("tar (GNU tar) 1.35".to_string()),
-                compression: None,
-                slices: vec![
-                    slice(1, Some(9), (20_480, 20_512), ("a", "b"), false),
-                    slice(2, Some(10), (20_480, 20_512), ("c", "d"), false),
-                ],
-            },
-            ManifestUnit {
-                name: "ledgers/fy24".to_string(),
-                uuid: "66666666-7777-8888-9999-000000000000".to_string(),
-                snapshot_version: 1,
-                stage_set_id: 43,
-                payload: "tar".to_string(),
-                stream_bytes: 10_240,
-                file_table: None,
-                id_map: None,
-                tar_version: None,
-                compression: None,
-                slices: vec![slice(1, Some(11), (10_240, 10_272), ("e", "f"), false)],
-            },
-        ],
-    };
+    let units = vec![
+        ManifestUnit {
+            name: "photos/2019".to_string(),
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            snapshot_version: 7,
+            stage_set_id: 42,
+            payload: "tar".to_string(),
+            stream_bytes: 40_960,
+            file_table: None,
+            id_map: None,
+            tar_version: Some("tar (GNU tar) 1.35".to_string()),
+            compression: None,
+            slices: vec![
+                slice(1, Some(9), (20_480, 20_512), ("a", "b"), false),
+                slice(2, Some(10), (20_480, 20_512), ("c", "d"), false),
+            ],
+        },
+        ManifestUnit {
+            name: "ledgers/fy24".to_string(),
+            uuid: "66666666-7777-8888-9999-000000000000".to_string(),
+            snapshot_version: 1,
+            stage_set_id: 43,
+            payload: "tar".to_string(),
+            stream_bytes: 10_240,
+            file_table: None,
+            id_map: None,
+            tar_version: None,
+            compression: None,
+            slices: vec![slice(1, Some(11), (10_240, 10_272), ("e", "f"), false)],
+        },
+    ];
+    let text =
+        generate_manifest_toml_at("L8-0001", "operator", &units, "2026-11-21T10:00:00+00:00");
     assert_pinned_text(
         "manifest-operator-envelope",
-        &manifest.to_toml(),
+        &text,
         MANIFEST_OPERATOR_ENVELOPE,
     );
 }
