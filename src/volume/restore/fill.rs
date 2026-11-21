@@ -74,15 +74,19 @@ struct Notes {
     rejected: Vec<String>,
     /// Copies that could not be read or asked for.
     unavailable: Vec<String>,
+    /// The unit's root member, as a copy gave it, when the root was lost and
+    /// is filled: the restore gives the destination its metadata from it.
+    root: Option<Vec<u8>>,
 }
 
 /// The restore's end: nothing lost, or the loss filled from another copy, or
-/// an error naming what is still lost. Returns the files filled.
+/// an error naming what is still lost. Returns the files filled, and the
+/// root member's bytes when the root was among them.
 pub(super) fn finish(
     ctx: &Finish<'_>,
     supply: &mut Supply<'_, '_, '_>,
     ex: &Extracted,
-) -> Result<Vec<(String, String)>> {
+) -> Result<(Vec<(String, String)>, Option<Vec<u8>>)> {
     let mut lost = ex.lost.clone();
     progress::log(&format!(
         "restore of unit \"{}\" v{}: {} file(s) damaged or missing after the extract; {} slice(s) \
@@ -100,7 +104,7 @@ pub(super) fn finish(
                  restore is whole"
             );
         }
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
 
     let mut notes = Notes::default();
@@ -109,7 +113,7 @@ pub(super) fn finish(
     supply.set_subject(subject);
     outcome?;
     if lost.is_empty() {
-        return Ok(notes.filled);
+        return Ok((notes.filled, notes.root));
     }
     Err(incomplete(ctx, ex, &lost, &notes))
 }
@@ -323,6 +327,9 @@ fn fill_from(
         tar_binary: &ctx.config.tar.binary,
         dest: &out,
         overwrite: false,
+        // The copy's own root member is kept, for a lost `.` of the
+        // destination (item 306: the root is a member, so it can be lost).
+        root_metadata: true,
         file_check: true,
     };
     let mut scratch_trace = RestoreTrace::default();
@@ -373,6 +380,13 @@ fn fill_from(
                         (Kind::Folder, _) => {
                             if let Some(m) = folder_meta.get(&source) {
                                 folders.push((m.clone(), dest));
+                            }
+                            // The unit's root (`.`) is given its recorded
+                            // metadata at the restore's very end, from the
+                            // member's own bytes, once this repair's hidden
+                            // directory is gone from it (item 303).
+                            if *path == "." {
+                                notes.root = read.root.clone();
                             }
                         }
                         (Kind::HardLink, Some(target)) => {

@@ -2313,4 +2313,104 @@ pub(crate) mod tests {
             "the entry that was there stays beside the new one"
         );
     }
+
+    /// Item 306, #594 C-1: the unit's root is a member, so it can be lost
+    /// with the slice it is in. The repair fills it from the other copy like
+    /// any folder (a folder that is there is left as it is), and gives the
+    /// destination's root the copy's recorded mode and mtime, as the restore's
+    /// own pass would have, had its root member come through.
+    #[test]
+    fn a_lost_root_member_is_filled_from_the_other_copy_with_its_recorded_metadata() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut h = Home::new("256K", None, 2);
+        h.unit(TENANT, UNIT, &tree());
+        let src = h.source(UNIT);
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o750)).unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(981_173_106);
+        fs::File::open(&src).unwrap().set_modified(when).unwrap();
+        h.stage(UNIT);
+        h.volume(A);
+        h.volume(B);
+        h.write(A);
+        let one = h.stage_set(UNIT, 1);
+        restage(&mut h, "192K");
+        h.write(B);
+        damage_in(&mut h, A, one, 1, 0);
+        let lost = lost_in_chunk(&h, one, SLICE_256K, 1, 0);
+        assert!(
+            lost.contains("."),
+            "positive control: the root is lost: {lost:?}"
+        );
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let (r, dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        r.expect("the other copy fills what the damaged chunk lost");
+        assert!(!bay.asked.is_empty(), "the other cartridge was asked for");
+        assert_restored(&h, UNIT, dest.path(), &[]);
+        let meta = fs::metadata(dest.path()).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o750,
+            "the recorded mode"
+        );
+        assert_eq!(meta.mtime(), 981_173_106, "the recorded mtime");
+    }
+
+    /// The repair's hidden directory is made in the destination's root and
+    /// removed from it, and the files it installs there, so a root that was
+    /// given its recorded times first would end with the repair's own: the
+    /// root is given them last (item 303), a repair that did not lose the
+    /// root member included.
+    #[test]
+    fn a_repair_leaves_the_destinations_root_with_its_recorded_mode_and_mtime() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut h = Home::new("256K", None, 2);
+        h.unit(TENANT, UNIT, &tree());
+        let src = h.source(UNIT);
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o750)).unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(981_173_106);
+        fs::File::open(&src).unwrap().set_modified(when).unwrap();
+        h.stage(UNIT);
+        h.volume(A);
+        h.volume(B);
+        h.write(A);
+        let one = h.stage_set(UNIT, 1);
+        restage(&mut h, "192K");
+        h.write(B);
+        damage_in(&mut h, A, one, 3, 1);
+        let lost = lost_in_chunk(&h, one, SLICE_256K, 3, 1);
+        assert!(
+            !lost.contains("."),
+            "positive control: the root stands: {lost:?}"
+        );
+        assert!(!lost.is_empty(), "positive control: something is repaired");
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let (r, dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        r.expect("the other copy fills what the damaged chunk lost");
+        assert!(!bay.asked.is_empty(), "the repair ran");
+        assert_restored(&h, UNIT, dest.path(), &[]);
+        let meta = fs::metadata(dest.path()).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o750,
+            "the recorded mode"
+        );
+        assert_eq!(
+            meta.mtime(),
+            981_173_106,
+            "the recorded mtime, after the repair"
+        );
+        assert_eq!(
+            fs::read_dir(dest.path())
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tapectl-repair-tmp"))
+                .count(),
+            0,
+            "the repair's hidden directory is gone"
+        );
+    }
 }

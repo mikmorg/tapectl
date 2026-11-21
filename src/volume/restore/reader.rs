@@ -79,6 +79,11 @@ pub(super) struct Job<'a> {
     /// Where tar extracts to.
     pub dest: &'a Path,
     pub overwrite: bool,
+    /// The destination was empty at the preflight and tar keeps old files
+    /// (no `--overwrite`): tar skips the `./` member's own metadata because
+    /// the directory is already there, so it is applied after tar ends
+    /// (ADR-0012 item 303, #594 C-1).
+    pub root_metadata: bool,
     /// Hash every restored file on disk afterwards (D16).
     pub file_check: bool,
 }
@@ -93,6 +98,11 @@ pub(super) struct Outcome {
     pub restored: usize,
     /// tar's own complaints, repeated (invariant 6: not the verdict).
     pub tar_said: Vec<String>,
+    /// The root member's bytes as they were fed to tar, when the job asked
+    /// for them (`root_metadata`), the root stands and tar ended clean:
+    /// [`apply_root`] gives them to the destination once everything else,
+    /// a repair included, is in (ADR-0012 item 303).
+    pub root: Option<Vec<u8>>,
 }
 
 /// The members left of a read, as it goes.
@@ -112,6 +122,9 @@ struct Reading<'j, 'a> {
     unavailable: BTreeMap<u64, String>,
     /// Consecutive tar runs that died under a feed.
     deaths: u32,
+    /// The `./` member's bytes as fed to tar (its extension headers and its
+    /// header), kept for [`apply_root`].
+    root: Option<Vec<u8>>,
 }
 
 /// A long member's run, in progress.
@@ -415,6 +428,9 @@ impl<'j, 'a> Reading<'j, 'a> {
         if self.put(bytes)? {
             self.deaths = 0;
             self.fed.push(idx);
+            if m.path == "." && self.job.root_metadata {
+                self.root = Some(bytes.to_vec());
+            }
         } else {
             self.lose(m, "tar stopped while it was being fed");
         }
@@ -568,6 +584,7 @@ pub(super) fn run(
         runs: Vec::new(),
         unavailable: BTreeMap::new(),
         deaths: 0,
+        root: None,
     };
     supply.set_route(job.positions);
     let total: u64 = job
@@ -689,11 +706,67 @@ pub(super) fn run(
         info!("restored files not hashed on disk (--no-file-check)");
     }
     let restored = fed.iter().filter(|m| !lost.contains_key(&m.path)).count();
+    // The root member's bytes go back to the caller, which applies them last
+    // (after any repair, whose own writes move the root's times): only when
+    // tar ended clean (ADR-0012 item 303).
+    let root = if reading.runs.iter().all(|r| r.exit_code == Some(0)) && !lost.contains_key(".") {
+        reading.root.take()
+    } else {
+        None
+    };
     Ok(Outcome {
         lost,
         restored,
         tar_said,
+        root,
     })
+}
+
+/// Give the destination's own directory the `./` member's recorded mode,
+/// owner, times, extended attributes and ACL (ADR-0012 item 303, #594 C-1).
+///
+/// `--keep-old-files` makes GNU tar skip a member whose name exists, and the
+/// destination exists (tapectl made it, or it was empty), so the first run
+/// leaves the root as `mkdir` made it, with exit 0 and no message. The
+/// member's bytes, as they were fed, go to a second tar with `--overwrite`
+/// and the same flags otherwise: it holds that one member, so nothing else
+/// is touched, and tar itself decides what it can set (a non-root run
+/// changes no owner), as it did for every other member. Returns what tar
+/// said, for the operator; never the verdict.
+pub(super) fn apply_root(tar_binary: &str, dest: &Path, member: &[u8]) -> Vec<String> {
+    let args = TarRun::args(dest, true);
+    let mut cmd = crate::tar::command(tar_binary);
+    cmd.args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return vec![format!(
+                "the destination's own mode, owner and times were not set: cannot run {tar_binary}: {e}"
+            )]
+        }
+    };
+    let stderr = drain(child.stderr.take());
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(member);
+        let _ = stdin.write_all(&[0u8; 2 * BLOCK as usize]);
+    }
+    let status = child.wait().ok();
+    let said = stderr
+        .and_then(|h| h.join().ok())
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let mut out: Vec<String> = said
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| format!("(the destination's own metadata) {}", l.trim()))
+        .collect();
+    if status.and_then(|s| s.code()) != Some(0) {
+        out.push("the destination's own mode, owner and times may not have been set".to_string());
+    }
+    out
 }
 
 /// Hash every file of `fed` at `root` against the table; a path that is not

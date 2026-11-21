@@ -1373,3 +1373,204 @@ fn restore_file_of_a_nested_file_reads_only_its_own_slices_and_makes_its_parents
     assert!((reads.len() as i64) < all, "{reads:?} of {all}");
     assert_eq!(only_row(&r.h.conn).files_restored, Some(1));
 }
+
+// ── ADR-0012 items 303, 306 (#594 C-1): the unit's root gets its recorded metadata ──
+
+/// The recorded mtime of the root in these tests: long ago, so no restore's
+/// own writes could match it.
+const ROOT_MTIME_SECS: i64 = 981_173_106; // 2001-02-03 04:05:06 UTC
+
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+fn mtime_of(p: &Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(p).unwrap().mtime()
+}
+
+fn xattr_of(p: &Path) -> Option<String> {
+    let o = std::process::Command::new("getfattr")
+        .args(["-n", "user.root-mark", "--only-values"])
+        .arg(p)
+        .output()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+fn acl_of(p: &Path) -> String {
+    let o = std::process::Command::new("getfacl")
+        .arg("-c")
+        .arg(p)
+        .output()
+        .expect("getfacl");
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// What the host let the test mark the root with.
+#[derive(Clone, Copy)]
+struct Marks {
+    xattr: bool,
+    acl: bool,
+    default_acl: bool,
+}
+
+/// A home whose unit folder carries a mode, an mtime, and (where the host
+/// allows) an extended attribute and an access and a default ACL of its own,
+/// staged and written. A mark the host refuses is said loudly and not
+/// checked.
+fn written_with_a_marked_root(label: &str) -> (Home, Marks) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = Home::new("64K", None, 1);
+    h.unit(TENANT, UNIT, &two_files());
+    let src = h.source(UNIT);
+    let ok = |cmd: &str, args: &[&str]| {
+        std::process::Command::new(cmd)
+            .args(args)
+            .arg(&src)
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let marks = Marks {
+        xattr: ok("setfattr", &["-n", "user.root-mark", "-v", "kept"]),
+        acl: ok("setfacl", &["-m", "u:12345:r-x"]),
+        default_acl: ok("setfacl", &["-d", "-m", "u:12346:r-x"]),
+    };
+    for (what, set) in [
+        ("xattr", marks.xattr),
+        ("ACL", marks.acl),
+        ("default ACL", marks.default_acl),
+    ] {
+        if !set {
+            eprintln!("SKIPPING the root's {what} half of item 303's test: the host refuses it");
+        }
+    }
+    // chmod after setfacl: an ACL's mask rides on the group bits.
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o750)).unwrap();
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(ROOT_MTIME_SECS as u64);
+    fs::File::open(&src)
+        .unwrap()
+        .set_modified(t)
+        .expect("the source root's mtime");
+    h.stage(UNIT);
+    h.volume(label);
+    h.write(label);
+    (h, marks)
+}
+
+fn assert_root_is_recorded(dest: &Path, marks: Marks) {
+    assert_eq!(
+        mode_of(dest),
+        0o750,
+        "the destination's mode is the root member's"
+    );
+    assert_eq!(
+        mtime_of(dest),
+        ROOT_MTIME_SECS,
+        "the destination's mtime is the root member's, not the restore's own"
+    );
+    if marks.xattr {
+        assert_eq!(xattr_of(dest).as_deref(), Some("kept"));
+    }
+    let acl = acl_of(dest);
+    if marks.acl {
+        assert!(acl.contains("user:12345:r-x"), "{acl}");
+    }
+    if marks.default_acl {
+        assert!(acl.contains("default:user:12346:r-x"), "{acl}");
+    }
+}
+
+#[test]
+fn an_empty_destinations_root_gets_the_recorded_mode_mtime_xattr_and_acls() {
+    let (h, marks) = written_with_a_marked_root("R3-EMPTY");
+    let r = Rig::new(h, "R3-EMPTY");
+    // TempDir makes it 0700, now: nothing like the recorded root.
+    let dest = TempDir::new().unwrap();
+    assert_ne!(mode_of(dest.path()), 0o750, "positive control");
+    r.unit("R3-EMPTY", dest.path(), &RestoreOptions::default())
+        .unwrap();
+    assert_restored(&r.h, UNIT, dest.path(), &[]);
+    assert_root_is_recorded(dest.path(), marks);
+}
+
+#[test]
+fn a_destination_tapectl_makes_gets_the_recorded_root_too() {
+    let (h, marks) = written_with_a_marked_root("R3-NEW");
+    let r = Rig::new(h, "R3-NEW");
+    let parent = TempDir::new().unwrap();
+    let dest = parent.path().join("made-by-tapectl");
+    assert!(!dest.exists());
+    r.unit("R3-NEW", &dest, &RestoreOptions::default()).unwrap();
+    assert_root_is_recorded(&dest, marks);
+}
+
+#[test]
+fn a_non_empty_destinations_root_keeps_its_own() {
+    let (h, _) = written_with_a_marked_root("R3-FULL");
+    let r = Rig::new(h, "R3-FULL");
+    let dest = TempDir::new().unwrap();
+    fs::write(dest.path().join("a.txt"), b"STALE").unwrap();
+    let (mode, mtime) = (mode_of(dest.path()), mtime_of(dest.path()));
+    let err = r
+        .unit("R3-FULL", dest.path(), &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("it is not empty"), "{err}");
+    assert_eq!(mode_of(dest.path()), mode);
+    assert_eq!(mtime_of(dest.path()), mtime);
+    assert_eq!(fs::read(dest.path().join("a.txt")).unwrap(), b"STALE");
+}
+
+/// `--overwrite` is tar's own: it sets the root itself, and tapectl runs no
+/// second tar for it.
+#[test]
+fn an_overwrite_restore_sets_the_root_by_tars_own_run_alone() {
+    let (h, marks) = written_with_a_marked_root("R3-OW");
+    let r = Rig::new(h, "R3-OW");
+    let dest = TempDir::new().unwrap();
+    let options = RestoreOptions {
+        overwrite: true,
+        ..RestoreOptions::default()
+    };
+    r.unit("R3-OW", dest.path(), &options).unwrap();
+    assert_root_is_recorded(dest.path(), marks);
+    let argv = only_row(&r.h.conn).tar_argv.expect("tar ran");
+    assert!(argv.contains(r#""--overwrite""#), "{argv}");
+}
+
+/// `restore file` places one file: the destination's own mode and times are
+/// never given the unit root's.
+#[test]
+fn a_restore_file_does_not_touch_the_destinations_root() {
+    let (h, _) = written_with_a_marked_root("R3-FILE");
+    let r = Rig::new(h, "R3-FILE");
+    let dest = TempDir::new().unwrap();
+    let mode = mode_of(dest.path());
+    r.file("R3-FILE", "b.txt", dest.path(), &RestoreOptions::default())
+        .unwrap();
+    assert_eq!(fs::read(dest.path().join("b.txt")).unwrap(), b"bravo");
+    assert_eq!(mode_of(dest.path()), mode, "its own mode");
+    assert_ne!(mtime_of(dest.path()), ROOT_MTIME_SECS);
+    assert_ne!(mode, 0o750, "positive control: the recorded root differs");
+    // Asking for the root by name is refused, whichever way: it is the
+    // destination itself, or a folder and not a file.
+    let err = r
+        .file("R3-FILE", ".", dest.path(), &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already exists"), "{err}");
+    let overwrite = RestoreOptions {
+        overwrite: true,
+        ..RestoreOptions::default()
+    };
+    let err = r
+        .file("R3-FILE", ".", dest.path(), &overwrite)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("is a directory"), "{err}");
+    assert_eq!(mode_of(dest.path()), mode);
+}

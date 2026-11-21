@@ -1846,6 +1846,12 @@ fn restore_planned(
         tar_binary: &config.tar.binary,
         dest: &extract,
         overwrite: options.overwrite,
+        // `restore unit` without `--overwrite` is refused unless the
+        // destination was empty (the preflight), so here it was: tar keeps
+        // an old file, the destination's root among them, so the root
+        // member's own metadata is applied after tar (ADR-0012 item 303).
+        // `--overwrite` is tar's own; `restore file` never touches the root.
+        root_metadata: matches!(target, RestoreTarget::Unit { .. }) && !options.overwrite,
         file_check: !options.no_file_check,
     };
     // One warning, before the first slice is read, from what this restore is
@@ -1888,6 +1894,7 @@ fn restore_planned(
     // What was lost, and — when a copy of the same version holds the rest —
     // the files filled from it (issue #480, ADR-0012 items 101, 102, 255).
     let holes = supply.damage[damage_before..].to_vec();
+    let root_member = outcome.root.take();
     let ex = fill::Extracted {
         root: extract.clone(),
         lost: outcome.lost,
@@ -1902,7 +1909,19 @@ fn restore_planned(
         stage_set_id: plan.stage_set_id,
         rows: &rows,
     };
-    trace.filled = fill::finish(&ctx, supply, &ex)?;
+    let (filled, filled_root) = fill::finish(&ctx, supply, &ex)?;
+    trace.filled = filled;
+    // The destination's own root, last: the repair's hidden directory and
+    // the files it installed have moved the root's times, and the restore
+    // is whole (ADR-0012 item 303). The first run's root member, or, when
+    // that was lost, the copy's.
+    if let Some(member) = root_member.or(filled_root) {
+        for line in reader::apply_root(&config.tar.binary, &extract, &member) {
+            warn!("tar: {line}");
+            progress::log(&format!("tar: {line}"));
+            trace.tar_said.push(line);
+        }
+    }
 
     // `restore file`: place the one requested entry, inside the recorded
     // span (see `RestoreTarget`).
