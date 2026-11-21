@@ -941,8 +941,9 @@ impl BuiltLayout {
 /// and queries that work on it. It describes generation 3
 /// (`volume-format-v3.md` §1.4), the shape `db::ontape_catalog::write`
 /// makes; `recovery_md_catalog_db_queries_run_on_what_write_makes` runs each
-/// query against that writer's output.
-const RECOVERY_CATALOG_DB: &str = "\n## Querying catalog.db\n\n\
+/// query against that writer's output. Public for its Layout 3 byte pin
+/// (`tests/on_tape_golden.rs`, ADR-0012 item 243).
+pub const RECOVERY_CATALOG_DB: &str = "\n## Querying catalog.db\n\n\
      This envelope also carries `catalog.db`, a small standalone SQLite \
      database (no tapectl or the source `tapectl.db` needed) covering every \
      unit written to THIS volume, across all tenants — operator-only, never \

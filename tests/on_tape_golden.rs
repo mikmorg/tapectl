@@ -396,8 +396,9 @@
 //! Pinned here: File 0, the MANIFEST (a whole unit, a range block, the operator envelope), the
 //! front index, the seal marker (full and short), the file table's text and the id map's
 //! text, File 1 (the guide of an LTO-8 tape and of an LTO-6 tape: it differs by generation)
-//! and RECOVERY.md (a tenant's envelope, with every compression in it, and the operator's).
-//! RESTORE.sh comes last, pinned by its sha256 after a CTO ruling.
+//! and RECOVERY.md (a tenant's envelope, with every compression in it, and the operator's,
+//! with the `catalog.db` section `build()` appends to it). RESTORE.sh comes last, pinned by
+//! its sha256.
 
 use tapectl::idmap::{self, IdKind, IdRow};
 use tapectl::volume::filetable::{self, Kind, Row};
@@ -5924,4 +5925,26 @@ fn layout3_recovery_md_operator_envelope() {
     ];
     let text = generate_recovery_md_at("L8-0001", "operator", &units, &[], "2026-11-21");
     assert_pinned_text("recovery-operator", &text, RECOVERY_OPERATOR);
+}
+
+const RECOVERY_CATALOG_DB_SECTION: &str = r###"
+## Querying catalog.db
+
+This envelope also carries `catalog.db`, a small standalone SQLite database (no tapectl or the source `tapectl.db` needed) covering every unit written to THIS volume, across all tenants — operator-only, never in a tenant envelope. Tables: `tenants`, `units`, `snapshots`, `stage_sets` (with each set's recorded recipient list, `key_fingerprints`), `stage_slices` (with `sha256_plain`), `paths` (each path once per unit, relative to the snapshot's `source_path`) and `file_versions` (one row per entry of each version: `kind` 0 directory, 1 regular file, 2 symlink, 3 special file such as a FIFO or device; `size_bytes`; `mtime_ns`, Unix time in nanoseconds; `sha256` as 32 raw bytes, `lower(hex(sha256))` prints it; `link_target`, a symlink's target), then `stage_files` (each staging's file table: one row for each file of its tar stream, `seq`, `kind`, `slice`, `path_id` into `paths`, `size`, `sha256`, `start` and `end`, and `link_path_id` for a hard link) and `stage_ids` (its id map: `kind` `u` or `g`, `id`, `name`, who each user and group number was on the computer that wrote the tape). Permissions, owners and extended attributes are in each unit's tar stream, not here; a tenant's envelope holds the same file table and id map as the text files in `tables/`. Tape positions are NOT here; MANIFEST.toml beside this file has them. `PRAGMA user_version` on this file mirrors the schema level of the `tapectl.db` it was generated from. With the operator or escrow key, `tapectl catalog rebuild --from-volume` reconstructs the catalog from this envelope. Examples: each unit's versions and their entry counts, then one unit's entries (put its name in place of UNIT):
+
+```bash
+sqlite3 catalog.db 'SELECT u.name, s.version, count(fv.path_id) FROM units u JOIN snapshots s ON s.unit_id = u.id LEFT JOIN file_versions fv ON fv.snapshot_id = s.id GROUP BY s.id;'
+sqlite3 catalog.db "SELECT p.path, CASE fv.kind WHEN 0 THEN 'dir' WHEN 1 THEN 'regular' WHEN 2 THEN 'symlink' ELSE 'special' END, fv.size_bytes, lower(hex(fv.sha256)), datetime(fv.mtime_ns / 1000000000, 'unixepoch'), fv.link_target FROM file_versions fv JOIN paths p ON p.id = fv.path_id JOIN snapshots s ON s.id = fv.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = 'UNIT' ORDER BY s.version, p.path;"
+```
+"###;
+
+/// The section `build()` appends to the operator envelope's RECOVERY.md when the envelope
+/// carries `catalog.db` (issue #83): on tape after the text pinned above.
+#[test]
+fn layout3_recovery_md_operator_catalog_db_section() {
+    assert_pinned_text(
+        "recovery-operator-catalog-db",
+        tapectl::volume::build::RECOVERY_CATALOG_DB,
+        RECOVERY_CATALOG_DB_SECTION,
+    );
 }
