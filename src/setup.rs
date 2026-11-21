@@ -1706,6 +1706,11 @@ impl Setup<'_> {
         }
         println!("  where things stand, and the next command, at any time:");
         println!("    tapectl status");
+        println!(
+            "  a collection that does not fit one cartridge continues on the next, so copy 2 \
+             also carries what copy 1 could not: more cartridges are owed, and `tapectl status` \
+             names each"
+        );
         println!();
         println!(
             "  Optional, with a spare cartridge: scripts/lto-profile.sh in the tapectl \

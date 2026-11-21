@@ -273,6 +273,10 @@ Put the stickers `L8-0001` and `L8-0002` on the cartridges, and take the second 
 to its place. `tapectl status` shows where things stand and the next command at any
 time.
 
+If the collection does not fit one cartridge, a unit continues on the next one when the
+tape nears its end, so copy 2 also carries what copy 1 could not hold, and each place is
+short a cartridge until the next write. `tapectl status` names every cartridge still owed.
+
 The labels follow the drive's generation (`L6-…` on LTO-6). The last lines of setup
 give them for your drive.
 
