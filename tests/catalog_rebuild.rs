@@ -4556,6 +4556,44 @@ fn an_unsealed_tape_under_an_initialized_row_attaches_aborted_writes() {
     }
 }
 
+/// #595 5-4 (ADR-0012 items 128, 144, 288): a version counts only on a
+/// volume the rebuild records `sealed`. A tape with no seal it could read,
+/// whether its row is inserted `initialized` or found so, leaves every
+/// snapshot it inserts `staged`, never `current`.
+#[test]
+fn an_unsealed_rebuild_leaves_the_snapshots_it_inserts_staged() {
+    let statuses = |conn: &rusqlite::Connection| -> Vec<String> {
+        conn.prepare("SELECT DISTINCT status FROM snapshots")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    // Inserted volume row.
+    let mut vol = build_sealed_volume(true);
+    drop_seal_marker(&mut vol);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert_eq!(statuses(&conn), ["staged"]);
+
+    // A found `initialized` row.
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    conn.execute(
+        "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
+                              capacity_bytes, status)
+         VALUES (?1, ?2, 'lto', 'lto0', 'LTO-6', 2500000000, 'initialized')",
+        rusqlite::params![LABEL, VOL_UUID],
+    )
+    .unwrap();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert_eq!(statuses(&conn), ["staged"]);
+}
+
 // ── Issue #459 item 2: the operator envelope is found by what it is ──────
 //
 // The operator envelope's manifest files every unit under the placeholder

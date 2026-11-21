@@ -2607,7 +2607,7 @@ fn insert_all(
         }
 
         let (snapshot_id, snapshot_inserted) =
-            ensure_snapshot(tx, unit, unit_id, written, supplement, report)?;
+            ensure_snapshot(tx, unit, unit_id, supplement, report)?;
         let stage_set_id = ensure_stage_set(tx, unit, snapshot_id, volume_id, supplement, report)?;
 
         let mut slice_ids = Vec::with_capacity(unit.slices.len());
@@ -2814,7 +2814,6 @@ fn ensure_snapshot(
     tx: &Connection,
     unit: &envelope::ManifestUnit,
     unit_id: i64,
-    written: Written,
     supplement: &Supplement,
     report: &mut RebuildReport,
 ) -> Result<(i64, bool)> {
@@ -2838,22 +2837,18 @@ fn ensure_snapshot(
     let snapshot_type = facts
         .map(|f| f.snapshot_type.clone())
         .unwrap_or_else(|| "full".to_string());
-    // 'current' matches what the write path itself produces: `session`'s seal
-    // promotes each written snapshot to 'current' and never demotes its
-    // predecessor, so several 'current' versions per unit is the normal
-    // shape of this catalog, not an anomaly a rebuild introduces.
-    //
-    // #478 (ADR-0012 items 128 and 130, X24): a spannable set's version is
-    // `current` only once every slice of it is on a sealed volume, which
-    // only the positions inserted after this row can show. It is inserted
-    // `staged`, as the writing catalog holds it before its tapes seal, and
-    // [`promote_spanning_version`] makes it `current` when the rule holds.
-    let status =
-        if held_in_part(unit) || matches!(written, Written::Range { .. } | Written::Unwritten) {
-            "staged"
-        } else {
-            "current"
-        };
+    // Every version is inserted `staged`, as the writing catalog holds it
+    // before its tapes seal, and [`promote_spanning_version`] makes it
+    // `current` once every slice of one of its stage sets is on a volume
+    // this catalog records `sealed` (ADR-0012 items 128, 144 and 288:
+    // `layout-session.md` "Promotion and the retire floor"; #595 5-4). The
+    // write path's own seal promotes each written snapshot to `current` and
+    // never demotes its predecessor, so several `current` versions per unit
+    // is the normal shape of this catalog, not an anomaly a rebuild
+    // introduces. A tape with no seal it read, or one under a found
+    // `initialized` row, leaves its versions `staged` until a sealed volume
+    // holds them.
+    let status = "staged";
     tx.execute(
         "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path,
                                 total_size, file_count)
