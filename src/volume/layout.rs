@@ -912,7 +912,7 @@ file when you are done.
 A key opens a tape only if the tape was written for it. If the escrow key
 opens nothing (RESTORE.sh ends "no envelope on this tape ... opens with the
 key given"; `age` itself says "no identity matched any of the recipients"
-for every envelope), check it first as above; then try the operator key and every
+(`rage`: "No matching keys found") for every envelope), check it first as above; then try the operator key and every
 tenant key you hold, one after another or together (`--key` may be
 repeated); then ask whether this tape was written by another installation,
 whose escrow is a different key. The keys that opened an envelope are
@@ -2282,8 +2282,8 @@ the tape was written, and the operator and escrow keys open every one.
        head -c $((size - tail_len + keep)) candidate.raw > candidate.stripped
 
 3. Try `age -d -i YOUR_KEY.age.key candidate.stripped > candidate.dec`.
-   "no identity matched" means the file is not sealed to your key: try the
-   next one. Any other error: real ciphertext can end in a zero byte, so
+   "no identity matched" (`rage`: "No matching keys found") means the file is
+   not sealed to your key: try the next one. Any other error: real ciphertext can end in a zero byte, so
    re-append a single zero byte and retry, up to four times:
    `printf '\0' >> candidate.stripped`, then the `age -d` line again. The
    retries add up, they do not start over: after the first failure one zero
@@ -3017,7 +3017,8 @@ pub fn generate_recovery_md(
          ```\n\n\
          Name only key files that exist:\n\
          one unreadable `-i` path fails the whole command.\n\
-         If every key fails with `no identity matched any of the recipients`, the\n\
+         If every key fails with `no identity matched any of the recipients` (`rage`:\n\
+         `No matching keys found`), the\n\
          slice was sealed to a key you have not supplied — the data is not corrupt.\n\
          `age-keygen -y YOUR_KEY.age.key` shows whether a file is a key at all (it\n\
          prints that one key's public `age1...` line, or an error), and the guide on\n\
@@ -3151,7 +3152,8 @@ pub fn generate_recovery_md(
            against the file table names what is missing; tar's exit status never does.\n\
          - **sha256 mismatch** — re-read the slice from tape; a short read or the wrong\n\
            block mode (must be 512KB fixed) is the usual cause.\n\
-         - **age: \"no identity matched any of the recipients\"** — none of the keys\n\
+         - **age: \"no identity matched any of the recipients\"** (`rage`: \"No matching\n\
+           keys found\") — none of the keys\n\
            you passed is the one this slice was sealed to. It may be an older key from\n\
            before a rotation (see \"Which key\"), or the operator key, which can read\n\
            every unit; or the tape may be another installation's. Pass them all with\n\
@@ -5669,6 +5671,9 @@ verify any entry by hashing the file it describes.
                 text.contains("no identity matched any of the recipients"),
                 "{what}"
             );
+            // rage, which both texts tell an heir to link as `age`, says it
+            // its own way (#596 heir-C3, the `age` crate's err-no-matching-keys).
+            assert!(text.contains("No matching keys found"), "{what}");
         }
         let flat = flat_text(&g);
         assert!(
