@@ -395,8 +395,8 @@
 //! a file under the target directory when it fails and names that file.
 
 use tapectl::volume::layout::{
-    generate_front_index, generate_id_thunk_v2, generate_seal_marker_requiring_at, FrontIndexFile,
-    IdThunkV2Params, REQUIRES,
+    generate_front_index, generate_id_thunk_v2, generate_seal_marker_requiring_at,
+    generate_short_seal_marker_requiring_at, FrontIndexFile, IdThunkV2Params, REQUIRES,
 };
 use tapectl::volume::manifest::{Manifest, ManifestSlice, ManifestUnit};
 
@@ -1084,4 +1084,106 @@ fn layout3_seal_marker_full() {
         "2026-11-21T10:05:00Z",
     );
     assert_pinned_text("seal-marker-full", &text, SEAL_MARKER_FULL);
+}
+
+const SEAL_MARKER_SHORT: &str = r##"================================================================
+                    TAPECTL SEAL MARKER
+================================================================
+
+Volume: L8-0001
+This file seals the tape: its presence means every file before it is
+present. Its absence means the tape is unsealed (interrupted or aborted).
+The tape may end before the last file the front index plans:
+ended_after below is the last file before this one, and a file the
+front index lists after it is not on this tape. It binds the front
+index by the sha256 below. The [[files]] entries are a copy of the
+front index (File 3) up to this file, usable if File 3 is damaged —
+verify any entry by hashing the file it describes.
+
+================================================================
+              MACHINE-READABLE DATA (TOML)
+================================================================
+
+[seal]
+volume = "L8-0001"
+layout_version = 3
+requires = []
+file_count = 10
+ended_after = 8
+sealed_at = "2026-11-21T10:05:00Z"
+front_index_sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+[[files]]
+position = 0
+type = "id_thunk"
+size_bytes = 1996
+sha256_encrypted = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[files]]
+position = 1
+type = "system_guide"
+size_bytes = 41212
+sha256_encrypted = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[files]]
+position = 2
+type = "restore_sh"
+size_bytes = 180000
+sha256_encrypted = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[files]]
+position = 3
+type = "front_index"
+size_bytes = 3100
+sha256_encrypted = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[files]]
+position = 4
+type = "operator_envelope"
+size_bytes = 30720
+sha256_encrypted = "4444444444444444444444444444444444444444444444444444444444444444"
+
+[[files]]
+position = 5
+type = "operator_envelope_backup"
+size_bytes = 30720
+sha256_encrypted = "5555555555555555555555555555555555555555555555555555555555555555"
+
+[[files]]
+position = 6
+type = "tenant_envelope"
+size_bytes = 20480
+sha256_encrypted = "6666666666666666666666666666666666666666666666666666666666666666"
+
+[[files]]
+position = 7
+type = "tenant_envelope_backup"
+size_bytes = 20480
+sha256_encrypted = "7777777777777777777777777777777777777777777777777777777777777777"
+
+[[files]]
+position = 8
+type = "data_slice"
+size_bytes = 20512
+sha256_encrypted = "8888888888888888888888888888888888888888888888888888888888888888"
+
+[[files]]
+position = 9
+type = "seal_marker"
+"##;
+
+/// A short seal (section 5.2): the early warning came after data slice 8, so the seal is
+/// at 9, `ended_after = 8`, `file_count = 10`; the copy runs to 8 and ends with the seal's
+/// own bare entry at 9.
+#[test]
+fn layout3_seal_marker_short() {
+    let text = generate_short_seal_marker_requiring_at(
+        "L8-0001",
+        8,
+        &"f".repeat(64),
+        &seal_copy(8),
+        REQUIRES,
+        "2026-11-21T10:05:00Z",
+    );
+    assert_pinned_text("seal-marker-short", &text, SEAL_MARKER_SHORT);
 }
