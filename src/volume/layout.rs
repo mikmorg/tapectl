@@ -3546,7 +3546,9 @@ mod tests {
             "{after}"
         );
         assert!(
-            after.contains("Alone it restores the files whose slices it holds, whole, and lists the rest"),
+            after.contains(
+                "Alone it restores the files whose slices it holds, whole, and lists the rest"
+            ),
             "{after}"
         );
     }
@@ -5865,7 +5867,9 @@ verify any entry by hashing the file it describes.
             "the tape is wound to the first slice it reads: {sec_b}"
         );
         assert!(
-            sec_b.contains("work/bbbbbbbb_v1_s7/slice.3.age | xz -dc > work/bbbbbbbb_v1_s7/slice.3.tar"),
+            sec_b.contains(
+                "work/bbbbbbbb_v1_s7/slice.3.age | xz -dc > work/bbbbbbbb_v1_s7/slice.3.tar"
+            ),
             "{sec_b}"
         );
         assert!(

@@ -2275,7 +2275,10 @@ mod tests {
             !prose.contains("each into its own folder under ./out"),
             "true only of a tape of several units"
         );
-        assert!(!prose.contains("truncate"), "RESTORE.sh never runs truncate");
+        assert!(
+            !prose.contains("truncate"),
+            "RESTORE.sh never runs truncate"
+        );
         assert!(prose.contains("dd, head, tail, tar, sha256sum"));
     }
 

@@ -584,7 +584,10 @@ fn the_seal_read_of_an_unsealed_tape_is_capped() {
         .filter_map(|l| l.strip_prefix(&format!("{} ", last - 1)))
         .map(|n| n.parse().unwrap())
         .collect();
-    assert!(!asked.is_empty(), "no capped read of the last file: {counts}");
+    assert!(
+        !asked.is_empty(),
+        "no capped read of the last file: {counts}"
+    );
     for n in asked {
         assert!(
             n * 524_288 <= 64 * 1024 * 1024,
@@ -4000,7 +4003,11 @@ fn the_line_after_a_range_holder_does_not_state_layout_2s_rule() {
         "{}",
         o.stdout
     );
-    assert!(!flat.contains("a restore needs every slice"), "{}", o.stdout);
+    assert!(
+        !flat.contains("a restore needs every slice"),
+        "{}",
+        o.stdout
+    );
 }
 
 /// BusyBox tar takes a member given whole, as the heir's path restore gives
@@ -5000,10 +5007,22 @@ fn a_signal_just_after_a_slice_was_fed_leaves_no_partial_file_from_that_slice() 
     let h = Heir::of(t);
     let kb = key(&h, Who::TenantB);
     let plain = h.dest("plain");
-    let o = h.run(&["--restore", "--key", &kb, "--to", plain.to_str().unwrap(), "--unit", UNIT_B]);
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        plain.to_str().unwrap(),
+        "--unit",
+        UNIT_B,
+    ]);
     assert_eq!(o.code, 0, "{}", o.all());
     let all = t.slice_positions();
-    let read: Vec<usize> = h.dd_reads().into_iter().filter(|p| all.contains(p)).collect();
+    let read: Vec<usize> = h
+        .dd_reads()
+        .into_iter()
+        .filter(|p| all.contains(p))
+        .collect();
     assert!(read.len() > 2, "{read:?}");
     for slow in &read[1..] {
         let h = Heir::of(t);
@@ -5011,7 +5030,15 @@ fn a_signal_just_after_a_slice_was_fed_leaves_no_partial_file_from_that_slice() 
         h.put_tool("tar", &heir::lagging_tar(&real, &python, &dest));
         let kb = key(&h, Who::TenantB);
         let spec = format!("{slow}:2");
-        let args = ["--restore", "--key", &kb, "--to", dest.to_str().unwrap(), "--unit", UNIT_B];
+        let args = [
+            "--restore",
+            "--key",
+            &kb,
+            "--to",
+            dest.to_str().unwrap(),
+            "--unit",
+            UNIT_B,
+        ];
         let mut r = h.spawn(&args, &[("FAKE_DD_SLOW", spec.as_str())]);
         let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !h.root.path().join("state/dd.slow").exists() {

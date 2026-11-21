@@ -404,7 +404,11 @@ fn the_walk_under_a_non_empty_to_is_find_and_still_finds_a_list_at_any_depth() {
     std::fs::write(dest.join("some/deep/dir/file"), "x").unwrap();
     let o = h.run(&["--restore", "--key", &ka, "--to", dstr(&dest)]);
     assert_eq!(o.code, 1, "{}", o.all());
-    assert!(o.stderr.contains("is not empty. Restore into"), "{}", o.all());
+    assert!(
+        o.stderr.contains("is not empty. Restore into"),
+        "{}",
+        o.all()
+    );
     let log = std::fs::read_to_string(h.root.path().join("state/find.log"))
         .unwrap_or_else(|_| panic!("the walk was not find: {}", o.all()));
     assert!(log.contains(".tapectl-damaged-files.txt"), "{log}");
@@ -414,7 +418,11 @@ fn the_walk_under_a_non_empty_to_is_find_and_still_finds_a_list_at_any_depth() {
     write_list(t, heir::UNIT_A, &dest.join("some/deep/dir"), &[]);
     let o = h.run(&["--restore", "--key", &ka, "--to", dstr(&dest)]);
     assert_eq!(o.code, 1, "{}", o.all());
-    assert!(o.stderr.contains("holds no damaged-file list"), "{}", o.all());
+    assert!(
+        o.stderr.contains("holds no damaged-file list"),
+        "{}",
+        o.all()
+    );
 }
 
 // ---- #578 ----
