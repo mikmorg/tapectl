@@ -1612,6 +1612,7 @@ tar_init() {
 # Check the destination before anything is made in it.
 check_destination() {
   if [ -e "$TO" ] && [ ! -d "$TO" ]; then die "--to $(safe_str "$TO") exists and is not a directory"; fi
+  local root
   if [ -d "$TO" ] && [ -n "$(ls -A -- "$TO" 2>/dev/null)" ] && [ "$OVERWRITE" = 0 ]; then
     # A destination that holds the damaged-file list of an earlier run is one a
     # later run from another tape adds to (whether it is the same unit and
@@ -1620,11 +1621,21 @@ check_destination() {
     # name may hold slashes (tv/breaking-bad/s01): no one-level glob finds it
     # (#577). The units of this run are not known yet, so any depth is looked
     # at; each unit's own directory is judged when that unit is restored.
-    if (
-      shopt -s globstar nullglob
-      set -- "$TO"/**/.tapectl-damaged-files.txt # ** also matches no directory at all: $TO itself
-      [ $# -gt 0 ]
-    ); then
+    # The walk is find's where there is one (it stops at the first list, and
+    # needs 0.4 s for a tree of 1,000,000 entries that holds none; bash's **
+    # builds the whole list in memory and took 9 s for it, #596 heir-C1).
+    if
+      if command -v find >/dev/null 2>&1; then
+        case $TO in -*) root=./$TO ;; *) root=$TO ;; esac # find reads a leading - as an option
+        [ -n "$(find "$root" -name .tapectl-damaged-files.txt -print 2>/dev/null | head -n 1)" ]
+      else
+        (
+          shopt -s globstar nullglob
+          set -- "$TO"/**/.tapectl-damaged-files.txt # ** also matches no directory at all: $TO itself
+          [ $# -gt 0 ]
+        )
+      fi
+    then
       TO_HELD_LIST=1
       return 0
     fi

@@ -379,6 +379,44 @@ fn a_later_run_finds_the_list_of_a_unit_with_a_hierarchical_name() {
     }
 }
 
+// ---- #596 heir-C1 ----
+
+/// #596 heir-C1: the refusal of a non-empty `--to` that holds no damaged-file
+/// list walks the tree. Bash's `**` glob built the whole list of a tree in
+/// memory (9 s on a tree of 1,000,000 entries on this host); `find` stops at
+/// the first list and needs 0.4 s for none. A `find` that logs is put in the
+/// PATH: the walk is its job, and the list at any depth is still found.
+#[test]
+fn the_walk_under_a_non_empty_to_is_find_and_still_finds_a_list_at_any_depth() {
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::host_tool("find").expect("find");
+    h.put_tool(
+        "find",
+        &format!(
+            "#!/bin/bash\necho \"$*\" >>\"$FAKE_TAPE/find.log\"\nexec {} \"$@\"\n",
+            real.display()
+        ),
+    );
+    let ka = key(&h, Who::TenantA);
+    let dest = h.dest("out");
+    std::fs::create_dir_all(dest.join("some/deep/dir")).unwrap();
+    std::fs::write(dest.join("some/deep/dir/file"), "x").unwrap();
+    let o = h.run(&["--restore", "--key", &ka, "--to", dstr(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stderr.contains("is not empty. Restore into"), "{}", o.all());
+    let log = std::fs::read_to_string(h.root.path().join("state/find.log"))
+        .unwrap_or_else(|_| panic!("the walk was not find: {}", o.all()));
+    assert!(log.contains(".tapectl-damaged-files.txt"), "{log}");
+    // A list three levels down is found: the refusal of the destination is
+    // past, and it is the unit's own directory that is judged (its words
+    // differ).
+    write_list(t, heir::UNIT_A, &dest.join("some/deep/dir"), &[]);
+    let o = h.run(&["--restore", "--key", &ka, "--to", dstr(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stderr.contains("holds no damaged-file list"), "{}", o.all());
+}
+
 // ---- #578 ----
 
 /// #578: `rage` linked as `age` says `No matching keys found` for an envelope
