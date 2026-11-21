@@ -1051,7 +1051,7 @@ fn dispatch(
                              copy, and `tapectl volume resume {}` will refuse it (it adopts no \
                              aborted session whose seal was never recorded). Do NOT run `volume \
                              write` on it: the tape carries a sealed volume. What works today: \
-                             `tapectl restore` or RESTORE.sh (tape file 2) restore what it holds, \
+                             `tapectl restore unit` or RESTORE.sh (tape file 2) restore what it holds, \
                              `tapectl volume verify {}` checks it, and a rebuild into a catalog \
                              with no row for \"{}\" records it as sealed",
                             report.label, report.label, report.label, report.label
