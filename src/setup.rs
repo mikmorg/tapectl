@@ -692,7 +692,9 @@ fn exec_word(path: &Path) -> String {
 /// as one quoted assignment (#599 9-4).
 fn environment_line(home: &Path) -> String {
     let h = home.display().to_string();
-    if h.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
+    if h.chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+    {
         let escaped = h.replace('\\', "\\\\").replace('"', "\\\"");
         format!("Environment=\"TAPECTL_HOME={escaped}\"\n")
     } else {
@@ -1492,8 +1494,7 @@ impl Setup<'_> {
         }
         let default_home = self.facts.user_home.join(".tapectl");
         let tapectl_home = (self.paths.home != default_home).then_some(self.paths.home.as_path());
-        if UNIT_FILES.iter().all(|f| dir.join(f).exists())
-            && !units_serve_home(&dir, tapectl_home)
+        if UNIT_FILES.iter().all(|f| dir.join(f).exists()) && !units_serve_home(&dir, tapectl_home)
         {
             // One account has one pair of user timers; these run tapectl for
             // another home, so this home is neither backed up nor audited

@@ -502,7 +502,10 @@ fn first_run_step_12s_eject_hint_names_the_home_through_op_cmd() {
         .lines()
         .find(|l| l.contains("Eject the test cartridge"))
         .expect("step 12's eject hint");
-    assert!(hint.contains("$OP_CMD drive eject --device $DEVICE"), "{hint}");
+    assert!(
+        hint.contains("$OP_CMD drive eject --device $DEVICE"),
+        "{hint}"
+    );
 }
 
 // ── the writer's tar floor (T5.4; ADR-0012 items 229, 274) ───────────────
