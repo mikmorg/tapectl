@@ -1210,5 +1210,17 @@ fn config_check_warns_when_a_restore_would_hold_more_than_the_hosts_memory() {
     assert_eq!(json["valid"], true, "{json}");
     let lines = json["restore_memory"].as_array().unwrap();
     assert_eq!(lines.len(), 1, "{json}");
-    assert_eq!(lines[0].as_str().unwrap(), line, "human and --json agree");
+    // The two runs read MemAvailable apart, and the host's figure moves
+    // between them (6.5 GiB then 6.6 GiB in a chain run), so they agree with
+    // the live figure masked; every other word must match.
+    let masked = |s: &str| {
+        let (head, rest) = s.split_once(", and only ").expect(s);
+        let (_, tail) = rest.split_once(" is available (MemAvailable)").expect(s);
+        format!("{head}, and only <avail> is available (MemAvailable){tail}")
+    };
+    assert_eq!(
+        masked(lines[0].as_str().unwrap()),
+        masked(line),
+        "human and --json agree"
+    );
 }
