@@ -3089,9 +3089,23 @@ pub fn generate_recovery_md(
     label: &str,
     tenant_name: &str,
     units: &[ManifestUnit],
-    _catalogue_members: &[String],
+    catalogue_members: &[String],
 ) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    generate_recovery_md_at(label, tenant_name, units, catalogue_members, &now)
+}
+
+/// [`generate_recovery_md`] with the `Date:` line's day (`YYYY-MM-DD`) given instead of
+/// read from the clock: a seam for the Layout 3 byte pins (`tests/on_tape_golden.rs`,
+/// ADR-0012 item 243). Production callers go through [`generate_recovery_md`], which
+/// passes the clock's `%Y-%m-%d` as before; every other byte is the same.
+pub fn generate_recovery_md_at(
+    label: &str,
+    tenant_name: &str,
+    units: &[ManifestUnit],
+    _catalogue_members: &[String],
+    now: &str,
+) -> String {
     let mut s = format!(
         "# Recovery Guide for {tenant_name}\n\n\
          Volume: {label}\n\
