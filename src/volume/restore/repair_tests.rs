@@ -1628,7 +1628,12 @@ pub(crate) mod tests {
             "the copy is not given up: {err}"
         );
         assert_eq!(fs::read(blocked.join("mine")).unwrap(), b"not for removal");
-        for path in lost.iter().filter(|p| *p != "alpha-01.bin") {
+        // The unit's root and any folder are members too (item 306): only
+        // the files are read back.
+        for path in lost
+            .iter()
+            .filter(|p| *p != "alpha-01.bin" && h.source(UNIT).join(p).is_file())
+        {
             assert_eq!(
                 fs::read(dest.path().join(path)).unwrap(),
                 fs::read(h.source(UNIT).join(path)).unwrap(),

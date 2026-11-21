@@ -1159,4 +1159,29 @@ mod tests {
         let paths_in_order: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(paths_in_order, [".", "!a", "#x", ".tapectl-unit.toml"]);
     }
+
+    /// Item 306, step 2: what is compared between the snapshot and the stage
+    /// is each entry's kind and a file's size (the scan) and a folder's
+    /// device and inode (the recheck), never a folder's mtime. The root's
+    /// mtime moves whenever a name in it comes or goes (tapectl's own
+    /// dotfile write, an editor's temporary file), so a root changed
+    /// between the snapshot and the stage is no reason to refuse.
+    #[test]
+    fn a_root_whose_mtime_and_mode_moved_since_the_snapshot_is_staged() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("a.txt"), b"a").unwrap();
+        let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+        // A name came and went in the root, and its mode was changed.
+        fs::write(src.join("passing.tmp"), b"x").unwrap();
+        fs::remove_file(src.join("passing.tmp")).unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o700)).unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        fs::File::open(&src).unwrap().set_modified(when).unwrap();
+        let id = stage_create(&conn, &paths, &config, snap, false)
+            .expect("a root's own mtime and mode are not compared");
+        let rows = crate::db::stage_files::load(&conn, id).unwrap();
+        assert_eq!(rows[0].path, ".");
+    }
 }
