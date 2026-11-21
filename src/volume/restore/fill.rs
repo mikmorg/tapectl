@@ -60,11 +60,9 @@ pub(super) struct Finish<'x> {
     pub unit_name: &'x str,
     pub version: i64,
     pub stage_set_id: i64,
-    pub target: RestoreTarget<'x>,
     /// The file table of the stage set the restore read: what the version's
     /// files are recorded to be, whichever copy supplies them.
     pub rows: &'x [Row],
-    pub options: &'x RestoreOptions,
 }
 
 /// What the fill did and could not do.

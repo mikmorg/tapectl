@@ -1900,9 +1900,7 @@ fn restore_planned(
         unit_name,
         version,
         stage_set_id: plan.stage_set_id,
-        target,
         rows: &rows,
-        options,
     };
     trace.filled = fill::finish(&ctx, supply, &ex)?;
 
