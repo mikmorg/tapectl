@@ -394,6 +394,7 @@
 //! text shows the format in the test; one that holds a sha256 writes the generated text to
 //! a file under the target directory when it fails and names that file.
 
+use tapectl::volume::filetable::{self, Kind, Row};
 use tapectl::volume::layout::{
     generate_front_index, generate_id_thunk_v2, generate_seal_marker_requiring_at,
     generate_short_seal_marker_requiring_at, FrontIndexFile, IdThunkV2Params, REQUIRES,
@@ -1186,4 +1187,120 @@ fn layout3_seal_marker_short() {
         "2026-11-21T10:05:00Z",
     );
     assert_pinned_text("seal-marker-short", &text, SEAL_MARKER_SHORT);
+}
+
+fn text_of(write: impl FnOnce(&mut Vec<u8>)) -> String {
+    let mut out = Vec::new();
+    write(&mut out);
+    String::from_utf8(out).expect("the format's text is UTF-8")
+}
+
+fn member(
+    kind: Kind,
+    slice: u64,
+    (start, end): (u64, u64),
+    size: u64,
+    hash_byte: Option<u8>,
+    path: &str,
+    link: Option<&str>,
+) -> Row {
+    Row {
+        kind,
+        slice,
+        start,
+        end,
+        size,
+        sha256: hash_byte.map(|b| [b; 32]),
+        path: path.to_string(),
+        link: link.map(str::to_string),
+    }
+}
+
+/// Tab-separated text: each TAB is written `\t` here so no editor can change it.
+const FILE_TABLE: &str = concat!(
+    "#tapectl-file-table 1\n",
+    "#stream_bytes 23040\n",
+    "d\t1\t0\t512\t0\t-\t.\t\n",
+    "f\t1\t512\t2048\t1000\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ta.txt\t\n",
+    "d\t1\t2048\t2560\t0\t-\tsub\t\n",
+    "f\t1\t2560\t4096\t1024\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tsub/a\\tb\t\n",
+    "f\t2\t4096\t10240\t5632\tcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\tsub/long.bin\t\n",
+    "h\t3\t10240\t10752\t1000\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tsub/again.txt\ta.txt\n",
+    "l\t3\t10752\t11264\t0\t-\tsub/ln\t\n",
+    "p\t3\t11264\t11776\t0\t-\tpipe\t\n",
+    "c\t3\t11776\t12288\t0\t-\tdev/null\t\n",
+    "b\t3\t12288\t12800\t0\t-\tdev/loop0\t\n",
+);
+
+/// A staging's file table (volume-format-v3.md section 1.6) with one row of every kind a
+/// stream holds: the unit's root `.`, folders, a file whose name holds a TAB (written
+/// escaped, `\t`), a hard link (its target's size and hash, the link target in the eighth
+/// field), a symbolic link, a FIFO and both devices; members in slices 1 to 3, one of them
+/// a long file whose run holds slice 2. Every row has eight fields.
+#[test]
+fn layout3_file_table_text() {
+    let rows = vec![
+        member(Kind::Folder, 1, (0, 512), 0, None, ".", None),
+        member(
+            Kind::File,
+            1,
+            (512, 2_048),
+            1_000,
+            Some(0xaa),
+            "a.txt",
+            None,
+        ),
+        member(Kind::Folder, 1, (2_048, 2_560), 0, None, "sub", None),
+        member(
+            Kind::File,
+            1,
+            (2_560, 4_096),
+            1_024,
+            Some(0xbb),
+            "sub/a\\tb",
+            None,
+        ),
+        member(
+            Kind::File,
+            2,
+            (4_096, 10_240),
+            5_632,
+            Some(0xcc),
+            "sub/long.bin",
+            None,
+        ),
+        member(
+            Kind::HardLink,
+            3,
+            (10_240, 10_752),
+            1_000,
+            Some(0xaa),
+            "sub/again.txt",
+            Some("a.txt"),
+        ),
+        member(Kind::Symlink, 3, (10_752, 11_264), 0, None, "sub/ln", None),
+        member(Kind::Fifo, 3, (11_264, 11_776), 0, None, "pipe", None),
+        member(
+            Kind::CharDevice,
+            3,
+            (11_776, 12_288),
+            0,
+            None,
+            "dev/null",
+            None,
+        ),
+        member(
+            Kind::BlockDevice,
+            3,
+            (12_288, 12_800),
+            0,
+            None,
+            "dev/loop0",
+            None,
+        ),
+    ];
+    let text = text_of(|w| {
+        filetable::write(w, 12_800 + 10_240, rows.into_iter().map(Ok)).unwrap();
+    });
+    assert_pinned_text("file-table", &text, FILE_TABLE);
 }
