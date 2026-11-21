@@ -15,9 +15,11 @@
 #                            with a non-ASCII letter, a hard link, a symbolic link)
 #   rec-bravo:  bravo-zstd, bravo-gzip (one small slice each; each compressed alone; xz is left
 #               out: each unit costs a tape file of 512 KiB in the fixture)
-# A short-sealed second tape is NOT made: scripts/short-seal-acceptance.sh needs its own
-# fixture binary (examples/short_seal_filler) and fills the cartridge to the drive's early
-# warning, which is code and drive time this fixture does not carry (T6.4 says to skip it then).
+# A short-sealed second tape is NOT made. mhvtl gives no real early warning: scripts/
+# short-seal-acceptance.sh --mhvtl reaches one with the TAPECTL_TEST_EARLY_WARNING_AT hook, after
+# filling the cartridge with examples/short_seal_filler (a binary built beside tapectl) up to a
+# warning set inside the filler. That is machinery and drive time this fixture does not carry,
+# and its tape would be as large as the fill. T6.4 says to skip it then.
 #
 # THE RULE (also in the fixture's README.md): the fixture is never re-recorded to make a test
 # pass. A later build that cannot read it has broken the format, which is the CTO's decision, as
@@ -116,10 +118,13 @@ TCTL archive-set create rec-gzip --compression gzip >>"$LOG" 2>&1
 
 # ---- the source trees: fixed names and contents; EXPECTED.toml is made from these ----
 step "source trees"
-python3 - "$SRC" "$OUT/EXPECTED.toml" "$LABEL" "$OPERATOR" "$ALPHA" "$BRAVO" <<'PY'
+GEN="$WORK/gen.py"
+cat >"$GEN" <<'PY'
 import hashlib, os, sys
 
-src, expected, label, operator, alpha, bravo = sys.argv[1:7]
+# make: build the source trees (before `unit init`); expect: write EXPECTED.toml from them
+# (after `unit init`, which adds each unit's .tapectl-unit.toml, a member of the tape).
+mode, src, expected, label, operator, alpha, bravo = sys.argv[1:8]
 
 
 def noise(n, seed):
@@ -153,35 +158,39 @@ def put(root, rel, data):
     os.chmod(p, 0o644)
 
 
-units = []  # (name, tenant, archive_set or None, root mode, root)
-
-# alpha-main: several slices at 64K; the special entries.
-r = os.path.join(src, "alpha-main")
-os.makedirs(r)
-for i in range(4):
-    put(r, f"data/big-{i + 1}.bin", noise(28_000, 100 + i))
-put(r, "docs/notes.txt", text(3_000, 7))
-put(r, "docs/deep/er/leaf.txt", b"the leaf of a nested folder\n")
-put(r, "empty.dat", b"")
-put(r, "café.txt", "crème brûlée\n".encode())
-put(r, "hard-a.txt", text(2_000, 11))
-os.link(os.path.join(r, "hard-a.txt"), os.path.join(r, "hard-b.txt"))
-os.symlink("docs/notes.txt", os.path.join(r, "link-to-notes"))
-os.makedirs(os.path.join(r, "docs/empty-dir"))
-for d, _, _ in os.walk(r):
-    os.chmod(d, 0o755)
-os.chmod(r, 0o750)
-units.append(("alpha-main", alpha, None, 0o750, r))
-
-for name, aset, seed in (("bravo-zstd", "rec-zstd", 21), ("bravo-gzip", "rec-gzip", 31)):
-    r = os.path.join(src, name)
+UNITS = [
+    ("alpha-main", alpha, None, 0o750),
+    ("bravo-zstd", bravo, "rec-zstd", 0o755),
+    ("bravo-gzip", bravo, "rec-gzip", 0o755),
+]
+if mode == "make":
+    # alpha-main: several slices at 64K; the special entries.
+    r = os.path.join(src, "alpha-main")
     os.makedirs(r)
-    put(r, "report.txt", text(20_000, seed))
-    put(r, "sub/more.txt", text(5_000, seed + 1))
-    put(r, "tiny.txt", f"{name}\n".encode())
+    for i in range(4):
+        put(r, f"data/big-{i + 1}.bin", noise(28_000, 100 + i))
+    put(r, "docs/notes.txt", text(3_000, 7))
+    put(r, "docs/deep/er/leaf.txt", b"the leaf of a nested folder\n")
+    put(r, "empty.dat", b"")
+    put(r, "café.txt", "crème brûlée\n".encode())
+    put(r, "hard-a.txt", text(2_000, 11))
+    os.link(os.path.join(r, "hard-a.txt"), os.path.join(r, "hard-b.txt"))
+    os.symlink("docs/notes.txt", os.path.join(r, "link-to-notes"))
+    os.makedirs(os.path.join(r, "docs/empty-dir"))
     for d, _, _ in os.walk(r):
         os.chmod(d, 0o755)
-    units.append((name, bravo, aset, 0o755, r))
+    os.chmod(r, 0o750)
+
+    for name, aset, seed in (("bravo-zstd", "rec-zstd", 21), ("bravo-gzip", "rec-gzip", 31)):
+        r = os.path.join(src, name)
+        os.makedirs(r)
+        put(r, "report.txt", text(20_000, seed))
+        put(r, "sub/more.txt", text(5_000, seed + 1))
+        put(r, "tiny.txt", f"{name}\n".encode())
+        for d, _, _ in os.walk(r):
+            os.chmod(d, 0o755)
+    sys.exit(0)
+units = [(n, t, a, m, os.path.join(src, n)) for n, t, a, m in UNITS]
 
 
 def toml_str(s):
@@ -192,7 +201,8 @@ lines = [
     "# What tests/fixtures/recorded-2.0.0 holds, made from the source trees by",
     "# scripts/record-recorded-tape.sh and never from tapectl's own catalog.",
     "# kind: file | dir | symlink.  A hard link's second name is a file of the same bytes",
-    "# (`hardlink_of` names the first).  `sha256` is of a file's bytes; `target` is a symlink's.",
+    "# (`hardlink_of` names the first).  `sha256` is of a file's bytes; `target` is a symlink's, and",
+    "# a symlink's size is its target's length, as lstat gives it.",
     "",
     "[tape]",
     f"label = {toml_str(label)}",
@@ -222,7 +232,7 @@ for name, tenant, aset, mode, root in sorted(units):
         st = os.lstat(full)
         if os.path.islink(full):
             kind, extra = "symlink", f'target = {toml_str(os.readlink(full))}'
-            size, sha = 0, None
+            size, sha = len(os.readlink(full).encode()), None
         elif os.path.isdir(full):
             kind, extra, size, sha = "dir", None, 0, None
         else:
@@ -243,6 +253,7 @@ for name, tenant, aset, mode, root in sorted(units):
         lines.append("")
 open(expected, "w").write("\n".join(lines))
 PY
+python3 "$GEN" make "$SRC" "$OUT/EXPECTED.toml" "$LABEL" "$OPERATOR" "$ALPHA" "$BRAVO"
 
 step "units"
 TCTL unit init "$SRC/alpha-main" --tenant "$ALPHA" --name alpha-main >>"$LOG" 2>&1
@@ -254,6 +265,8 @@ sleep 3
 step "snapshot, stage (the real path: GNU tar, cut, pack, age)"
 TCTL snapshot create alpha-main bravo-zstd bravo-gzip >>"$LOG" 2>&1
 TCTL stage create alpha-main bravo-zstd bravo-gzip >>"$LOG" 2>&1
+# EXPECTED.toml, from the source trees as they are now: the unit dotfiles are on the tape.
+python3 "$GEN" expect "$SRC" "$OUT/EXPECTED.toml" "$LABEL" "$OPERATOR" "$ALPHA" "$BRAVO"
 
 # ---- the tape: a freshly erased cartridge, one volume ----
 step "erase the cartridge, volume init, volume write"
@@ -313,7 +326,7 @@ DRIVE_LINE="$(lsscsi 2>/dev/null | grep -F "$(basename "$TAPE_DEV" | sed 's/^n//
     echo "# How tests/fixtures/recorded-2.0.0 was recorded"
     echo
     echo "- tapectl: $("$BIN" --version)"
-    echo "- built from commit: $(git -C "$REPO" rev-parse HEAD)"
+    echo "- recording script at commit (the repository HEAD when it ran; the binary's own commit is the one its --version line names): $(git -C "$REPO" rev-parse HEAD)"
     echo "- GNU tar that made the tape: $("$TAR_BIN" --version | head -n 1)"
     echo "- date (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "- drive: $DEVICE ($TAPE_DEV), mhvtl: ${DRIVE_LINE:-not reported by lsscsi}"
