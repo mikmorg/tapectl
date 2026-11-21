@@ -329,6 +329,9 @@ fn fill_from(
     // Folders the copy gave, `(copy's folder, destination)`: their recorded
     // metadata is applied once everything under them is in (restore-6).
     let mut folders: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Hard links the copy gave, `(destination of the name, destination of its
+    // target)`: each is made a link again once every path is in (#594 4-6).
+    let mut links: Vec<(PathBuf, PathBuf)> = Vec::new();
     for path in &wanted {
         let source = out.join(crate::volume::index::on_disk(path));
         if read.lost.contains_key(*path) || fs::symlink_metadata(&source).is_err() {
@@ -339,7 +342,7 @@ fn fill_from(
                 let dest = ex.root.join(crate::volume::index::on_disk(path));
                 // One path that cannot be put in place does not end the
                 // fill: it stays lost, with the reason, and the others go on.
-                if let Err(e) = install(&source, &dest) {
+                if let Err(e) = install_under(&ex.root, &source, &dest) {
                     warn!(file = %path, volume = %holder.label, "cannot be installed: {e}");
                     if let Some(why) = lost.get_mut(*path) {
                         why.push_str(&format!(
@@ -349,8 +352,15 @@ fn fill_from(
                     }
                     continue;
                 }
-                if by_path.get(*path).is_some_and(|r| r.kind == Kind::Folder) {
-                    folders.push((source.clone(), dest));
+                if let Some(row) = by_path.get(*path) {
+                    match (&row.kind, row.link.as_deref()) {
+                        (Kind::Folder, _) => folders.push((source.clone(), dest)),
+                        (Kind::HardLink, Some(target)) => links.push((
+                            dest,
+                            ex.root.join(crate::volume::index::on_disk(target)),
+                        )),
+                        _ => {}
+                    }
                 }
                 supply.note_here(format!(
                     "supplied {path} of unit \"{}\" v{} for the restore",
@@ -369,6 +379,15 @@ fn fill_from(
                     holder.label
                 ));
             }
+        }
+    }
+    // A hard link is a link again (item 256): the name the copy gave came out
+    // as a file of its own, which the copy's tar had linked to a target that
+    // stays in the scratch directory. A target that is not in the destination
+    // (it is still lost) leaves the name a verified file of its own.
+    for (dest, target) in &links {
+        if let Err(e) = relink(dest, target) {
+            warn!(file = %dest.display(), "could not be made a hard link to {}: {e}", target.display());
         }
     }
     // The folders last, the deepest first, so a folder whose mode forbids
@@ -434,6 +453,57 @@ fn verified(source: &Path, expected: Option<&Row>) -> std::result::Result<String
             Ok("present".to_string())
         }
     }
+}
+
+/// Make `dest`, a regular file the repair installed, a hard link to `target`
+/// in the destination, when `target` is a regular file there that is not
+/// already the same file. Made beside `dest` and renamed over it, so a failure
+/// leaves `dest` as it was.
+fn relink(dest: &Path, target: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(t) = fs::symlink_metadata(target) else {
+        return Ok(());
+    };
+    let d = fs::symlink_metadata(dest)?;
+    if !t.is_file() || !d.is_file() || (t.dev(), t.ino()) == (d.dev(), d.ino()) {
+        return Ok(());
+    }
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".tapectl-relink");
+    let tmp = dest.with_file_name(name);
+    if fs::symlink_metadata(&tmp).is_ok() {
+        fs::remove_file(&tmp)?;
+    }
+    fs::hard_link(target, &tmp)?;
+    if let Err(e) = fs::rename(&tmp, dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// [`install`] into the destination `root`: a path whose parent, at any depth
+/// below `root`, is a symbolic link is refused, never followed out of the
+/// destination (#594 C4). tar's own `--overwrite` replaces such a link where
+/// its folder's member comes through, and refuses to go through one where it
+/// does not; the repair holds to the same. The link is the leaf of a path
+/// that is itself being installed (a lost folder over it) only by that path's
+/// own turn, which comes first.
+fn install_under(root: &Path, source: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent().and_then(|p| p.strip_prefix(root).ok()) {
+        let mut at = root.to_path_buf();
+        for component in parent.components() {
+            at.push(component);
+            if fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(TapectlError::Other(format!(
+                    "{} is a symbolic link in the destination, and the repair does not follow \
+                     it out of the destination",
+                    at.display()
+                )));
+            }
+        }
+    }
+    install(source, dest)
 }
 
 /// Put the verified file where the damaged one is: replacing only that path.
@@ -632,6 +702,44 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
+    }
+
+    /// #594 C4: with `--overwrite` into a destination that already holds a
+    /// symbolic link where a folder of the version goes, a path under it is
+    /// not installed through the link, out of the destination.
+    #[test]
+    fn a_path_under_a_symbolic_link_in_the_destination_is_not_installed_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        fs::write(&from, b"good").unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("x")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("x/deep")).unwrap();
+        // The control: `install` alone goes through the link.
+        install(&from, &root.join("a/b")).unwrap();
+        assert!(outside.join("b").exists(), "install follows the link");
+        fs::remove_file(outside.join("b")).unwrap();
+        for path in ["a/b", "x/deep/c"] {
+            let err = install_under(&root, &from, &root.join(path)).unwrap_err();
+            assert!(err.to_string().contains("symbolic link"), "{err}");
+        }
+        assert_eq!(
+            fs::read_dir(&outside).unwrap().count(),
+            0,
+            "nothing went out of the destination"
+        );
+        // Positive control: a real folder is installed into, and the link
+        // itself is replaced by a folder's own turn.
+        install_under(&root, &from, &root.join("x/ok")).unwrap();
+        assert_eq!(fs::read(root.join("x/ok")).unwrap(), b"good");
+        fs::create_dir(dir.path().join("dirsrc")).unwrap();
+        install_under(&root, &dir.path().join("dirsrc"), &root.join("a")).unwrap();
+        assert!(fs::symlink_metadata(root.join("a")).unwrap().is_dir());
+        install_under(&root, &from, &root.join("a/b")).unwrap();
+        assert_eq!(fs::read(root.join("a/b")).unwrap(), b"good");
     }
 
     /// A verified file replaces only the damaged path, and a path under a

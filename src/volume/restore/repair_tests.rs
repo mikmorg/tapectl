@@ -424,8 +424,12 @@ pub(crate) mod tests {
     /// Version 1 staged at 256K and written to A, then staged again at 192K
     /// and written to B. Returns the home and the two stage sets.
     fn two_stagings() -> (Home, i64, i64) {
+        two_stagings_of(&tree())
+    }
+
+    fn two_stagings_of(items: &[Item]) -> (Home, i64, i64) {
         let mut h = Home::new("256K", None, 2);
-        h.unit(TENANT, UNIT, &tree());
+        h.unit(TENANT, UNIT, items);
         h.stage(UNIT);
         h.volume(A);
         h.volume(B);
@@ -686,10 +690,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A slice bad in the SAME chunk on every copy cannot be had whole: after
-    /// every copy has been tried, the chunk is a hole, the files it fell in are
-    /// named, and the restore fails.
-    #[test]
     /// #594 4-10: the INCOMPLETE text's remedy names only what tapectl has.
     /// tapectl's restore writes no list file and no command takes a list of
     /// paths, so "give the list to another copy" was advice with nothing
@@ -710,6 +710,10 @@ pub(crate) mod tests {
         assert!(err.contains("tapectl catalog locate alpha"), "{err}");
     }
 
+    /// A slice bad in the SAME chunk on every copy cannot be had whole: after
+    /// every copy has been tried, the chunk is a hole, the files it fell in are
+    /// named, and the restore fails.
+    #[test]
     fn a_chunk_bad_on_every_copy_is_a_hole_after_every_copy_was_tried() {
         let mut h = copies("256K", None, &[A, B]);
         damage(&mut h, A, 3, 1);
@@ -1310,6 +1314,50 @@ pub(crate) mod tests {
         assert_restored(&h, UNIT, dest.path(), &[]);
         let filled: BTreeSet<String> = report.filled.iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(filled, lost, "every lost path was filled");
+    }
+
+    /// #594 4-6, item 256: "hard links are kept as links". A hard link whose
+    /// member is in a bad chunk is filled from the other staging as a link to
+    /// its target in the destination, not as a second file that happens to
+    /// hold the same bytes.
+    #[test]
+    fn a_hard_link_the_repair_fills_is_a_link_to_its_restored_target() {
+        use std::os::unix::fs::MetadataExt;
+        let mut items = tree();
+        items.push(Item::Hard("alpha-zz-link.bin".into(), "alpha-01.bin".into()));
+        let (mut h, one, _two) = two_stagings_of(&items);
+        let rows = stage_files::load(&h.conn, one).unwrap();
+        let link = rows
+            .iter()
+            .find(|r| r.path == "alpha-zz-link.bin")
+            .expect("the link's row");
+        assert_eq!(link.kind, Kind::HardLink);
+        let begins = filetable::slice_start(&rows, SLICE_256K, link.slice).unwrap();
+        let chunk = (link.start - begins) / CHUNK;
+        let slice = link.slice;
+        damage_in(&mut h, A, one, slice as i64, chunk);
+        let lost = lost_in_chunk(&h, one, SLICE_256K, slice, chunk);
+        assert!(lost.contains("alpha-zz-link.bin"), "{lost:?}");
+        assert!(
+            !lost.contains("alpha-01.bin"),
+            "positive control: the target is restored whole by the first read: {lost:?}"
+        );
+        let mut bay = h.bay(A, &[Reply::Load(B)]);
+        let (r, dest) = restore_unit(&h, A, &RestoreOptions::default(), &mut bay);
+        let report = r.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            report.filled.iter().any(|(p, _)| p == "alpha-zz-link.bin"),
+            "the link was filled: {:?}",
+            report.filled
+        );
+        let target = fs::metadata(dest.path().join("alpha-01.bin")).unwrap();
+        let name = fs::metadata(dest.path().join("alpha-zz-link.bin")).unwrap();
+        assert_eq!(
+            (name.dev(), name.ino()),
+            (target.dev(), target.ino()),
+            "the second name is the target's inode"
+        );
+        assert_eq!(target.nlink(), 2);
     }
 
     /// #583 and item 264: a slice of the restoring staging whose age header
