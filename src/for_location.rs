@@ -181,7 +181,8 @@ pub struct ReadSlicesCommand {
     pub from: String,
     pub unit: String,
     pub version: i64,
-    /// The slices this read is run for, in slice order.
+    /// The slices of the version this read stages, in slice order: every one
+    /// the holder holds, which is what `volume read-slices --from` reads.
     pub slices: Vec<i64>,
 }
 
@@ -851,6 +852,12 @@ fn read_back(
             }
         }
         let mut left: Vec<i64> = slices.clone();
+        // What the commands chosen so far read: `volume read-slices --from L`
+        // reads every slice of the version L holds, not only the ones it was
+        // chosen for, so a later read that holds any of these stages them
+        // again over the first read's files, which then stay on the staging
+        // device named by no catalog row (#598 8-5; #474).
+        let mut read: Vec<i64> = Vec::new();
         let mut commands = Vec::new();
         while let Some(&lowest) = left.first() {
             let best = held
@@ -864,7 +871,11 @@ fn read_back(
                     // the LAST maximum: rank earlier holders higher so the
                     // first in order wins a tie.
                     let rank = held.len() - held.iter().position(|(x, _)| x == l).unwrap_or(0);
-                    (in_service.contains(l), n, rank)
+                    // After standing, a holder whose read stages nothing a
+                    // chosen read staged already: overlapping reads are the
+                    // last resort.
+                    let disjoint = !s.iter().any(|n| read.contains(n));
+                    (in_service.contains(l), disjoint, n, rank)
                 });
             let Some((label, s)) = best else {
                 break;
@@ -872,11 +883,15 @@ fn read_back(
             let mut covered: Vec<i64> = left.iter().copied().filter(|n| s.contains(n)).collect();
             covered.sort_unstable();
             left.retain(|n| !covered.contains(n));
+            // The command's slices are what it reads: all the holder holds.
+            let mut reads = s.clone();
+            reads.sort_unstable();
+            read.extend(reads.iter().copied());
             commands.push(ReadSlicesCommand {
                 from: label.clone(),
                 unit: unit.to_string(),
                 version,
-                slices: covered,
+                slices: reads,
             });
         }
         if left.is_empty() {
@@ -2196,6 +2211,44 @@ mod tests {
             [
                 ("A1".to_string(), vec![1, 2]),
                 ("A2".to_string(), vec![3, 4, 5, 6]),
+            ],
+            "{:?}",
+            plan.skipped
+        );
+    }
+
+    /// 8-5: `volume read-slices --from L` reads everything L holds of the
+    /// version, so the plan prefers holders whose reads do not overlap, and a
+    /// command's slices are what it reads. Two copies of one version, each
+    /// cut in two (V1 1-2 and V2 3-6; V3 1-4 and V4 5-6): V3 reads 1-4, and
+    /// V2 would read 3-6, staging 3 and 4 again over V3's files; V4 reads
+    /// only 5-6.
+    #[test]
+    fn read_back_prefers_reads_that_do_not_overlap() {
+        let c = Cat::new();
+        let v1 = c.tape("V1", Some("home"));
+        let v2 = c.tape("V2", Some("home"));
+        let v3 = c.tape("V3", Some("home"));
+        let v4 = c.tape("V4", Some("home"));
+        let u = c.unit("split", "tape_only", None);
+        c.targets(u, r#"{"offsite":1}"#);
+        let v = c.version(u, 1, "current");
+        let set = c.set(v, &[MIB; 6], "cleaned", false);
+        c.write(set, v1, "range", 1, 2);
+        c.write(set, v2, "range", 3, 6);
+        c.write(set, v3, "range", 1, 4);
+        c.write(set, v4, "range", 5, 6);
+        let plan = c.plan("offsite").unwrap();
+        let commands: Vec<(String, Vec<i64>)> = plan
+            .read_slices()
+            .iter()
+            .map(|r| (r.from.clone(), r.slices.clone()))
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                ("V3".to_string(), vec![1, 2, 3, 4]),
+                ("V4".to_string(), vec![5, 6]),
             ],
             "{:?}",
             plan.skipped
