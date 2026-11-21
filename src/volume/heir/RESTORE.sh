@@ -872,6 +872,26 @@ last_planned() { awk -F'|' 'END { print $1 }' "$FILES_TXT"; }
 
 # ---- --info ----
 
+# The front index and the seal marker hold no size for themselves in the index
+# (it cannot hold its own), so the row says what is true: the size of what was
+# read from this tape, or where the size is.
+info_own_size() { # <type>
+  local f n
+  case $1 in
+  front_index) f="$WORK/front_index.stripped" ;;
+  seal_marker)
+    if [ "$SEAL_STATE" = full ] || [ "$SEAL_STATE" = short ]; then f="$WORK/seal.stripped"; fi
+    ;;
+  *) return 0 ;;
+  esac
+  if [ -n "${f:-}" ] && [ -s "$f" ]; then
+    n=$(wc -c <"$f")
+    printf '%s bytes' "$((n + 0))"
+  else
+    printf '%s' "(its size is not in the index, and it was not read from this tape)"
+  fi
+}
+
 do_info() {
   establish
   local pos type size hash last
@@ -893,10 +913,11 @@ do_info() {
   while IFS='|' read -r pos type size hash; do
     if [ -n "$ENDED_AFTER" ] && [ "$pos" -gt "$((ENDED_AFTER + 1))" ]; then break; fi
     if [ -n "$ENDED_AFTER" ] && [ "$pos" -eq "$((ENDED_AFTER + 1))" ]; then
-      printf '  %4d  %-24s\n' "$pos" "seal_marker"
+      printf '  %4d  %-24s %s\n' "$pos" "seal_marker" "$(info_own_size seal_marker)"
       break
     fi
-    printf '  %4d  %-24s %s\n' "$pos" "$(safe_str "$type")" "${size:+$size bytes}"
+    if [ -n "$size" ]; then size="$size bytes"; else size=$(info_own_size "$type"); fi
+    printf '  %4d  %-24s %s\n' "$pos" "$(safe_str "$type")" "$size"
   done <"$FILES_TXT"
   if [ -n "$ENDED_AFTER" ] && [ "$SEAL_STATE" = short ]; then
     printf '  %s\n' "$(not_on_tape_line "$last")"

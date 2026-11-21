@@ -1097,3 +1097,25 @@ fn done_with_a_refused_cartridge_keeps_the_no_cartridge_was_given_suffix() {
         "{all}"
     );
 }
+
+/// #548 T6.2-3: `--info`'s rows for the front index and the seal marker had
+/// a blank size (the index cannot hold its own); each now says its size.
+#[test]
+fn info_gives_the_front_index_and_seal_marker_rows_a_size() {
+    let t = two();
+    let h = Heir::of(t);
+    let o = h.run(&["--info"]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    for kind in ["front_index", "seal_marker"] {
+        let row = o
+            .stdout
+            .lines()
+            .find(|l| l.split_whitespace().nth(1) == Some(kind))
+            .unwrap_or_else(|| panic!("no {kind} row: {}", o.stdout));
+        let size: Vec<&str> = row.split_whitespace().skip(2).collect();
+        assert!(
+            size.len() >= 2 && size[0].parse::<u64>().is_ok_and(|n| n > 0) && size[1] == "bytes",
+            "the {kind} row has no size: {row:?}"
+        );
+    }
+}
