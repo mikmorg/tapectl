@@ -368,7 +368,8 @@ pub fn parse_front_index_document(raw: &str) -> Result<ParsedFrontIndex> {
     if doc.index.layout_version != LAYOUT_VERSION {
         return Err(TapectlError::Other(format!(
             "front index: layout_version {} — this tapectl ({}) reads layout {LAYOUT_VERSION} only; \
-             read the tape with a newer tapectl or the RESTORE.sh at its file 2",
+             read the tape with the tapectl that wrote it (a File 3 of an older layout is not a \
+             newer tape; File 0 names the writer) or with the RESTORE.sh at its file 2",
             doc.index.layout_version,
             env!("CARGO_PKG_VERSION"),
         )));
@@ -798,6 +799,26 @@ impl FormatClaims {
     }
 }
 
+/// §1.2 rule 2's warning: the keys File 0 does not state among `magic` and
+/// `layout_version`, or `None` when it states both.
+fn absent_claims_warning(claims: &FormatClaims) -> Option<String> {
+    let mut absent = Vec::new();
+    if claims.magic.is_none() {
+        absent.push("`magic`");
+    }
+    if claims.layout_version.is_none() {
+        absent.push("`layout_version`");
+    }
+    if absent.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "File 0 states no {} (a damaged File 0): this tapectl reads on, and the seal's own \
+         `layout_version` and `requires` decide (volume-format-v3.md §1.2 rule 2)",
+        absent.join(" and ")
+    ))
+}
+
 /// Refuse File 0 `raw` if it claims a format this tapectl cannot read. A
 /// File 0 whose claims do not parse (say, a `requires` that is not a list)
 /// is refused too: it cannot be shown to be readable.
@@ -813,7 +834,15 @@ pub fn check_id_thunk_readable(raw: &str) -> Result<()> {
     };
     match claims.refusal("File 0") {
         Some(why) => Err(TapectlError::Other(why)),
-        None => Ok(()),
+        None => {
+            // §1.2 rule 2: an absent `magic` or `layout_version` (a damaged
+            // File 0) is warned about, not refused; the seal's own
+            // `layout_version` and `requires` then decide.
+            if let Some(w) = absent_claims_warning(&claims) {
+                tracing::warn!("{w}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1616,6 +1645,34 @@ mod forward_compat_tests {
         let s =
             parse_seal_marker(&seal().replace("layout_version = 3", "layout_version = 2")).unwrap();
         assert!(s.refusal().unwrap().contains("layout_version = 2"));
+    }
+
+    /// #593 3-4 (`volume-format-v3.md` §1.2 rule 2): a File 0 stating neither
+    /// `magic` nor `layout_version` is warned about, not refused, by the one
+    /// check every reader makes. A positive control: a whole File 0 is quiet.
+    #[test]
+    fn a_file_0_with_no_magic_or_layout_version_is_warned_about_not_refused() {
+        let damaged = thunk()
+            .replace("magic = \"tapectl-volume-v3\"\n", "")
+            .replace("layout_version = 3\n", "");
+        let (read, heard) = crate::progress::heard::during(|| check_id_thunk_readable(&damaged));
+        read.expect("warned about, not refused");
+        assert_eq!(heard.count("states no `magic`").0, 1, "{:?}", heard.stderr);
+        let (read, heard) = crate::progress::heard::during(|| check_id_thunk_readable(&thunk()));
+        read.unwrap();
+        assert!(heard.stderr.is_empty(), "{:?}", heard.stderr);
+    }
+
+    /// #593 (the remedy string at `format.rs`): a File 3 of an OLDER layout is
+    /// not helped by "a newer tapectl"; the remedy names the tapectl that
+    /// wrote it (`volume-format-v3.md` §1.2 rule 1).
+    #[test]
+    fn an_older_file_3_is_not_told_to_find_a_newer_tapectl() {
+        let older = "[index]\nvolume = \"X\"\nlayout_version = 2\n";
+        let err = parse_front_index(older).unwrap_err().to_string();
+        assert!(!err.contains("newer tapectl"), "{err}");
+        assert!(err.contains("the tapectl that wrote it"), "{err}");
+        assert!(err.contains("RESTORE.sh at its file 2"), "{err}");
     }
 }
 
