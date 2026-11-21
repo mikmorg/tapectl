@@ -13286,7 +13286,8 @@ mod tests {
             // #597 7-2: a range is not a copy on its own (§5.3), so a report
             // that lists one never says every unit before the warning counts.
             assert!(
-                !report.contains("on this tape and counts as a copy"),
+                !report
+                    .contains("Every unit wholly before it is on this tape and counts as a copy"),
                 "{report}"
             );
             assert!(report.contains("counts no copy on its own"), "{report}");
