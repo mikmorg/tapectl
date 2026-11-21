@@ -2797,10 +2797,12 @@ from it.
 
 ```text
 error: not enough disk space in <dir> for this restore: it needs about <size>, and <size> is free. Nothing was read
-from tape. <why>. Free space there, choose a larger disk with --to, or put the scratch directory on another disk
-with --scratch DIR. (--no-space-check skips this check, for a filesystem that holds more than it reports free,
-such as a compressed or thin-provisioned one.)
+from tape. <why>. Free space there, choose a larger disk with --to. (--no-space-check skips this check, for a
+filesystem that holds more than it reports free, such as a compressed or thin-provisioned one.)
 ```
+
+`restore file` adds one more way out: "or put the file's extraction on another disk with --scratch DIR". A restore of
+a unit has no such way, because it writes no slice to disk and `--scratch` changes nothing about what it needs.
 
 `<why>` names which of two restores this is, because they need different room:
 

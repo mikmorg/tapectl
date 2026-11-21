@@ -761,7 +761,7 @@ fn check_restore_space(destination: &Path, scratch: &Path, plan: &RestorePlan) -
          size in --to; no slice is written to disk."
     };
     match space_needs(destination, scratch, plan.bytes, plan.file_size) {
-        Some(needs) => require_space(&needs, why),
+        Some(needs) => require_space(&needs, why, plan.file_size.is_some()),
         None => Ok(()),
     }
 }
@@ -829,7 +829,12 @@ fn space_needs(
 /// Refuse when a filesystem cannot hold `needs`: per filesystem, everything
 /// kept plus the largest transient — restores of a set run one after
 /// another, each removing its scratch before the next (issue #398).
-fn require_space(needs: &[SpaceNeed], why: &str) -> Result<()> {
+///
+/// `scratch_helps` is whether `--scratch DIR` changes what the restore needs:
+/// only `restore file` extracts in the scratch directory; a restore of a
+/// unit writes no slice to disk, so its refusal must not send the operator to
+/// a flag that cannot get past it (#594).
+fn require_space(needs: &[SpaceNeed], why: &str, scratch_helps: bool) -> Result<()> {
     let mut by_fs: Vec<(Option<u64>, PathBuf, i64, i64)> = Vec::new();
     for n in needs {
         match by_fs.iter_mut().find(|(dev, ..)| *dev == n.dev) {
@@ -859,12 +864,16 @@ fn require_space(needs: &[SpaceNeed], why: &str) -> Result<()> {
             return Err(TapectlError::Other(format!(
                 "not enough disk space in {} for this restore: it needs about {}, and {} is \
                  free. Nothing was read from tape. {why} Free space there, choose a larger disk \
-                 with --to, or put any decrypted slices on another disk with --scratch DIR. \
-                 (--no-space-check skips this check, for a filesystem that holds more than it \
-                 reports free, such as a compressed or thin-provisioned one.)",
+                 with --to{}. (--no-space-check skips this check, for a filesystem that holds \
+                 more than it reports free, such as a compressed or thin-provisioned one.)",
                 dir.display(),
                 crate::util::format_bytes_binary(bytes),
                 crate::util::format_bytes_binary(free),
+                if scratch_helps {
+                    ", or put the file's extraction on another disk with --scratch DIR"
+                } else {
+                    ""
+                },
             )));
         }
     }
@@ -2422,6 +2431,7 @@ fn plan_set(
             &needs,
             "Restoring these units one after another keeps every restored unit; no slice is \
              written to disk.",
+            false,
         )?;
     }
     // The units that could not be planned come first, in the order asked: they

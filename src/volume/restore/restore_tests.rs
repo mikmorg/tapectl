@@ -759,7 +759,10 @@ fn a_short_space_destination_is_refused_before_the_drive_is_opened() {
             .to_string();
         assert!(err.contains("not enough disk space"), "{err}");
         assert!(err.contains("Nothing was read from tape"), "{err}");
-        assert!(err.contains("--scratch DIR"), "{err}");
+        // #594: a unit writes no slice to disk, so --scratch changes nothing
+        // for it and the refusal does not send the operator to it.
+        assert!(!err.contains("--scratch"), "{err}");
+        assert!(err.contains("--to"), "{err}");
         r.assert_no_tape_contact();
 
         // --no-space-check is the escape, as in RESTORE.sh.
@@ -862,6 +865,8 @@ fn the_space_figures_are_the_units_bytes_and_for_a_file_its_scratch() {
             .to_string();
         assert!(err.contains("not enough disk space"), "{err}");
         assert!(err.contains("moves it into place"), "{err}");
+        // For `restore file` --scratch DIR moves the extraction.
+        assert!(err.contains("--scratch DIR"), "{err}");
     }
     let _free = RestoreFreeOverride::set(need);
     check_restore_space(dest.path(), &scratch, &plan).unwrap();
