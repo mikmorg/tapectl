@@ -615,9 +615,11 @@ pub(super) fn run(
         };
         trace.bytes_decrypted += read.authentic_bytes as i64;
         if let Some(why) = read.unavailable.clone() {
+            // Not read: the cartridge was not given (#594 4-9).
             reading.unavailable.insert(n, why);
             continue;
         }
+        trace.slices_read += 1;
         let cut = cut_of(read, wp, job.compression);
         if let Err(e) = reading.slice(wp, &cut) {
             failure = Some(e);
@@ -625,7 +627,6 @@ pub(super) fn run(
         }
     }
     if failure.is_none() {
-        trace.slices_read += 1;
         phase.done();
         reading.close_skipped(u64::MAX);
         if reading.run.is_some() {
