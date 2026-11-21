@@ -395,6 +395,7 @@
 //! a file under the target directory when it fails and names that file.
 
 use tapectl::volume::layout::{generate_id_thunk_v2, IdThunkV2Params};
+use tapectl::volume::manifest::{Manifest, ManifestSlice, ManifestUnit};
 
 /// Compare a generated document with its pinned text. On a difference the generated text
 /// is written under the target directory and the failure names the file.
@@ -516,4 +517,138 @@ fn layout3_file_0_id_thunk() {
         cartridge_identity_source: Some("mam"),
     };
     assert_pinned_text("file-0", &generate_id_thunk_v2(&params), FILE_0);
+}
+
+fn slice(
+    number: i64,
+    tape_position: Option<i64>,
+    sizes: (i64, i64),
+    hashes: (&str, &str),
+    continues: bool,
+) -> ManifestSlice {
+    ManifestSlice {
+        number,
+        tape_position,
+        size_bytes: sizes.0,
+        encrypted_bytes: sizes.1,
+        sha256_plain: hashes.0.repeat(64),
+        sha256_encrypted: hashes.1.repeat(64),
+        continues,
+    }
+}
+
+const MANIFEST_WHOLE_UNITS: &str = r##"[manifest]
+volume = "L8-0001"
+tenant = "alpha"
+created_at = "2026-11-21T10:00:00+00:00"
+may_end_early = true
+
+[[units]]
+name = "photos/2019"
+uuid = "11111111-2222-3333-4444-555555555555"
+snapshot_version = 7
+stage_set_id = 42
+payload = "tar"
+stream_bytes = 40960
+file_table = "tables/11111111_v7_s42.tsv"
+id_map = "tables/11111111_v7_s42.ids.tsv"
+tar_version = "tar (GNU tar) 1.35"
+
+[[units.slices]]
+number = 1
+tape_position = 9
+size_bytes = 20480
+encrypted_bytes = 20512
+sha256_plain = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+sha256_encrypted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[[units.slices]]
+number = 2
+tape_position = 10
+size_bytes = 20480
+encrypted_bytes = 20512
+sha256_plain = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+sha256_encrypted = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+[[units]]
+name = "ledgers/fy24"
+uuid = "66666666-7777-8888-9999-000000000000"
+snapshot_version = 1
+stage_set_id = 43
+payload = "tar"
+stream_bytes = 31744
+file_table = "tables/66666666_v1_s43.tsv"
+id_map = "tables/66666666_v1_s43.ids.tsv"
+tar_version = "tar (GNU tar) 1.35"
+compression = "zstd"
+
+[[units.slices]]
+number = 1
+tape_position = 11
+size_bytes = 20480
+encrypted_bytes = 4100
+sha256_plain = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+sha256_encrypted = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+[[units.slices]]
+number = 2
+tape_position = 12
+size_bytes = 11264
+encrypted_bytes = 2300
+sha256_plain = "1111111111111111111111111111111111111111111111111111111111111111"
+sha256_encrypted = "2222222222222222222222222222222222222222222222222222222222222222"
+continues = true
+
+"##;
+
+/// A tenant envelope's two whole units: every key of a block (the first, uncompressed),
+/// and a compressed staging whose second slice continues a member (the second).
+/// The input is fixed; `Manifest::to_toml` is the writer `generate_manifest_toml` calls.
+#[test]
+fn layout3_manifest_whole_units() {
+    let manifest = Manifest {
+        volume: "L8-0001".to_string(),
+        tenant: "alpha".to_string(),
+        created_at: "2026-11-21T10:00:00+00:00".to_string(),
+        may_end_early: true,
+        units: vec![
+            ManifestUnit {
+                name: "photos/2019".to_string(),
+                uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                snapshot_version: 7,
+                stage_set_id: 42,
+                payload: "tar".to_string(),
+                stream_bytes: 40_960,
+                file_table: Some("tables/11111111_v7_s42.tsv".to_string()),
+                id_map: Some("tables/11111111_v7_s42.ids.tsv".to_string()),
+                tar_version: Some("tar (GNU tar) 1.35".to_string()),
+                compression: None,
+                slices: vec![
+                    slice(1, Some(9), (20_480, 20_512), ("a", "b"), false),
+                    slice(2, Some(10), (20_480, 20_512), ("c", "d"), false),
+                ],
+            },
+            ManifestUnit {
+                name: "ledgers/fy24".to_string(),
+                uuid: "66666666-7777-8888-9999-000000000000".to_string(),
+                snapshot_version: 1,
+                stage_set_id: 43,
+                payload: "tar".to_string(),
+                stream_bytes: 31_744,
+                file_table: Some("tables/66666666_v1_s43.tsv".to_string()),
+                id_map: Some("tables/66666666_v1_s43.ids.tsv".to_string()),
+                tar_version: Some("tar (GNU tar) 1.35".to_string()),
+                compression: Some("zstd".to_string()),
+                slices: vec![
+                    slice(1, Some(11), (20_480, 4_100), ("e", "f"), false),
+                    slice(2, Some(12), (11_264, 2_300), ("1", "2"), true),
+                ],
+            },
+        ],
+    };
+    assert_pinned_text(
+        "manifest-whole-units",
+        &manifest.to_toml(),
+        MANIFEST_WHOLE_UNITS,
+    );
 }
