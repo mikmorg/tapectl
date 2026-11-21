@@ -652,3 +652,81 @@ fn layout3_manifest_whole_units() {
         MANIFEST_WHOLE_UNITS,
     );
 }
+
+const MANIFEST_RANGE_BLOCK: &str = r##"[manifest]
+volume = "L8-0002"
+tenant = "alpha"
+created_at = "2026-11-21T10:00:00+00:00"
+may_end_early = true
+
+[[units]]
+name = "photos/2019"
+uuid = "11111111-2222-3333-4444-555555555555"
+snapshot_version = 7
+stage_set_id = 42
+payload = "tar"
+stream_bytes = 61440
+file_table = "tables/11111111_v7_s42.tsv"
+id_map = "tables/11111111_v7_s42.ids.tsv"
+tar_version = "tar (GNU tar) 1.35"
+compression = "xz"
+
+[[units.slices]]
+number = 1
+size_bytes = 20480
+encrypted_bytes = 9000
+sha256_plain = "1111111111111111111111111111111111111111111111111111111111111111"
+sha256_encrypted = "4444444444444444444444444444444444444444444444444444444444444444"
+
+[[units.slices]]
+number = 2
+size_bytes = 20480
+encrypted_bytes = 9001
+sha256_plain = "2222222222222222222222222222222222222222222222222222222222222222"
+sha256_encrypted = "5555555555555555555555555555555555555555555555555555555555555555"
+
+[[units.slices]]
+number = 3
+tape_position = 4
+size_bytes = 20480
+encrypted_bytes = 9002
+sha256_plain = "3333333333333333333333333333333333333333333333333333333333333333"
+sha256_encrypted = "6666666666666666666666666666666666666666666666666666666666666666"
+continues = true
+
+"##;
+
+/// A range block (volume-format-v3.md section 5.3): the staging continues on this tape
+/// from slice 3, so slices 1 and 2 are listed with no `tape_position` and slice 3, which
+/// continues a member begun in slice 2, is the run's first slice here.
+#[test]
+fn layout3_manifest_range_block() {
+    let manifest = Manifest {
+        volume: "L8-0002".to_string(),
+        tenant: "alpha".to_string(),
+        created_at: "2026-11-21T10:00:00+00:00".to_string(),
+        may_end_early: true,
+        units: vec![ManifestUnit {
+            name: "photos/2019".to_string(),
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            snapshot_version: 7,
+            stage_set_id: 42,
+            payload: "tar".to_string(),
+            stream_bytes: 61_440,
+            file_table: Some("tables/11111111_v7_s42.tsv".to_string()),
+            id_map: Some("tables/11111111_v7_s42.ids.tsv".to_string()),
+            tar_version: Some("tar (GNU tar) 1.35".to_string()),
+            compression: Some("xz".to_string()),
+            slices: vec![
+                slice(1, None, (20_480, 9_000), ("1", "4"), false),
+                slice(2, None, (20_480, 9_001), ("2", "5"), false),
+                slice(3, Some(4), (20_480, 9_002), ("3", "6"), true),
+            ],
+        }],
+    };
+    assert_pinned_text(
+        "manifest-range-block",
+        &manifest.to_toml(),
+        MANIFEST_RANGE_BLOCK,
+    );
+}
