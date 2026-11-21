@@ -1151,3 +1151,62 @@ fn info_gives_the_front_index_and_seal_marker_rows_a_size() {
         );
     }
 }
+
+// ---- T6.4-1 (#552): names uutils quotes ----
+
+/// uutils' `sha256sum -c` quotes a name with a space, a quote, a `;`, a `*`,
+/// a `$`, `,@%+=:` or a non-ASCII byte under `LC_ALL=C`. The per-file check
+/// reads no name back, so a whole restore of such names is COMPLETE.
+fn quoted_tape() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::one("none");
+        shape.quoted_names = true;
+        Tape::build(&shape)
+    })
+}
+
+#[test]
+fn a_whole_restore_of_names_a_tool_quotes_is_complete_with_no_damaged_file() {
+    let t = quoted_tape();
+    let h = Heir::of(t);
+    let dest = h.dest("quoted");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dstr(&dest),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{all}");
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists(), "{all}");
+    for n in heir::QUOTED_NAMES {
+        assert!(dest.join(n).is_file(), "{n} is restored: {all}");
+    }
+}
+
+#[test]
+fn a_damaged_file_among_quoted_names_is_the_only_one_reported() {
+    let t = quoted_tape();
+    let h = Heir::of(t);
+    let dest = h.dest("quoted-damaged");
+    let real = heir::host_tool("tar").expect("tar");
+    h.put_tool("tar", &heir::corrupting_tar(&real, "caf\u{e9}.txt"));
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dstr(&dest),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(o.stdout.contains("RESTORE INCOMPLETE"), "{all}");
+    assert_eq!(
+        damaged_list(&dest),
+        vec!["caf\u{e9}.txt".to_string()],
+        "{all}"
+    );
+}

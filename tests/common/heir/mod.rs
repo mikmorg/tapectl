@@ -159,7 +159,21 @@ pub struct Shape {
     /// named, a hard link and a symbolic link whose target is such a name
     /// (`UnitTruth::raw_files`; [`RAW_NAMES`]).
     pub raw_names: bool,
+    /// Add to each BIG unit files whose names uutils' `sha256sum -c` quotes
+    /// under `LC_ALL=C` ([`QUOTED_NAMES`]).
+    pub quoted_names: bool,
 }
+
+/// Names a uutils `sha256sum -c` prints quoted (`'./a b.txt': OK`), all UTF-8.
+pub const QUOTED_NAMES: [&str; 7] = [
+    "a b.txt",
+    "caf\u{e9}.txt",
+    "it's.txt",
+    "semi;c",
+    "star*",
+    "dollar$x",
+    "punct,@%+=:",
+];
 
 /// The names a `raw_names` shape adds, as the bytes they are on disk: a
 /// Latin-1 file, a folder so named with a file in it, a hard link to the
@@ -213,6 +227,7 @@ impl Shape {
             no_index: false,
             span: None,
             raw_names: false,
+            quoted_names: false,
         }
     }
     /// One big unit of tenant A, compressed.
@@ -228,6 +243,7 @@ impl Shape {
             no_index: false,
             span: None,
             raw_names: false,
+            quoted_names: false,
         }
     }
 }
@@ -331,6 +347,7 @@ fn make_unit(
     tenant: &'static str,
     big: bool,
     raw: bool,
+    quoted: bool,
     seed: u32,
 ) -> UnitTruth {
     let dir = h.sources.join(name);
@@ -351,6 +368,11 @@ fn make_unit(
         // A folder whose name holds a backslash.
         files.push(("dir\\one/leaf.txt".to_string(), text(700, seed + 33)));
         files.push(("notes.txt".to_string(), text(40_000, seed + 31)));
+        if quoted {
+            for (i, n) in QUOTED_NAMES.iter().enumerate() {
+                files.push((n.to_string(), text(900 + i * 7, seed + 50 + i as u32)));
+            }
+        }
     }
     for (path, bytes) in &files {
         fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
@@ -689,6 +711,7 @@ impl Tape {
                 tenant,
                 *big,
                 shape.raw_names,
+                shape.quoted_names,
                 1 + 7 * i as u32,
             ));
         }
@@ -1571,6 +1594,27 @@ done
 "{real}" "$@"
 rc=$?
 if [ -n "$dest" ] && [ -d "$dest" ]; then rm -f -- "$dest/{victim}"; fi
+exit $rc
+"#,
+        real = real.display(),
+        victim = victim
+    )
+}
+
+/// A tar stand-in that runs the real tar and then changes one byte of the
+/// file `victim` (relative to `-C`) on disk: a file the restore wrote and
+/// the disk then damaged, whole in length.
+pub fn corrupting_tar(real: &Path, victim: &str) -> String {
+    format!(
+        r#"#!/bin/bash
+dest=""
+args=("$@")
+for ((i = 0; i < ${{#args[@]}}; i++)); do
+  if [ "${{args[$i]}}" = -C ]; then dest=${{args[$((i + 1))]}}; fi
+done
+"{real}" "$@"
+rc=$?
+if [ -n "$dest" ] && [ -f "$dest/{victim}" ]; then printf 'Z' | dd of="$dest/{victim}" bs=1 seek=3 conv=notrunc 2>/dev/null; fi
 exit $rc
 "#,
         real = real.display(),
