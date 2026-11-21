@@ -1842,6 +1842,10 @@ fn unit_names<'u>(units: impl IntoIterator<Item = &'u BuildUnit>) -> String {
         .join(", ")
 }
 
+/// What [`plan_span_set`] decided: the slices this tape plans, the set's span,
+/// its class, and where its source held it ([`carried_order_key`]).
+type PlannedSet = (Vec<BuildSlice>, UnitSpan, PlanClass, Option<(String, i64)>);
+
 /// A set a plan with no bound ends inside: its slices `first` to `last`
 /// (of the run this tape would take) are planned, and the rest of the run is
 /// not.
@@ -9645,7 +9649,7 @@ fn plan_span_set(
     unit: &crate::db::models::Unit,
     min_copies: i64,
     version: i64,
-) -> Result<(Vec<BuildSlice>, UnitSpan, PlanClass, Option<(String, i64)>)> {
+) -> Result<PlannedSet> {
     let rows: Vec<SpanRow> = conn
         .prepare(
             "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
