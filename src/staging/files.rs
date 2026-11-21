@@ -288,7 +288,7 @@ impl SliceWriter {
                 // D15: what was hashed is what goes to tape.
                 if decoded.len != self.plain_len || decoded.sha256 != sha256_plain {
                     return Err(TapectlError::Other(format!(
-                        "staged slice {}: packed with {} at level {}, it decodes to {} bytes                          of sha256 {}, and its cut was {} bytes of sha256 {}. A slice whose                          packed bytes are not its cut is never kept; nothing was staged.",
+                        "staged slice {}: packed with {} at level {}, it decodes to {} bytes of sha256 {}, and its cut was {} bytes of sha256 {}. A slice whose packed bytes are not its cut is never kept; nothing was staged.",
                         self.path.display(),
                         p.algorithm.name(),
                         p.level,
@@ -693,6 +693,8 @@ mod tests {
                 msg.contains(algorithm.name()) && msg.contains("decodes to"),
                 "{msg}"
             );
+            // #592 2-5: a lost line continuation once left a run of spaces.
+            assert!(!msg.contains("  "), "no run of spaces in: {msg}");
             assert!(!path.exists(), "the refused slice is removed");
         }
     }
