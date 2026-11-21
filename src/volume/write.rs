@@ -4046,8 +4046,10 @@ fn aborted_not_adoptable(
              earlier rebuild could not, the tape may be sealed: read it again, check it with \
              `tapectl volume verify {label}`, restore what it holds (`tapectl restore unit`, or \
              RESTORE.sh at tape file 2), and rebuild into a catalog with no row for \"{label}\" \
-             to record it as sealed; `tapectl cartridge erase` (it asks for the label) only if \
-             the tape is to be given up."
+             to record it as sealed (a rebuild into this catalog finishes the record only for a \
+             row nothing has changed since its seal could not be read, ADR-0012 item 302); \
+             `tapectl cartridge erase` (it asks for the label) only if the tape is to be \
+             given up."
         )),
         AbortedAdoption::ConditionNotOk { condition } => TapectlError::Other(format!(
             "volume \"{label}\": its write session was aborted AFTER its seal was recorded, so \

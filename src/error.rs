@@ -519,9 +519,10 @@ pub enum TapectlError {
          not be READ then, which is not the same as the tape having none — it may carry a \
          SEALED volume. The row is quarantined, so this command will not write to it or resume \
          it as an unsealed one, and `--force` does not apply. Do not overwrite the tape. Read it \
-         again (another drive, or after cleaning this one) and rebuild again into a catalog with \
-         no row for \"{label}\", which records it as sealed; `tapectl volume verify {label}` \
-         checks the tape against its own front index (it does not seal the row); what it holds \
+         again (another drive, or after cleaning this one) and run `catalog rebuild --from-volume` \
+         again into this catalog, which finishes the record as sealed while nothing has changed \
+         the row since (rebuild before `tapectl volume verify {label}`, which checks the tape \
+         against its own front index and does not seal the row); what it holds \
          restores with `tapectl restore unit` or RESTORE.sh at its file 2. Only if the tape is to be \
          given up: `tapectl volume retire {label}`, then `tapectl cartridge erase`, which asks \
          for the tape's label."

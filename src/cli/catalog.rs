@@ -863,6 +863,10 @@ fn dispatch(
                 obj["recorded_as_seal_unreadable"] =
                     serde_json::json!(report.volume_inserted && report.seal_read_failed);
                 obj["found_volume_status"] = serde_json::json!(report.found_volume_status);
+                // ADR-0012 item 302: additive. This run read the seal and
+                // finished the record an earlier rebuild began on a seal it
+                // could not read: the volume is now `sealed`.
+                obj["seal_promoted"] = serde_json::json!(report.seal_promoted);
                 // #420: additive. Where a short tape ended, the units it
                 // took none of (planned and not written: no row), and what
                 // was recorded of the ending on a found row.
@@ -1001,6 +1005,9 @@ fn dispatch(
                 for line in unsealed_tape_lines(&report) {
                     println!("{line}");
                 }
+                for line in seal_promoted_lines(&report) {
+                    println!("{line}");
+                }
                 // #420, outside the is_noop() branch for the same reason: a
                 // tape that ended early says so on every run.
                 for line in short_tape_lines(&report) {
@@ -1038,14 +1045,15 @@ fn dispatch(
                         println!(
                             "  warning: volume \"{}\" was already in this catalog as \"{status}\" \
                              with its writes \"aborted\" — an earlier rebuild could not read this \
-                             tape's seal. The seal reads now, but this rebuild does not edit that \
-                             row or its writes (a rebuild never edits a row it finds), so nothing on it counts as a copy yet, and \
-                             `tapectl volume resume {}` will refuse it (it adopts no aborted \
-                             session whose seal was never recorded). Do NOT run `volume write` on \
-                             it: the tape carries a sealed volume. What works today: `tapectl \
-                             restore` or RESTORE.sh (tape file 2) restore what it holds, `tapectl \
-                             volume verify {}` checks it, and a rebuild into a catalog with no \
-                             row for \"{}\" records it as sealed",
+                             tape's seal. The seal reads now, but the row has been changed since \
+                             (a rebuild finishes only a row nothing has touched since, ADR-0012 \
+                             item 302; it never edits any other row), so nothing on it counts as a \
+                             copy, and `tapectl volume resume {}` will refuse it (it adopts no \
+                             aborted session whose seal was never recorded). Do NOT run `volume \
+                             write` on it: the tape carries a sealed volume. What works today: \
+                             `tapectl restore` or RESTORE.sh (tape file 2) restore what it holds, \
+                             `tapectl volume verify {}` checks it, and a rebuild into a catalog \
+                             with no row for \"{}\" records it as sealed",
                             report.label, report.label, report.label, report.label
                         );
                     } else {
@@ -1535,6 +1543,24 @@ fn unsealed_tape_lines(report: &RebuildReport) -> Vec<String> {
     lines
 }
 
+/// What `catalog rebuild` says when this run read the seal and finished the
+/// record an earlier rebuild began on a seal it could not read (ADR-0012 item
+/// 302, #582). Empty otherwise.
+fn seal_promoted_lines(report: &RebuildReport) -> Vec<String> {
+    if !report.seal_promoted {
+        return Vec::new();
+    }
+    let label = &report.label;
+    vec![format!(
+        "  volume \"{label}\": the seal marker now reads, and this catalog's row was still the one an \
+         earlier rebuild recorded when it could not read it (and nothing had changed it since), so \
+         this rebuild finished that record: the volume is now \"sealed\", its quarantine is \
+         cleared, its writes are \"completed\" (or \"range\") and its slice positions \"written\", \
+         as a first rebuild of the sealed tape would have recorded them. It counts as a copy now \
+         (not verified by a read-back: `tapectl volume verify {label}` does that)."
+    )]
+}
+
 /// What `catalog rebuild` says when the seal marker could not be READ (#582):
 /// not "no seal". The tape may be a sealed one the drive could not read just
 /// now, so none of these lines sends the operator to write over it (ADR-0012
@@ -1562,8 +1588,10 @@ fn seal_unreadable_lines(report: &RebuildReport, why: &str) -> Vec<String> {
     );
     lines.push(format!(
         "    The tape may carry a sealed volume. Do NOT run `volume write {label}` on it. Read it \
-         again (another drive, or after cleaning this one), and rebuild again into a catalog with \
-         no row for \"{label}\" to record it as sealed. `tapectl volume verify {label}` checks \
+         again (another drive, or after cleaning this one) and run `catalog rebuild --from-volume` \
+         again into this catalog: a rebuild that reads the seal cleanly finishes this record (the \
+         volume `sealed`, its writes and positions a sealed tape's) while nothing has changed the \
+         row since (ADR-0012 item 302). `tapectl volume verify {label}` checks \
          the tape against its own front index and, when clean and full, clears the quarantine \
          (it does not seal the row). What the tape holds restores with `tapectl restore unit` or \
          RESTORE.sh at its file 2. Only to give the tape up: `tapectl volume retire {label}`, \

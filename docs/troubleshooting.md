@@ -3213,20 +3213,33 @@ quarantines it, with a `seal_unreadable` event, so `volume write` and
 `volume resume` refuse it and say why; no flag passes that refusal. Do not write
 over the tape. What works:
 
-- read it again, with another drive or after cleaning this one, and rebuild into
-  a catalog that has no row for the label: that rebuild records it as `sealed`;
+- read it again, with another drive or after cleaning this one, and run
+  `tapectl catalog rebuild --from-volume` again into the same catalog: a rebuild
+  that reads the seal cleanly finishes the record (ADR-0012 item 302). The
+  volume becomes `sealed`, its quarantine is cleared, its writes `completed` (or
+  `range`) and its positions `written`, as a first rebuild of the sealed tape
+  records them, and a `seal_promoted` event says so. Do this before anything
+  else touches the row;
 - `tapectl volume verify <label>` checks the tape against its own front index; a
-  clean full verify clears the quarantine, and does not seal the row;
+  clean full verify clears the quarantine, and does not seal the row. It is an
+  event on the volume, so a verify run first puts the row out of the rebuild's
+  reach (see below): rebuild first, verify after;
 - restore what it holds: `tapectl restore unit`, or RESTORE.sh at tape file 2 with a
   tenant key or the escrow key;
 - only if the tape is to be given up: `tapectl volume retire <label>`, then
   `tapectl cartridge erase`, which asks for the tape's label.
 
-A later rebuild that reads the seal cleanly does not edit the rows the earlier
-one wrote (it never edits a row it finds), so it warns that the volume is still
-`initialized` with `aborted` writes. `volume resume` refuses that state, since no
-seal was ever recorded, and `volume write` is not the way on: the tape carries a
-sealed volume.
+A later rebuild that reads the seal cleanly finishes that record, and only that
+one: the volume's row must still be what the earlier rebuild left (`initialized`
+and quarantined, with its `seal_unreadable` event), no event on the volume may
+have come after it but a rebuild's (a write, resume, verify, retire or edit each
+log one), and its writes must still be `aborted` and its positions `pending`.
+Every other row a rebuild finds is left alone (a rebuild never changes a status
+it finds, #158, #360). When the row has been changed since, the rebuild warns
+that the volume is still `initialized` with `aborted` writes: `volume resume`
+refuses that state, since no seal was ever recorded, and `volume write` is not
+the way on, because the tape carries a sealed volume. Rebuild into a catalog
+that has no row for the label to record it as `sealed`.
 
 ### `catalog rebuild`: `NO VALID SEAL MARKER`
 
