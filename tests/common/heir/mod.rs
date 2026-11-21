@@ -1547,6 +1547,28 @@ exit $rc
     )
 }
 
+/// A tar stand-in that runs the real tar and, when it was restoring into
+/// `dest` (`-C dest`), exits with status 2, as tar does when it restored what
+/// it could and reports a failure (item 301). Its other calls (the envelopes)
+/// are the real tar's.
+pub fn failing_tar(real: &Path, dest: &Path) -> String {
+    format!(
+        r#"#!/bin/bash
+restoring=0
+args=("$@")
+for ((i = 0; i < ${{#args[@]}}; i++)); do
+  if [ "${{args[$i]}}" = -C ] && [ "${{args[$((i + 1))]}}" = "{dest}" ]; then restoring=1; fi
+done
+"{real}" "$@"
+rc=$?
+if [ "$restoring" = 1 ] && [ "$rc" = 0 ]; then rc=2; fi
+exit $rc
+"#,
+        real = real.display(),
+        dest = dest.display()
+    )
+}
+
 // ---- editing the generated index (what a real catalog of one write does not make) ----
 
 /// Rewrite a TSV file: `f` gets the header's column names and the rows (each a

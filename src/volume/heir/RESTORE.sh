@@ -132,6 +132,11 @@ FOREIGN_LOADED=0
 GAVE_UP=0        # 1 once the heir said "I do not have it" for this unit
 QUIT=0           # 1 once the heir typed quit
 TO_HELD_LIST=0   # 1 when --to held an earlier run's damaged-file list
+TAR_FAILED=0     # 1 once tar ended non-zero under --no-file-check: no check judges it, so the run is incomplete (item 301)
+DRIVE_HOLDS=""   # the slice the last "done" probe found the cartridge in the drive does hold
+ABSENT_HOW=fresh # which restore says what to do about slices not in the drive: fresh, continue, path or repair
+ABSENT_DEST=""
+RUN_UNITS=1      # how many units this run restores
 TAR_OPEN=0       # 1 while tar's input (fd 4) is open
 FEEDING=0        # the slice being prepared or fed
 INFLIGHT_DEST="" # where, and from which table, a signal's cleanup looks for a partial member
@@ -1486,10 +1491,14 @@ recheck_drive() { # <slice asked for>
   NEED_HASH=${SL_SHAE[$1]} NEED_SIZE=${SL_ENC[$1]}
   (probe_cartridge "$sub" "$1") 2>/dev/null || rc=$?
   CUR=""
+  DRIVE_HOLDS=""
   if [ "$rc" = 3 ] || [ "$rc" = 4 ]; then
     FOREIGN_LOADED=0
   else
     FOREIGN_LOADED=1
+    # Another cartridge that holds the slice asked for is in the drive: the
+    # heir typed done before it was taken.
+    if [ "$rc" = 0 ]; then DRIVE_HOLDS=$1; fi
   fi
   locate_here
   return 0
@@ -1651,7 +1660,9 @@ feeder_fatal() {
 absent_slice() { # <slice number>
   local k=$1 p why
   p=${SL_POS[$k]:-}
-  if [ "$FOREIGN_LOADED" = 1 ] && [ -n "${SL_DESC[$k]:-}" ]; then
+  if [ "$DRIVE_HOLDS" = "$k" ]; then
+    why="the cartridge in the drive does hold it, but done was answered before it was taken: nothing was read from it (ask again and press ENTER to take it)"
+  elif [ "$FOREIGN_LOADED" = 1 ] && [ -n "${SL_DESC[$k]:-}" ]; then
     why="it is on the tape $(safe_str "${LABEL:-the run started on}"), which is not in the drive now: load that tape again and its slices are restored"
     printf '%s\n' "$k" >>"$WORK/outdrive.slices"
   elif [ "$HOME_CART" = 0 ] && start_holds "$k"; then
@@ -1661,12 +1672,14 @@ absent_slice() { # <slice number>
     why="file $((10#$p)) is after the end of this tape (it ended after file $ENDED_AFTER)"
   elif [ "$HOME_CART" = 1 ]; then
     why="this tape's plan does not hold it (it is on another cartridge)"
+  elif [ "$FOREIGN_LOADED" = 1 ]; then
+    why="it is on a cartridge that is not in the drive (nothing was read from the one that is)"
   else
     why="the cartridge in the drive does not hold it (it is on another cartridge)"
   fi
   if [ "$QUIT" = 1 ]; then
     why="$why; you stopped the restore"
-  elif [ "$GAVE_UP" = 1 ] && [ "$FOREIGN_LOADED" = 0 ]; then
+  elif [ "$GAVE_UP" = 1 ] && [ "$DRIVE_HOLDS" != "$k" ]; then
     why="$why; no cartridge that holds it was given"
   fi
   printf '%s\n' "$k" >>"$WORK/absent.slices"
@@ -1873,7 +1886,8 @@ unesc() {
 # was restored, and under --no-file-check no check runs, so nothing does.
 tar_status_note() { # <status>
   if [ "$NO_FILE_CHECK" = 1 ]; then
-    note "tar ended with status $1: $(head -n 3 "$WORK/tar.err" 2>/dev/null | tr '\n' ' '). --no-file-check: no check runs, so nothing says what was restored."
+    TAR_FAILED=1
+    note "tar ended with status $1: $(head -n 3 "$WORK/tar.err" 2>/dev/null | tr '\n' ' '). --no-file-check: no check runs, so nothing says what was restored, and the run is incomplete."
   else
     note "tar ended with status $1: $(head -n 3 "$WORK/tar.err" 2>/dev/null | tr '\n' ' '). The per-file check below decides what was restored."
   fi
@@ -2052,6 +2066,7 @@ unit_open() { # <chosen row>
   : >"$WORK/outstart.slices"
   FEEDING=0
   GAVE_UP=0
+  DRIVE_HOLDS=""
   locate_here
 }
 
@@ -2101,16 +2116,36 @@ ranges_of() { # <file of slice numbers>: 1-3, 5
     END { if (have) printf "%s%s", (c++ ? ", " : ""), (first == last ? first : first "-" last) }'
 }
 
+# What to do once the tape holding slices that were not in the drive is loaded,
+# by the mode of the restore that left them out: only a whole-unit restore and a
+# repair have a continuation (the same command), and a restore of several units
+# refuses the directory of one that came out whole (it holds no list).
+absent_remedy() {
+  local d
+  d=$(safe_str "$ABSENT_DEST")
+  case $ABSENT_HOW in
+  path) printf 'give the damaged-file list to --paths-from (--restore --paths-from %s/.tapectl-damaged-files.txt --to %s): --path has no continuation, and the same command is refused, its files are already there. The files of those slices are on the damaged-file list.' "$d" "$d" ;;
+  repair) printf 'run the same command again: the paths of those slices are still on the damaged-file list, and the repair restores them.' ;;
+  *)
+    if [ "$RUN_UNITS" -gt 1 ]; then
+      printf 'run the command again for only the units that did not come out whole, each as --unit NAME --to %s/NAME (the same command is refused for a unit that did: its directory holds no damaged-file list). The files of those slices are on the damaged-file list, and the continuation restores them.' "$(safe_str "$TO")"
+    else
+      printf 'run the same command again: the files of those slices are on the damaged-file list, and the continuation restores them.'
+    fi
+    ;;
+  esac
+}
+
 report_absent() { # <damaged paths file>
   [ -s "$WORK/absent.slices" ] || return 0
   local ranges nh
   # Slices the tape the run's facts describe holds, while another cartridge (or
   # none) is in the drive: they are not on a tape the heir lacks.
   if [ -s "$WORK/outdrive.slices" ]; then
-    say "NOT IN THE DRIVE: slices $(ranges_of "$WORK/outdrive.slices") of $NSL of unit $(safe_str "$U_NAME") (version $U_VER) are on the tape $(safe_str "${LABEL:-the run started on}"), which is not in the drive now (another cartridge, or none, is). Nothing was read from what is in the drive. Load $(safe_str "${LABEL:-that tape}") and run the same command again: the files of those slices are on the damaged-file list, and the continuation restores them."
+    say "NOT IN THE DRIVE: slices $(ranges_of "$WORK/outdrive.slices") of $NSL of unit $(safe_str "$U_NAME") (version $U_VER) are on the tape $(safe_str "${LABEL:-the run started on}"), which is not in the drive now (another cartridge, or none, is). Nothing was read from what is in the drive. Load $(safe_str "${LABEL:-that tape}") and $(absent_remedy)"
   fi
   if [ -s "$WORK/outstart.slices" ]; then
-    say "NOT IN THE DRIVE: slices $(ranges_of "$WORK/outstart.slices") of $NSL of unit $(safe_str "$U_NAME") (version $U_VER) are on the tape $(safe_str "${START_LABEL:-the run started on}"), the one this restore started on, which is not in the drive now. Nothing was read from what is in the drive. Load $(safe_str "${START_LABEL:-that tape}") and run the same command again: the files of those slices are on the damaged-file list, and the continuation restores them."
+    say "NOT IN THE DRIVE: slices $(ranges_of "$WORK/outstart.slices") of $NSL of unit $(safe_str "$U_NAME") (version $U_VER) are on the tape $(safe_str "${START_LABEL:-the run started on}"), the one this restore started on, which is not in the drive now. Nothing was read from what is in the drive. Load $(safe_str "${START_LABEL:-that tape}") and $(absent_remedy)"
   fi
   cat "$WORK/outdrive.slices" "$WORK/outstart.slices" >"$WORK/outall.slices"
   awk 'FILENAME == ARGV[1] { o[$1 + 0] = 1; next } !(($1 + 0) in o)' "$WORK/outall.slices" "$WORK/absent.slices" >"$WORK/absent.other"
@@ -2268,6 +2303,7 @@ restore_one() { # <chosen row> <destination>
     write_damaged_list "$dest" "$name" "$uuid" "$ver" "$WORK/damaged.paths"
     print_damaged "$WORK/damaged.paths" "$ndam" "$list"
     DAMAGED_TOTAL=$((DAMAGED_TOTAL + ndam))
+    ABSENT_HOW=fresh ABSENT_DEST=$dest
     report_absent "$WORK/damaged.paths"
   else
     rm -f -- "$list"
@@ -2480,14 +2516,18 @@ resolve_paths() { # <wanted paths file> <table>
 # damaged.paths), plus what is still damaged. Another unit's list is never
 # touched (returns 2). The list is removed when nothing is left.
 LIST_LEFT=0
+LIST_EXISTED=0 # 1 when the destination held this unit's list before the merge
+ADD_ASKED=0    # 1 for a repair under --no-file-check: what it asked for was not checked, so it goes on the list
 merge_damaged_list() { # <destination> <requested and brought paths file>
   local list="$1/.tapectl-damaged-files.txt" first
   : >"$WORK/list.old"
+  LIST_EXISTED=0
   if [ -f "$list" ]; then
     first=$(head -n 1 "$list" 2>/dev/null || true)
     case $first in
     "#tapectl-damaged-files"$'\t'1$'\t'"unit=$U_NAME"$'\t'"uuid=$U_UUID"$'\t'"version=$U_VER")
       sed -n '2,$p' "$list" | grep -v '^$' >"$WORK/list.old" || true
+      LIST_EXISTED=1
       ;;
     *)
       note "$list is the damaged-file list of another unit or version and is left alone; this run's damaged paths are only printed."
@@ -2499,6 +2539,7 @@ merge_damaged_list() { # <destination> <requested and brought paths file>
     # Nothing is checked, so no path is known to be whole: none leaves the
     # list. A run with the check (or the repair) removes each that passes.
     cp "$WORK/list.old" "$WORK/list.kept"
+    if [ "$ADD_ASKED" = 1 ]; then cat "$2" >>"$WORK/list.kept"; fi
   else
     awk 'FILENAME == ARGV[1] { drop[$0 ""] = 1; next } !(($0 "") in drop)' "$2" "$WORK/list.old" >"$WORK/list.kept"
   fi
@@ -2650,6 +2691,14 @@ restore_paths() { # <destination> <how>
     fi
   else
     note "--no-file-check: the restored files were not checked against the file table."
+    # A hard-linked name whose first name is not here is neither made nor
+    # checked: nothing else would list it.
+    local hk hp
+    while IFS=$'\t' read -r hk _ _ _ _ _ hp _; do
+      [ "$hk" = h ] || continue
+      unesc "$hp"
+      if [ ! -e "$dest/$REPLY" ] && [ ! -L "$dest/$REPLY" ]; then printf '%s\n' "$hp" >>"$WORK/failed.paths"; fi
+    done <"$WORK/wanted.rows"
   fi
   INFLIGHT_TABLE=""
   # A name made from its first name is whole if the check passed it (a name it
@@ -2664,6 +2713,8 @@ restore_paths() { # <destination> <how>
   sort -u "$WORK/want.sorted" "$WORK/brought.paths" >"$WORK/asked.paths"
   if [ "$how" = continue ]; then cat "$WORK/passes.paths" >>"$WORK/asked.paths"; fi
   local merged=0 counted=$ndam
+  ADD_ASKED=0
+  if [ "$NO_FILE_CHECK" = 1 ] && [ "$how" = repair ]; then ADD_ASKED=1; fi
   merge_damaged_list "$dest" "$WORK/asked.paths" || merged=$?
   if [ "$NO_FILE_CHECK" = 1 ] && [ "$how" != path ] && [ "$merged" = 0 ] && [ "$LIST_LEFT" -gt "$ndam" ]; then
     counted=$LIST_LEFT
@@ -2675,14 +2726,19 @@ restore_paths() { # <destination> <how>
       say "DAMAGED: $ndam path(s) were left out or failed the check:"
       head -n 41 "$WORK/damaged.paths" | sed 's/^/  /'
     fi
+    ABSENT_HOW=$how ABSENT_DEST=$dest
     report_absent "$WORK/damaged.paths"
   fi
   DAMAGED_TOTAL=$((DAMAGED_TOTAL + counted))
   if [ "$NO_FILE_CHECK" = 1 ] && [ "$how" != path ] && [ "$merged" = 0 ] && [ "$LIST_LEFT" -gt 0 ]; then
-    say "The damaged-file list in $dest is kept with $LIST_LEFT path(s): --no-file-check judges nothing, so no path leaves it. The same run without --no-file-check (or the repair, --paths-from, on a tape that holds them) removes each path that passes."
+    if [ "$LIST_EXISTED" = 1 ]; then
+      say "The damaged-file list in $dest is kept with $LIST_LEFT path(s): --no-file-check judges nothing, so no path leaves it. The same run without --no-file-check (or the repair, --paths-from, on a tape that holds them) removes each path that passes."
+    else
+      say "The damaged-file list in $dest is written with $LIST_LEFT path(s): --no-file-check checked none of them, so none is known whole. The same run without --no-file-check removes each path that passes."
+    fi
   elif [ "$ndam" -eq 0 ] && [ "$how" != path ] && [ "$merged" = 0 ]; then
     if [ "$LIST_LEFT" -eq 0 ]; then
-      say "The damaged-file list in $dest is removed: nothing is left to repair."
+      if [ "$LIST_EXISTED" = 1 ]; then say "The damaged-file list in $dest is removed: nothing is left to repair."; fi
     else
       say "The damaged-file list in $dest is kept with the $LIST_LEFT path(s) this run did not name."
     fi
@@ -2800,6 +2856,7 @@ do_restore() {
   else
     choose_units
     n=$(wc -l <"$WORK/chosen.txt" | tr -d ' ')
+    RUN_UNITS=$n
     # A unit directory that is not empty and holds no list is refused before
     # any unit is touched, while the lists of its siblings are still there to
     # be named (a unit continued first would have removed its own).
@@ -2827,6 +2884,10 @@ do_restore() {
   fi
   if [ "$DAMAGED_TOTAL" -gt 0 ]; then
     say "RESTORE INCOMPLETE: $DAMAGED_TOTAL path(s) are damaged or left out; restore them from another copy (the list is the one repair: give it to --paths-from on a tape that holds the same version)."
+    return 1
+  fi
+  if [ "$TAR_FAILED" = 1 ]; then
+    say "RESTORE INCOMPLETE: tar ended with a status other than 0, and --no-file-check runs no check to say what it restored. Run again without --no-file-check to learn which files are whole."
     return 1
   fi
   if [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; then

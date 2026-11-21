@@ -700,3 +700,354 @@ fn a_checked_continuation_removes_every_listed_path_that_passes() {
         "{all}"
     );
 }
+
+// ---- item 301: a flagged run whose tar failed is incomplete (#596 heir2-C1) ----
+
+/// The unit B tape with tar standing in as one that exits 2 after the real
+/// tar restored into `dest`.
+fn failing_tar_heir() -> (Heir, std::path::PathBuf) {
+    let h = Heir::of(two());
+    let dest = h.dest("out");
+    let real = heir::host_tool("tar").unwrap();
+    h.put_tool("tar", &heir::failing_tar(&real, &dest));
+    (h, dest)
+}
+
+/// Item 301, a fresh run: the flag skips the check, not tar's report.
+#[test]
+fn a_flagged_fresh_restore_whose_tar_failed_is_incomplete() {
+    let (h, dest) = failing_tar_heir();
+    let kb = key(&h, Who::TenantB);
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dstr(&dest),
+        "--no-file-check",
+    ]);
+    let all = o.all();
+    assert!(all.contains("tar ended with status 2"), "{all}");
+    assert!(all.contains("RESTORE INCOMPLETE"), "{all}");
+    assert!(!all.contains("RESTORE COMPLETE"), "{all}");
+    assert_eq!(o.code, 1, "{all}");
+}
+
+/// Item 301, a `--path` run.
+#[test]
+fn a_flagged_path_restore_whose_tar_failed_is_incomplete() {
+    let (h, dest) = failing_tar_heir();
+    let kb = key(&h, Who::TenantB);
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--unit",
+        heir::UNIT_B,
+        "--path",
+        "notes.txt",
+        "--to",
+        dstr(&dest),
+        "--no-file-check",
+    ]);
+    let all = o.all();
+    assert!(all.contains("tar ended with status 2"), "{all}");
+    assert!(all.contains("RESTORE INCOMPLETE"), "{all}");
+    assert!(!all.contains("RESTORE COMPLETE"), "{all}");
+    assert_eq!(o.code, 1, "{all}");
+}
+
+/// Item 301, a repair (its list is in `--to`, as the documented form has it).
+#[test]
+fn a_flagged_repair_whose_tar_failed_is_incomplete() {
+    let t = two();
+    let (h, dest) = failing_tar_heir();
+    let good = Heir::of(t);
+    let kb = key(&good, Who::TenantB);
+    let o = good.run(&["--restore", "--key", &kb, "--to", dstr(&dest)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    write_list(t, heir::UNIT_B, &dest, &["notes.txt"]);
+    let list = dest.join(".tapectl-damaged-files.txt");
+    let kb = key(&h, Who::TenantB);
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dstr(&dest),
+        "--paths-from",
+        dstr(&list),
+        "--no-file-check",
+    ]);
+    let all = o.all();
+    assert!(all.contains("tar ended with status 2"), "{all}");
+    assert!(all.contains("RESTORE INCOMPLETE"), "{all}");
+    assert_eq!(o.code, 1, "{all}");
+    assert_eq!(damaged_list(&dest), vec!["notes.txt".to_string()], "{all}");
+}
+
+/// Item 301's positive control: a flagged whole restore whose tar exited 0
+/// still ends complete, exit 0 (`scripts/mhvtl-verify-gate.sh` expects it).
+#[test]
+fn a_flagged_whole_restore_whose_tar_exited_zero_is_complete() {
+    let h = Heir::of(two());
+    let kb = key(&h, Who::TenantB);
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dstr(&dest),
+        "--no-file-check",
+    ]);
+    let all = o.all();
+    assert!(all.contains("RESTORE COMPLETE"), "{all}");
+    assert_eq!(o.code, 0, "{all}");
+}
+
+// ---- #596 heir2-6: what to do about slices not in the drive ----
+
+/// `--path` has no continuation: "run the same command again" dies "already
+/// in DEST". The remedy named is `--paths-from` with the damaged-file list.
+#[test]
+fn not_in_the_drive_for_a_path_run_names_paths_from_not_the_same_command() {
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    h.shelve_blank("BLANK");
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    // Slice 1 (the first name) is asked for first; the blank cartridge is
+    // loaded and refused, and `notes.txt`, in a slice of the start tape, is
+    // then not read from the drive.
+    let o = h.run_prompted(
+        &[
+            "--restore",
+            "--key",
+            &ka,
+            "--unit",
+            heir::UNIT_A,
+            "--path",
+            "alpha-unit-small.txt",
+            "--path",
+            "notes.txt",
+            "--to",
+            dstr(&dest),
+        ],
+        |k, _| match k {
+            1 => {
+                h.load("BLANK");
+                Some("done".into())
+            }
+            _ => panic!("asked {k} times"),
+        },
+    );
+    let all = o.all();
+    assert!(all.contains("NOT IN THE DRIVE"), "{all}");
+    assert!(all.contains("--paths-from"), "{all}");
+    assert!(!all.contains("run the same command again"), "{all}");
+    assert!(all.contains("Load HEIR02"), "{all}");
+}
+
+/// `--all` with a unit that came out whole: the same command is refused for
+/// that unit's directory. The remedy names the units that did not.
+#[test]
+fn not_in_the_drive_for_all_names_only_the_units_that_did_not_come_out_whole() {
+    let mut shape = Shape::two();
+    shape.units[0].2 = true;
+    shape.span = Some(heir::Span {
+        min_copies: 1,
+        warns: vec![Some(0), None],
+    });
+    let t = Tape::build_series(&shape);
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    h.shelve_blank("BLANK");
+    let dest = h.dest("out");
+    let ko = key(&h, Who::Operator);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ko, "--all", "--to", dstr(&dest)],
+        |_, _| {
+            h.load("BLANK");
+            Some("done".into())
+        },
+    );
+    let all = o.all();
+    assert!(all.contains("NOT IN THE DRIVE"), "{all}");
+    assert!(all.contains("did not come out whole"), "{all}");
+}
+
+// ---- #596 heir2-7: a repair into a directory that holds no list ----
+
+/// The list of unit A at a path of its own, for `--paths-from` into a `--to`
+/// that holds none.
+fn list_outside(h: &Heir, t: &Tape, paths: &[&str]) -> std::path::PathBuf {
+    let d = h.dest("lists");
+    std::fs::create_dir_all(&d).unwrap();
+    write_list(t, heir::UNIT_A, &d, paths);
+    d.join(".tapectl-damaged-files.txt")
+}
+
+/// A flagged repair whose `--to` holds no list checked nothing: it neither
+/// says a list is removed (none was there) nor ends COMPLETE; what it asked
+/// for goes on a list a checked run can judge.
+#[test]
+fn a_flagged_repair_into_a_directory_with_no_list_is_not_complete() {
+    let t = span2();
+    let h = Heir::of(&t[0]);
+    let ka = key(&h, Who::TenantA);
+    let list = list_outside(&h, &t[0], &["alpha-unit-small.txt"]);
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dstr(&dest),
+        "--paths-from",
+        dstr(&list),
+        "--no-file-check",
+    ]);
+    let all = o.all();
+    assert!(
+        !all.contains("is removed: nothing is left to repair"),
+        "{all}"
+    );
+    assert!(!all.contains("RESTORE COMPLETE"), "{all}");
+    assert_eq!(o.code, 1, "{all}");
+    assert!(dest.join("alpha-unit-small.txt").is_file(), "{all}");
+    assert!(
+        damaged_list(&dest).contains(&"alpha-unit-small.txt".to_string()),
+        "{all}"
+    );
+}
+
+/// The same repair with the check on says nothing of a list that was never
+/// there, and ends complete.
+#[test]
+fn a_checked_repair_into_a_directory_with_no_list_does_not_claim_to_remove_one() {
+    let t = span2();
+    let h = Heir::of(&t[0]);
+    let ka = key(&h, Who::TenantA);
+    let list = list_outside(&h, &t[0], &["alpha-unit-small.txt"]);
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dstr(&dest),
+        "--paths-from",
+        dstr(&list),
+    ]);
+    let all = o.all();
+    assert!(
+        !all.contains("is removed: nothing is left to repair"),
+        "{all}"
+    );
+    assert!(all.contains("RESTORE COMPLETE"), "{all}");
+    assert_eq!(o.code, 0, "{all}");
+}
+
+/// A hard-linked name whose first name is on a cartridge not given is neither
+/// made nor, before this, listed under the flag: it is listed.
+#[test]
+fn a_flagged_repair_lists_a_hard_link_whose_first_name_is_absent() {
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    let ka = key(&h, Who::TenantA);
+    let list = list_outside(&h, &t[0], &["alpha-unit-small.txt"]);
+    let dest = h.dest("out");
+    let o = h.run_prompted(
+        &[
+            "--restore",
+            "--key",
+            &ka,
+            "--to",
+            dstr(&dest),
+            "--paths-from",
+            dstr(&list),
+            "--no-file-check",
+        ],
+        |_, _| Some("done".into()),
+    );
+    let all = o.all();
+    assert!(
+        damaged_list(&dest).contains(&"alpha-unit-small.txt".to_string()),
+        "{all}"
+    );
+    assert_eq!(o.code, 1, "{all}");
+}
+
+// ---- #596 heir2-8: what the probe found on `done` ----
+
+fn span3() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::one("none");
+        shape.span = Some(heir::Span {
+            min_copies: 1,
+            warns: vec![Some(0), Some(0), None],
+        });
+        Tape::build_series(&shape)
+    })
+}
+
+/// `done` typed with the cartridge that holds the asked slice in the drive
+/// (after another cartridge was taken, HOME_CART 0): the reason says what the
+/// probe found, not that the cartridge does not hold it.
+#[test]
+fn done_with_the_cartridge_that_holds_the_slice_in_the_drive_says_so() {
+    let t = span3();
+    let h = Heir::of_series(&[&t[2], &t[0], &t[1]]);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, _| match k {
+            1 => {
+                h.load("HEIR01");
+                Some(String::new())
+            }
+            2 => {
+                h.load("HEIR02");
+                Some("done".into())
+            }
+            _ => panic!("asked {k} times"),
+        },
+    );
+    let all = o.all();
+    assert!(
+        !all.contains("the cartridge in the drive does not hold it"),
+        "{all}"
+    );
+    assert!(
+        all.contains("the cartridge in the drive does hold it"),
+        "{all}"
+    );
+}
+
+/// `done` with a refused cartridge in the drive: the reason keeps its suffix,
+/// "no cartridge that holds it was given", which is true there.
+#[test]
+fn done_with_a_refused_cartridge_keeps_the_no_cartridge_was_given_suffix() {
+    let t = span2();
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    h.shelve_blank("BLANK");
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, _| match k {
+            1 => {
+                h.load("BLANK");
+                Some("done".into())
+            }
+            _ => panic!("asked {k} times"),
+        },
+    );
+    let all = o.all();
+    assert!(
+        all.contains("slice 1: this tape's plan does not hold it (it is on another cartridge); no cartridge that holds it was given"),
+        "{all}"
+    );
+}
