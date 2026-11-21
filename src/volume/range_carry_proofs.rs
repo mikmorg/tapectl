@@ -1230,3 +1230,64 @@ fn the_consent_names_every_slice_the_source_holds_and_the_one_it_holds_alone() {
         "{facts}"
     );
 }
+
+const S8: &str = "kumquat-zspan-sierra";
+const S8_TAPES: [&str; 3] = ["SPL-1", "SPL-2", "SPL-3"];
+
+/// 8-C2: a version of six slices at a copy target of 1 over three tapes, each
+/// fully read back: 1-2, 3-4 and 5-6.
+fn three_tape_span_home() -> Home {
+    let mut h = Home::new(None, 1, "64K");
+    h.unit(TENANT_ONE, S8, files("sierra-reel", &[50_000; 6], 13));
+    h.stage(S8);
+    assert_eq!(num_slices(&h.conn, S8), 6);
+    for label in S8_TAPES {
+        h.volume(label);
+    }
+    write_full(&mut h, S8_TAPES[0], Warn::InSlice(S8, 2));
+    write_full(&mut h, S8_TAPES[1], Warn::InSlice(S8, 4));
+    write_full(&mut h, S8_TAPES[2], Warn::Never);
+    assert_eq!(
+        write::recorded_ranges(&h.conn, S8_TAPES[2]).unwrap(),
+        [range(S8, 5, 6)]
+    );
+    h
+}
+
+/// 8-C2: slices already staged that the write would not plan (their copies
+/// meet the floor and no source carries them) cannot make the run the
+/// rewrite writes break, so they do not refuse the read. Tape 1's slices
+/// 1-2 are staged by `read-slices`, then tape 3 (5-6) is rewritten: the write
+/// plans only 5-6, one unbroken run, and the join refusal ("compact the
+/// volume that holds the slices between them") is wrong for it. A slice that
+/// WOULD be planned (below the floor) still refuses, naming the staging.
+#[test]
+fn staged_slices_the_write_would_not_plan_do_not_refuse_a_rewrite() {
+    let mut h = three_tape_span_home();
+    let mut store = copy_of(&h.tapes[S8_TAPES[0]]);
+    write::read_slices(
+        &h.conn,
+        &h.config,
+        S8_TAPES[0],
+        S8,
+        None,
+        &mut store,
+        ContactSite::new(
+            &h.config,
+            Operation::VolumeReadSlices,
+            DEVICE,
+            Medium::NoBackend,
+        ),
+    )
+    .unwrap();
+    let ran = rewrite_with(&mut h, S8_TAPES[2], "SPL-3R", false);
+    let report = ran
+        .result
+        .unwrap_or_else(|e| panic!("rewrite: {e}\nsteps: {:?}", ran.log));
+    assert_eq!(report.slices, 2, "the two slices the source held");
+    assert_eq!(
+        write::recorded_ranges(&h.conn, "SPL-3R").unwrap(),
+        [range(S8, 5, 6)],
+        "the run the source held, and only it"
+    );
+}

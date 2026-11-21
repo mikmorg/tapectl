@@ -8536,7 +8536,7 @@ fn compact_read_contacted(
         )));
     }
 
-    refuse_runs_that_do_not_join(conn, label, &live_slices)?;
+    refuse_runs_that_do_not_join(conn, config, label, &live_slices)?;
 
     let staging_dir = &config.staging.directory;
     let compact_dir = std::path::Path::new(staging_dir).join(format!("compact-{label}"));
@@ -8659,24 +8659,59 @@ fn compact_read_contacted(
 
 /// Refuse, before anything is read, a read that would leave one staging with
 /// runs of slices that do not join (T5.3; ADR-0012 item 122): the slices
-/// `live` holds of a set, with those of it already staged (another source's
-/// compact-read, a `read-slices`), must be one unbroken run, because a
-/// destination holds at most one unbroken range of a stage set and writes the
-/// run it was staged as. Names the staging.
+/// `live` holds of a set, with those of it already staged that the write
+/// would plan beside them, must be one unbroken run, because a destination
+/// holds at most one unbroken range of a stage set and writes the run it was
+/// staged as. The slices the write would plan are the ones another source
+/// carries (staged under `compact-LABEL`) and the ones short of the copy
+/// floor ([`plan_span_set`]); a slice already staged whose copies meet the
+/// floor and that no source carries is not written, so it cannot break the
+/// run (#598 8-C2). Names the staging.
 fn refuse_runs_that_do_not_join(
     conn: &Connection,
+    config: &Config,
     label: &str,
     live: &[RecoverySlice],
 ) -> Result<()> {
     let sets: std::collections::BTreeSet<i64> = live.iter().map(|s| s.stage_set_id).collect();
     for set in sets {
-        let mut numbers: std::collections::BTreeSet<i64> = conn
+        let (unit_uuid, unit_status): (String, String) = conn.query_row(
+            "SELECT u.uuid, u.status FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id WHERE ss.id = ?1",
+            params![set],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let unit = queries::get_unit_by_uuid(conn, &unit_uuid)?
+            .ok_or_else(|| TapectlError::UnitNotFound(unit_uuid.clone()))?;
+        let floor = coverage::copy_floor(
+            config,
+            crate::policy::resolve(conn, config, &unit)?.copy_floor_base(),
+            &unit_status,
+        );
+        let copies: std::collections::BTreeMap<i64, i64> = coverage::slice_copies(conn, set)?
+            .into_iter()
+            .map(|s| (s.slice_number, s.copies))
+            .collect();
+        let staged: Vec<(i64, String)> = conn
             .prepare(
-                "SELECT slice_number FROM stage_slices
+                "SELECT slice_number, staging_path FROM stage_slices
                  WHERE stage_set_id = ?1 AND staging_path IS NOT NULL",
             )?
-            .query_map(params![set], |r| r.get(0))?
+            .query_map(params![set], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
+        let mut numbers: std::collections::BTreeSet<i64> = staged
+            .into_iter()
+            .filter(|(n, path)| {
+                let carried = Path::new(path)
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("compact-"));
+                carried || copies.get(n).copied().unwrap_or(0) < floor
+            })
+            .map(|(n, _)| n)
+            .collect();
         for s in live.iter().filter(|s| s.stage_set_id == set) {
             numbers.insert(conn.query_row(
                 "SELECT slice_number FROM stage_slices WHERE id = ?1",
