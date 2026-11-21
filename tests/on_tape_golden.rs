@@ -397,8 +397,7 @@
 //! front index, the seal marker (full and short), the file table's text and the id map's
 //! text, File 1 (the guide of an LTO-8 tape and of an LTO-6 tape: it differs by generation)
 //! and RECOVERY.md (a tenant's envelope, with every compression in it, and the operator's,
-//! with the `catalog.db` section `build()` appends to it). RESTORE.sh comes last, pinned by
-//! its sha256.
+//! with the `catalog.db` section `build()` appends to it), and RESTORE.sh by its sha256.
 
 use tapectl::idmap::{self, IdKind, IdRow};
 use tapectl::volume::filetable::{self, Kind, Row};
@@ -5947,4 +5946,31 @@ fn layout3_recovery_md_operator_catalog_db_section() {
         tapectl::volume::build::RECOVERY_CATALOG_DB,
         RECOVERY_CATALOG_DB_SECTION,
     );
+}
+
+/// RESTORE.sh's sha256: the heir's script, `src/volume/heir/RESTORE.sh`, which `build()`
+/// writes to every tape as File 2 byte for byte (`heir::RESTORE_SH`, `include_str!`). Pinned
+/// by its hash, not its text (it is long, and the file in the tree is the text): a change to
+/// it is a change to every tape's heir path, a CTO decision, and proved in the `tapectl-u26`
+/// container as uid 1000 and by the gate's heir legs before this moves.
+const RESTORE_SH_SHA256: &str = "96d4a663afaae7798a0cd07a18264c26f172425c71b3e9754bd6b409b0c04df4";
+
+#[test]
+fn layout3_restore_sh_sha256() {
+    use sha2::{Digest, Sha256};
+    let script = tapectl::volume::heir::RESTORE_SH;
+    let got: String = Sha256::digest(script.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if got != RESTORE_SH_SHA256 {
+        let path =
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("golden-restore-sh.actual");
+        let _ = std::fs::write(&path, script);
+        panic!(
+            "the on-tape bytes of RESTORE.sh changed (sha256 {got}, pinned {RESTORE_SH_SHA256}): \
+             a CTO decision, never a re-pin by an agent. The script is in {}",
+            path.display()
+        );
+    }
 }
