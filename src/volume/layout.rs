@@ -1096,10 +1096,19 @@ like a damaged tape and is not. The by-id name is the steadiest to use,
 because it does not change when the numbering does: it looks like
 `/dev/tape/by-id/scsi-XXXXXXXX-nst` (an example: use your own).
 
-A wrong device does not always fail loudly: if another tape is loaded in
-it, the commands below will succeed and recover the WRONG volume. File 0
-names the volume this tape carries, and `./RESTORE.sh --info` prints it
-("Tape: ..."): compare it with the label you meant.
+With several drives, ask each one whether it has a cartridge loaded:
+
+    mt -f /dev/nst0 status
+
+The one that says `ONLINE` (or does not say `DR_OPEN`) has a cartridge
+in it; one that is empty says `DR_OPEN`. Then confirm it is yours: a wrong
+device does not always fail loudly: if another tape is loaded in it, the
+commands below will succeed and recover the WRONG volume. File 0 names the
+volume this tape carries, and `./RESTORE.sh --info` prints it on its
+"Tape:" line: compare it with the label on the cartridge you meant. A drive that is
+not your own may hold someone else's tape: on a drive you are not sure of,
+run only read-only commands (`mt status` is one), and never a rewind, a
+read or a write.
 
 `mt` and `dd` take the device in their own words (`mt -f DEVICE`,
 `dd if=DEVICE`). RESTORE.sh reads it from the environment variable
@@ -4712,6 +4721,28 @@ verify any entry by hashing the file it describes.
             ladder.contains("`mt -f /dev/nst0 rewind`, then `mt -f /dev/nst0 fsf 3`"),
             "{ladder}"
         );
+    }
+
+    /// #548 T6.2-1: with several drives, how to tell which holds the tape,
+    /// with read-only commands only.
+    #[test]
+    fn t62_1_file_1_says_how_to_tell_which_drive_holds_the_tape() {
+        let g = generate_system_guide_v2_for_media("DEV1", 12, "LTO-6");
+        let dev = guide_section(&g, "Which device?");
+        let f = flat_text(dev);
+        assert!(
+            dev.lines()
+                .any(|l| l.trim_start().starts_with("mt -f /dev/nst0 status")),
+            "{dev}"
+        );
+        for needle in [
+            "has a cartridge loaded",
+            "\"Tape:\" line",
+            "may hold someone else's tape",
+            "only read-only commands",
+        ] {
+            assert!(f.contains(needle), "{needle:?}: {f}");
+        }
     }
 
     /// #477 item 6: `eod` and `bsfm 2` explained, and which file is last.
