@@ -173,6 +173,10 @@ fn fenced(section: &str) -> Vec<Vec<String>> {
 /// `the_zero_strip_recipe_keeps_interior_zero_bytes_and_decrypts`.
 const OWNED_ELSEWHERE: &[(&str, &str)] = &[
     (
+        "The short way",
+        "layout.rs: t62_4_file_1_opens_with_the_short_way_and_its_commands_are_the_recovery_sections (every command line is a line of \"Automated Recovery (recommended)\", which this file runs)",
+    ),
+    (
         "The Heir Kit's catalogue (catalog.db.age)",
         "layout.rs: reread4_item1_the_heir_kits_catalogue_opens_and_the_queries_run",
     ),

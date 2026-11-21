@@ -690,6 +690,33 @@ pub fn generate_system_guide_v2_for_media(
     format!(
         r#"# tapectl Archival Volume Recovery Guide
 
+## The short way
+
+If everything goes right, these commands do the whole job. Each says which
+section explains it; if one fails, or a check does not pass, read that
+section, and "Start here" below it. `/dev/nst0` is an example: "Which
+device?" says how to find your drive.
+
+Set the drive to the tape's block size and read RESTORE.sh, File 2, off the
+tape ("Automated Recovery (recommended)" explains each line):
+
+    mt -f /dev/nst0 setblk 524288
+    mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 2
+    dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE.sh
+    chmod +x RESTORE.sh
+
+See what is on the tape, with no key ("Automated Recovery (recommended)"):
+
+    ./RESTORE.sh --info
+
+Restore every unit your key opens to an empty directory; `YOUR_KEY.age.key`
+is your key file ("Which file is your key"), and the escrow or operator key
+opens every unit on the tape, a tenant's key only that tenant's:
+
+    ./RESTORE.sh --restore --key YOUR_KEY.age.key --all --to /destination
+
+Then check that it got everything: "Did the restore get everything?".
+
 ## Volume: {label}
 
 This document describes how to recover data from this tape without
@@ -4758,6 +4785,43 @@ verify any entry by hashing the file it describes.
             f.contains("lists (once for each unit and version, with the envelopes that list it named on its line"),
             "{f}"
         );
+    }
+
+    /// #548 T6.2-4: a short block at the very top of File 1: the commands
+    /// that do the whole job, each pointing at the section that explains it,
+    /// and nothing the rest of File 1 does not say (every command line of it
+    /// is a line of "Automated Recovery (recommended)").
+    #[test]
+    fn t62_4_file_1_opens_with_the_short_way_and_its_commands_are_the_recovery_sections() {
+        let g = generate_system_guide_v2_for_media("DEV1", 12, "LTO-6");
+        let titles: Vec<&str> = g.lines().filter(|l| l.starts_with("## ")).collect();
+        assert_eq!(titles[0], "## The short way", "{titles:?}");
+        assert!(titles[1].starts_with("## Volume: "), "{titles:?}");
+        assert_eq!(titles[2], "## Start here", "{titles:?}");
+        let short = guide_section(&g, "The short way");
+        let auto = guide_section(&g, "Automated Recovery (recommended)");
+        let cmds: Vec<&str> = short
+            .lines()
+            .filter(|l| l.starts_with("    "))
+            .map(str::trim)
+            .collect();
+        assert_eq!(cmds.len(), 6, "{short}");
+        for c in &cmds {
+            assert!(
+                auto.lines().any(|l| l.trim() == *c),
+                "{c:?} is not a line of Automated Recovery"
+            );
+        }
+        let f = flat_text(short);
+        for section in [
+            "Which device?",
+            "Automated Recovery (recommended)",
+            "Which file is your key",
+            "Did the restore get everything?",
+            "Start here",
+        ] {
+            assert!(f.contains(&format!("\"{section}\"")), "{section}: {f}");
+        }
     }
 
     /// #477 item 6: `eod` and `bsfm 2` explained, and which file is last.
