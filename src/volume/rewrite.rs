@@ -919,11 +919,37 @@ fn partly_held_versions(
             .map(i64::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        // Every slice the source holds, whoever else holds it too (#598 8-4):
+        // the consent says which slices of the version leave with the source.
+        let mut on_source_numbers: Vec<i64> = conn
+            .prepare(
+                "SELECT DISTINCT sl.slice_number FROM write_positions wp
+                 JOIN writes w ON w.id = wp.write_id
+                 JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                 WHERE w.volume_id = ?1 AND w.stage_set_id = ?2 AND wp.status = 'written'
+                   AND w.status IN ('completed', 'range')
+                 ORDER BY sl.slice_number",
+            )?
+            .query_map(params![source_id, set], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        on_source_numbers.sort_unstable();
+        let held_here = if on_source_numbers == held {
+            format!("slice(s) {which} of {total}, which \"{source}\" holds of this version")
+        } else {
+            format!(
+                "slice(s) {} of {total}, which \"{source}\" holds of this version, and slice(s) \
+                 {which} are on no other volume",
+                on_source_numbers
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         out.insert(
             (unit, version),
             format!(
-                "slice(s) {which} of {total}, which \"{source}\" holds of this version; the \
-                 rest is on {}",
+                "{held_here}; the rest is on {}",
                 if others.is_empty() {
                     "no other volume".to_string()
                 } else {

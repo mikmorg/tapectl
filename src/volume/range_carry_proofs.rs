@@ -1183,3 +1183,50 @@ fn a_rewrite_that_would_leave_a_version_on_two_generations_is_refused_before_the
     assert_eq!(ran.log, ["read", "write_preflight"], "no erase");
     assert_eq!(volume_status(&h.conn, R1[1]), "sealed");
 }
+
+// ── #598: the low findings of area 8 ──
+
+const P8: &str = "kumquat-zspan-papa";
+const P8_TAPES: [&str; 3] = ["OVL-A", "OVL-B", "OVL-C"];
+
+/// Four slices at a copy target of 2 over three cartridges, every tape fully
+/// read back: tape A holds a range 1-3, tape B a range 1-2, tape C the owed
+/// 3-4. Slice 3 is on A and C, slice 4 only on C.
+fn overlapping_copies_home() -> Home {
+    let mut h = Home::new(None, 2, "64K");
+    h.unit(TENANT_ONE, P8, files("papa-reel", &[50_000; 4], 11));
+    h.stage(P8);
+    assert_eq!(num_slices(&h.conn, P8), 4);
+    for label in P8_TAPES {
+        h.volume(label);
+    }
+    write_full(&mut h, P8_TAPES[0], Warn::InSlice(P8, 3));
+    write_full(&mut h, P8_TAPES[1], Warn::InSlice(P8, 2));
+    write_full(&mut h, P8_TAPES[2], Warn::Never);
+    h
+}
+
+/// 8-4: the consent says which slices the source holds, not only the ones it
+/// holds alone (§5.4: "which slices ... and the volumes that hold the rest").
+/// Tape C holds slices 3 and 4, and tape A also holds slice 3: the sentence
+/// names 3, 4 as C's, and says 4 is the one no other volume holds.
+#[test]
+fn the_consent_names_every_slice_the_source_holds_and_the_one_it_holds_alone() {
+    let h = overlapping_copies_home();
+    assert_eq!(
+        write::recorded_ranges(&h.conn, P8_TAPES[2]).unwrap(),
+        [range(P8, 3, 4)],
+        "tape C holds the owed 3-4"
+    );
+    let plan = rewrite::plan(&h.conn, &h.config, &options(P8_TAPES[2], "OVL-CR")).unwrap();
+    let facts = plan.typed_facts(P8_TAPES[2], "OVL-CR").join("\n");
+    assert!(
+        facts.contains(&format!("\"{}\" holds of this version", P8_TAPES[2])),
+        "{facts}"
+    );
+    assert!(facts.contains("slice(s) 3, 4 of 4, which"), "{facts}");
+    assert!(
+        facts.contains("and slice(s) 4 are on no other volume"),
+        "{facts}"
+    );
+}
