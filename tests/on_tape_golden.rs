@@ -395,7 +395,9 @@
 //! target directory and names that file. Every Layout 3 pin so far holds its whole text.
 //! Pinned here: File 0, the MANIFEST (a whole unit, a range block, the operator envelope), the
 //! front index, the seal marker (full and short), the file table's text and the id map's
-//! text. RESTORE.sh, File 1 and RECOVERY.md come after a CTO ruling.
+//! text, File 1 (the guide of an LTO-8 tape and of an LTO-6 tape: it differs by generation)
+//! and RECOVERY.md (a tenant's envelope, with every compression in it, and the operator's).
+//! RESTORE.sh comes last, pinned by its sha256 after a CTO ruling.
 
 use tapectl::idmap::{self, IdKind, IdRow};
 use tapectl::volume::filetable::{self, Kind, Row};
@@ -5583,4 +5585,343 @@ fn layout3_recovery_md_tenant_envelope() {
     let units = vec![whole, zstd, range, gzip];
     let text = generate_recovery_md_at("L8-0001", "alpha", &units, &[], "2026-11-21");
     assert_pinned_text("recovery-tenant", &text, RECOVERY_TENANT);
+}
+
+const RECOVERY_OPERATOR: &str = r####"# Recovery Guide for operator
+
+Volume: L8-0001
+Date: 2026-11-21
+
+This tape holds age-encrypted pieces of tar archives: each unit is one tar
+stream, cut into slices that begin where a file begins, and each slice is
+encrypted on its own. With your age key(s) and the standard tools (`mt`,
+`dd`, `truncate`, `age`, `tar`, `sha256sum`) you can recover your data by
+hand — no tapectl required. The automated `RESTORE.sh` (tape file 2) does
+the same for you, and checks every restored file against the unit's file
+table; use it if you can.
+
+The commands below are written for the directory this envelope was
+unpacked in (`env/` in the guide's steps): run them from the directory
+that holds `env/`. Each unit's block makes a work directory and a
+destination of its own, so the blocks can be run one after another in
+one place and never read each other's slices.
+
+## Which key
+
+The key that opened this envelope is
+not necessarily the key that opens the slices below.
+The envelope was sealed when the tape was written; each slice was sealed
+earlier, when it was staged. If the keys were rotated in between, the
+slices need an older key. `age` accepts several keys at once and uses
+whichever one matches, so pass every key you hold:
+
+```bash
+age -d -i OLD.age.key -i NEW.age.key slice.1.age > slice.1.tar
+```
+
+Name only key files that exist:
+one unreadable `-i` path fails the whole command.
+If every key fails with `no identity matched any of the recipients` (`rage`:
+`No matching keys found`), the
+slice was sealed to a key you have not supplied — the data is not corrupt.
+`age-keygen -y YOUR_KEY.age.key` shows whether a file is a key at all (it
+prints that one key's public `age1...` line, or an error), and the guide on
+this tape (File 1, "Which file is your key") tells a bad key file from a
+tape of another installation.
+
+## Units in this envelope
+
+| Unit | Snapshot | Slices | Tape files |
+|------|----------|--------|------------|
+| photos/2019 | v7 | 2 | 9..10 |
+| ledgers/fy24 | v1 | 1 | 11..11 |
+
+## Where this tape ended
+
+This tape may end before the last tape file the write planned, because the
+drive reached the end of its medium. The table above is the plan, written
+before any slice was. A unit that does not fit continues on the next
+cartridge: this tape then holds the first slices of it (a range), and the
+rest are on another tape.
+
+The seal marker, the last file on the tape, says where it ended: its
+`ended_after` is the last tape file before the seal, and every tape file
+after `ended_after` is not on this tape. To read it by hand, with no key
+(`/dev/nst0` below is an example — run `ls -l /dev/tape/by-id/` and
+substitute your own drive, or you may read a different tape):
+
+```bash
+mt -f /dev/nst0 setblk 524288
+mt -f /dev/nst0 eod          # GNU mt: eom
+mt -f /dev/nst0 bsfm 2
+dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(file_count|ended_after) ='
+```
+
+When a slice of a unit (its tape file in the table above) is after
+`ended_after`, it is on another tape: never read it from this one. The files
+whose slices are all here are restored by the steps below with the slices that
+are; the others need the other tape. The index (`index/units.tsv`, below)
+and `RESTORE.sh --where UNIT` name the tapes that hold them. `RESTORE.sh`
+(tape file 2) does all of this by itself: `--info` and `--verify` report where
+the tape ended.
+
+## photos/2019
+
+UUID: `11111111-2222-3333-4444-555555555555`  ·  snapshot v7  ·  40960 bytes of tar stream
+
+This (the operator's) envelope lists the unit but holds its file table only
+as rows of `catalog.db`; the unit's own tenant's envelope has it as a file.
+
+Put the drive in fixed 512KB block mode, then read, trim, verify and
+decrypt each slice, in order: the tape is wound to the first slice
+once, and each read that finishes leaves it at the start of the next
+file. A `dd` that stops with an error ("Input/output error") leaves
+the head inside that file instead: `mt rewind`, then `mt fsf` to the
+tape file of the slice you want next, which its `# Slice` line gives.
+`/dev/nst0` below is an example — run `ls -l /dev/tape/by-id/` and
+substitute your own drive, or you may read a different tape. The block
+makes `work/` and a directory for this unit and removes it when the unit is
+restored: it needs room for the whole unit's slices (its stream size) once,
+and the destination needs the same again.
+
+```bash
+mkdir -p work/11111111_v7_s42 /destination/11111111_v7_s42
+mt -f /dev/nst0 setblk 524288
+
+# On each `age -d` line, add `-i <file>` for every other key you hold
+# (see "Which key" above).
+
+# Slice 1 — tape file 9, 20512 bytes
+mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 9
+dd if=/dev/nst0 bs=512k of=work/11111111_v7_s42/slice.1.age
+truncate -s 20512 work/11111111_v7_s42/slice.1.age
+echo "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  work/11111111_v7_s42/slice.1.age" | sha256sum -c - && age -d -i YOUR_KEY.age.key work/11111111_v7_s42/slice.1.age > work/11111111_v7_s42/slice.1.tar && rm work/11111111_v7_s42/slice.1.age
+test $(wc -c < work/11111111_v7_s42/slice.1.tar) -eq 20480 && echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  work/11111111_v7_s42/slice.1.tar" | sha256sum -c -
+
+# Slice 2 — tape file 10, 20512 bytes
+dd if=/dev/nst0 bs=512k of=work/11111111_v7_s42/slice.2.age
+truncate -s 20512 work/11111111_v7_s42/slice.2.age
+echo "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  work/11111111_v7_s42/slice.2.age" | sha256sum -c - && age -d -i YOUR_KEY.age.key work/11111111_v7_s42/slice.2.age > work/11111111_v7_s42/slice.2.tar && rm work/11111111_v7_s42/slice.2.age
+test $(wc -c < work/11111111_v7_s42/slice.2.tar) -eq 20480 && echo "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  work/11111111_v7_s42/slice.2.tar" | sha256sum -c -
+
+# The slices, joined in order, are the unit's tar stream. One tar run, into the
+# directory made above (numbers, not names, for owner and group; with another
+# tar than GNU tar, leave out the flags it does not know):
+cat work/11111111_v7_s42/slice.1.tar work/11111111_v7_s42/slice.2.tar | LC_ALL=C tar -x --numeric-owner -p --xattrs --acls -f - -C /destination/11111111_v7_s42
+rm -r work/11111111_v7_s42
+```
+
+## ledgers/fy24
+
+UUID: `66666666-7777-8888-9999-000000000000`  ·  snapshot v1  ·  10240 bytes of tar stream
+
+Each slice of this unit was compressed with zstd, after the cut and before
+it was encrypted: the block below pipes each decrypted slice through
+`zstd -dc` (package zstd). The length and the hash it checks are of the
+decompressed slice.
+
+This (the operator's) envelope lists the unit but holds its file table only
+as rows of `catalog.db`; the unit's own tenant's envelope has it as a file.
+
+Put the drive in fixed 512KB block mode, then read, trim, verify and
+decrypt each slice, in order: the tape is wound to the first slice
+once, and each read that finishes leaves it at the start of the next
+file. A `dd` that stops with an error ("Input/output error") leaves
+the head inside that file instead: `mt rewind`, then `mt fsf` to the
+tape file of the slice you want next, which its `# Slice` line gives.
+`/dev/nst0` below is an example — run `ls -l /dev/tape/by-id/` and
+substitute your own drive, or you may read a different tape. The block
+makes `work/` and a directory for this unit and removes it when the unit is
+restored: it needs room for the whole unit's slices (its stream size) once,
+and the destination needs the same again.
+
+```bash
+mkdir -p work/66666666_v1_s43 /destination/66666666_v1_s43
+mt -f /dev/nst0 setblk 524288
+
+# On each `age -d` line, add `-i <file>` for every other key you hold
+# (see "Which key" above).
+
+# Slice 1 — tape file 11, 4100 bytes
+mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 11
+dd if=/dev/nst0 bs=512k of=work/66666666_v1_s43/slice.1.age
+truncate -s 4100 work/66666666_v1_s43/slice.1.age
+echo "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  work/66666666_v1_s43/slice.1.age" | sha256sum -c - && age -d -i YOUR_KEY.age.key work/66666666_v1_s43/slice.1.age | zstd -dc > work/66666666_v1_s43/slice.1.tar && rm work/66666666_v1_s43/slice.1.age
+test $(wc -c < work/66666666_v1_s43/slice.1.tar) -eq 10240 && echo "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee  work/66666666_v1_s43/slice.1.tar" | sha256sum -c -
+
+# The slices, joined in order, are the unit's tar stream. One tar run, into the
+# directory made above (numbers, not names, for owner and group; with another
+# tar than GNU tar, leave out the flags it does not know):
+cat work/66666666_v1_s43/slice.1.tar | LC_ALL=C tar -x --numeric-owner -p --xattrs --acls -f - -C /destination/66666666_v1_s43
+rm -r work/66666666_v1_s43
+```
+
+## The index of other tapes
+
+This envelope also holds an index of the archive as it was known when
+this tape was written, next to MANIFEST.toml:
+
+- `index/units.tsv`: every version of the units it knows of, and the tapes
+  that hold each. A tenant's envelope lists that tenant's units; the
+  operator's envelope lists every tenant's, with a `tenant` column.
+- `index/paths.tsv`: every path of those versions, with its unit and
+  version. A tenant's envelope has it; the operator's does not.
+
+A unit that was renamed after this tape was written is listed here under
+the name it had then, and a newer tape's index lists it under its newer
+name. They are one unit when their `unit_uuid` is the same, so match units by
+`unit_uuid`, and on each tape give RESTORE.sh the name that tape shows
+(`--unit` takes a name, and an envelope knows a unit by the name it had when
+its tape was written). Two units of one name but different `unit_uuid` are
+different units: restore each into a directory of its own.
+
+An index is as of the moment its own tape was written. It never names a
+tape written after it, and a tape it names may since have been retired or
+erased, so the NEWEST tape's index is the most complete. Nothing on a tape
+can name tapes written after it, so the newest tape you hold may not be the
+newest ever written. `RESTORE.sh --where UNIT`, `--where --all` (every unit
+the index names, with no limit: its newest version, whether the tape in the
+drive holds it, and every tape that holds each version) and `--find TEXT`
+(with your key) read it for you.
+
+Both files are plain text. The first line names the columns, fields are
+separated by one TAB, and each row ends in a newline. Inside a field four
+characters are escaped and nothing else: a backslash is written `\\`, a TAB
+`\t`, a newline `\n` and a carriage return `\r` (a path may hold any of
+them). Find a column by its name, and ignore a column you do not know.
+
+`units.tsv` has one row for each version and holding tape: `tenant`
+(operator envelope only), `unit`, `unit_uuid`, `version`, `num_slices`,
+`first_slice` and `last_slice` (the slices that tape holds), `version_bytes`,
+`volume` (the tape's label), `volume_uuid`, `cartridge_serial`,
+`generation`, `state` (`sealed`, `quarantined` or `this-tape`) and
+`sealed_at`. `paths.tsv` has `unit`, `version`, `kind` (`d` directory, `f`
+file, `l` symlink, `s` special), `size_bytes`, `sha256` (the file's content
+hash as 64 hex characters; empty for anything but a regular file, and where
+none was recorded) and `path`.
+
+These two lines (run them inside `env/`) print the rows for a unit, and the
+paths that contain some text. They compare the text as it is stored, so type a backslash, TAB or
+newline of a name the way the file writes it:
+
+```bash
+U='photos/2019' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next } $c["unit"] == ENVIRON["U"]' index/units.tsv
+T='report' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next } index($c["path"], ENVIRON["T"])' index/paths.tsv
+```
+
+The newest version of a unit holds the files that version had; a file deleted
+before it was made exists only in an older version. In a tenant's envelope this
+prints the paths version `OLD` of a unit has and version `NEW` lacks (both
+versions need rows in this `paths.tsv`: a version held only on another tape has
+none here, and the command says so):
+
+```bash
+OLD=2 NEW=3 U='photos/2019' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next } $c["unit"] == ENVIRON["U"] { if ($c["version"] == ENVIRON["NEW"]) { n++; seen[$c["path"]] } else if ($c["version"] == ENVIRON["OLD"]) old[$c["path"]] } END { if (!n) print "no paths for version " ENVIRON["NEW"] > "/dev/stderr"; else for (p in old) if (!(p in seen)) print p }' index/paths.tsv | sort
+```
+
+To restore one of them, follow the section of this file for version `OLD` of
+the unit, into a directory of its own.
+
+## If a slice or a file is damaged
+
+Another tape that holds this unit at the same version holds the same slices,
+byte for byte, when both tapes were written from one staging of it: its
+front index (File 3) lists the same `sha256_encrypted` for each, at whatever
+tape file and under whatever number that tape puts it. Only the same unit at
+the same version is a copy; another version may differ in the very files that
+are damaged.
+
+A slice that fails its `sha256sum -c` above is damaged: do not decrypt it,
+and do not put an empty file in its place. `RESTORE.sh` (tape file 2) leaves
+a slice that fails out by itself, restores every file whose slices are good,
+and writes the paths of the others, one per line (a backslash, TAB, newline
+and carriage return escaped as the index escapes them), to
+`.tapectl-damaged-files.txt` in the unit's directory. Load a tape that holds
+the same unit at the same version and run that list through its one repair,
+into the same directory (here `/destination/UNIT` stands for the unit's
+directory):
+
+```bash
+./RESTORE.sh --restore --key YOUR_KEY.age.key --paths-from /destination/UNIT/.tapectl-damaged-files.txt --to /destination/UNIT
+```
+
+It restores exactly the listed files over their damaged copies, leaves
+everything else in the directory alone, checks each against the unit's file
+table, and refuses a tape that holds another unit or another version.
+
+By hand, with no other copy, leave the failed slice out of the steps above:
+remove its `slice.N.tar`, and if it is part of a long file's run (it or a
+slice just before it states `continues = true` in MANIFEST.toml) leave out the
+whole run, so that tar is never given the head of a file without its tail.
+The slices that are left, joined in order, are a tar stream of whole files,
+and tar restores every file in them; the file table's `slice` column says
+which files were in the slices you left out. A file's sha256 in the table is
+the check: the line after the steps prints `FAILED` for each file that is
+missing or differs.
+
+## Troubleshooting
+
+- **age: "failed to decrypt and authenticate payload chunk"** (age 1.1.1) — the
+file still has 512KB block padding, or a part of it is damaged. Re-run
+`truncate -s <bytes>` to the exact `encrypted_bytes` shown above (a slice's
+`size_bytes` in MANIFEST.toml is its PLAIN length: never trim to that); if the
+sha256 of the trimmed file matches, the file is whole and the key is the
+question, and if it does not, the slice is damaged.
+- **age: "failed to read header: parsing age header"** — what was read is not
+an age file: the wrong tape file, or the head was not where you thought.
+`mt rewind`, `fsf` to the slice's tape file, and read it again.
+- **tar: "Unexpected EOF in archive" or "This does not look like a tar
+archive"** — the slices given to tar are not whole files in order: one is
+missing, left out, or the first begins in the middle of a file. The check
+against the file table names what is missing; tar's exit status never does.
+- **sha256 mismatch** — re-read the slice from tape; a short read or the wrong
+block mode (must be 512KB fixed) is the usual cause.
+- **age: "no identity matched any of the recipients"** (`rage`: "No matching
+keys found") — none of the keys
+you passed is the one this slice was sealed to. It may be an older key from
+before a rotation (see "Which key"), or the operator key, which can read
+every unit; or the tape may be another installation's. Pass them all with
+repeated `-i`.
+"####;
+
+/// RECOVERY.md of the operator's envelope, as `build()` makes it before it appends its
+/// `catalog.db` section: tenant `operator`, units with no file table and no id map (the
+/// catalog.db carries them), and the first unit compressed. The text differs from a tenant's
+/// in the paragraph that says the file table is only rows of `catalog.db` and in the missing
+/// check against `env/tables/`.
+#[test]
+fn layout3_recovery_md_operator_envelope() {
+    let units = vec![
+        ManifestUnit {
+            name: "photos/2019".to_string(),
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            snapshot_version: 7,
+            stage_set_id: 42,
+            payload: "tar".to_string(),
+            stream_bytes: 40_960,
+            file_table: None,
+            id_map: None,
+            tar_version: Some("tar (GNU tar) 1.35".to_string()),
+            compression: None,
+            slices: vec![
+                slice(1, Some(9), (20_480, 20_512), ("a", "b"), false),
+                slice(2, Some(10), (20_480, 20_512), ("c", "d"), false),
+            ],
+        },
+        ManifestUnit {
+            name: "ledgers/fy24".to_string(),
+            uuid: "66666666-7777-8888-9999-000000000000".to_string(),
+            snapshot_version: 1,
+            stage_set_id: 43,
+            payload: "tar".to_string(),
+            stream_bytes: 10_240,
+            file_table: None,
+            id_map: None,
+            tar_version: None,
+            compression: Some("zstd".to_string()),
+            slices: vec![slice(1, Some(11), (10_240, 4_100), ("e", "f"), false)],
+        },
+    ];
+    let text = generate_recovery_md_at("L8-0001", "operator", &units, &[], "2026-11-21");
+    assert_pinned_text("recovery-operator", &text, RECOVERY_OPERATOR);
 }
