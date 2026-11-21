@@ -382,3 +382,138 @@
 //! MANIFEST, the short seal and the two tests that parsed it). The history above is kept.
 //! Layout 3's pins come in T6.3 (`docs/design/v3-implementation-plan.md`), each in a commit
 //! of its own, and pin no data-zone bytes made by tar (#562).
+//!
+//! **2026-11-21, T6.3 of the 2.0.0 plan: the Layout 3 pins begin here**, under ADR-0012
+//! item 243 (the on-tape authorization), each in a commit of its own. Each is made by the
+//! real generator the write path calls, fed fixed inputs (a fixed uuid, label, dates, keys
+//! and stage set), so the bytes are the same on every run and every host. No pin holds
+//! data-zone bytes made by tar (two tar versions differ; #562) or age ciphertext (age draws
+//! fresh keys and nonces). **If one of these fails, the on-tape format changed: that is a
+//! CTO decision (bytes on tape are forever), never something to fix by updating the
+//! constant here**, and a pin moves only in a commit of its own. A pin that holds a whole
+//! text shows the format in the test; one that holds a sha256 writes the generated text to
+//! a file under the target directory when it fails and names that file.
+
+use tapectl::volume::layout::{generate_id_thunk_v2, IdThunkV2Params};
+
+/// Compare a generated document with its pinned text. On a difference the generated text
+/// is written under the target directory and the failure names the file.
+#[allow(dead_code)]
+fn assert_pinned_text(name: &str, actual: &str, expected: &str) {
+    if actual != expected {
+        let path =
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("golden-{name}.actual"));
+        let _ = std::fs::write(&path, actual);
+        panic!(
+            "the on-tape bytes of {name} changed: a CTO decision, never a re-pin by an agent. \
+             The generated text is in {}",
+            path.display()
+        );
+    }
+}
+
+/// Compare a generated document's sha256 with its pin; on a difference the generated text
+/// is written under the target directory and the failure names the file.
+#[allow(dead_code)]
+fn assert_pinned_sha256(name: &str, actual: &str, expected_hex: &str) {
+    use sha2::{Digest, Sha256};
+    let got = format!("{:x}", Sha256::digest(actual.as_bytes()));
+    if got != expected_hex {
+        let path =
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("golden-{name}.actual"));
+        let _ = std::fs::write(&path, actual);
+        panic!(
+            "the on-tape bytes of {name} changed: a CTO decision, never a re-pin by an agent. \
+             sha256 {got}, pinned {expected_hex}; the generated text is in {}",
+            path.display()
+        );
+    }
+}
+
+const FILE_0: &str = r##"================================================================
+                     TAPECTL ARCHIVAL VOLUME
+================================================================
+
+Label:   L8-0001
+Media:   LTO-8
+Created: 2026-11-21T10:00:00+00:00
+
+This tape contains encrypted archival data managed by tapectl,
+an open-source archival storage tool.
+
+>>> COMPLETE INSTRUCTIONS ARE IN THE NEXT FILE ON THIS TAPE. <<<
+>>> THE FULL MAP OF THIS TAPE IS FILE 3 (the front index).   <<<
+
+Your drive may not be /dev/nst0. That is an example, not a fact
+about this tape. List the tape drives on the machine you are
+using and substitute the right one everywhere below:
+
+    ls -l /dev/tape/by-id/
+
+A wrong device reads a DIFFERENT tape, or fails outright.
+
+To read the next file (the full recovery guide):
+
+    mt -f /dev/nst0 setblk 524288
+    mt -f /dev/nst0 fsf 1
+    dd if=/dev/nst0 bs=512k | tr -d '\0' > GUIDE.md
+    less GUIDE.md
+
+If you just read this file and the tape is already positioned
+past it, read the next file directly:
+
+    mt -f /dev/nst0 setblk 524288
+    dd if=/dev/nst0 bs=512k | tr -d '\0' > GUIDE.md
+
+The guide explains everything: what tools you need, how to find
+your encryption key, and how to recover your data step by step.
+It is written so that an AI assistant can follow it to help you.
+
+================================================================
+              MACHINE-READABLE METADATA (TOML)
+================================================================
+
+[volume]
+magic = "tapectl-volume-v3"
+label = "L8-0001"
+uuid = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+layout_version = 3
+requires = []
+tapectl_version = "2.0.0"
+media_type = "LTO-8"
+nominal_capacity_bytes = 12000000000000
+mam_capacity_bytes = 11999999000000
+created_at = "2026-11-21T10:00:00+00:00"
+
+[layout]
+front_index = 3
+seal_marker = 8
+total_files = 9
+
+[media]
+cartridge_manufacturer = "FUJIFILM"
+cartridge_serial = "ABC123"
+cartridge_identity_source = "mam"
+tape_length_meters = 960
+load_count_at_write = 7
+"##;
+
+#[test]
+fn layout3_file_0_id_thunk() {
+    let params = IdThunkV2Params {
+        label: "L8-0001",
+        uuid: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        media_type: "LTO-8",
+        tapectl_version: "2.0.0",
+        nominal_capacity: 12_000_000_000_000,
+        mam_capacity: 11_999_999_000_000,
+        total_files: 9,
+        mam_manufacturer: "FUJIFILM",
+        mam_serial: "ABC123",
+        mam_length: 960,
+        mam_loads: 7,
+        created_at: "2026-11-21T10:00:00+00:00",
+        cartridge_identity_source: Some("mam"),
+    };
+    assert_pinned_text("file-0", &generate_id_thunk_v2(&params), FILE_0);
+}
