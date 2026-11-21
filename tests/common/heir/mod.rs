@@ -1401,6 +1401,67 @@ impl Heir {
         }
     }
 
+    /// A directory tape of a RECORDED tape (`tests/recorded_tape.rs`): the
+    /// fixture's tape files as read from the cartridge (block-padded) and the
+    /// script taken from the fixture's own File 2, with the fixture's key
+    /// files copied in under the names given. No [`Tape`] is built: nothing
+    /// here is made by this build.
+    pub fn recorded(
+        files: &[Vec<u8>],
+        script: &[u8],
+        label: &str,
+        keys: &[(&'static str, &Path)],
+    ) -> Heir {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        let cart = r.join("cart").join(label);
+        fs::create_dir_all(&cart).unwrap();
+        std::os::unix::fs::symlink(&cart, r.join("files")).unwrap();
+        fs::create_dir_all(r.join("state")).unwrap();
+        fs::create_dir_all(r.join("bin")).unwrap();
+        fs::create_dir_all(r.join("keys")).unwrap();
+        for (n, bytes) in files.iter().enumerate() {
+            let p = r.join("files").join(n.to_string());
+            fs::write(&p, bytes).unwrap();
+            let blocks = bytes.len().div_ceil(BLOCK).max(1);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_len((blocks * BLOCK) as u64)
+                .unwrap();
+        }
+        fs::write(r.join("state/pos"), "0").unwrap();
+        fs::write(r.join("state/ops"), "").unwrap();
+        let script_path = r.join("RESTORE.sh");
+        fs::write(&script_path, script).unwrap();
+        let mut key_paths = BTreeMap::new();
+        for (name, from) in keys {
+            let p = r.join("keys").join(format!("{name}.key"));
+            fs::copy(from, &p).unwrap();
+            key_paths.insert(*name, p);
+        }
+        let bin = r.join("bin");
+        write_exec(&bin.join("mt"), FAKE_MT);
+        write_exec(&bin.join("dd"), FAKE_DD);
+        std::os::unix::fs::symlink(heir_age_binary(), bin.join("age")).unwrap();
+        for tool in HOST_TOOLS {
+            if *tool == "dd" {
+                continue;
+            }
+            if let Some(p) = host_tool(tool) {
+                let _ = std::os::unix::fs::symlink(p, bin.join(tool));
+            }
+        }
+        Heir {
+            root,
+            keys: key_paths,
+            script: script_path,
+            entries: Vec::new(),
+            file_count: files.len(),
+        }
+    }
+
     pub fn bin(&self) -> PathBuf {
         self.root.path().join("bin")
     }
