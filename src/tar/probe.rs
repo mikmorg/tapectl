@@ -182,7 +182,10 @@ pub fn parse_first_line(line: &str) -> (bool, Option<TarVersion>) {
 /// bare name is looked up on `PATH` (never a hard-coded `/usr/bin/tar`).
 fn resolve(binary: &str) -> Result<PathBuf> {
     if binary.contains('/') {
-        let p = PathBuf::from(binary);
+        // Absolute: the writer runs tar in the unit's root, where a relative
+        // name would be a different file (#591 1-C1).
+        let p = std::path::absolute(binary)
+            .map_err(|_| TapectlError::TarNotFound(binary.to_string()))?;
         return if p.is_file() {
             Ok(p)
         } else {
@@ -460,6 +463,16 @@ mod tests {
             minor,
             patch,
         })
+    }
+
+    /// #591 1-C1: a name with a `/` is probed where tapectl stands and the
+    /// writer runs tar in the unit's root, so the probe's path is absolute and
+    /// the same file is the one that runs.
+    #[test]
+    fn a_relative_binary_with_a_slash_resolves_to_an_absolute_path() {
+        let p = resolve("./Cargo.toml").unwrap();
+        assert!(p.is_absolute(), "{}", p.display());
+        assert!(p.ends_with("Cargo.toml"));
     }
 
     /// The version table: GNU tar's lines, a distribution's suffix, bsdtar
