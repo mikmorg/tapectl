@@ -63,7 +63,7 @@
 //! asks it before the tape moves, so a resume with no verify behind it is
 //! refused without a contact. [`adopt`] asks all three in the ruling's order.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::events;
 use crate::error::{Result, TapectlError};
@@ -502,8 +502,9 @@ fn staged_match(
         return Ok(Err(format!(
             "this catalog holds no file table for {}: the table is what a copy written from \
              the staging carries (volume-format-v3.md §1.6), so it is not adopted without it. \
-             `catalog rebuild --from-volume` puts a table back from a tape's operator \
-             envelope, or stage the version again",
+             `catalog rebuild --from-volume` of a tape that carries this staging puts a \
+             table back from that tape's operator envelope (staging the version again \
+             does not: the adoption reads the staging this volume was written from)",
             without_table.join(", ")
         )));
     }
@@ -674,8 +675,46 @@ fn record_adoption(
     // The three-way split the rows record (`staged_match` checked they say
     // what the tape says), each in plan order, for the `write_completed`
     // event a confirm of this write would have recorded.
-    // A set the tape holds none of has no row to read it from (item 288).
-    let unwritten_units: Vec<String> = Vec::new();
+    // A set the tape holds none of has no row (item 288), so it is read from
+    // the front index, the plan: a slice planned after a short seal's K whose
+    // ciphertext hash is a slice of a staging this catalog holds, and which
+    // has no write on this volume, belongs to a unit planned and not written
+    // (`layout-session.md` "Confirm's split"; #595 5-3). Plan order.
+    let mut unwritten_units: Vec<String> = Vec::new();
+    if let Some(k) = tape.ended_after {
+        let mut by_position: Vec<(i64, &str)> = tape
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    ZoneKind::from_type_label(&e.type_label),
+                    Some(ZoneKind::Slice { .. })
+                ) && i64::from(e.position) > i64::from(k)
+            })
+            .filter_map(|e| Some((i64::from(e.position), e.sha256_encrypted.as_deref()?)))
+            .collect();
+        by_position.sort_by_key(|(p, _)| *p);
+        let mut lookup = tx.prepare(
+            "SELECT u.name FROM stage_slices sl
+               JOIN stage_sets ss ON ss.id = sl.stage_set_id
+               JOIN snapshots s ON s.id = ss.snapshot_id
+               JOIN units u ON u.id = s.unit_id
+              WHERE sl.sha256_encrypted = ?1
+                AND NOT EXISTS (SELECT 1 FROM writes w
+                                 WHERE w.stage_set_id = ss.id AND w.volume_id = ?2)
+              ORDER BY ss.id LIMIT 1",
+        )?;
+        for (_, sha) in &by_position {
+            let name: Option<String> = lookup
+                .query_row(params![sha, volume_id], |r| r.get(0))
+                .optional()?;
+            if let Some(name) = name {
+                if !unwritten_units.contains(&name) {
+                    unwritten_units.push(name);
+                }
+            }
+        }
+    }
     // A range's run is its row's `written` positions (item 121): the
     // rebuild left the positions past the end `pending`.
     let range_units: Vec<crate::volume::session::RangeUnit> = tx
@@ -2376,8 +2415,9 @@ mod tests {
             assert_eq!(detail["ended_after"], k);
             assert_eq!(
                 detail["unwritten_units"],
-                serde_json::json!([]),
-                "the rows say nothing of a set the tape took none of"
+                serde_json::json!(["charlie"]),
+                "the event names the set the tape took none of, as a passing confirm's \
+                 does (#595 5-3)"
             );
             assert_eq!(
                 detail["range_units"],
@@ -2390,6 +2430,24 @@ mod tests {
                     .starts_with("adopted by `volume resume`"),
                 "{detail}"
             );
+        }
+
+        /// #595 5-2: the refusal for a missing file table names the one
+        /// remedy that works, a rebuild of a tape that carries the staging;
+        /// staging again makes a new stage set, which this volume's write
+        /// does not point at.
+        #[test]
+        fn the_no_file_table_refusal_does_not_offer_staging_again() {
+            let mut lost = rebuilt_and_verified();
+            lost.conn.execute("DELETE FROM stage_files", []).unwrap();
+            let LostAdoption::NotWhatThisCatalogStaged { why } =
+                adopt(&lost.conn, &mut lost.t.store, lost.t.volume_id, LABEL, BS).unwrap()
+            else {
+                panic!("a staging with no file table must be refused");
+            };
+            assert!(why.contains("holds no file table"), "{why}");
+            assert!(why.contains("catalog rebuild --from-volume"), "{why}");
+            assert!(!why.contains("or stage the version again"), "{why}");
         }
 
         /// The catalog's rows must say what the tape says: a unit with a
