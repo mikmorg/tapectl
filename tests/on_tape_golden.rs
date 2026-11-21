@@ -730,3 +730,100 @@ fn layout3_manifest_range_block() {
         MANIFEST_RANGE_BLOCK,
     );
 }
+
+const MANIFEST_OPERATOR_ENVELOPE: &str = r##"[manifest]
+volume = "L8-0001"
+tenant = "operator"
+created_at = "2026-11-21T10:00:00+00:00"
+may_end_early = true
+
+[[units]]
+name = "photos/2019"
+uuid = "11111111-2222-3333-4444-555555555555"
+snapshot_version = 7
+stage_set_id = 42
+payload = "tar"
+stream_bytes = 40960
+tar_version = "tar (GNU tar) 1.35"
+
+[[units.slices]]
+number = 1
+tape_position = 9
+size_bytes = 20480
+encrypted_bytes = 20512
+sha256_plain = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+sha256_encrypted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[[units.slices]]
+number = 2
+tape_position = 10
+size_bytes = 20480
+encrypted_bytes = 20512
+sha256_plain = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+sha256_encrypted = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+[[units]]
+name = "ledgers/fy24"
+uuid = "66666666-7777-8888-9999-000000000000"
+snapshot_version = 1
+stage_set_id = 43
+payload = "tar"
+stream_bytes = 10240
+
+[[units.slices]]
+number = 1
+tape_position = 11
+size_bytes = 10240
+encrypted_bytes = 10272
+sha256_plain = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+sha256_encrypted = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+"##;
+
+/// The operator envelope's manifest (section 1.4): tenant `operator`, and no `file_table`,
+/// `id_map` (the catalog.db carries them), and a block with no `tar_version`.
+#[test]
+fn layout3_manifest_operator_envelope() {
+    let manifest = Manifest {
+        volume: "L8-0001".to_string(),
+        tenant: "operator".to_string(),
+        created_at: "2026-11-21T10:00:00+00:00".to_string(),
+        may_end_early: true,
+        units: vec![
+            ManifestUnit {
+                name: "photos/2019".to_string(),
+                uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                snapshot_version: 7,
+                stage_set_id: 42,
+                payload: "tar".to_string(),
+                stream_bytes: 40_960,
+                file_table: None,
+                id_map: None,
+                tar_version: Some("tar (GNU tar) 1.35".to_string()),
+                compression: None,
+                slices: vec![
+                    slice(1, Some(9), (20_480, 20_512), ("a", "b"), false),
+                    slice(2, Some(10), (20_480, 20_512), ("c", "d"), false),
+                ],
+            },
+            ManifestUnit {
+                name: "ledgers/fy24".to_string(),
+                uuid: "66666666-7777-8888-9999-000000000000".to_string(),
+                snapshot_version: 1,
+                stage_set_id: 43,
+                payload: "tar".to_string(),
+                stream_bytes: 10_240,
+                file_table: None,
+                id_map: None,
+                tar_version: None,
+                compression: None,
+                slices: vec![slice(1, Some(11), (10_240, 10_272), ("e", "f"), false)],
+            },
+        ],
+    };
+    assert_pinned_text(
+        "manifest-operator-envelope",
+        &manifest.to_toml(),
+        MANIFEST_OPERATOR_ENVELOPE,
+    );
+}
