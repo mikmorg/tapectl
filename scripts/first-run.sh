@@ -2228,7 +2228,7 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
     ok "rehearsal green"
     # B14: step 13 checks for this marker (per binary) before the first write.
     mkdir -p "$(dirname "$LOG")"; printf '%s %s %s\n' "$(date -u +%FT%TZ)" "$TEST_BARCODE" "$("$TAPECTL" --version 2>/dev/null)" > "$(dirname "$LOG")/rehearsal-ok-$(sha256sum "$TAPECTL" | cut -c1-16)"
-    note "Eject the test cartridge ($( [ "$SVC_MODE" = 1 ] && printf 'sudo -u %s -H ' "$SVC_USER" )tapectl drive eject --device $DEVICE) and load the production one before step 13."
+    note "Eject the test cartridge ($OP_CMD drive eject --device $DEVICE) and load the production one before step 13."
   fi
 else note "skipped"; fi
 # The step's end, whatever happened in it: the poll timer runs again (item 190).

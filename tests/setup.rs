@@ -46,9 +46,14 @@ impl World {
 
     /// `tapectl --home <home> ARGS`, stdin closed (not a terminal).
     fn tapectl(&self, args: &[&str]) -> Output {
+        self.tapectl_at(&self.home(), args)
+    }
+
+    /// The same, for another home in the same account.
+    fn tapectl_at(&self, home: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_tapectl"))
             .arg("--home")
-            .arg(self.home())
+            .arg(home)
             .args(args)
             .env("HOME", self.p("user"))
             .env("USER", "friend")
@@ -444,6 +449,60 @@ fn setup_dry_run_on_a_kept_config_with_a_collection_does_not_panic() {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let (stdout, _) = assert_ok(&w.tapectl(&args), "setup --dry-run");
     assert!(stdout.contains("collection photos"), "{stdout}");
+}
+
+/// #599 9-2: one `--location` is one place; the printed copy 2 is not
+/// shelved beside copy 1, and setup says a second place is missing.
+#[test]
+fn one_location_does_not_send_both_copies_to_it() {
+    let w = World::new();
+    let (stdout, _) = assert_ok(&w.setup(&["--location", "vault"]), "setup --location vault");
+    assert!(
+        !stdout.contains("L6-0002 --init --full-confirm --move-to vault"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("one place is not two"), "{stdout}");
+    assert!(stdout.contains("<SECOND-PLACE>"), "{stdout}");
+}
+
+/// #599 9-5: timers written for one home are not "already done" for
+/// another home in the same account.
+#[test]
+fn timers_written_for_another_home_are_not_already_done() {
+    let w = World::new();
+    assert_ok(&w.setup(&[]), "setup for home A");
+    let other = w.p("other-home");
+    let mut args = w.setup_args();
+    args.retain(|a| a != "--yes");
+    args.push("--dry-run".into());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, _) = assert_ok(&w.tapectl_at(&other, &args), "setup --dry-run, home B");
+    assert!(
+        !stdout.contains("already done: tapectl-backup.timer"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("for another home"), "{stdout}");
+    // The same home still finds its own timers done.
+    let (again, _) = assert_ok(&w.setup(&[]), "setup again, home A");
+    assert!(
+        again.contains("already done: tapectl-backup.timer"),
+        "{again}"
+    );
+}
+
+/// #599 9-6: first-run step 12's eject hint is built from `OP_CMD`, which
+/// names the home (`--home`) whenever TAPECTL_HOME_DIR is set (item 197), not
+/// from literal text that does not.
+#[test]
+fn first_run_step_12s_eject_hint_names_the_home_through_op_cmd() {
+    let script =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/first-run.sh"))
+            .unwrap();
+    let hint = script
+        .lines()
+        .find(|l| l.contains("Eject the test cartridge"))
+        .expect("step 12's eject hint");
+    assert!(hint.contains("$OP_CMD drive eject --device $DEVICE"), "{hint}");
 }
 
 // ── the writer's tar floor (T5.4; ADR-0012 items 229, 274) ───────────────
