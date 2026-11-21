@@ -1334,7 +1334,10 @@ fn a_unit_whose_file_table_was_deleted_is_refused_by_name() {
     assert!(!err.contains(UNIT_A), "{err}");
     assert!(err.contains("Stage each version again"), "{err}");
     // #593 3-3: the set is still staged, so the way out is the release first.
-    assert!(err.contains("stage clean --unit <unit> --version <N> --force"), "{err}");
+    assert!(
+        err.contains("stage clean --unit <unit> --version <N> --force"),
+        "{err}"
+    );
     let dir = tempfile::tempdir().unwrap();
     assert!(write::generate_tables(&h.conn, &[], dir.path())
         .unwrap()
