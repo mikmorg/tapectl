@@ -135,34 +135,39 @@ pub struct Query<'c> {
     stmt: Statement<'c>,
 }
 
-fn kind_of(letter: &str) -> rusqlite::Result<Kind> {
-    Kind::from_letter(letter).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("not a file table kind: {letter:?}").into(),
-        )
-    })
+/// A refusal that names the row (`volume-format-v3.md` §1.4: "A reader
+/// refuses, naming the row, a value outside a column's allowed set"; #595
+/// 5-C2): a `catalog.db` built without the CHECKs reaches this.
+fn bad_row(stage_set_id: i64, seq: i64, what: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        format!("stage_files row (stage_set_id {stage_set_id}, seq {seq}): {what}").into(),
+    )
 }
 
-fn sha_of(blob: Option<Vec<u8>>) -> rusqlite::Result<Option<[u8; 32]>> {
-    blob.map(|b| {
-        <[u8; 32]>::try_from(b.as_slice()).map_err(|_| {
-            rusqlite::Error::FromSqlConversionFailure(
-                6,
-                rusqlite::types::Type::Blob,
-                "a sha256 that is not 32 bytes".into(),
-            )
-        })
-    })
-    .transpose()
+fn kind_of(letter: &str) -> Option<Kind> {
+    Kind::from_letter(letter)
+}
+
+fn sha_of(blob: Option<Vec<u8>>) -> Option<Option<[u8; 32]>> {
+    match blob {
+        None => Some(None),
+        Some(b) => <[u8; 32]>::try_from(b.as_slice()).ok().map(Some),
+    }
+}
+
+/// A column that must not be negative, as the unsigned the row holds.
+fn unsigned(v: i64, column: &str, set: i64, seq: i64) -> rusqlite::Result<u64> {
+    u64::try_from(v).map_err(|_| bad_row(set, seq, format!("{column} is {v}, below zero")))
 }
 
 impl<'c> Query<'c> {
     pub fn new(conn: &'c Connection) -> Result<Self> {
         Ok(Query {
             stmt: conn.prepare(
-                "SELECT f.kind, f.slice, f.start, f.\"end\", f.size, f.sha256, p.path, lp.path
+                "SELECT f.kind, f.slice, f.start, f.\"end\", f.size, f.sha256, p.path, lp.path,
+                        f.stage_set_id, f.seq
                    FROM stage_files f
                    JOIN paths p ON p.id = f.path_id
                    LEFT JOIN paths lp ON lp.id = f.link_path_id
@@ -175,13 +180,19 @@ impl<'c> Query<'c> {
     /// `stage_set_id`'s rows, in stream order.
     pub fn rows(&mut self, stage_set_id: i64) -> Result<impl Iterator<Item = Result<Row>> + '_> {
         let rows = self.stmt.query_map(params![stage_set_id], |r| {
+            let (set, seq): (i64, i64) = (r.get(8)?, r.get(9)?);
+            let letter: String = r.get(0)?;
+            let kind = kind_of(&letter)
+                .ok_or_else(|| bad_row(set, seq, format!("kind {letter:?} is not a file kind")))?;
+            let sha256 = sha_of(r.get(5)?)
+                .ok_or_else(|| bad_row(set, seq, "sha256 is not 32 bytes".into()))?;
             Ok(Row {
-                kind: kind_of(&r.get::<_, String>(0)?)?,
-                slice: r.get::<_, i64>(1)? as u64,
-                start: r.get::<_, i64>(2)? as u64,
-                end: r.get::<_, i64>(3)? as u64,
-                size: r.get::<_, i64>(4)? as u64,
-                sha256: sha_of(r.get(5)?)?,
+                kind,
+                slice: unsigned(r.get(1)?, "slice", set, seq)?,
+                start: unsigned(r.get(2)?, "start", set, seq)?,
+                end: unsigned(r.get(3)?, "end", set, seq)?,
+                size: unsigned(r.get(4)?, "size", set, seq)?,
+                sha256,
                 path: r.get(6)?,
                 link: r.get(7)?,
             })
@@ -200,6 +211,35 @@ pub fn load(conn: &Connection, stage_set_id: i64) -> Result<Vec<Row>> {
 mod tests {
     use super::*;
     use crate::volume::filetable;
+
+    /// #595 5-C2: a `catalog.db` made without the CHECKs refuses naming the
+    /// staging and `seq` of the bad row.
+    #[test]
+    fn a_row_outside_the_allowed_set_is_refused_naming_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE paths (id INTEGER PRIMARY KEY, unit_id INTEGER, path TEXT);
+             CREATE TABLE stage_files (stage_set_id INTEGER, seq INTEGER, kind TEXT,
+               slice INTEGER, path_id INTEGER, size INTEGER, sha256 BLOB, start INTEGER,
+               \"end\" INTEGER, link_path_id INTEGER);
+             INSERT INTO paths VALUES (1, 1, 'a');
+             INSERT INTO stage_files VALUES (7, 0, 'd', 1, 1, 0, NULL, 0, 1, NULL);
+             INSERT INTO stage_files VALUES (7, 3, 'x', 1, 1, 0, NULL, 0, 1, NULL);",
+        )
+        .unwrap();
+        let err = load(&conn, 7).unwrap_err().to_string();
+        assert!(err.contains("stage_set_id 7, seq 3"), "{err}");
+        assert!(err.contains("\"x\""), "{err}");
+        conn.execute("DELETE FROM stage_files WHERE seq = 3", [])
+            .unwrap();
+        conn.execute("UPDATE stage_files SET size = -5", [])
+            .unwrap();
+        let err = load(&conn, 7).unwrap_err().to_string();
+        assert!(
+            err.contains("stage_set_id 7, seq 0") && err.contains("size"),
+            "{err}"
+        );
+    }
 
     /// A catalog with one unit, one version of it and one stage set, the
     /// version's file list holding `a` (so one path is interned already).

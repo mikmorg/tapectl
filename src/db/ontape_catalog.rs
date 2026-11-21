@@ -572,7 +572,27 @@ pub fn read_all_but_files(path: &Path) -> Result<(Connection, OnTapeCatalog)> {
                     encrypted_bytes: r.get(4)?,
                     sha256_plain: r.get(5)?,
                     sha256_encrypted: r.get(6)?,
-                    continues: r.get(7)?,
+                    continues: {
+                        // SQLite reads any non-zero integer as true: a value
+                        // outside 0 and 1 is refused naming the row (§1.4;
+                        // #595 5-C2).
+                        let (id, set, number): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
+                        match r.get::<_, i64>(7)? {
+                            0 => false,
+                            1 => true,
+                            other => {
+                                return Err(rusqlite::Error::FromSqlConversionFailure(
+                                    7,
+                                    rusqlite::types::Type::Integer,
+                                    format!(
+                                        "stage_slices row {id} (stage set {set}, slice \
+                                         {number}): continues is {other}, not 0 or 1"
+                                    )
+                                    .into(),
+                                ))
+                            }
+                        }
+                    },
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1492,6 +1512,28 @@ mod tests {
                 "{name}: {err}"
             );
         }
+    }
+
+    /// #595 5-C2 (§1.4): SQLite reads any non-zero integer as true, so a
+    /// `continues` of 2 was accepted; it is refused naming the row.
+    #[test]
+    fn a_continues_outside_zero_and_one_is_refused_naming_the_row() {
+        let conn = crate::db::open_memory().unwrap();
+        let (_unit, ss_id) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("continues.db");
+        write(&conn, &[ss_id], &p).unwrap();
+        let out = Connection::open(&p).unwrap();
+        out.execute_batch(
+            "PRAGMA ignore_check_constraints = 1; UPDATE stage_slices SET continues = 2;",
+        )
+        .unwrap();
+        drop(out);
+        let err = read(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("stage_slices row") && err.contains("continues is 2"),
+            "{err}"
+        );
     }
 
     /// Issue #413: a rebuild streams one version's rows at a time, and each

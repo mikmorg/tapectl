@@ -53,13 +53,24 @@ pub fn load(conn: &Connection, stage_set_id: i64) -> Result<Vec<IdRow>> {
           ORDER BY CASE kind WHEN 'u' THEN 0 ELSE 1 END, id",
     )?;
     let rows = stmt.query_map(params![stage_set_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get(2)?))
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get(2)?))
     })?;
+    // Refuses naming the row (`volume-format-v3.md` §1.4; #595 5-C2): a
+    // `catalog.db` built without the CHECKs reaches these.
     rows.map(|row| {
         let (kind, id, name) = row?;
-        let kind = IdKind::from_letter(&kind)
-            .ok_or_else(|| TapectlError::Other(format!("stage_ids: not an id kind: {kind:?}")))?;
-        Ok(IdRow { kind, id, name })
+        let named =
+            || format!("stage_ids row (stage_set_id {stage_set_id}, kind {kind:?}, id {id})");
+        let parsed = IdKind::from_letter(&kind)
+            .ok_or_else(|| TapectlError::Other(format!("{}: not an id kind", named())))?;
+        let id = u32::try_from(id).map_err(|_| {
+            TapectlError::Other(format!("{}: id is outside 0 to 4294967295", named()))
+        })?;
+        Ok(IdRow {
+            kind: parsed,
+            id,
+            name,
+        })
     })
     .collect()
 }
@@ -68,6 +79,30 @@ pub fn load(conn: &Connection, stage_set_id: i64) -> Result<Vec<IdRow>> {
 mod tests {
     use super::*;
     use crate::idmap;
+
+    /// #595 5-C2: rows a CHECK-less `catalog.db` can hold are refused naming
+    /// the row.
+    #[test]
+    fn a_row_outside_the_allowed_set_is_refused_naming_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE stage_ids (stage_set_id INTEGER, kind TEXT, id INTEGER, name TEXT);
+             INSERT INTO stage_ids VALUES (7, 'q', 5, NULL);",
+        )
+        .unwrap();
+        let err = load(&conn, 7).unwrap_err().to_string();
+        assert!(
+            err.contains("stage_set_id 7") && err.contains("\"q\""),
+            "{err}"
+        );
+        conn.execute("UPDATE stage_ids SET kind = 'u', id = 4294967296", [])
+            .unwrap();
+        let err = load(&conn, 7).unwrap_err().to_string();
+        assert!(
+            err.contains("stage_set_id 7") && err.contains("4294967296"),
+            "{err}"
+        );
+    }
 
     fn catalog() -> (Connection, i64) {
         let conn = crate::db::open_memory().unwrap();
