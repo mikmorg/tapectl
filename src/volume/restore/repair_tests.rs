@@ -327,6 +327,76 @@ pub(crate) mod tests {
         plain
     }
 
+    /// The age header length of slice `n` of `set` as staged: the recorded
+    /// length less the 16-byte nonce and each chunk with its 16-byte tag.
+    fn header_len_of(h: &Home, set: i64, n: i64) -> usize {
+        let (size, encrypted) = slice_sizes(h, set, n);
+        let chunks = size.div_ceil(CHUNK as usize).max(1);
+        encrypted - 16 - size - 16 * chunks
+    }
+
+    /// Whether `encrypt_data_with_header_len` reaches a header of `len` bytes
+    /// with near certainty: age 0.11's grease stanza is 13 to 190 bytes, each
+    /// size from 41 to 148 drawn about 0.7% of the time, so 10,000 tries miss
+    /// one of those with probability below e^-70, and a rarer size by much
+    /// more (the extremes are drawn 6e-8 of the time, #489). The header is
+    /// 168 bytes and the grease stanza (ONE_RECIPIENT_HEADER_LEN is 168 + 100).
+    fn header_len_is_reachable(len: usize) -> bool {
+        (168 + 41..=168 + 148).contains(&len)
+    }
+
+    /// Build a fixture with `build` until the age headers of slices 2 and 3 are
+    /// ones a re-encryption to the recorded length can reach, drawing again
+    /// when the staging drew a rare one: the staging encrypts at random and a
+    /// test that replaces a slice must match what it drew.
+    fn redraw_until_replaceable(
+        mut build: impl FnMut() -> Home,
+        reachable: impl Fn(usize) -> bool,
+    ) -> Home {
+        for _ in 0..200 {
+            let h = build();
+            let set = h.stage_set(UNIT, 1);
+            if [2, 3].iter().all(|&n| reachable(header_len_of(&h, set, n))) {
+                return h;
+            }
+        }
+        panic!("no fixture drew common age headers in 200 builds");
+    }
+
+    /// [`copies`], for a test that replaces slice 2 or 3 with an age file of
+    /// the recorded length.
+    fn replaceable_copies(labels: &[&str]) -> Home {
+        redraw_until_replaceable(|| copies("256K", None, labels), header_len_is_reachable)
+    }
+
+    /// A rare original header no longer fails a replacing test: the fixture is
+    /// drawn again until it is a common one, and the replacement then matches
+    /// the recorded length.
+    #[test]
+    fn a_rare_original_header_is_drawn_again_and_the_replacement_matches() {
+        assert!(!header_len_is_reachable(168 + 13));
+        assert!(!header_len_is_reachable(168 + 190));
+        assert!(header_len_is_reachable(268));
+        // Treat the first fixture as having drawn a rare header.
+        let builds = std::cell::Cell::new(0);
+        let mut h = redraw_until_replaceable(
+            || {
+                builds.set(builds.get() + 1);
+                copies("256K", None, &[A])
+            },
+            |_| builds.get() > 1,
+        );
+        assert_eq!(
+            builds.get(),
+            2,
+            "the first draw was refused and drawn again"
+        );
+        let set = h.stage_set(UNIT, 1);
+        let (size, _) = slice_sizes(&h, set, 3);
+        // replace_slice asserts the recorded length itself.
+        replace_slice(&mut h, A, set, 3, &unlike(size, 7));
+    }
+
     /// Replace slice `n` of `set` as cartridge `label` holds it with `plain`
     /// encrypted afresh to the recipients the staging used: a DIFFERENT age
     /// file (its own file key, nonce and header) of exactly the length the
@@ -346,9 +416,7 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
-        // header + the 16-byte nonce + each chunk and its 16-byte tag.
-        let chunks = plain.len().div_ceil(CHUNK as usize).max(1);
-        let header_len = encrypted - 16 - plain.len() - 16 * chunks;
+        let header_len = header_len_of(h, set, n);
         let mut cipher =
             crate::staging::encrypt_data_with_header_len(plain, &recipients, header_len);
         assert_eq!(cipher.len(), encrypted, "the recorded length");
@@ -829,7 +897,7 @@ pub(crate) mod tests {
     /// is whole with the substitution said.
     #[test]
     fn a_wrong_age_file_at_the_right_position_is_replaced_from_another_copy() {
-        let mut h = copies("256K", None, &[A, B]);
+        let mut h = replaceable_copies(&[A, B]);
         let set = h.stage_set(UNIT, 1);
         let (size, _) = slice_sizes(&h, set, 3);
         replace_slice(&mut h, A, set, 3, &unlike(size, 4242));
@@ -862,7 +930,7 @@ pub(crate) mod tests {
     /// out), so the restored file is the archived one.
     #[test]
     fn a_plaintext_one_byte_off_is_replaced_from_another_copy_and_never_reaches_tar() {
-        let mut h = copies("256K", None, &[A, B]);
+        let mut h = replaceable_copies(&[A, B]);
         let set = h.stage_set(UNIT, 1);
         let plain = plain_at(&h, A, set, 3);
         let (path, at) = byte_in_a_member(&h, set, 3);
@@ -902,7 +970,7 @@ pub(crate) mod tests {
     /// the other copy's ciphertext does prove itself.
     #[test]
     fn an_unproven_slice_gives_way_to_a_copy_that_hashes_as_recorded() {
-        let mut h = copies("256K", None, &[A, B]);
+        let mut h = replaceable_copies(&[A, B]);
         let set = h.stage_set(UNIT, 1);
         forget_plain_sha(&h, set, 3);
         let plain = plain_at(&h, A, set, 3);
@@ -956,7 +1024,7 @@ pub(crate) mod tests {
     /// success.
     #[test]
     fn a_wrong_age_file_on_the_only_copy_is_a_whole_slice_of_hole() {
-        let mut h = copies("256K", None, &[A]);
+        let mut h = replaceable_copies(&[A]);
         let set = h.stage_set(UNIT, 1);
         let (size, _) = slice_sizes(&h, set, 3);
         let wrong = unlike(size, 4242);
@@ -1008,7 +1076,7 @@ pub(crate) mod tests {
     #[test]
     fn a_slice_one_byte_off_on_the_only_copy_is_judged_by_its_checksum_or_by_its_files() {
         for recorded in [true, false] {
-            let mut h = copies("256K", None, &[A]);
+            let mut h = replaceable_copies(&[A]);
             let set = h.stage_set(UNIT, 1);
             let plain = plain_at(&h, A, set, 3);
             let (path, at) = byte_in_a_member(&h, set, 3);
@@ -1055,7 +1123,7 @@ pub(crate) mod tests {
     #[test]
     fn a_reencrypted_slice_is_whole_by_its_plaintext_checksum_and_unproven_without_one() {
         for recorded in [true, false] {
-            let mut h = copies("256K", None, &[A]);
+            let mut h = replaceable_copies(&[A]);
             let set = h.stage_set(UNIT, 1);
             let plain = plain_at(&h, A, set, 3);
             replace_slice(&mut h, A, set, 3, &plain);
@@ -1084,7 +1152,7 @@ pub(crate) mod tests {
     /// refuses, by name.
     #[test]
     fn chunks_of_two_age_files_are_never_mixed_into_one_slice() {
-        let mut h = copies("256K", None, &[A, B]);
+        let mut h = replaceable_copies(&[A, B]);
         let set = h.stage_set(UNIT, 1);
         let (size, _) = slice_sizes(&h, set, 2);
         assert!(size as u64 > 2 * CHUNK, "slice 2 holds {size} bytes");
