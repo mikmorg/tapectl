@@ -10054,8 +10054,11 @@ fn check_file_tables(conn: &Connection, units: &[BuildUnit]) -> Result<()> {
     Err(TapectlError::Other(format!(
         "refusing to write: the catalog holds no file table for these units, and every \
          tape carries the file table of each unit it holds (volume-format-v3.md §1.6). \
-         Stage each version again (`tapectl stage create`) and write that. Nothing was \
-         written and the drive was not touched:{missing}"
+         Stage each version again and write that: for each below, release its stage set \
+         first, with `tapectl stage clean --unit <unit> --version <N> --force` (the set is \
+         still `staged`, and `stage create` refuses a set that is), then `tapectl stage \
+         create <unit> --version <N>`. Nothing was written and the drive was not \
+         touched:{missing}"
     )))
 }
 
@@ -10155,8 +10158,15 @@ pub fn generate_tables(
         let stream_bytes = u64::try_from(stream_bytes.unwrap_or(-1)).map_err(|_| {
             TapectlError::Other(format!(
                 "{} v{} (stage set {}): the catalog records no stream length for its file \
-                 table; stage the version again",
-                u.unit_name, u.snapshot_version, u.stage_set_id
+                 table; release it with `tapectl stage clean --unit {} --version {} --force` and \
+                 stage the version again with `tapectl stage create {} --version {}`",
+                u.unit_name,
+                u.snapshot_version,
+                u.stage_set_id,
+                u.unit_name,
+                u.snapshot_version,
+                u.unit_name,
+                u.snapshot_version,
             ))
         })?;
         let tables = build::StagingTables {
@@ -31699,6 +31709,16 @@ mod layout_3_tables_tests {
             "names the unit: {err}"
         );
         assert!(err.contains("Stage each version again"), "{err}");
+        // #593 3-3: the remedy works in the state it refuses: the set is still
+        // `staged`, so `stage create` alone refuses it; it names the release.
+        assert!(
+            err.contains("`tapectl stage clean --unit <unit> --version <N> --force`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("`tapectl stage create <unit> --version <N>`"),
+            "{err}"
+        );
         assert!(
             !err.contains("unit-whole"),
             "only the unit without one: {err}"

@@ -975,7 +975,9 @@ fn snapshot_to_stage(
                         "{head} — use `tapectl volume write` to consume them; it has no \
                          completed write backing it, so `tapectl stage clean \
                          --unit {name} --version {v}` would leave it untouched — \
-                         pass --force to release it"
+                         pass --force to release it. If `tapectl volume write` refuses it \
+                         (a set with no file table), release it with `tapectl stage clean \
+                         --unit {name} --version {v} --force`, then stage it again"
                     ),
                     // #478 (ADR-0012 items 85 and 129): a span in
                     // progress. Its released slices are on tape; the short
@@ -1896,6 +1898,13 @@ mod tests {
         assert!(
             msg.contains("--force"),
             "must name --force unconditionally: {msg}"
+        );
+        // #593 3-3: `volume write` refuses a set with no file table, so the
+        // text says what to do then: release it with --force, stage it again.
+        assert!(
+            msg.contains("`tapectl volume write` refuses it")
+                && msg.contains("tapectl stage clean --unit unit1 --version 1 --force"),
+            "{msg}"
         );
         assert!(
             !msg.contains("copy floor"),

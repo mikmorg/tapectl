@@ -311,8 +311,16 @@ pub fn build_with_plan_bound(
             if !tables.contains_key(&unit.stage_set_id) {
                 return Err(TapectlError::Other(format!(
                     "build: unit {} v{} (stage set {}) has no file table to carry, and a tape \
-                     is never written without one (item 265): stage the version again",
-                    unit.unit_name, unit.snapshot_version, unit.stage_set_id
+                     is never written without one (item 265): release the stage set with \
+                     `tapectl stage clean --unit {} --version {} --force` and stage the version \
+                     again with `tapectl stage create {} --version {}`",
+                    unit.unit_name,
+                    unit.snapshot_version,
+                    unit.stage_set_id,
+                    unit.unit_name,
+                    unit.snapshot_version,
+                    unit.unit_name,
+                    unit.snapshot_version,
                 )));
             }
         }
@@ -3387,6 +3395,12 @@ mod tests {
         let err = build(&uncovered, &dir).unwrap_err().to_string();
         assert!(err.contains("bravo-books v2 (stage set 8)"), "{err}");
         assert!(err.contains("stage the version again"), "{err}");
+        // #593 3-3: a set still `staged` is released first, or `stage create`
+        // refuses it.
+        assert!(
+            err.contains("tapectl stage clean --unit bravo-books --version 2 --force"),
+            "{err}"
+        );
         assert!(!dir.exists(), "nothing is written");
     }
 
