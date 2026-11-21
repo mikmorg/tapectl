@@ -1269,7 +1269,13 @@ impl Setup<'_> {
         let cfg = self.config()?;
         if let Some(cfg) = cfg.as_ref().filter(|c| !c.collections.is_empty()) {
             let names: Vec<&str> = cfg.collections.iter().map(|c| c.name.as_str()).collect();
-            let conn = self.conn()?.expect("a config means a home");
+            let Some(conn) = self.conn()? else {
+                // A kept config.toml and no catalog yet (#538), previewed by a
+                // dry run: nothing to sync against until the home is made.
+                println!("  already done: collection {}", names.join(", "));
+                println!("  would register its unit folders once the catalog is made");
+                return Ok(());
+            };
             let mut unregistered = 0;
             for lib in &cfg.collections {
                 if let Ok(preview) =

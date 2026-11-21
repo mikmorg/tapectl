@@ -426,6 +426,26 @@ fn setup_dry_run_says_it_would_keep_a_config_toml_it_finds() {
     );
 }
 
+/// #599 9-1: a kept `config.toml` that names a collection, and no catalog,
+/// is the same recovery; its dry run previews every step and exits 0. On the
+/// parent step 6 panicked ("a config means a home", exit 101).
+#[test]
+fn setup_dry_run_on_a_kept_config_with_a_collection_does_not_panic() {
+    let w = world_with_a_kept_config();
+    let mut config = std::fs::read_to_string(w.home().join("config.toml")).unwrap();
+    config.push_str(&format!(
+        "\n[[collections]]\nname = \"photos\"\nroot = \"{}\"\ntenant = \"friend\"\n",
+        w.p("media/photos").display()
+    ));
+    std::fs::write(w.home().join("config.toml"), config).unwrap();
+    let mut args = w.setup_args();
+    args.retain(|a| a != "--yes");
+    args.push("--dry-run".into());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, _) = assert_ok(&w.tapectl(&args), "setup --dry-run");
+    assert!(stdout.contains("collection photos"), "{stdout}");
+}
+
 // ── the writer's tar floor (T5.4; ADR-0012 items 229, 274) ───────────────
 
 /// A directory holding an executable `tar` that is a shell script.
