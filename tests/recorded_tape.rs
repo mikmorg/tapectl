@@ -5,7 +5,7 @@
 //! padded to 524,288 bytes): two tenants, the operator and the escrow recipient; a unit of
 //! three slices whose root has mode 0750 and which has a nested folder, an empty file, an
 //! empty folder, a name with a non-ASCII letter, a hard link and a symbolic link; and a zstd
-//! unit and a gzip unit. It was written through the real staging path (`stage create`: GNU
+//! unit and a gzip unit (each unit's own `.tapectl-unit.toml` is a member too). It was written through the real staging path (`stage create`: GNU
 //! tar, the cut at member starts, each slice compressed alone, age) and `volume write`.
 //! `RECORDED.md` names the tapectl commit, the tar that made it (GNU tar 1.35), the drive
 //! emulation and the command line; `EXPECTED.toml` says what the tape holds, made from the
@@ -17,6 +17,13 @@
 //! and the tape's OWN RESTORE.sh (File 2 of the fixture, never the tree's) restores every
 //! unit under the heir harness, `mt` and `dd` standing in for the drive and serving the
 //! fixture's tape files.
+//!
+//! NOT COVERED HERE: `restore file` (issue #552 names it). tapectl's one-file restore has no
+//! seam over a store: `restore_file` opens the drive and `RestoreTarget` is crate-private,
+//! so an integration test cannot hand it the fixture's files. The seam would be a
+//! `restore_file_from_store_for_tests` beside `restore_unit_from_store_for_tests` in
+//! `src/volume/restore.rs`, outside this task's fence; until it lands, the one-file
+//! restore is covered here only by the tape's own RESTORE.sh for whole units.
 //!
 //! THE RULE. This fixture is never re-recorded to make a test pass. A later build that
 //! cannot read it has broken the format, and that is the CTO's decision, as a change to a
@@ -100,7 +107,7 @@ fn tape_files() -> Vec<Vec<u8>> {
         }
         let bytes = fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         assert!(
-            !bytes.is_empty() && bytes.len() % BLOCK == 0,
+            !bytes.is_empty() && bytes.len().is_multiple_of(BLOCK),
             "{}: a tape file as the heir reads it is whole {BLOCK}-byte blocks, not {} bytes",
             p.display(),
             bytes.len()
@@ -226,12 +233,14 @@ fn walk(root: &Path) -> BTreeMap<String, PathBuf> {
 /// root's mode. `what` names the source of the restore in a failure.
 fn assert_unit_restored(unit: &UnitE, dir: &Path, what: &str) {
     let fixture = fixture_dir().join("EXPECTED.toml");
+    // Every entry, the unit's `.tapectl-unit.toml` (a member of the tape) among them.
     let on_disk = walk(dir);
-    // The restore's own bookkeeping files are not part of the unit.
-    let on_disk: BTreeMap<_, _> = on_disk
-        .into_iter()
-        .filter(|(rel, _)| !rel.starts_with(".tapectl-") && rel != ".tapectl-unit.toml")
-        .collect();
+    assert!(
+        !on_disk.contains_key(".tapectl-damaged-files.txt"),
+        "{} ({what}): unit {} came back with a damaged-files list",
+        fixture.display(),
+        unit.name
+    );
     let want: Vec<&str> = unit.path.iter().map(|p| p.path.as_str()).collect();
     let got: Vec<&str> = on_disk.keys().map(String::as_str).collect();
     let mut want_sorted = want.clone();
@@ -292,6 +301,42 @@ fn assert_unit_restored(unit: &UnitE, dir: &Path, what: &str) {
     );
 }
 
+/// A unit's rebuilt file rows at `version`: path -> (kind name, size, sha256 hex).
+fn file_rows(
+    conn: &rusqlite::Connection,
+    unit: &str,
+    version: i64,
+) -> BTreeMap<String, (String, u64, Option<String>)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.path, fv.kind, fv.size_bytes, fv.sha256
+               FROM file_versions fv
+               JOIN paths p ON p.id = fv.path_id
+               JOIN snapshots s ON s.id = fv.snapshot_id
+               JOIN units u ON u.id = s.unit_id
+              WHERE u.name = ?1 AND s.version = ?2",
+        )
+        .unwrap();
+    stmt.query_map(rusqlite::params![unit, version], |r| {
+        let kind: i64 = r.get(1)?;
+        let sha: Option<Vec<u8>> = r.get(3)?;
+        Ok((
+            r.get::<_, String>(0)?,
+            (
+                tapectl::db::files::FileKind::from_code(kind)
+                    .unwrap()
+                    .as_str()
+                    .to_string(),
+                r.get::<_, i64>(2)? as u64,
+                sha.map(|b| b.iter().map(|x| format!("{x:02x}")).collect()),
+            ),
+        ))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
 fn key_name_of(tenant: &str) -> &'static str {
     match tenant {
         "rec-alpha" => "tenant-alpha",
@@ -329,7 +374,8 @@ fn recorded_md_names_the_tar_that_made_the_tape() {
 // ---- tapectl reads it ----
 
 /// `catalog rebuild` from the tape gives the catalog EXPECTED describes: the volume, the
-/// tenants, every unit under its tenant at its version, and each unit's file table.
+/// tenants, every unit under its tenant at its version and with its compression, and each
+/// unit's file rows (every path with its kind, size and sha256, and no other).
 #[test]
 fn catalog_rebuild_from_the_recorded_tape_matches_expected() {
     let want = expected();
@@ -383,6 +429,27 @@ fn catalog_rebuild_from_the_recorded_tape_matches_expected() {
                 |r| r.get(0),
             )
             .unwrap_or_else(|e| panic!("{ctx}: unit {}'s stage set not rebuilt: {e}", u.name));
+        let rows = file_rows(&home.conn, &u.name, u.version);
+        let want_rows: BTreeMap<String, (String, u64, Option<String>)> = u
+            .path
+            .iter()
+            .map(|e| {
+                let kind = match e.kind.as_str() {
+                    "file" => "regular",
+                    other => other,
+                };
+                (e.path.clone(), (kind.to_string(), e.size, e.sha256.clone()))
+            })
+            .collect();
+        assert_eq!(
+            rows.keys().collect::<Vec<_>>(),
+            want_rows.keys().collect::<Vec<_>>(),
+            "{ctx}: unit {}'s rebuilt file rows name other paths than EXPECTED",
+            u.name
+        );
+        for (path, got) in &rows {
+            assert_eq!(got, &want_rows[path], "{ctx}: unit {} row {path}", u.name);
+        }
         assert_eq!(
             compression.as_deref().unwrap_or("none"),
             u.compression,

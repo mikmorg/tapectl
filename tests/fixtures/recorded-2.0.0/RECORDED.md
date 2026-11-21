@@ -1,7 +1,8 @@
 # How tests/fixtures/recorded-2.0.0 was recorded
 
 - tapectl: tapectl 2.0.0 (v1.9.2-387-g9d920085, 2026-11-21)
-- built from commit: cac00aaede65e79b9c5273d25c8b38dbe79b4a97
+- binary: built from 9d920085 (the commit its --version line names), debug build
+- recording script: the version committed as fe494a28 (repository HEAD was cac00aae when it ran, with the script's fixes of that commit not yet committed). Later script commits changed only how EXPECTED.toml is made (after `unit init`, so the unit dotfiles are in it; a symlink's size is its target's length); EXPECTED.toml here was made by that code from the recording's own source trees
 - GNU tar that made the tape: tar (GNU tar) 1.35
 - date (UTC): 2026-11-21T22:10:11Z
 - drive: /dev/tape/by-id/scsi-XYZZY_A2-nst (/dev/nst1), mhvtl: [4:0:2:0]    tape    IBM      ULT3580-TD8      2160  /dev/st1 

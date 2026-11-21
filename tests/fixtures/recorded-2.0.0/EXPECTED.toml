@@ -1,7 +1,8 @@
 # What tests/fixtures/recorded-2.0.0 holds, made from the source trees by
 # scripts/record-recorded-tape.sh and never from tapectl's own catalog.
 # kind: file | dir | symlink.  A hard link's second name is a file of the same bytes
-# (`hardlink_of` names the first).  `sha256` is of a file's bytes; `target` is a symlink's.
+# (`hardlink_of` names the first).  `sha256` is of a file's bytes; `target` is a symlink's, and
+# a symlink's size is its target's length, as lstat gives it.
 
 [tape]
 label = "REC-0001"
@@ -14,6 +15,12 @@ tenant = "rec-alpha"
 version = 1
 compression = "none"
 root_mode = 0o750
+
+[[unit.path]]
+path = ".tapectl-unit.toml"
+kind = "file"
+size = 178
+sha256 = "ed7c0b3474a88eb7ecb412648837626f1beba6b29ebf82803cc1e48d9ebc1b9b"
 
 [[unit.path]]
 path = "café.txt"
@@ -104,7 +111,7 @@ hardlink_of = "hard-a.txt"
 [[unit.path]]
 path = "link-to-notes"
 kind = "symlink"
-size = 0
+size = 14
 target = "docs/notes.txt"
 
 [[unit]]
@@ -113,6 +120,12 @@ tenant = "rec-bravo"
 version = 1
 compression = "gzip"
 root_mode = 0o755
+
+[[unit.path]]
+path = ".tapectl-unit.toml"
+kind = "file"
+size = 203
+sha256 = "15069914c257cdec56093505bc3f01dd8d0ee6568e34e26968c01e6c8b8a2d34"
 
 [[unit.path]]
 path = "report.txt"
@@ -143,6 +156,12 @@ tenant = "rec-bravo"
 version = 1
 compression = "zstd"
 root_mode = 0o755
+
+[[unit.path]]
+path = ".tapectl-unit.toml"
+kind = "file"
+size = 203
+sha256 = "125af885e8f3acd7403a529bae90478e12d5e69143b87f562d00032190981918"
 
 [[unit.path]]
 path = "report.txt"
