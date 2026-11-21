@@ -112,23 +112,28 @@ fn kind_agrees(recorded: FileKind, now: Kind) -> bool {
 pub(crate) fn scan(conn: &Connection, snapshot_id: i64, root: &Path, unit: &str) -> Result<Scan> {
     let started_ns = now_ns();
     let mut stmt = conn.prepare(&format!(
-        "SELECT p.path, fv.kind FROM {} WHERE fv.snapshot_id = ?1",
+        "SELECT p.path, fv.kind, fv.size_bytes FROM {} WHERE fv.snapshot_id = ?1",
         crate::db::files::VERSION_FILES
     ))?;
-    let mut recorded: Vec<(String, FileKind)> = stmt
+    let mut recorded: Vec<(String, FileKind, i64)> = stmt
         .query_map(params![snapshot_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, FileKind>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, FileKind>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let dotfile = crate::unit::dotfile::UNIT_DOTFILE;
-    if !recorded.iter().any(|(p, _)| p == dotfile) {
-        recorded.push((dotfile.to_string(), FileKind::Regular));
+    if !recorded.iter().any(|(p, _, _)| p == dotfile) {
+        // Not content: listed at the size it has now.
+        recorded.push((dotfile.to_string(), FileKind::Regular, 0));
     }
     recorded.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     recorded.dedup_by(|a, b| a.0 == b.0);
 
     let mut entries = Vec::with_capacity(recorded.len());
-    for (i, (path, kind)) in recorded.into_iter().enumerate() {
+    for (i, (path, kind, recorded_size)) in recorded.into_iter().enumerate() {
         if i % 4096 == 0 {
             crate::signal::check(|| format!("stopped while looking at unit \"{unit}\"'s files"))?;
         }
@@ -161,6 +166,21 @@ pub(crate) fn scan(conn: &Connection, snapshot_id: i64, root: &Path, unit: &str)
                 kind.as_str()
             )));
         };
+        // §3.2: the list is the snapshot's own entries by path, kind and
+        // size. A file that is not the size the snapshot recorded was edited
+        // since the source check: refused, not listed at its new size (#591
+        // 1-2). The dotfile is not content and is listed as it is.
+        if !is_dotfile && kind == FileKind::Regular && now == Kind::File {
+            let on_disk_size = meta.len();
+            if i64::try_from(on_disk_size).ok() != Some(recorded_size) {
+                return Err(TapectlError::Other(format!(
+                    "DIRTY: source file size changed: {path} (expected {recorded_size} bytes, \
+                     found {on_disk_size} bytes) — it was edited between the source check and \
+                     the scan of unit \"{unit}\". Take a new snapshot (`tapectl snapshot \
+                     create {unit}`) and stage that instead."
+                )));
+            }
+        }
         let c = CString::new(full.as_os_str().as_bytes())
             .map_err(|_| TapectlError::Other(format!("a source path holds a NUL byte: {path}")))?;
         let acl = AclOnDisk {
