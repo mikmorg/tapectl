@@ -767,7 +767,11 @@ fn tar_dying_in_the_middle_of_a_long_member_leaves_no_partial_file() {
 /// other slices' files are whole (ADR-0012 item 298). `column` is what the
 /// row's corruption is: `size_bytes` (the decoded cut's buffer, and an
 /// uncompressed slice's) or `encrypted_bytes` (a compressed slice's frame).
-fn a_slice_whose_recorded_size_cannot_be_held_is_bad(compression: Option<&str>, column: &str) {
+fn a_slice_whose_recorded_size_cannot_be_held_is_bad(
+    compression: Option<&str>,
+    column: &str,
+    said: &str,
+) {
     let items = files("many", 12, 20_000, 7);
     let h = home_with("alpha", &items, "64K", compression);
     assert!(h.num_slices("alpha") >= 3, "several slices");
@@ -794,7 +798,7 @@ fn a_slice_whose_recorded_size_cannot_be_held_is_bad(compression: Option<&str>, 
     let (r, dest) = h.restore("alpha", What::Unit, "RDR-A", &options, &mut bay);
     let err = r.expect_err("a slice that cannot be held").to_string();
     assert!(err.contains("INCOMPLETE"), "{err}");
-    assert!(err.contains("cannot be held in memory"), "{err}");
+    assert!(err.contains(said), "{err}");
     assert!(err.contains(&format!("slice {n} is bad")), "{err}");
     // The reason has parentheses of its own, so read the paths by hand.
     let lost: BTreeSet<String> = err
@@ -816,17 +820,32 @@ fn a_slice_whose_recorded_size_cannot_be_held_is_bad(compression: Option<&str>, 
 
 #[test]
 fn an_uncompressed_slice_whose_recorded_size_cannot_be_held_is_bad() {
-    a_slice_whose_recorded_size_cannot_be_held_is_bad(None, "size_bytes");
+    a_slice_whose_recorded_size_cannot_be_held_is_bad(None, "size_bytes", "cannot be held in memory");
 }
 
 #[test]
 fn a_compressed_slice_whose_recorded_cut_cannot_be_held_is_bad() {
-    a_slice_whose_recorded_size_cannot_be_held_is_bad(Some("zstd"), "size_bytes");
+    a_slice_whose_recorded_size_cannot_be_held_is_bad(Some("zstd"), "size_bytes", "cannot be held in memory");
 }
 
 #[test]
 fn a_compressed_slice_whose_recorded_frame_cannot_be_held_is_bad() {
-    a_slice_whose_recorded_size_cannot_be_held_is_bad(Some("zstd"), "encrypted_bytes");
+    a_slice_whose_recorded_size_cannot_be_held_is_bad(
+        Some("zstd"),
+        "encrypted_bytes",
+        "cannot be held in memory",
+    );
+}
+
+/// #594 4-7: an uncompressed slice reserves its recorded cut, so a corrupt
+/// `encrypted_bytes` is not refused by `reserve`; the tolerant read of a sole
+/// copy then counts every chunk past the tape file's real end as a hole, and
+/// the hole's placeholder bytes grew the buffer without bound (an allocation
+/// failure aborts the process). A hole may not run past what was reserved: the
+/// slice is bad, by name (item 298).
+#[test]
+fn an_uncompressed_slice_whose_recorded_encrypted_size_runs_past_its_cut_is_bad() {
+    a_slice_whose_recorded_size_cannot_be_held_is_bad(None, "encrypted_bytes", "more than");
 }
 
 /// The second name of a hard-linked symbolic link (#581, item 299): its row

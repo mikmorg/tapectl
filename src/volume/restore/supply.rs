@@ -370,6 +370,12 @@ pub(super) struct SliceOut {
     holes: Vec<Range<u64>>,
     /// Zero bytes of holes held.
     hole_bytes: u64,
+    /// The most plaintext the slice may hold: what [`SliceOut::reserve`] made
+    /// room for. A hole may not run past it (#594 4-7).
+    limit: u64,
+    /// Set when a read found the age file longer than `limit`: the slice is
+    /// bad, by this name, and the read stops ([`Supply::salvage`] says so).
+    overrun: Option<String>,
     /// Reads begun on this slice, from any cartridge.
     attempts: u32,
     /// The age file (header and nonce) that delivered this slice's first
@@ -388,6 +394,8 @@ impl SliceOut {
             bytes: Vec::new(),
             holes: Vec::new(),
             hole_bytes: 0,
+            limit: u64::MAX,
+            overrun: None,
             attempts: 0,
             bound: None,
         }
@@ -453,7 +461,28 @@ impl SliceOut {
             format!(
                 "the {expected} bytes the catalog records for it cannot be held in memory ({e})"
             )
-        })
+        })?;
+        self.limit = expected;
+        Ok(())
+    }
+
+    /// A hole of `len` bytes, as [`SliceOut::hole`], unless the slice would
+    /// then hold more than was reserved for it. The tolerant read of a sole
+    /// copy counts every chunk of `encrypted_bytes` the tape file does not
+    /// have as a hole, so a corrupt `encrypted_bytes` on an uncompressed
+    /// staging (whose reservation is its cut) would otherwise grow the buffer
+    /// without bound, and an allocation that fails aborts the process (item
+    /// 298, #594 4-7). `Err` says why the slice is bad.
+    fn try_hole(&mut self, len: u64) -> std::result::Result<(), String> {
+        if self.delivered().saturating_add(len) > self.limit {
+            return Err(format!(
+                "its age file is longer than the {} bytes the catalog records for the slice \
+                 (more than it can hold): the catalog's size for it is wrong",
+                self.limit
+            ));
+        }
+        self.hole(len);
+        Ok(())
     }
 
     /// Start the slice over: what was written is not to be kept (it is not
@@ -1220,6 +1249,15 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 });
             }
         };
+        // The age file is longer than the slice can be: nothing of the tolerant
+        // read is kept, and the slice is bad by name (#594 4-7).
+        if let Some(why) = out.overrun.take() {
+            return Ok(Some(format!(
+                "{}; {why}",
+                described(&cause)
+                    .unwrap_or_else(|| format!("slice {} cannot be read", wp.slice_number)),
+            )));
+        }
         if let Some(e) = ended.open_error {
             let text = format!(
                 "{}; and it cannot be read around: {e}",
@@ -2002,7 +2040,10 @@ fn decrypt_chunks(
                         break;
                     }
                     out.bind(&header);
-                    out.hole(end - skip.max(pos));
+                    if let Err(why) = out.try_hole(end - skip.max(pos)) {
+                        out.overrun = Some(why);
+                        break;
+                    }
                 }
                 pos = end;
             }
