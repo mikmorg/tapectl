@@ -1,0 +1,168 @@
+# What tests/fixtures/recorded-2.0.0 holds, made from the source trees by
+# scripts/record-recorded-tape.sh and never from tapectl's own catalog.
+# kind: file | dir | symlink.  A hard link's second name is a file of the same bytes
+# (`hardlink_of` names the first).  `sha256` is of a file's bytes; `target` is a symlink's.
+
+[tape]
+label = "REC-0001"
+operator = "rec-operator"
+tenants = ["rec-alpha", "rec-bravo"]
+
+[[unit]]
+name = "alpha-main"
+tenant = "rec-alpha"
+version = 1
+compression = "none"
+root_mode = 0o750
+
+[[unit.path]]
+path = "café.txt"
+kind = "file"
+size = 16
+sha256 = "72ef7765842795b68e6eade7a07ebb18187028917fe3e7db0535f4f2edfa8d23"
+
+[[unit.path]]
+path = "data"
+kind = "dir"
+size = 0
+
+[[unit.path]]
+path = "data/big-1.bin"
+kind = "file"
+size = 28000
+sha256 = "a373a6c39d6a8b297c0c54b4b768e599425530b11641574403cea4def5033a0d"
+
+[[unit.path]]
+path = "data/big-2.bin"
+kind = "file"
+size = 28000
+sha256 = "8bd9348989509804917e2ba6443d8bcc32f8560ce3915a640ccfdf5459e2e9c3"
+
+[[unit.path]]
+path = "data/big-3.bin"
+kind = "file"
+size = 28000
+sha256 = "20fcf110c9c3e9c4497e41495c4d7a2ceff1074d30187ffc21bcc4473bc54cc7"
+
+[[unit.path]]
+path = "data/big-4.bin"
+kind = "file"
+size = 28000
+sha256 = "134dc930f2221130755c0bc322f005402061ff4ecee0e17a11bd6d340cbce8d2"
+
+[[unit.path]]
+path = "docs"
+kind = "dir"
+size = 0
+
+[[unit.path]]
+path = "docs/deep"
+kind = "dir"
+size = 0
+
+[[unit.path]]
+path = "docs/deep/er"
+kind = "dir"
+size = 0
+
+[[unit.path]]
+path = "docs/deep/er/leaf.txt"
+kind = "file"
+size = 28
+sha256 = "62aedb4f05317204d575bee784c255b066b6735380cca2c7e967f81e89976357"
+
+[[unit.path]]
+path = "docs/empty-dir"
+kind = "dir"
+size = 0
+
+[[unit.path]]
+path = "docs/notes.txt"
+kind = "file"
+size = 3000
+sha256 = "7810e8697ab0d6db039e35251be3fb3d0039f60d13e5e56637beba3fee5d643f"
+
+[[unit.path]]
+path = "empty.dat"
+kind = "file"
+size = 0
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+[[unit.path]]
+path = "hard-a.txt"
+kind = "file"
+size = 2000
+sha256 = "26f9d4e44ea2c82dd81c7eaec6165c8db20a22cae62e32b689904cd4228e1063"
+
+[[unit.path]]
+path = "hard-b.txt"
+kind = "file"
+size = 2000
+sha256 = "26f9d4e44ea2c82dd81c7eaec6165c8db20a22cae62e32b689904cd4228e1063"
+hardlink_of = "hard-a.txt"
+
+[[unit.path]]
+path = "link-to-notes"
+kind = "symlink"
+size = 0
+target = "docs/notes.txt"
+
+[[unit]]
+name = "bravo-gzip"
+tenant = "rec-bravo"
+version = 1
+compression = "gzip"
+root_mode = 0o755
+
+[[unit.path]]
+path = "report.txt"
+kind = "file"
+size = 20000
+sha256 = "e6f22e8d19a48fe1c6ba0c9325285b5337760c714d3a2bcc1d51e9715b6cd029"
+
+[[unit.path]]
+path = "sub"
+kind = "dir"
+size = 0
+
+[[unit.path]]
+path = "sub/more.txt"
+kind = "file"
+size = 5000
+sha256 = "36ea63476c2ac9fa7a4943587609cf940be3410795180095aa683aa87229df35"
+
+[[unit.path]]
+path = "tiny.txt"
+kind = "file"
+size = 11
+sha256 = "cbf2f14e60a616f8de7cf7fb57b614ee1a3c6894d146eb8c3179f653b3827616"
+
+[[unit]]
+name = "bravo-zstd"
+tenant = "rec-bravo"
+version = 1
+compression = "zstd"
+root_mode = 0o755
+
+[[unit.path]]
+path = "report.txt"
+kind = "file"
+size = 20000
+sha256 = "e9c9fc09cad8252b94d5caa89dc44710f8bdd7b6cf0117418a36402f93eeea55"
+
+[[unit.path]]
+path = "sub"
+kind = "dir"
+size = 0
+
+[[unit.path]]
+path = "sub/more.txt"
+kind = "file"
+size = 5000
+sha256 = "7e2237b6ce2b4e7a775eee5ed10a3a659f120825a75f6f5d6f33690ac78890ac"
+
+[[unit.path]]
+path = "tiny.txt"
+kind = "file"
+size = 11
+sha256 = "af02168eee67d3bcce3a87a3912c1169f675487af76b795315d06344a7671b96"
