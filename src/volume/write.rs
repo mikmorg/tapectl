@@ -2109,6 +2109,33 @@ fn build_span_layout(
 /// A compaction reaches the write only through here (`compact-write` is an
 /// ordinary write of what `compact-read` staged), and `volume rewrite` asks
 /// it of its rehearsal ([`rehearse_write_capacity`]), before it erases.
+/// The one rule of which sealed ranges a run of a stage set joins (ADR-0012
+/// items 86 and 300): the volumes (label, generation) holding a sealed `range`
+/// of `set` whose last written slice (`last`) or first is `edge`. A run
+/// `first..=last` joins the ranges ending at `first - 1` (`last: true`) and
+/// beginning at `last + 1` (`last: false`). The refusal below and `audit`'s
+/// `span_in_progress` both ask it.
+pub(crate) fn sealed_ranges_adjoining(
+    conn: &Connection,
+    set: i64,
+    last: bool,
+    edge: i64,
+) -> Result<Vec<(String, Option<String>)>> {
+    let aggregate = if last { "MAX" } else { "MIN" };
+    Ok(conn
+        .prepare(&format!(
+            "SELECT v.label, v.media_type FROM writes w
+             JOIN volumes v ON v.id = w.volume_id
+             WHERE w.stage_set_id = ?1 AND w.status = 'range' AND v.status = 'sealed'
+               AND (SELECT {aggregate}(sl.slice_number) FROM write_positions wp
+                      JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                     WHERE wp.write_id = w.id AND wp.status = 'written') = ?2
+             ORDER BY w.id"
+        ))?
+        .query_map(params![set, edge], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn continuation_generation_refusal(
     conn: &Connection,
     label: &str,
@@ -2122,23 +2149,8 @@ fn continuation_generation_refusal(
         (Some(a), Some(b)) => a == b,
         _ => a == b,
     };
-    // The volumes (label, generation) holding a sealed `range` of `set`
-    // whose last written slice (`last`) or first is `edge`.
-    let adjoining = |set: i64, last: bool, edge: i64| -> Result<Vec<(String, Option<String>)>> {
-        let aggregate = if last { "MAX" } else { "MIN" };
-        Ok(conn
-            .prepare(&format!(
-                "SELECT v.label, v.media_type FROM writes w
-                 JOIN volumes v ON v.id = w.volume_id
-                 WHERE w.stage_set_id = ?1 AND w.status = 'range' AND v.status = 'sealed'
-                   AND (SELECT {aggregate}(sl.slice_number) FROM write_positions wp
-                          JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-                         WHERE wp.write_id = w.id AND wp.status = 'written') = ?2
-                 ORDER BY w.id"
-            ))?
-            .query_map(params![set, edge], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
-    };
+    let adjoining =
+        |set: i64, last: bool, edge: i64| sealed_ranges_adjoining(conn, set, last, edge);
     let named = |g: Option<&str>| g.unwrap_or("of an unrecorded generation").to_string();
     for (unit, class) in batch.units.iter().zip(&batch.classes) {
         let (Some(first), Some(last)) = (unit.slices.first(), unit.slices.last()) else {

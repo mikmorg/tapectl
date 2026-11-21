@@ -2662,29 +2662,24 @@ fn continuation_generation(
     first: i64,
     last: i64,
 ) -> Result<Option<(String, String)>> {
-    let joined = |aggregate: &str, edge: i64| -> Result<Option<(String, String)>> {
-        Ok(conn
-            .prepare(&format!(
-                "SELECT v.label, v.media_type FROM writes w
-                   JOIN volumes v ON v.id = w.volume_id
-                  WHERE w.stage_set_id = ?1 AND w.status = 'range' AND v.status = 'sealed'
-                    AND v.media_type IS NOT NULL
-                    AND (SELECT {aggregate}(sl.slice_number) FROM write_positions wp
-                           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-                          WHERE wp.write_id = w.id AND wp.status = 'written') = ?2
-                  ORDER BY w.id"
-            ))?
-            .query_map(params![set, edge], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+    // The rule is `continuation_generation_refusal`'s own, asked of it.
+    let known = |ranges: Vec<(String, Option<String>)>| {
+        ranges
             .into_iter()
-            .next())
+            .find_map(|(label, media)| media.map(|m| (label, m)))
     };
     if first > 1 {
-        if let Some(found) = joined("MAX", first - 1)? {
+        let before = crate::volume::write::sealed_ranges_adjoining(conn, set, true, first - 1)?;
+        if let Some(found) = known(before) {
             return Ok(Some(found));
         }
     }
-    joined("MIN", last + 1)
+    Ok(known(crate::volume::write::sealed_ranges_adjoining(
+        conn,
+        set,
+        false,
+        last + 1,
+    )?))
 }
 
 /// What `span_in_progress` tells the operator to do: load a cartridge, of
