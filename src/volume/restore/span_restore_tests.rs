@@ -711,6 +711,22 @@ fn with_nobody_at_the_terminal_the_restore_takes_what_its_tape_holds_whole_and_l
     assert!(!dest.path().join(SCRATCH_NAME).exists());
 }
 
+/// #594 4-9: `restores.slices_read` counts the slices the restore read. With
+/// nobody at the terminal the slices on the cartridge it was not given are
+/// not read, and the row must not say they were.
+#[test]
+fn slices_read_does_not_count_the_slices_of_a_cartridge_not_given() {
+    let (h, n) = spanned(&[A, B], &[3]);
+    assert!(n > 3, "positive control: slices lie on the other cartridge");
+    let mut bay = h.bay(A, &[Reply::Load(B)]);
+    bay.attended = false;
+    let (r, _dest) = h.restore(UNIT, What::Unit, A, &RestoreOptions::default(), &mut bay);
+    r.expect_err("the files on the other cartridge are listed");
+    let rows = crate::volume::restore_record::rows(&h.conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].slices_read, Some(3), "slices 1 to 3 only");
+}
+
 /// "I do not have it" at the prompt for the next cartridge (item 266, R7)
 /// is allowed: the restore goes on with the files its tape holds whole and
 /// lists the rest, and does not ask for the cartridge again.

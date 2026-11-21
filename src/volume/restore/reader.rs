@@ -607,7 +607,6 @@ pub(super) fn run(
                 break;
             }
         };
-        trace.slices_read += 1;
         trace.bytes_decrypted += read.authentic_bytes as i64;
         if let Some(why) = read.unavailable.clone() {
             reading.unavailable.insert(n, why);
@@ -620,6 +619,7 @@ pub(super) fn run(
         }
     }
     if failure.is_none() {
+        trace.slices_read += 1;
         phase.done();
         reading.close_skipped(u64::MAX);
         if reading.run.is_some() {
