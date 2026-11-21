@@ -3358,8 +3358,7 @@ mod tests {
         // Appended to, after the source check and before scan.
         fs::write(src.join("a"), vec![1u8; 20]).unwrap();
         let err = archive::scan(&conn, outcome.snapshot_id, &src, "unit1")
-            .err()
-            .expect("a size that is not the snapshot's is refused");
+            .expect_err("a size that is not the snapshot's is refused");
         let msg = err.to_string();
         assert!(msg.contains("DIRTY") && msg.contains("a"), "{msg}");
         assert!(msg.contains("10") && msg.contains("20"), "{msg}");
