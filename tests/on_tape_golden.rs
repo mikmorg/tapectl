@@ -391,8 +391,11 @@
 //! fresh keys and nonces). **If one of these fails, the on-tape format changed: that is a
 //! CTO decision (bytes on tape are forever), never something to fix by updating the
 //! constant here**, and a pin moves only in a commit of its own. A pin that holds a whole
-//! text shows the format in the test; one that holds a sha256 writes the generated text to
-//! a file under the target directory when it fails and names that file.
+//! text shows the format in the test; a failure writes the generated text to a file under the
+//! target directory and names that file. Every Layout 3 pin so far holds its whole text.
+//! Pinned here: File 0, the MANIFEST (a whole unit, a range block, the operator envelope), the
+//! front index, the seal marker (full and short), the file table's text and the id map's
+//! text. RESTORE.sh, File 1 and RECOVERY.md come after a CTO ruling.
 
 use tapectl::idmap::{self, IdKind, IdRow};
 use tapectl::volume::filetable::{self, Kind, Row};
@@ -404,7 +407,6 @@ use tapectl::volume::manifest::{Manifest, ManifestSlice, ManifestUnit};
 
 /// Compare a generated document with its pinned text. On a difference the generated text
 /// is written under the target directory and the failure names the file.
-#[allow(dead_code)]
 fn assert_pinned_text(name: &str, actual: &str, expected: &str) {
     if actual != expected {
         let path =
@@ -413,24 +415,6 @@ fn assert_pinned_text(name: &str, actual: &str, expected: &str) {
         panic!(
             "the on-tape bytes of {name} changed: a CTO decision, never a re-pin by an agent. \
              The generated text is in {}",
-            path.display()
-        );
-    }
-}
-
-/// Compare a generated document's sha256 with its pin; on a difference the generated text
-/// is written under the target directory and the failure names the file.
-#[allow(dead_code)]
-fn assert_pinned_sha256(name: &str, actual: &str, expected_hex: &str) {
-    use sha2::{Digest, Sha256};
-    let got = format!("{:x}", Sha256::digest(actual.as_bytes()));
-    if got != expected_hex {
-        let path =
-            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("golden-{name}.actual"));
-        let _ = std::fs::write(&path, actual);
-        panic!(
-            "the on-tape bytes of {name} changed: a CTO decision, never a re-pin by an agent. \
-             sha256 {got}, pinned {expected_hex}; the generated text is in {}",
             path.display()
         );
     }
