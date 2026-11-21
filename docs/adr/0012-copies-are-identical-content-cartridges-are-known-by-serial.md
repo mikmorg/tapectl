@@ -3921,3 +3921,23 @@ the same fixes):
 - #598 8-A1: `stage for-location`'s planner applies item 159's location rule, not item 300's
   generation rule; a set planned for a destination of the wrong generation is refused at the
   write, by name (`continuation_generation_refusal`).
+
+## Amendment, 2026-11-21 (later): the unit's root is archived
+
+Ruled 2026-11-21. Building item 303 found that it had no subject: staging never archived the
+unit's root (the walk skipped it), so no stream held a `./` member and the root's own metadata
+was not on tape. Question 50 had been put on a finder's reading of the restore alone; the
+coordinator did not check it against the writer. Put again as question 53, with two options
+(archive the root, recommended; or amend item 303 to say the root's metadata is not kept);
+the CTO chose to archive it.
+
+306. **The unit's root is a member** (question 53, #594 C-1; amends the writer's list of
+     §3.1 and gives item 303 its subject). The list given to tar begins with the unit's root,
+     before the sorted entries, so the stream's first member is the root folder with its own
+     mode, owner, times, extended attributes and ACL (a default ACL included), and the file
+     table's first row is the root's, written `.` (§1.6's rule for the root "when it is a
+     member"). It is checked as every member is (§3.2) and sits in slice 1. Item 303 then
+     applies as ruled: tapectl gives an empty destination the root's recorded metadata after
+     tar exits 0, and never touches the root of a destination that was not empty; RESTORE.sh's
+     tar already applies it to an empty `--to` (measured with GNU tar 1.35, 2026-11-21). This
+     is an on-tape change under item 243.

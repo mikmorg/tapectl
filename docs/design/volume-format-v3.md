@@ -414,7 +414,7 @@ each member of the staging's tar stream, **in stream order**:
   `f`; the target's, for `h`; `-` for the others.
 - `path` (**determined**): written as the index's `paths.tsv` writes a path: relative to
   the unit's root, with no leading `./`, escaped by §1.5's rule. The unit's root itself,
-  when it is a member, is written `.`. A reader that names a member to tar prefixes `./`,
+  always a member and the table's first row (ADR-0012 item 306), is written `.`. A reader that names a member to tar prefixes `./`,
   as the stream has it (T0.7, item 293).
 - `link target`: for `h` only, the path of the name archived first, escaped the same
   way. A symbolic link's target is in the stream, not in the table.
@@ -677,9 +677,10 @@ stored in the raw record no reader restores with its ordinary flags (T0.1).
   names do not depend on tar's process id (#562). Access and change times are not stored.
 - No `--sparse`: a sparse file is stored as its bytes. No compression by tar.
 
-**The list** is tapectl's: the snapshot's own entries, NUL-separated, every name prefixed
-`./`, sorted bytewise on each name's escaped text (§1.5), folders listed as their own
-entries, the unit's dotfile included.
+**The list** is tapectl's: the unit's root first (ADR-0012 item 306: the stream's first
+member is the root folder, and the file table's first row is `.`), then the snapshot's own
+entries, NUL-separated, every name prefixed `./`, sorted bytewise on each name's escaped
+text (§1.5), folders listed as their own entries, the unit's dotfile included.
 
 **The environment.** tar runs in the unit's root, with `LC_ALL=C`, and with `TAR_OPTIONS`
 and `POSIXLY_CORRECT` removed from its environment. If `--directory` is used in place of
@@ -1321,6 +1322,11 @@ reader zero-fills a lost slice, and none passes `--ignore-zeros`** (item 264).
   `--absolute-names`; with `LC_ALL=C` and without `TAR_OPTIONS` or `POSIXLY_CORRECT`. What
   tar could not set it says, and tapectl repeats it. The reader's tar is not held to the
   writer's floor.
+- **The root's own metadata** (ADR-0012 items 303, 306): `--keep-old-files` leaves an
+  existing destination's root as it is, so after tar exits 0 tapectl gives the destination
+  root the root member's recorded mode, owner, times, extended attributes and ACL when the
+  destination was empty at the preflight (tapectl made it, or found it empty), and never
+  when it was not.
 - **A bad slice** is replaced from another copy by its sha256 (item 101(a)): tapectl asks
   for the cartridge by label, sticker and chip serial. With no copy, the members in it are
   left out and listed, and the restore goes on (item 264). tapectl reads around a bad 64
