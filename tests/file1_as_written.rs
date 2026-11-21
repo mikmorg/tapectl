@@ -186,9 +186,10 @@ const OWNED_ELSEWHERE: &[(&str, &str)] = &[
     ),
 ];
 
-/// The code lines no test can run: finding the drive on a host that has one.
+/// The code lines no test can run: finding the drive on a host that has one,
+/// and asking a drive whether a cartridge is in it (#548 T6.2-1).
 /// Everything else in a code block is run.
-const NOT_RUN: &[&str] = &["ls -l /dev/tape/by-id/"];
+const NOT_RUN: &[&str] = &["ls -l /dev/tape/by-id/", "mt -f /dev/nst0 status"];
 
 // ---- running a block as written ----
 
