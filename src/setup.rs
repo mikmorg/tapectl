@@ -632,7 +632,9 @@ pub fn root_lines(
     linger: bool,
 ) -> Vec<RootLine> {
     let mut lines = Vec::new();
-    if !groups.iter().any(|g| g == drive_group) {
+    // A node owned by group `root` (no udev tape rule) is no group to join:
+    // first-run.sh step 6 excludes it the same way (#599 9-3).
+    if drive_group != "root" && !groups.iter().any(|g| g == drive_group) {
         lines.push(RootLine {
             command: format!("sudo usermod -aG {drive_group} {user}"),
             why: format!("the drive's group; then log out and back in (`id` lists {drive_group})"),
@@ -685,15 +687,41 @@ fn exec_word(path: &Path) -> String {
     }
 }
 
+/// The `Environment=` line that points a unit at `home`. systemd splits an
+/// unquoted `Environment=` at whitespace, so a home with a space is written
+/// as one quoted assignment (#599 9-4).
+fn environment_line(home: &Path) -> String {
+    let h = home.display().to_string();
+    if h.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
+        let escaped = h.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("Environment=\"TAPECTL_HOME={escaped}\"\n")
+    } else {
+        format!("Environment=TAPECTL_HOME={h}\n")
+    }
+}
+
+/// Whether the service units already in `dir` run tapectl for `home`
+/// (`None`: the default home, no `TAPECTL_HOME` at all).
+fn units_serve_home(dir: &Path, home: Option<&Path>) -> bool {
+    let want = home.map(environment_line);
+    [UNIT_FILES[0], UNIT_FILES[2]].iter().all(|f| {
+        let Ok(text) = std::fs::read_to_string(dir.join(f)) else {
+            return false;
+        };
+        match &want {
+            Some(line) => text.lines().any(|l| l == line.trim_end()),
+            None => !text.contains("TAPECTL_HOME="),
+        }
+    })
+}
+
 /// The four user unit files: name and text.
 pub fn unit_files(
     exe: &Path,
     tapectl_home: Option<&Path>,
     backup_dir: &Path,
 ) -> Vec<(&'static str, String)> {
-    let env = tapectl_home
-        .map(|h| format!("Environment=TAPECTL_HOME={}\n", h.display()))
-        .unwrap_or_default();
+    let env = tapectl_home.map(environment_line).unwrap_or_default();
     let exe = exec_word(exe);
     let backup = exec_word(backup_dir);
     vec![
@@ -1233,6 +1261,19 @@ impl Setup<'_> {
         } else {
             self.args.locations.clone()
         };
+        let mut places = existing.clone();
+        for name in &wanted {
+            let name = name.trim().to_string();
+            if !places.contains(&name) {
+                places.push(name);
+            }
+        }
+        if places.len() < 2 {
+            println!(
+                "  warning: one place is not two: a fire or a flood takes both copies. Give \
+                 --location twice, or add a second with `tapectl location add NAME`"
+            );
+        }
         for name in wanted {
             let name = name.trim().to_string();
             if existing.contains(&name) {
@@ -1449,6 +1490,28 @@ impl Setup<'_> {
             );
             return Ok(());
         }
+        let default_home = self.facts.user_home.join(".tapectl");
+        let tapectl_home = (self.paths.home != default_home).then_some(self.paths.home.as_path());
+        if UNIT_FILES.iter().all(|f| dir.join(f).exists())
+            && !units_serve_home(&dir, tapectl_home)
+        {
+            // One account has one pair of user timers; these run tapectl for
+            // another home, so this home is neither backed up nor audited
+            // (#599 9-5). Overwriting them would unmake that home's.
+            println!(
+                "  not done: {} and {} in {} run tapectl for another home, not {}",
+                UNIT_FILES[1],
+                UNIT_FILES[3],
+                dir.display(),
+                self.paths.home.display()
+            );
+            println!(
+                "  one account has one pair of user timers: back this home up with `tapectl \
+                 --home {} db backup DIR`, or move those four files away and run setup again",
+                self.paths.home.display()
+            );
+            return Ok(());
+        }
         if UNIT_FILES.iter().all(|f| dir.join(f).exists()) {
             println!(
                 "  already done: {} and {} in {}",
@@ -1507,8 +1570,6 @@ impl Setup<'_> {
                 self.paths.home.display()
             );
         }
-        let default_home = self.facts.user_home.join(".tapectl");
-        let tapectl_home = (self.paths.home != default_home).then_some(self.paths.home.as_path());
         let files = unit_files(&self.facts.tapectl_exe, tapectl_home, &backup_dir);
         if self.dry() {
             for (name, _) in &files {
@@ -1618,7 +1679,8 @@ impl Setup<'_> {
             };
         }
         let first = places.first().cloned().unwrap_or_else(|| "home".into());
-        let second = places.get(1).cloned().unwrap_or_else(|| first.clone());
+        // One place is not two: copy 2 is not shelved beside copy 1 (#599 9-2).
+        let second = places.get(1).cloned();
         println!("  see how the units pack into tapes:");
         println!("    tapectl collection plan");
         println!("  copy 1: load a blank cartridge, then");
@@ -1627,7 +1689,21 @@ impl Setup<'_> {
              --full-confirm --move-to {first}"
         );
         println!("  copy 2: load the next blank cartridge, then");
-        println!("    tapectl volume write {prefix}-0002 --init --full-confirm --move-to {second}");
+        match &second {
+            Some(second) => println!(
+                "    tapectl volume write {prefix}-0002 --init --full-confirm --move-to {second}"
+            ),
+            None => {
+                println!(
+                    "    tapectl volume write {prefix}-0002 --init --full-confirm --move-to \
+                     <SECOND-PLACE>"
+                );
+                println!(
+                    "  only one place is recorded, \"{first}\": copy 2 belongs in a second, \
+                     away from the first. Add it first: `tapectl location add <SECOND-PLACE>`"
+                );
+            }
+        }
         println!("  where things stand, and the next command, at any time:");
         println!("    tapectl status");
         println!();
@@ -1656,6 +1732,43 @@ fn same_disk(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #599 9-3: a tape node owned by group `root` is no group to join.
+    #[test]
+    fn the_root_block_never_says_to_join_root() {
+        let empty = tempfile::TempDir::new().unwrap();
+        let lines = root_lines(
+            "alice",
+            "root",
+            &["alice".into()],
+            empty.path().as_os_str(),
+            false,
+            true,
+        );
+        assert!(
+            lines.iter().all(|l| !l.command.contains("usermod")),
+            "{lines:?}"
+        );
+    }
+
+    /// #599 9-4: a home with a space is one quoted `Environment=` assignment.
+    #[test]
+    fn a_home_with_a_space_is_one_quoted_environment_assignment() {
+        let files = unit_files(
+            Path::new("/usr/local/bin/tapectl"),
+            Some(Path::new("/home/a/My Archive")),
+            Path::new("/mnt/b"),
+        );
+        for i in [0, 2] {
+            assert!(
+                files[i]
+                    .1
+                    .contains("Environment=\"TAPECTL_HOME=/home/a/My Archive\"\n"),
+                "{}",
+                files[i].1
+            );
+        }
+    }
 
     #[test]
     fn names_and_prefixes_follow_the_generation() {
