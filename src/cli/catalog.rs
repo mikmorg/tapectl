@@ -1592,8 +1592,8 @@ fn seal_unreadable_lines(report: &RebuildReport, why: &str) -> Vec<String> {
          again into this catalog: a rebuild that reads the seal cleanly finishes this record (the \
          volume `sealed`, its writes and positions a sealed tape's) while nothing has changed the \
          row since (ADR-0012 item 302). `tapectl volume verify {label}` checks \
-         the tape against its own front index and, when clean and full, clears the quarantine \
-         (it does not seal the row). What the tape holds restores with `tapectl restore unit` or \
+         the tape against its own front index; it neither clears the quarantine nor seals the \
+         row, in either order with the rebuild. What the tape holds restores with `tapectl restore unit` or \
          RESTORE.sh at its file 2. Only to give the tape up: `tapectl volume retire {label}`, \
          then `tapectl cartridge erase`, which asks for the tape's label."
     ));

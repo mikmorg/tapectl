@@ -1973,6 +1973,25 @@ pub const SEAL_UNREADABLE_EVENT: &str = "seal_unreadable";
 /// earlier rebuild began on a seal it could not read (ADR-0012 item 302, #582).
 pub const SEAL_PROMOTED_EVENT: &str = "seal_promoted";
 
+/// Whether `volume_id` carries a [`SEAL_UNREADABLE_EVENT`] that no later
+/// [`SEAL_PROMOTED_EVENT`] has answered: a rebuild recorded it from a seal it
+/// could not read, and no rebuild has read that seal since. Such a volume may
+/// carry a SEALED tape (ADR-0012 #277, ADR-0003), so `volume write` and
+/// `volume resume` refuse it whatever its `observed_condition`, and a clean
+/// full verify does not clear its quarantine (#582, item 302). Keyed on the
+/// events, never on the condition.
+pub fn seal_unreadable_pending(conn: &Connection, volume_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events e
+                       WHERE e.entity_type = 'volume' AND e.entity_id = ?1 AND e.action = ?2
+                         AND NOT EXISTS(SELECT 1 FROM events p
+                                        WHERE p.entity_type = 'volume' AND p.entity_id = ?1
+                                          AND p.action = ?3 AND p.id > e.id))",
+        params![volume_id, SEAL_UNREADABLE_EVENT, SEAL_PROMOTED_EVENT],
+        |r| r.get(0),
+    )?)
+}
+
 /// Whether a rebuild recorded `volume_id` as one whose seal it could not read
 /// ([`SEAL_UNREADABLE_EVENT`]).
 pub fn seal_unreadable_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
@@ -1994,8 +2013,10 @@ pub fn seal_unreadable_recorded(conn: &Connection, volume_id: i64) -> Result<boo
 /// 2. it carries a [`SEAL_UNREADABLE_EVENT`], the rebuild's own mark that it
 ///    wrote the row (an operator's or a write's `initialized` row has none);
 /// 3. no event on the volume came after the last such event except a
-///    `catalog_rebuild`'s (a write, resume, verify, retire, edit or
-///    adoption each log one), so nothing has acted on the row since;
+///    `catalog_rebuild`'s or a failed verify's `verify_quarantined` (a write,
+///    resume, retire, edit or adoption each log one; a verify changes nothing
+///    on such a row, since it never clears this quarantine), so nothing has
+///    acted on the row since;
 /// 4. every write on it is still `aborted` and every position of those writes
 ///    still `pending`, as `ensure_write` and `ensure_position` left them for
 ///    an unsealed reading (a write or an adoption changes them).
@@ -2022,7 +2043,7 @@ fn unreadable_seal_row_unchanged(
     Ok(conn.query_row(
         "SELECT NOT EXISTS(SELECT 1 FROM events
                            WHERE entity_type = 'volume' AND entity_id = ?1 AND id > ?2
-                             AND action <> 'catalog_rebuild')
+                             AND action NOT IN ('catalog_rebuild', 'verify_quarantined'))
             AND NOT EXISTS(SELECT 1 FROM writes WHERE volume_id = ?1 AND status <> 'aborted')
             AND NOT EXISTS(SELECT 1 FROM write_positions wp
                            JOIN writes w ON w.id = wp.write_id

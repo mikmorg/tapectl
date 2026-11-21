@@ -1372,6 +1372,16 @@ pub(crate) fn volume_write_contacted<'c>(
     // the problem, which would be actively misleading for a volume that
     // reads `initialized` (the one legal write-target status) and was
     // refused on its condition instead.
+    // #582 (item 302): a row a rebuild recorded from a seal it could not read
+    // may hold a SEALED tape, so it is refused on the events, whatever its
+    // condition says: a clean verify cannot make it a write target.
+    if volume_status == "initialized"
+        && crate::volume::rebuild::seal_unreadable_pending(conn, volume_id)?
+    {
+        return Err(TapectlError::VolumeSealUnreadable {
+            label: label.to_string(),
+        });
+    }
     if !coverage::is_write_target(&volume_status, &observed_condition) {
         if volume_status != "initialized" {
             return Err(TapectlError::VolumeNotWriteTarget {
@@ -3236,6 +3246,14 @@ pub(crate) fn volume_resume_contacted<'c>(
     //
     // ADR-0012's 2026-09-17 amendment (issue #242): same distinguishable
     // two-part refusal as `volume_write` -- see its comment for why.
+    // #582 (item 302): as in `volume_write`, on the events.
+    if volume_status == "initialized"
+        && crate::volume::rebuild::seal_unreadable_pending(conn, volume_id)?
+    {
+        return Err(TapectlError::VolumeSealUnreadable {
+            label: label.to_string(),
+        });
+    }
     if !coverage::is_write_target(&volume_status, &observed_condition) {
         if volume_status != "initialized" {
             return Err(TapectlError::VolumeNotWriteTarget {
@@ -5233,6 +5251,13 @@ pub(crate) fn clear_condition_on_clean_full_verify(
         // ordinary case and must not write an events row on every run.
         return Ok(None);
     }
+    // #582 (item 302): the quarantine of a row a rebuild recorded from a seal
+    // it could not read is not the medium's condition a verify observes: the
+    // tape may be sealed, and returning the row to service would make it a
+    // write target. A rebuild that reads the seal finishes the record.
+    if crate::volume::rebuild::seal_unreadable_pending(conn, volume_id)? {
+        return Ok(None);
+    }
     conn.execute(
         "UPDATE volumes SET observed_condition = 'ok' WHERE id = ?1",
         params![volume_id],
@@ -7189,7 +7214,7 @@ fn refuse_verify_contact<T>(
 /// and a fixture drive through the site's two probe seams, which the old
 /// placement ("needs the drive's sg node, which a `MemStore` does not
 /// have") predated.
-pub(crate) fn volume_verify_with_store(
+pub fn volume_verify_with_store(
     conn: &Connection,
     store: &mut dyn Store,
     label: &str,

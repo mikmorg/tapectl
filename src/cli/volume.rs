@@ -2909,6 +2909,22 @@ pub fn run(
                 .ok()
                 .and_then(|id| crate::volume::session::resume_would_reconfirm(conn, id).ok())
                 .unwrap_or(false);
+            // #582 (item 302): a clean full verify leaves the quarantine of a
+            // row a rebuild recorded from an unreadable seal; said, not silent.
+            let seal_unreadable_kept = report.failed == 0
+                && report.cleared.is_none()
+                && report.quarantine.is_none()
+                && tier == Tier::Integrity
+                && crate::volume::rebuild::seal_unreadable_pending(
+                    conn,
+                    conn.query_row(
+                        "SELECT id FROM volumes WHERE label = ?1",
+                        [label.as_str()],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0),
+                )
+                .unwrap_or(false);
             if json_output {
                 // Issue #142: `failed: 3` without naming the three is the
                 // difference between an operator who knows what to re-copy
@@ -2950,6 +2966,7 @@ pub fn run(
                         report.cleared.is_some(),
                         volume_counts_as_copy,
                     ),
+                    "seal_unreadable_quarantine_kept": seal_unreadable_kept,
                     "cleared": report.cleared.as_ref().map(|c| serde_json::json!({
                         "previous_condition": c.previous_condition,
                         "condition_changed": true,
@@ -3082,6 +3099,15 @@ pub fn run(
                             );
                         }
                     }
+                }
+                if seal_unreadable_kept {
+                    println!(
+                        "note: volume \"{label}\" stays quarantined: a catalog rebuild could not \
+                         read this tape's seal, so it may carry a SEALED volume, and no verify \
+                         returns it to service or makes it writable. Run `tapectl catalog \
+                         rebuild --from-volume` again; a rebuild that reads the seal finishes \
+                         the record (ADR-0012 item 302)."
+                    );
                 }
                 // ADR-0012 2026-10-07 item 33 (#423): what this verify
                 // recorded of the figures the write left unrecorded.

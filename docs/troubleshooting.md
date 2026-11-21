@@ -3218,12 +3218,11 @@ over the tape. What works:
   that reads the seal cleanly finishes the record (ADR-0012 item 302). The
   volume becomes `sealed`, its quarantine is cleared, its writes `completed` (or
   `range`) and its positions `written`, as a first rebuild of the sealed tape
-  records them, and a `seal_promoted` event says so. Do this before anything
-  else touches the row;
-- `tapectl volume verify <label>` checks the tape against its own front index; a
-  clean full verify clears the quarantine, and does not seal the row. It is an
-  event on the volume, so a verify run first puts the row out of the rebuild's
-  reach (see below): rebuild first, verify after;
+  records them, and a `seal_promoted` event says so;
+- `tapectl volume verify <label>` checks the tape against its own front index. It
+  does not clear this quarantine and does not seal the row, in either order with
+  the rebuild: the tape may be sealed, and a row a verify returned to service
+  would be a write target. It says so when it leaves the quarantine;
 - restore what it holds: `tapectl restore unit`, or RESTORE.sh at tape file 2 with a
   tenant key or the escrow key;
 - only if the tape is to be given up: `tapectl volume retire <label>`, then
@@ -3232,8 +3231,8 @@ over the tape. What works:
 A later rebuild that reads the seal cleanly finishes that record, and only that
 one: the volume's row must still be what the earlier rebuild left (`initialized`
 and quarantined, with its `seal_unreadable` event), no event on the volume may
-have come after it but a rebuild's (a write, resume, verify, retire or edit each
-log one), and its writes must still be `aborted` and its positions `pending`.
+have come after it but a rebuild's or a failed verify's (a write, resume, retire
+or edit each log one; a verify changes nothing on such a row), and its writes must still be `aborted` and its positions `pending`.
 Every other row a rebuild finds is left alone (a rebuild never changes a status
 it finds, #158, #360). When the row has been changed since, the rebuild warns
 that the volume is still `initialized` with `aborted` writes: `volume resume`

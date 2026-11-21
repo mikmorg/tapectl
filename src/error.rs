@@ -521,8 +521,8 @@ pub enum TapectlError {
          it as an unsealed one, and `--force` does not apply. Do not overwrite the tape. Read it \
          again (another drive, or after cleaning this one) and run `catalog rebuild --from-volume` \
          again into this catalog, which finishes the record as sealed while nothing has changed \
-         the row since (rebuild before `tapectl volume verify {label}`, which checks the tape \
-         against its own front index and does not seal the row); what it holds \
+         the row since (`tapectl volume verify {label}` checks the tape against its own front \
+         index; it neither clears the quarantine nor seals the row); what it holds \
          restores with `tapectl restore unit` or RESTORE.sh at its file 2. Only if the tape is to be \
          given up: `tapectl volume retire {label}`, then `tapectl cartridge erase`, which asks \
          for the tape's label."

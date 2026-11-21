@@ -7121,6 +7121,115 @@ fn an_unreadable_seal_row_changed_since_is_not_promoted() {
     assert!(total > 0 && aborted == total);
 }
 
+/// A full `volume verify` of `vol` through its MemStore (the real verify
+/// path, one contact).
+fn full_verify(
+    conn: &rusqlite::Connection,
+    vol: &mut SealedVolume,
+) -> tapectl::volume::write::VerifyReport {
+    let site = ContactSite::new(
+        cfg(),
+        Operation::VolumeVerify,
+        "memstore",
+        Medium::NoBackend,
+    );
+    tapectl::volume::write::volume_verify_with_store(
+        conn,
+        &mut vol.store,
+        LABEL,
+        volume_id_of(conn, LABEL),
+        512 * 1024,
+        tapectl::store::Tier::Integrity,
+        site,
+    )
+    .unwrap()
+}
+
+/// The refusals of `volume write` (with `--force`) and `volume resume` on LABEL.
+fn write_and_resume_errors(conn: &rusqlite::Connection) -> [(&'static str, String); 2] {
+    let home = tempfile::tempdir().unwrap();
+    let paths = tapectl::config::TapectlPaths::new(home.path().join("home"));
+    let config = tapectl::config::Config::default();
+    let write = tapectl::volume::write::volume_write(
+        conn,
+        &paths,
+        &config,
+        LABEL,
+        "/nonexistent/tapectl-582-nst",
+        512 * 1024,
+        true,
+        false,
+        false,
+        false,
+        true,
+    )
+    .unwrap_err()
+    .to_string();
+    let resume = tapectl::volume::write::volume_resume(
+        conn,
+        &paths,
+        &config,
+        LABEL,
+        "/nonexistent/tapectl-582-nst",
+        512 * 1024,
+        false,
+        false,
+    )
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
+    [("write", write), ("resume", resume)]
+}
+
+/// Item 302 round 3 (#582): a clean full verify between the two rebuilds does
+/// not clear the unreadable-seal quarantine, `volume write` and `volume
+/// resume` still refuse with the unreadable-seal refusal, and the later clean
+/// rebuild still finishes the record.
+#[test]
+fn a_clean_full_verify_keeps_the_unreadable_seal_quarantine_and_the_rebuild_still_promotes() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    rebuild_with_seal_read(&conn, &mut vol, scratch.path(), true).unwrap();
+    let report = full_verify(&conn, &mut vol);
+    assert_eq!(
+        report.failed, 0,
+        "premise: a clean verify: {:?}",
+        report.mismatches
+    );
+    assert!(report.cleared.is_none(), "the quarantine is not cleared");
+    assert_eq!(volume_state(&conn, LABEL).1, "quarantined");
+    for (what, msg) in write_and_resume_errors(&conn) {
+        assert!(msg.contains("could not be READ"), "{what}: {msg}");
+    }
+    let second = rebuild_with_seal_read(&conn, &mut vol, scratch.path(), false).unwrap();
+    assert!(second.seal_promoted, "{second:?}");
+    let (status, condition, _) = volume_state(&conn, LABEL);
+    assert_eq!((status.as_str(), condition.as_str()), ("sealed", "ok"));
+    assert!(tapectl::policy::coverage::counts_as_copy(&conn, LABEL).unwrap());
+}
+
+/// With the quarantine cleared by hand, the events still refuse `volume
+/// write` and `volume resume`: the check is on the mark, not the condition.
+#[test]
+fn an_unreadable_seal_row_is_refused_by_its_events_whatever_its_condition() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    rebuild_with_seal_read(&conn, &mut vol, scratch.path(), true).unwrap();
+    conn.execute(
+        "UPDATE volumes SET observed_condition = 'ok' WHERE label = ?1",
+        rusqlite::params![LABEL],
+    )
+    .unwrap();
+    for (what, msg) in write_and_resume_errors(&conn) {
+        assert!(msg.contains("could not be READ"), "{what}: {msg}");
+        assert!(!msg.contains("nonexistent"), "{what}: {msg}");
+    }
+}
+
 /// `volume resume` on an unsealed aborted write says what is true: a new
 /// `volume write` starts over the same tape, so it is named as a choice to make
 /// only when the tape holds nothing to keep, and the true remedies for a tape
