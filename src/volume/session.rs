@@ -878,14 +878,19 @@ impl SealedSession {
         };
         let mut report = format!(
             "volume \"{label}\" sealed short: the drive's early warning came in tape file \
-             {ended_after}, so the tape ends after it. Every unit wholly before it is on this \
-             tape and counts as a copy.",
+             {ended_after}, so the tape ends after it.",
             label = self.label,
         );
-        if !self.range_units.is_empty() {
+        if self.range_units.is_empty() {
+            report.push_str(" Every unit wholly before it is on this tape and counts as a copy.");
+        } else {
+            // A range, an owed run included, is not a copy on its own
+            // (volume-format-v3.md §5.3; ADR-0012 item 127).
             let ranges: Vec<String> = self.range_units.iter().map(RangeUnit::describe).collect();
             report.push_str(&format!(
-                " Held here as a range, the rest of each still staged: {}.",
+                " Every other unit wholly before it is on this tape and counts as a copy; a unit \
+                 held as a range counts no copy on its own. Held here as a range, the rest of \
+                 each still staged: {}.",
                 ranges.join(", ")
             ));
         }
@@ -13278,6 +13283,13 @@ mod tests {
             );
             let report = done.short_ending_report().unwrap();
             assert!(report.contains("Held here as a range"), "{report}");
+            // #597 7-2: a range is not a copy on its own (§5.3), so a report
+            // that lists one never says every unit before the warning counts.
+            assert!(
+                !report.contains("on this tape and counts as a copy"),
+                "{report}"
+            );
+            assert!(report.contains("counts no copy on its own"), "{report}");
             assert!(
                 report.contains("Planned and not written (still staged): c."),
                 "{report}"
