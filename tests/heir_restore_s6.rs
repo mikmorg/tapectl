@@ -54,6 +54,38 @@ fn a_relative_to_and_work_restore_complete_with_an_empty_failure_list() {
     );
 }
 
+/// ADR-0012 items 303 and 306 (#594 C-1): the unit's root is a member, and
+/// RESTORE.sh's own tar (`--keep-old-files`, as tapectl's) gives an empty
+/// `--to` its recorded mode and mtime, measured with GNU tar 1.35. With the
+/// real tar and a real staging, so it is the stream's `././` member that is
+/// read. The per-file check and the damaged-file list know nothing of it.
+#[test]
+fn an_empty_to_gets_the_unit_roots_recorded_mode_and_mtime() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let t = two();
+    let h = Heir::of(t);
+    let dest = h.dest("root-metadata");
+    let before = std::fs::metadata(&dest).unwrap();
+    assert_ne!(
+        before.permissions().mode() & 0o7777,
+        heir::ROOT_MODE,
+        "positive control: the empty --to is not already the recorded root"
+    );
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dstr(&dest),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.all());
+    let after = std::fs::metadata(&dest).unwrap();
+    assert_eq!(after.permissions().mode() & 0o7777, heir::ROOT_MODE);
+    assert_eq!(after.mtime(), heir::ROOT_MTIME_SECS);
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists());
+}
+
 // ---- helpers ----
 
 fn unit_files<'a>(t: &'a Tape, name: &str) -> &'a [(String, Vec<u8>)] {

@@ -161,11 +161,26 @@ cleanup() {
   tar_close 300 || true
   scrub_inflight || true
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
+    # The work directory is made in --to by default, and taking it out moves
+    # that directory's modification time: tar has just given the unit's root
+    # its recorded one (ADR-0012 item 303). A reference file keeps it.
+    local ref=""
+    if [ -n "$WORK_MADE_IN" ] && [ -d "$WORK_MADE_IN" ]; then
+      ref=$(mktemp "${TMPDIR:-/tmp}/.tapectl-mtime.XXXXXX" 2>/dev/null) || ref=""
+      if [ -n "$ref" ] && ! touch -r "$WORK_MADE_IN" "$ref" 2>/dev/null; then
+        rm -f "$ref" 2>/dev/null || true
+        ref=""
+      fi
+    fi
     chmod -R u+rwx "$WORK" 2>/dev/null || true
     if ! rm -rf "$WORK" 2>/dev/null; then
       # The restored root may have been given a mode that forbids it.
       chmod u+w "$WORK_MADE_IN" 2>/dev/null || true
       rm -rf "$WORK" 2>/dev/null || warn "could not remove the work directory $WORK"
+    fi
+    if [ -n "$ref" ]; then
+      touch -r "$ref" "$WORK_MADE_IN" 2>/dev/null || true
+      rm -f "$ref" 2>/dev/null || true
     fi
   fi
   exit "$rc"

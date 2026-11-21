@@ -56,6 +56,10 @@ const SLICE: &str = "64K";
 pub const OPERATOR: &str = "quandong-operator";
 pub const TENANT_A: &str = "loquat-alpha";
 pub const TENANT_B: &str = "loquat-bravo";
+/// The mode and the mtime every unit's root has when it is staged.
+pub const ROOT_MODE: u32 = 0o750;
+pub const ROOT_MTIME_SECS: i64 = 981_173_106; // 2001-02-03 04:05:06 UTC
+
 pub const UNIT_A: &str = "alpha-unit";
 pub const UNIT_B: &str = "bravo-unit";
 
@@ -391,6 +395,16 @@ fn make_unit(
         None,
     )
     .unwrap();
+    // The unit's root is a member (ADR-0012 item 306): give it a mode and a
+    // time of its own, so a restore that gives it back is told from one that
+    // leaves it as it made it.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(ROOT_MODE)).unwrap();
+    fs::File::open(&dir)
+        .unwrap()
+        .set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(ROOT_MTIME_SECS as u64),
+        )
+        .unwrap();
     let snapshot = tapectl::staging::snapshot_create(&h.conn, name, &h.config).unwrap();
     let stage_set_id = tapectl::staging::stage_create(&h.conn, &h.paths, &h.config, snapshot, true)
         .unwrap_or_else(|e| panic!("stage create {name}: {e}"));
