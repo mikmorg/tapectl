@@ -2076,15 +2076,22 @@ fn build_span_layout(
     ))
 }
 
-/// ADR-0012 item 86 (X19; `layout-session.md` "Refusals"): one copy's span
-/// stays on one LTO generation, so one drive reads every tape of it. An owed
-/// run that does not start at slice 1 continues the range that ends just
-/// before it (a `range` row on a sealed volume whose last `written` slice is
-/// the one before the run), and is planned only onto a cartridge of that
-/// range's generation; onto another the write is refused, naming both. A
-/// run with no such range before it (its earlier slices are held whole
-/// elsewhere) continues none, and is not refused. `generation` is this
-/// volume's (`volumes.media_type`, decided at `volume init`).
+/// ADR-0012 item 86 (X19; `layout-session.md` "Refusals") as item 300 binds
+/// it in both directions: one copy's span stays on one LTO generation, so one
+/// drive reads every tape of it. A run written to a cartridge must be of the
+/// generation of the sealed `range` of its set that ends just before it (an
+/// owed run that does not start at slice 1) and of the one that begins just
+/// after it (a run that stops short of the set's last slice: a carried head
+/// or middle run); onto another the write is refused, naming the volume that
+/// holds the adjoining range and both generations. In each direction the run
+/// passes when any adjoining range is of its generation (the catalog has no
+/// copy identity, item 122), and a run with no such range on that side
+/// adjoins none there. `generation` is this volume's (`volumes.media_type`,
+/// decided at `volume init`).
+///
+/// A compaction reaches the write only through here (`compact-write` is an
+/// ordinary write of what `compact-read` staged), and `volume rewrite` asks
+/// it of its rehearsal ([`rehearse_write_capacity`]), before it erases.
 fn continuation_generation_refusal(
     conn: &Connection,
     label: &str,
@@ -2098,44 +2105,67 @@ fn continuation_generation_refusal(
         (Some(a), Some(b)) => a == b,
         _ => a == b,
     };
+    // The volumes (label, generation) holding a sealed `range` of `set`
+    // whose last written slice (`last`) or first is `edge`.
+    let adjoining = |set: i64, last: bool, edge: i64| -> Result<Vec<(String, Option<String>)>> {
+        let aggregate = if last { "MAX" } else { "MIN" };
+        Ok(conn
+            .prepare(&format!(
+                "SELECT v.label, v.media_type FROM writes w
+                 JOIN volumes v ON v.id = w.volume_id
+                 WHERE w.stage_set_id = ?1 AND w.status = 'range' AND v.status = 'sealed'
+                   AND (SELECT {aggregate}(sl.slice_number) FROM write_positions wp
+                          JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                         WHERE wp.write_id = w.id AND wp.status = 'written') = ?2
+                 ORDER BY w.id"
+            ))?
+            .query_map(params![set, edge], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+    let named = |g: Option<&str>| g.unwrap_or("of an unrecorded generation").to_string();
     for (unit, class) in batch.units.iter().zip(&batch.classes) {
         let (Some(first), Some(last)) = (unit.slices.first(), unit.slices.last()) else {
             continue;
         };
-        if *class != PlanClass::Owed || first.slice_number <= 1 {
-            continue;
+        // The range that ends just before an owed run that starts after
+        // slice 1 (item 86).
+        if *class == PlanClass::Owed && first.slice_number > 1 {
+            let before = adjoining(unit.stage_set_id, true, first.slice_number - 1)?;
+            if !before.is_empty() && !before.iter().any(|(_, g)| same(g.as_deref(), generation)) {
+                let (range_on, range_generation) = &before[0];
+                return Ok(Some(format!(
+                    "refusing to write: volume \"{label}\" is {this}, and this tape would continue \
+                     \"{unit}\" v{version} ({run}) from its range on volume \"{range_on}\", which is \
+                     {that}. One copy's span stays on one LTO generation, so one drive reads every tape \
+                     of it (ADR-0012 item 86). Nothing was written and the drive was not touched. Write \
+                     it onto a cartridge of {that}",
+                    this = named(generation),
+                    unit = unit.unit_name,
+                    version = unit.snapshot_version,
+                    run = slice_run(first.slice_number, last.slice_number),
+                    that = named(range_generation.as_deref()),
+                )));
+            }
         }
-        let before: Vec<(String, Option<String>)> = conn
-            .prepare(
-                "SELECT v.label, v.media_type FROM writes w
-                 JOIN volumes v ON v.id = w.volume_id
-                 WHERE w.stage_set_id = ?1 AND w.status = 'range' AND v.status = 'sealed'
-                   AND (SELECT MAX(sl.slice_number) FROM write_positions wp
-                          JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-                         WHERE wp.write_id = w.id AND wp.status = 'written') = ?2
-                 ORDER BY w.id",
-            )?
-            .query_map(params![unit.stage_set_id, first.slice_number - 1], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if before.is_empty() || before.iter().any(|(_, g)| same(g.as_deref(), generation)) {
-            continue;
+        // The range that begins just after the run (item 300): a carried
+        // head or middle run, which the direction above asks nothing of.
+        let after = adjoining(unit.stage_set_id, false, last.slice_number + 1)?;
+        if !after.is_empty() && !after.iter().any(|(_, g)| same(g.as_deref(), generation)) {
+            let (range_on, range_generation) = &after[0];
+            return Ok(Some(format!(
+                "refusing to write: volume \"{label}\" is {this}, and this tape would hold \
+                 \"{unit}\" v{version} ({run}), the run that comes just before its range on volume \
+                 \"{range_on}\", which is {that}. One copy's span stays on one LTO generation, so \
+                 one drive reads every tape of it (ADR-0012 items 86 and 300). Nothing was written \
+                 and the drive was not touched. Write it onto a cartridge of {that}, or carry every \
+                 tape of the version into the same destination",
+                this = named(generation),
+                unit = unit.unit_name,
+                version = unit.snapshot_version,
+                run = slice_run(first.slice_number, last.slice_number),
+                that = named(range_generation.as_deref()),
+            )));
         }
-        let (range_on, range_generation) = &before[0];
-        let named = |g: Option<&str>| g.unwrap_or("of an unrecorded generation").to_string();
-        return Ok(Some(format!(
-            "refusing to write: volume \"{label}\" is {this}, and this tape would continue \
-             \"{unit}\" v{version} ({run}) from its range on volume \"{range_on}\", which is \
-             {that}. One copy's span stays on one LTO generation, so one drive reads every tape \
-             of it (ADR-0012 item 86). Nothing was written and the drive was not touched. Write \
-             it onto a cartridge of {that}",
-            this = named(generation),
-            unit = unit.unit_name,
-            version = unit.snapshot_version,
-            run = slice_run(first.slice_number, last.slice_number),
-            that = named(range_generation.as_deref()),
-        )));
     }
     Ok(None)
 }
@@ -2526,7 +2556,16 @@ pub(crate) fn rehearse_write_capacity(
     } = write_budget(backend, volume.capacity_bytes)?;
     // A rewrite plans under the fill ceiling (ADR-0012 item 142): its
     // rehearsal refuses a batch that does not fit it whole, before the erase.
-    let units = checked_staged_units(conn, config, only)?.units;
+    let batch = checked_staged_units(conn, config, only)?;
+    // Item 300: a rewrite whose destination is of another generation than a
+    // range its run adjoins is refused here, before it erases anything; the
+    // write after the erase asks the same and must never be the first to.
+    if let Some(refusal) =
+        continuation_generation_refusal(conn, label, Some(volume.media_type), &batch)?
+    {
+        return Err(TapectlError::Other(refusal));
+    }
+    let units = batch.units;
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let SessionKeys {
         keys,

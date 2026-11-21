@@ -1965,6 +1965,23 @@ The slices a span still owes continue the range on `<other>`, and the
 cartridge you initialised is of another generation. Write onto a cartridge of
 the generation the message names last.
 
+The same refusal comes from the other side (ADR-0012 item 300): a run that
+stops short of the version's last slice, as a compaction of one tape of a
+version carries, must be of the generation of the range that begins just after
+it.
+
+```text
+error: refusing to write: volume "<label>" is <generation>, and this tape would hold "<unit>" v<n> (slices <a>-<b>), the run that comes just before its range on volume "<other>", which is <generation>. One copy's span stays on one LTO generation, so one drive reads every tape of it (ADR-0012 items 86 and 300). Nothing was written and the drive was not touched. Write it onto a cartridge of <generation>, or carry every tape of the version into the same destination
+```
+
+To move a version that spans tapes onto a newer generation, `volume
+compact-read` every tape that holds a range of it, then `volume compact-write`
+once to the one destination: the runs join into the whole version, which
+adjoins no range. `volume rewrite` reuses the source's own cartridge, so it
+keeps the source's generation and meets the refusal only for a version a
+catalog from before the rule already holds on two generations; it refuses at
+its rehearsal, before it erases anything.
+
 ### A slice a span owes was released from staging
 
 ```text

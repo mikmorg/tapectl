@@ -248,6 +248,13 @@ impl RewriteSteps for MemSteps<'_> {
 /// the fact that makes a write a copy a rewrite may lean on
 /// ([`crate::policy::coverage::fully_read_back_copy`]).
 fn write_full(h: &mut Home, label: &str, warn: Warn) {
+    try_write_full(h, label, warn).unwrap_or_else(|e| panic!("volume write {label}: {e}"));
+    crate::cli::volume::release_staging_after_write(&h.conn, &h.config, label, false);
+}
+
+/// [`write_full`]'s write, its result given back (the medium is put back
+/// either way) and no staging release.
+fn try_write_full(h: &mut Home, label: &str, warn: Warn) -> Result<()> {
     let medium = h.tapes.remove(label).expect("the volume was made");
     let mut drive = Drive::new(&h.conn, label, medium, warn);
     let mut slot = ContactSlot::empty();
@@ -269,8 +276,7 @@ fn write_full(h: &mut Home, label: &str, warn: Warn) {
     );
     let r = slot.finish_result(r);
     h.tapes.insert(label.to_string(), drive.medium);
-    r.unwrap_or_else(|e| panic!("volume write {label}: {e}"));
-    crate::cli::volume::release_staging_after_write(&h.conn, &h.config, label, false);
+    r
 }
 
 fn volume_id(conn: &Connection, label: &str) -> i64 {
@@ -995,4 +1001,185 @@ fn a_rewritten_and_a_compacted_volume_rebuild_to_the_same_rows() {
         0,
         "no hold is left open"
     );
+}
+
+// ── item 300: a carried run binds its generation in both directions (#590) ──
+
+/// `volume` is made on an LTO-8 cartridge (the fixtures' cartridges are
+/// LTO-6): its generation and capacity are the catalog's, as `volume init`
+/// decides them from the medium.
+fn make_lto8(h: &Home, volume: &str) {
+    h.conn
+        .execute(
+            "UPDATE volumes SET media_type = 'LTO-8', capacity_bytes = 12000000000000
+             WHERE label = ?1",
+            params![volume],
+        )
+        .unwrap();
+}
+
+/// The drive is an LTO-8 now: it is the drive of the destination's write (a
+/// drive writes its own generation and the one before it, so an LTO-6 drive
+/// is no drive for an LTO-8 cartridge). The tapes already written stay what
+/// they were, LTO-6.
+fn lto8_drive(h: &mut Home) {
+    h.config.backends.lto[0].generation = "LTO-8".into();
+}
+
+/// What the catalog and the cartridge hold of `volume`: nothing was written
+/// since `files_before` (what `volume init` left on it).
+fn assert_nothing_written(h: &Home, volume: &str, files_before: usize) {
+    assert!(
+        write::recorded_ranges(&h.conn, volume).unwrap().is_empty(),
+        "no range was recorded on {volume}"
+    );
+    assert_eq!(
+        h.tapes[volume].files.len(),
+        files_before,
+        "no file reached {volume}'s cartridge"
+    );
+}
+
+/// #590's trace: tape 1 (LTO-6) holds a version's head 1-2, tape 2 (LTO-6)
+/// the rest. Compacting tape 1 onto an LTO-8 destination would leave the
+/// version on two generations, which no one drive reads: the write is
+/// refused, before the drive is touched, naming tape 2 and LTO-6, and the
+/// source is not retired. Positive control: both tapes carried into the one
+/// LTO-8 destination pass, and `compact-finish` retires both.
+#[test]
+fn a_head_compacted_to_another_generation_than_the_range_after_it_is_refused() {
+    let mut h = range_only_home();
+    h.volume("RNG-C");
+    make_lto8(&h, "RNG-C");
+    lto8_drive(&mut h);
+    compact_read_from(&h, R1[0]).unwrap_or_else(|e| panic!("{e}"));
+    let on_tape = h.tapes["RNG-C"].files.len();
+    let err = try_write_full(&mut h, "RNG-C", Warn::Never)
+        .expect_err("the head's destination is another generation than the range after it")
+        .to_string();
+    assert!(
+        err.contains("volume \"RNG-C\" is LTO-8")
+            && err.contains(&format!("volume \"{}\", which is LTO-6", R1[1]))
+            && err.contains("ADR-0012 items 86 and 300")
+            && err.contains("Nothing was written and the drive was not touched"),
+        "{err}"
+    );
+    assert_nothing_written(&h, "RNG-C", on_tape);
+    let finish = compact_finish(&h, R1[0])
+        .expect_err("the source holds the only copy")
+        .to_string();
+    assert!(
+        finish.contains("have no copy on another volume"),
+        "{finish}"
+    );
+    assert_eq!(
+        volume_status(&h.conn, R1[0]),
+        "sealed",
+        "nothing was retired"
+    );
+
+    // Both tapes of the version into the same destination: slices 1-2 and 3
+    // join into the whole staging, which adjoins no range.
+    compact_read_from(&h, R1[1]).unwrap_or_else(|e| panic!("{e}"));
+    compact_write_to(&mut h, "RNG-C");
+    assert_eq!(
+        write::recorded_ranges(&h.conn, "RNG-C").unwrap(),
+        Vec::<_>::new(),
+        "the destination holds the whole staging, not a range"
+    );
+    compact_finish(&h, R1[0]).unwrap_or_else(|e| panic!("{e}"));
+    compact_finish(&h, R1[1]).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(volume_status(&h.conn, R1[0]), "retired");
+    assert_eq!(volume_status(&h.conn, R1[1]), "retired");
+    assert_eq!(snapshot_status(&h.conn, B1), "current");
+    assert_eq!(slice_copies(&h.conn, B1), [1, 1, 1]);
+}
+
+/// A carried middle run adjoins a range on each side. Tape 1 holds 1-2, tape
+/// 2 slice 3 and tape 3 slices 4-5. Tape 1 is of the destination's
+/// generation, so the direction item 86 had passes; tape 3 is not, and the
+/// range that begins just after the run refuses it, naming tape 3.
+#[test]
+fn a_middle_run_compacted_to_another_generation_than_the_range_after_it_is_refused() {
+    let mut h = Home::new(None, 1, "64K");
+    let unit = "kumquat-zspan-delta";
+    h.unit(TENANT_ONE, unit, files("delta-reel", &[50_000; 5], 9));
+    h.stage(unit);
+    assert_eq!(num_slices(&h.conn, unit), 5);
+    for label in ["MD-T1", "MD-T2", "MD-T3", "MD-C"] {
+        h.volume(label);
+    }
+    write_full(&mut h, "MD-T1", Warn::InSlice(unit, 2));
+    write_full(&mut h, "MD-T2", Warn::InSlice(unit, 3));
+    write_full(&mut h, "MD-T3", Warn::Never);
+    assert_eq!(
+        write::recorded_ranges(&h.conn, "MD-T2").unwrap(),
+        [range(unit, 3, 3)]
+    );
+    make_lto8(&h, "MD-T1");
+    make_lto8(&h, "MD-C");
+    lto8_drive(&mut h);
+    compact_read_from(&h, "MD-T2").unwrap_or_else(|e| panic!("{e}"));
+    let on_tape = h.tapes["MD-C"].files.len();
+    let err = try_write_full(&mut h, "MD-C", Warn::Never)
+        .expect_err("the range after the run is of another generation")
+        .to_string();
+    assert!(
+        err.contains("volume \"MD-C\" is LTO-8")
+            && err.contains("volume \"MD-T3\", which is LTO-6")
+            && err.contains("ADR-0012 items 86 and 300"),
+        "{err}"
+    );
+    assert_nothing_written(&h, "MD-C", on_tape);
+    assert_eq!(volume_status(&h.conn, "MD-T2"), "sealed");
+
+    // Positive control: once the range after it is of the destination's
+    // generation too, the middle run is carried.
+    make_lto8(&h, "MD-T3");
+    compact_write_to(&mut h, "MD-C");
+    assert_eq!(
+        write::recorded_ranges(&h.conn, "MD-C").unwrap(),
+        [range(unit, 3, 3)]
+    );
+}
+
+/// `volume rewrite` writes onto the source's own cartridge, so it keeps the
+/// source's generation; it reaches item 300 only where the version already
+/// stands on two generations (a catalog from before the rule). It refuses
+/// that at the rehearsal, before it erases or retires anything, in the
+/// direction item 86 had (the range before the tail) and the one item 300
+/// adds (the range after the head), naming the volume and its generation.
+#[test]
+fn a_rewrite_that_would_leave_a_version_on_two_generations_is_refused_before_the_erase() {
+    // The head (tape 1) rewritten, the range after it on LTO-8.
+    let mut h = range_only_home();
+    make_lto8(&h, R1[1]);
+    let ran = rewrite_with(&mut h, R1[0], "RNG-T1R", false);
+    let err = ran
+        .result
+        .expect_err("the range after the head is of another generation")
+        .to_string();
+    assert!(
+        err.contains(&format!("volume \"{}\", which is LTO-8", R1[1]))
+            && err.contains("ADR-0012 items 86 and 300"),
+        "{err}"
+    );
+    assert_eq!(ran.log, ["read", "write_preflight"], "no erase");
+    assert_eq!(volume_status(&h.conn, R1[0]), "sealed");
+    assert_eq!(rewrite::holds(&h.conn).unwrap().len(), 0, "no hold is left");
+
+    // The tail (tape 2) rewritten, the range before it on LTO-8.
+    let mut h = range_only_home();
+    make_lto8(&h, R1[0]);
+    let ran = rewrite_with(&mut h, R1[1], "RNG-T2R", false);
+    let err = ran
+        .result
+        .expect_err("the range before the tail is of another generation")
+        .to_string();
+    assert!(
+        err.contains(&format!("volume \"{}\", which is LTO-8", R1[0])),
+        "{err}"
+    );
+    assert_eq!(ran.log, ["read", "write_preflight"], "no erase");
+    assert_eq!(volume_status(&h.conn, R1[1]), "sealed");
 }
