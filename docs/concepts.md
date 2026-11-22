@@ -545,9 +545,10 @@ VIOLATIONS (4):
   [copy_count] photos/2019-italy: has 1 copy, needs 2
   [copy_count] photos/2020-garden: has 1 copy, needs 2
   [copy_count] work/invoices-2024: has 1 copy, needs 2
-WARNINGS (1):
+WARNINGS (2):
   [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
-audit: 4 violations, 1 warning (exit 2)
+  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
+audit: 4 violations, 2 warnings (exit 2)
 for the fixes: tapectl audit --action-plan
 ```
 
@@ -698,12 +699,14 @@ VIOLATIONS (4):
   [copy_count] photos/2019-italy: has 1 copy, needs 2
   [copy_count] photos/2020-garden: has 1 copy, needs 2
   [copy_count] work/invoices-2024: has 1 copy, needs 2
-WARNINGS (1):
+WARNINGS (2):
   [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
-ACTION PLAN (2 fixes):
+  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
+ACTION PLAN (3 fixes):
   fix: tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
   fix: tapectl key escrow-kit <DIR> — for archive
-audit: 4 violations, 1 warning (exit 2)
+  fix: run RESTORE.sh from a sealed tape as an heir would (docs/handoff.md), then tapectl drill record LABEL — for archive
+audit: 4 violations, 2 warnings (exit 2)
 ```
 
 Once `L8-0002` was written and moved offsite, only the heir-kit warning was
@@ -711,9 +714,10 @@ left, so `audit` exited 1:
 
 ```text
 $ tapectl audit
-WARNINGS (1):
+WARNINGS (2):
   [escrow_kit_missing] archive: 2 sealed volumes exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 0 violations, 1 warning (exit 1)
+  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
+audit: 0 violations, 2 warnings (exit 1)
 for the fixes: tapectl audit --action-plan
 ```
 

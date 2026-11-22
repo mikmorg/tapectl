@@ -478,12 +478,14 @@ VIOLATIONS (4):
   [copy_count] photos/2019-italy: has 1 copy, needs 2
   [copy_count] photos/2020-garden: has 1 copy, needs 2
   [copy_count] work/invoices-2024: has 1 copy, needs 2
-WARNINGS (1):
+WARNINGS (2):
   [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
-ACTION PLAN (2 fixes):
+  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
+ACTION PLAN (3 fixes):
   fix: tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
   fix: tapectl key escrow-kit <DIR> — for archive
-audit: 4 violations, 1 warning (exit 2)
+  fix: run RESTORE.sh from a sealed tape as an heir would (docs/handoff.md), then tapectl drill record LABEL — for archive
+audit: 4 violations, 2 warnings (exit 2)
 ```
 
 Without `--action-plan`, `audit` prints the findings and points at it. One copy is
@@ -514,9 +516,10 @@ volume "L8-0002" moved to "offsite"
   cartridge "L8-0002" moved with it
 next: nothing to do; every unit written has its policy's copies
 
-WARNINGS (1):
+WARNINGS (2):
   [escrow_kit_missing] archive: 2 sealed volumes exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 0 violations, 1 warning (exit 1)
+  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
+audit: 0 violations, 2 warnings (exit 1)
 for the fixes: tapectl audit --action-plan
 
   family/letters: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
@@ -539,8 +542,9 @@ next: nothing to do
 ```
 
 The violations are gone, and so is the staging: this copy brought every unit to its
-copy floor, so each released its staged slices. The one warning left, the missing
-Heir Kit, is dealt with in step 13. No volume is due a verify: both were read back in
+copy floor, so each released its staged slices. The two warnings left, the missing
+Heir Kit (step 13) and the heir drill nobody has recorded yet (`tapectl drill record`, after
+running `RESTORE.sh` as an heir would; step 14 rehearses the recovery), stay until then. No volume is due a verify: both were read back in
 full as they were written. A year on (`verify_interval_days`, 365 by default), `status`
 names each one again, and `tapectl volume verify <LABEL>` reads it back in full.
 

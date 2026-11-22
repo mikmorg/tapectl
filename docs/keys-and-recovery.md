@@ -466,8 +466,7 @@ still to do, and only you can do it:
   4. store copies in at least TWO independent failure domains
 ```
 
-The directory is the command's one argument (`--out DIR` before 1.9.0, refused by
-name since). It is created if absent, mode 0700. Running the command again into the
+The directory is the command's one argument (`--out DIR` was 1.8's spelling). It is created if absent, mode 0700. Running the command again into the
 same directory is the routine refresh: it writes the kit's files over the old ones.
 
 | File | What it is |

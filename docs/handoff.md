@@ -8,6 +8,18 @@ work needs a person, and which does not?** What 2.0.0 changes is in
 [releases/2.0.0.md](releases/2.0.0.md); what each step creates on the host is in
 [install.md](install.md).
 
+## History: the 1.x steps
+
+This file's earlier lettered steps are in git (`git show v1.9.2:docs/handoff.md`) and their
+records are in `docs/runs/`: (a) the 1.1.0 real-drive proof and (c) its fresh start
+(`2026-10-12-1.1.0-real-drive-proof.md`), (f) the upgrade to 1.5.0
+(`2026-10-20-1.5.0-step12-rehearsal.md`), (g) the 1.6.0 acceptance
+(`2026-10-21-1.6.0-acceptance.md`), (h) the upgrade to 1.8.0
+(`2026-10-29-1.8.0-handoff-h.md`) and (i) the fresh start on 1.8.1 with copies on 1.9.2
+(`2026-11-02-1.8.1-handoff-i.md`, `2026-11-09-handoff-i-1.9.2-and-copies.md`). Scripts that cite
+"handoff.md (i) step 8" mean that file's copy-2 step: this file's "Copy 2" below is its
+2.0.0 form. None of them applies to 2.0.0.
+
 ## The state, in one paragraph
 
 tapectl 2.0.0 writes Layout Version 3 and reads and writes nothing else (ADR-0012 item 242;
@@ -24,7 +36,7 @@ build, the drill and the reads (items 248 and 262); the real-drive runs are the 
 
 | | Step | Who |
 |---|---|---|
-| 1 | Tag `v2.0.0`, once the build is complete and proven on test cartridges; CI builds the static binary | the coordinator, on the CTO's word |
+| 1 | Tag `v2.0.0`, once the build is complete and proven on test cartridges; CI builds the static binary (the coordinator prepares it; the tag is the CTO's call) | the CTO |
 | 2 | The fresh start on home2: the host's tar, the old state aside, `first-run.sh` | **you** (sudo, the escrow paper, the cartridges) |
 | 3 | Erase L6-0001 and L6-0002 with the typed label, and write both at real scale | **you** |
 | 4 | The drill: a whole-tape restore at real scale with the Heir Kit's keys, and File 1's steps on a real cartridge; record it | **you** |
@@ -41,21 +53,20 @@ build, the drill and the reads (items 248 and 262); the real-drive runs are the 
 
   ```bash
   grep ESCROW_PUBLIC_KEY ~/.config/tapectl/home2.local.profile
-  sudo cat /srv/archive_meta/tapectl/home/keys/mikmorg-escrow.age.pub
+  sudo cat /srv/archive_meta/tapectl/home/keys/<operator>-escrow.age.pub
   ```
 
   The two must be identical, and the paper's secret must give that key. No command replaces an
   escrow identity later (ADR-0005). To mint a new one instead, move the local profile aside and
   leave step 7's question empty: the new secret is handwritten and sealed in two failure
   domains, and the old paper and kits stay until the old tapes are erased.
-- **Nothing owed to the old tapes.** L6-0001 and L6-0002 can be rewritten whenever (item 245):
-  from the erase until two new copies seal and verify, `keepsake` has no copy on tape, and its
-  originals stay on disk. The same holds for the old catalog and keys: they open only the
-  erased tapes.
-- **Keep tapectl 1.9.2** (`/usr/local/bin/tapectl-1.9.2`, or the `v1.9.2` checkout) until you
-  are sure no Layout 2 tape you still need is unread. 2.0.0 knows such a tape by its label and
-  reads nothing else of it (item 269).
-- **Quiet vm-desk1.** The development VM shares home2's CPUs: no builds there while a tape
+- **Nothing is owed to the old tapes.** L6-0001 and L6-0002 can be rewritten whenever (item
+  245), and `keepsake`'s originals stay on disk. The cartridges are reused one at a time, so
+  while copy 1 is written L6-0002 still holds the Layout 2 copy, and it is erased only once
+  copy 1 has read back. That copy is read with tapectl 1.9.2 and the old keys, so both are
+  kept aside until the tidy; 2.0.0 knows such a tape by its label and reads nothing else of it
+  (item 269).
+- **Keep the development VM quiet.** It shares home2's CPUs: no builds there while a tape
   write or its read-back runs. Tell the coordinator ahead of each write.
 
 ## The fresh start (item 244)
@@ -83,6 +94,9 @@ escrow identity, its secret prints there once.
    done
    sudo find /srv/acache/tapectl-staging -mindepth 1 -delete
    ```
+
+   Keep tapectl 1.9.2 as well, before step 5 replaces the installed binary:
+   `sudo cp -p /usr/local/bin/tapectl /usr/local/bin/tapectl-1.9.2`.
 
    The move is required: a 1.x catalog is refused by name, and `first-run.sh` runs `init`
    when the home has no catalog.
@@ -112,13 +126,37 @@ escrow identity, its secret prints there once.
    - **step 8** registers the drive with `post_warning_bytes = 99008M` from the profile;
    - **step 9** generates the Heir Kit in `~/tapectl-heir-kit` (answer yes if it finds the
      old one: its `catalog.db.age` is the old catalog), with this release's static binary;
-   - **step 11** mints new keys for `parents` and `family`, registers the `keepsake`
-     collection and its folders as new units;
+   - **step 10** creates the profile's locations, `home2-rack` and `offsite`; **step 11** mints
+     new keys for `parents` and `family`;
    - **step 12** is the rehearsal on the test cartridge EW7VWMVKF6, with the installed binary:
      type its serial. It is required before the first write.
 
-   Then check where it went: `cat /etc/tapectl/home`, and `tapectl-op status` (units: 27
-   registered).
+   Step 1 removed the timers and `tapectl-op`, and `--to 12` stops before step 14 installs
+   them. Install them now, so the commands below and the drive-poll timer exist:
+
+   ```bash
+   scripts/first-run.sh --profile contrib/hosts/home2.profile --from 14 --to 14
+   cat /etc/tapectl/home                    # /srv/archive_meta/tapectl/home
+   tapectl-op status
+   tapectl-op tenant list                   # the operator, parents, family
+   tapectl-op location list                 # home2-rack and offsite
+   tapectl-op config get post_warning_bytes # "99008M"
+   ```
+
+6. **Register keepsake.** `home2.profile` names no collection (ADR-0012 item 204), so step 11
+   made the tenants and not the collection, and step 13 writes only registered units:
+
+   ```bash
+   tapectl-op collection add keepsake /srv/keepsake/original-data --tenant family
+   tapectl-op collection sync --dry-run   # collection "keepsake" (dry run): would create 27; ...
+   tapectl-op collection sync
+   tapectl-op collection status           # collection "keepsake": 27 pending (27 never archived) ...
+   ```
+
+   `collection add` checks the service user's access, prints any `setfacl` line it lacks and
+   writes the `[[collections]]` table. Exit 1 of the sync is a warning (a folder refused for
+   its name, an entry outside every unit): read it, it stops nothing. Exit 2 is an error: fix
+   what it names first.
 
 ## The cartridges (step 3 of the plan)
 
@@ -136,18 +174,19 @@ tape as soon as the first one reads back.
 
    Step 13 snapshots every keepsake unit, stages them (two at a time), shows `stage list` and
    `volume plan`, checks that the host is quiet and asks you to type `L6-0001` before it
-   writes. Its `volume init` refuses the Layout 2 volume on the tape, which it names ("a
-   tapectl volume of Layout 2, label L6-0001"), and offers `cartridge erase`: type
+   writes. Its `volume init` refuses the Layout 2 volume on the tape, which it names (`this is a
+   tapectl volume of Layout 2, label "L6-0001"; read it with the tapectl that wrote it, or with
+   the RESTORE.sh in its own file 2`), and offers `cartridge erase`: type
    `L6-0001`. The erase registers the cartridge by its chip serial and the `volume init`
    after it gives it the volume's label as its barcode. The write ends with `sealed and
    confirmed: …; full readback passed` and moves the tape to `home2-rack`. Every unit stays
    staged: one copy is short of the copy floor of two.
 
-   **Every unit continues on the next cartridge at the drive's early warning** (item 288), so
-   `keepsake`, at 1.2 TiB, may or may not fit one LTO-6: when it does not, the unit the early
-   warning ends is a range on this tape and its tail is written first on the next. That is
-   not a failure: the seal says where the tape ended, and `tapectl-op volume list` and
-   `stage list` show what is owed.
+   **Every unit continues on the next cartridge at the drive's early warning** (item 288).
+   `keepsake` held 1.20 TiB per cartridge under 1.9.2, well inside an LTO-6, so this write is
+   expected to end full. If the drive's early warning ends it anyway, the unit it ends is a
+   range on this tape and its tail is written first on the next. That is not a failure: the
+   seal says where the tape ended, and `tapectl-op stage list --owing` shows what is owed.
 2. **Copy 2.** Eject L6-0001 (`tapectl-op drive eject`), load L6-0002, tell the coordinator
    first, and run the same command with `--label L6-0002 --location offsite`. Step 13 notes
    `1 volume(s) already in the catalog`: answer yes to writing another tape. Its
@@ -163,10 +202,14 @@ tape as soon as the first one reads back.
    sudo systemctl start tapectl-backup.service
    ```
 
-   Copy 2's step 13 regenerated the Heir Kit with both tapes in its catalog. Print its
-   `COVER.txt` and replace the one in each envelope, with the new `catalog.db.age` and
-   `tapectl-2.0.0` on the media; the handwritten secret stays. A new escrow identity also goes
-   into the local profile for the next rebuild.
+   Copy 2's step 13 regenerated the Heir Kit with both tapes in its catalog. It holds a copy
+   of the installed binary, `tapectl-2.0.0`, which needs this host's C library; the release's
+   static build goes in beside it with `key escrow-kit … --static-binary FILE`, and
+   `first-run.sh`'s step 9 does not pass that flag
+   ([Keys and recovery](keys-and-recovery.md#the-heir-kit) says how). Print the new
+   `COVER.txt` and replace the one in each envelope, with the new `catalog.db.age` and the
+   binaries on the media; the handwritten secret stays. A new escrow identity also goes into
+   the local profile for the next rebuild.
 
 ## The drill (step 4 of the plan; #548)
 

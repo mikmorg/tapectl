@@ -502,9 +502,10 @@ VIOLATIONS (4):
   [copy_count] photos/2019-italy: has 1 copy, needs 2
   [copy_count] photos/2020-garden: has 1 copy, needs 2
   [copy_count] work/invoices-2024: has 1 copy, needs 2
-WARNINGS (1):
+WARNINGS (2):
   [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
-audit: 4 violations, 1 warning (exit 2)
+  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
+audit: 4 violations, 2 warnings (exit 2)
 for the fixes: tapectl audit --action-plan
 ```
 
@@ -521,9 +522,10 @@ volume "L8-0002" moved to "offsite"
 next: nothing to do; every unit written has its policy's copies
 
 $ tapectl audit
-WARNINGS (1):
+WARNINGS (2):
   [escrow_kit_missing] archive: 2 sealed volumes exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 0 violations, 1 warning (exit 1)
+  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
+audit: 0 violations, 2 warnings (exit 1)
 for the fixes: tapectl audit --action-plan
 
 $ tapectl report copies
@@ -552,8 +554,9 @@ $ tapectl db backup /mnt/backup
 database backed up to /mnt/backup/tapectl-20261105T034233Z.db (728.0 KiB); private keys not included — pass --include-keys to copy them
 ```
 
-(The remaining warning, `escrow_kit_missing`, is what step 5's
-`key escrow-kit` clears. Take the catalog backup last, once the session is
+(The remaining warnings are `escrow_kit_missing`, which step 5's
+`key escrow-kit` clears, and `drill_age`, which stays until a drill is recorded
+([Annually](#annually--the-heir-path-restore-drill)). Take the catalog backup last, once the session is
 over; [Database Operations](#database-operations) says why a mid-session one
 is not enough.) No `stage clean` was needed: the second copy released every
 unit's staging itself. `--keep-staging` on a write holds everything, and
@@ -2145,12 +2148,14 @@ $ tapectl audit --action-plan
 VIOLATIONS (4):
   [copy_count] family/letters: has 1 copy, needs 2
   ...
-WARNINGS (1):
+WARNINGS (2):
   [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
-ACTION PLAN (2 fixes):
+  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
+ACTION PLAN (3 fixes):
   fix: tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
   fix: tapectl key escrow-kit <DIR> — for archive
-audit: 4 violations, 1 warning (exit 2)
+  fix: run RESTORE.sh from a sealed tape as an heir would (docs/handoff.md), then tapectl drill record LABEL — for archive
+audit: 4 violations, 2 warnings (exit 2)
 ```
 
 A unit with no copy yet whose version is staged gets the one copy loop,
@@ -3273,7 +3278,17 @@ lists — `mt`, `dd`, `age`, `tar`, `sha256sum`, `head` and `tail`, and `gzip`,
 `xz` or `zstd` for a unit stored compressed — plus the shell tools any Linux system has, and no `tapectl`, against
 nothing but the printed key material.
 
-Nothing automated performs a drill; schedule it yourself, on real hardware.
+Nothing automated performs a drill; schedule it yourself, on real hardware. Then
+record it, so the clock is kept:
+
+```bash
+tapectl drill record L8-0001 --note "RESTORE.sh with the stock tools, whole unit"
+```
+
+The record names the volume and the sha256 of the `RESTORE.sh` it carries. `audit`
+warns (`drill_age`, never a violation) when a sealed volume exists and no drill is
+recorded, or when the newest is older than `[defaults] drill_interval_days` (365
+when unset).
 
 While you are there, confirm your off-tape recovery inputs are current:
 
