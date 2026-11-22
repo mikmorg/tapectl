@@ -18,8 +18,8 @@ in authority order: `docs/design/volume-format-v3.md` (the byte format) → the 
 section of `docs/design/layout-session.md` → ADR-0012 items 239 onward (a later item amends
 an earlier one) → `docs/design/v3-implementation-plan.md` (the build plan). Layout 2's texts
 (`volume-format-v2.md`, `v2-open-questions.md`, `v2-implementation-plan.md`) are history:
-2.0.0 neither reads nor writes Layout 2 (item 242). This file is rewritten for the release
-by T6.7; until then, where a line below disagrees with that set, the set wins.
+2.0.0 neither reads nor writes Layout 2 (item 242). Where a line below disagrees with that
+set, the set wins.
 
 `tapectl-design-v4_0.md` remains the reference for everything those do NOT cover,
 read **together with `docs/design-errata.md`** (the complete list of
@@ -182,12 +182,20 @@ tagged in its clone only), builds both in debug, and stands in for the host's un
 transient `tapectl-drive-poll.timer` in `/run/systemd/system`, an installed backup unit under
 `TAPECTL_UNIT_DIR`, the binary at `TAPECTL_INSTALL_BIN`. It needs a committed HEAD and two
 cartridges of the drive's generation. Not covered: tidy's removal (a typed word), step 11's
-real backup service, a release build.
+real backup service, a release build. **2.0.0 has no 2.x predecessor** (a 1.x home is not
+upgraded in place: item 244's fresh start), so the harness is not part of 2.0.0's chain (plan
+T3.4, T6.5) and runs again from 2.0.1 on.
 
 ```bash
 TAPECTL_MHVTL=1 bash scripts/upgrade-mhvtl.sh \
     --device "$(readlink -f /dev/tape/by-id/scsi-XYZZY_A1-nst)"
 ```
+
+**Layout 3's on-tape bytes are held twice in plain `cargo test`:** `tests/on_tape_golden.rs`
+pins every plaintext file and envelope text a build generates (File 0, File 1, RESTORE.sh by
+sha256, MANIFEST, the front index, the seal, RECOVERY.md, the file table and id map), and
+`tests/recorded_tape.rs` reads a tape 2.0.0 wrote (rebuild, restores, verify, and that tape's
+own RESTORE.sh under the heir harness).
 
 **The heir path's only test with real tools is the mhvtl gate** (ADR-0012 item 70,
 #457). `tests/heir_restore_sh.rs` runs RESTORE.sh with `mt`, `dd` and `age` faked (CI
