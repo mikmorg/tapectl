@@ -107,8 +107,10 @@ because tape punishes surprises.
   encrypted slices are what make those numbers known in advance.
 - **The pre-flight capacity gate.** Because every size is known, `volume write`
   adds up the whole layout and refuses before touching the tape if it will not
-  fit. This check is tapectl's only defense against running out of tape: if the
-  drive hits the physical end of tape anyway, the write aborts cleanly and leaves
+  fit, or plans it past the fill ceiling to the drive's early warning (next bullet). If the
+  write reaches the early warning, it finishes the slice in flight and seals the
+  tape short, and the slices it did not write stay staged for the next cartridge. If
+  the drive hits the physical end of tape anyway, the write aborts cleanly and leaves
   an unsealed tape. It never salvages a partial tape.
   [`volume plan`](cli/volume.md#tapectl-volume-plan) shows you the same arithmetic:
 
@@ -124,6 +126,17 @@ because tape punishes surprises.
   estimated tapes: 1 (at the 97% fill ceiling)
   cross-volume index: about 2.3 KiB per tape, 4.6 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
   ```
+
+- **A unit may continue on the next cartridge.** The plan fills a tape from the queue
+  in order, and it may end inside a unit: when the drive reports its early warning the
+  write finishes the slice in flight and seals the tape **short**, and the seal says
+  where the tape ended. The slices of that unit not written stay staged and are the
+  first thing written on the next cartridge. This holds for every unit, with no
+  opt-in (ADR-0012 items 288 and 289). The run of a unit's slices that one tape holds
+  is a **range**; the unit's version is not current, and its staged tail is not
+  released, until the next cartridge is written. A restore of the unit reads across
+  both cartridges, and a restore from one cartridge alone gives the files that tape
+  holds whole and lists the rest.
 
 - **Stage once, write many.** A stage set stays on disk after it is written, so
   the same encrypted slices can go to a second and a third tape. The second copy
@@ -365,7 +378,7 @@ about the content), so the tape's integrity can be checked with no key at all.
 ### Receipt
 
 A **receipt** is the list of recipients a stage set was encrypted to. It is
-recorded at staging and, on tapes written since 2026-09-11, carried on the tape
+recorded at staging and carried on the tape
 inside the operator envelope. It is how tapectl knows the escrow recipient can
 decrypt a copy. `audit` reports escrow coverage as covered, a gap, or unknown,
 and `catalog locate` shows it in its Escrow column. A catalog rebuilt from tape
