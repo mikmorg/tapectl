@@ -90,7 +90,8 @@ is an ordinary usage error and still exits 2: a mistyped subcommand such as
 `volume verfy` or `audt`, or an unknown flag in front of `verify`
 (`tapectl --hme <dir> volume verify <label>`,
 `tapectl volume --bogus verify <label>`). `--help` exits 0 everywhere. A
-spelling 1.9.0 renamed exits 2 too ([below](#tapectl-old-was-renamed-in-190-use-tapectl-new)).
+spelling a 1.x release used and 2.0.0 does not exits 2 too
+([below](#unrecognized-subcommand-or-unexpected-argument-from-a-script-written-for-1x)).
 
 ### 75: catalog busy
 
@@ -409,26 +410,30 @@ From 1.9.0, on a host with a home pointer, root is refused unless `--home` or
 would otherwise open an archive nobody chose. Use `tapectl-op`. `host check`,
 `--help`, `--version` and `completions` still run.
 
-### `` `tapectl <old>` was renamed in 1.9.0: use `tapectl <new>` ``
+### `unrecognized subcommand` or `unexpected argument` from a script written for 1.x
 
 ```text
-error: `tapectl staging clean` was renamed in 1.9.0: use `tapectl stage clean`
+error: unrecognized subcommand 'staging'
+
+  tip: a similar subcommand exists: 'stage'
 ```
 
-1.9.0 renamed some commands and flags, and the old spellings are refused by
-name, with exit 2 and nothing done, however they are typed: as a command, with
-`--help`, through `tapectl help <old>`, or as a bare old group. Type the new
-spelling the message names. The full list is in the
-[1.9.0 release notes](releases/1.9.0.md). Under `--json` the refusal is the JSON
-error document ([Exit codes](#exit-codes)). A script written for 1.8 fails
-loudly here, never quietly: change its spelling.
+tapectl 1.9.0 renamed some commands and flags (`backend` to `drive`, `staging` to `stage`,
+`report summary` to `status`, `report pending` to `stage list --owing`, `catalog ls` to
+`catalog list`, `db backup --to FILE` to `db backup PATH`, and others), and refused each old
+spelling by name. 2.0.0 does not: an old spelling is an ordinary usage error, exit 2 with
+nothing done, and clap's tip, where it has one, names a near match. Type the new spelling;
+`tapectl <command> --help` and [the command reference](cli/README.md) list the current ones,
+and the table in the [1.9.0 release notes](releases/1.9.0.md) maps the old to the new. A
+script written for 1.8 fails loudly here, never quietly: change its spelling. Under `--json`
+the refusal is the JSON error document ([Exit codes](#exit-codes)).
 
 The three commands every tape's File 1 prints work for good: `init --operator
 … --escrow-public-key …`, `catalog rebuild --from-volume --device … --key …` and
 `restore unit --unit … --device … --to … --key …`.
 
-`config add collections` and `config remove 'collections[…]'` are refused the
-same way, pointing at `collection add` and `collection remove`.
+`config add collections` and `config remove 'collections[…]'` are still refused by
+name, pointing at `collection add` and `collection remove`.
 
 ### What is this key set to?
 
@@ -808,8 +813,8 @@ extension, e.g. .db
 An existing file is a backup taken before: name a new file, or name the
 directory and let it take a dated name. Two backups into one directory in the
 same second meet the same refusal; run it again a second later. `db backup --to
-<path>`, the spelling before 1.9.0, is refused by name
-([renamed](#tapectl-old-was-renamed-in-190-use-tapectl-new)).
+<path>`, the spelling before 1.9.0, is an unexpected argument
+([old spellings](#unrecognized-subcommand-or-unexpected-argument-from-a-script-written-for-1x)).
 
 A missing directory is usually a backup disk that is not mounted. With
 `--include-keys`, the private keys go beside the file, with its extension
@@ -827,189 +832,36 @@ then the result on stdout:
 database backed up to /mnt/usb/tapectl.db (464.0 KiB); private keys copied to /mnt/usb/tapectl.keys/ (276 B) — treat that directory as secret
 ```
 
-### `migration 026 cannot run`
-
-The first command a new tapectl runs on an older catalog brings its schema up
-to date. One step removes statuses no tapectl release has ever written. If a
-row carries one anyway (it was set by hand), every command that opens the
-catalog refuses. Only the few that never open it, such as `host check`, still
-run:
+### `the catalog … was made by tapectl 1.x`
 
 ```text
-error: failed to open database: migration error: migration 026 cannot run: units.status = 'retired' on 1 row(s)
-(id 1); snapshots.status = 'superseded' on 2 row(s) (id 2, 3). Migration 026 removes these statuses from the
-schema. No tapectl release has ever written one, so these rows were set by hand, and 026 will not guess what
-they should say. Change each named row to a status the new schema allows -- units: active, tape_only, missing;
-snapshots: created, staged, current, reclaimable, purged; volumes: initialized, active, full, retired, erased,
-sealed -- then run the command again. Nothing has been changed.
+error: failed to open database: migration error: the catalog at <home>/tapectl.db was made by tapectl 1.x; tapectl 2.0.0 does not upgrade it (ADR-0012 item 258): start a new catalog, or use tapectl 1.9.2 for this one
 ```
 
-The statuses it removes are `retired` (units), `superseded` and `failed`
-(snapshots), and `blank` and `missing` (volumes). The volume statuses its
-message lists still include `full`, which migration 032 removes in turn (see
-[below](#migration-032-cannot-run)): do not choose it. Nothing has been changed:
-the whole step rolls back. Neither `db fsck --repair` nor `db backup` can
-help, because both have to open the database too. Decide, row by row, which
-allowed status tells the truth about it, then set it by hand while no tapectl
-command is running.
+tapectl 2.0.0's catalog is one baseline schema that carries tapectl's own SQLite
+`application_id`; a catalog from 1.x has none and is refused by name, before anything
+is written to it. There is no upgrade and no migration. Either use tapectl 1.9.2 on that
+home (for reading its Layout 2 tapes), or start a new home with `tapectl setup` or
+`tapectl init`, with new keys and new units: the way is [install.md](install.md) §10.
+Every command that opens a catalog refuses, so move the old home aside first; `first-run.sh`
+runs `init` only when the home has no catalog.
 
-That takes `sqlite3`, the SQLite command-line shell. tapectl carries its own
-SQLite and never needs the shell, so it may not be installed (on Debian or
-Ubuntu: `sudo apt install sqlite3`). Keep a copy of the file first:
-
-```bash
-DB=~/.tapectl/tapectl.db
-cp "$DB" "$DB.before-026"
-sqlite3 "$DB" "UPDATE units SET status = 'active' WHERE id = 1"
-sqlite3 "$DB" "UPDATE snapshots SET status = 'current' WHERE id IN (2, 3)"
-tapectl unit list
-```
-
-On a first-run install the catalog belongs to the service user, in a home
-only that user can enter. Give the file's full path, because a `~` would
-expand to your own home, and run each line as that user. That home is not
-always `/var/lib/tapectl/.tapectl`: a host profile's `SVC_HOME_WANT` moves the
-account's home, and its `TAPECTL_HOME_DIR` the tapectl home itself (home2's is
-`/srv/archive_meta/tapectl/home`, ADR-0012 item 197). The pointer
-`/etc/tapectl/home` names it on an installed host, so ask it rather than typing a path:
-
-```bash
-DB="$(cat /etc/tapectl/home)/tapectl.db"   # no pointer: "$(getent passwd tapectl | cut -d: -f6)/.tapectl/tapectl.db"
-sudo -u tapectl -H test -f "$DB" && echo "catalog: $DB"    # no line printed: wrong path, stop here
-sudo -u tapectl -H cp "$DB" "$DB.before-026"
-sudo -u tapectl -H sqlite3 "$DB" "UPDATE units SET status = 'active' WHERE id = 1"
-sudo -u tapectl -H sqlite3 "$DB" "UPDATE snapshots SET status = 'current' WHERE id IN (2, 3)"
-tapectl-op unit list
-```
-
-### `migration 027 cannot run`
-
-Migration 027 drops the `manifest_entries` table, an older copy of each
-snapshot's file list that nothing reads; the `files` table keeps every path,
-size and checksum. Before it drops anything it checks that `manifest_entries`
-holds nothing `files` does not. Every tapectl release has kept the two in step,
-so this refusal means the catalog was edited by hand:
+### `configuration error: … unknown field` for `[dar]`, `allow_spanning` or `preserve_fsa`
 
 ```text
-error: failed to open database: migration error: migration 027 cannot run: 1 manifest_entries row(s) with no
-files row for the same snapshot and path (id 77001). Migration 027 drops the manifest_entries table, which every
-tapectl release has kept in step with files, so these rows were set by hand and 027 will not guess which table is
-right. Make each named manifest_entries row agree with its files row (or delete it), then run the command again.
-Nothing has been changed.
+config: INVALID
+  - configuration error: <home>/config.toml: TOML parse error at line 64, column 2
+   |
+64 | [dar]
+   |  ^^^
 ```
 
-The other finding it can name is a `manifest_entries` row carrying a sha256
-that its `files` row lacks or disagrees with. Nothing has been changed. Look at
-the named rows with `sqlite3`, the same way as for migration 026 above, and
-either copy the value into `files` or delete the `manifest_entries` row.
-
-Once 027 applies, the same command compacts the catalog once (SQLite's
-`VACUUM`), which needs free disk about twice the catalog's size. If that fails
-it only warns: the catalog is correct, just larger than it needs to be.
-
-### `migration 030 cannot run`
-
-Migration 030 stores each unit's file list in a narrower shape: a path once
-per unit, a sha256 as 32 bytes, a modified time as a number. It converts every
-`files` row exactly or not at all, and refuses a value it could not turn back
-into the same text:
-
-```text
-error: failed to open database: migration error: migration 030 cannot run: 1 files row(s) whose sha256 is not 64
-lowercase hex characters (id 4012). Migration 030 converts every files row exactly (paths interned per unit,
-sha256 as 32 bytes, modified_at as an integer) and will not guess a value it cannot convert. Correct each named
-files row (a sha256 or modified_at you cannot recover may be set to NULL; delete only a row whose snapshot no
-longer exists), then run the command again. Nothing has been changed.
-```
-
-Look at the named rows with `sqlite3`, the same way as for migration 026 above
-(`sqlite3 "$DB" "SELECT * FROM files WHERE id = 4012"`), and correct them.
-Do not delete a row whose snapshot still exists: a version records how many
-files it holds, and one short a row cannot be staged (it reads as an
-interrupted `snapshot create`, see [A snapshot is incomplete](#a-snapshot-is-incomplete)),
-while the next `snapshot create` sees the file as added and records a new
-version.
-
-The findings it can name, and what to do about each:
-
-- **A `modified_at` not in the spelling every tapectl release writes**
-  (`2026-09-01T12:00:00+00:00`).
-- **A sha256 that is not 64 lowercase hex characters.**
-- **An `is_directory` and `file_type` that disagree**, or a `file_type` that
-  is not `dir`, `regular`, `symlink` or `special`.
-- **A row whose snapshot no longer exists.** This is the one row to delete:
-  it belongs to no version.
-
-Every row they name was edited by hand.
-A sha256 or a `modified_at` you cannot recover may be set to NULL: a
-version without a sha256 is baselined again by its next stage, and a file
-whose modified time is NULL reads as changed to the next
-`snapshot create`, which records a new version. A row with no `file_type` at
-all is not refused: it takes the type its `is_directory` gives, as migration
-005 did.
-
-A `modified_at` in that spelling but before 1677-09-21 or after 2262-04-11 --
-1601-01-01, the zero time of an NTFS volume, say -- is not refused, and
-neither is a year past 9999 in the spelling earlier releases gave it, with a
-leading sign (`+10000-01-01T00:00:00+00:00`). No nanosecond count holds
-either, so 030 records no modified time for that file, which is what the walk
-records for it today, and the unit still reads as unchanged. It says so once,
-on stderr, naming up to ten rows and then the count (`, ... (12 rows)`):
-
-```text
-WARN tapectl::db: migration 030 recorded no modified time for 1 file row(s) whose modified_at is outside
-1677-09-21..2262-04-11, the range a nanosecond count holds: files row 4012 (snapshot 31, path id 977, was
-1601-01-01T00:00:00+00:00). A walk records none for such a file either, so these units still read as unchanged;
-nothing else was altered
-```
-
-Nothing needs doing about it. The `files` row is gone once 030 applies; the
-path it named is `sqlite3 "$DB" "SELECT path FROM paths WHERE id = 977"`.
-
-Once 030 applies, the same command compacts the catalog once, as after 027.
-
-### `migration 032 cannot run`
-
-Migration 032 removes the volume status `full`, which no tapectl release has
-ever written. A volume carrying it was set by hand, and 032 will not guess what
-it should say:
-
-```text
-error: failed to open database: migration error: migration 032 cannot run: volumes.status = 'full' on 1 row(s)
-(id 7). Migration 032 removes this status from the schema. No tapectl release has ever written it, so these rows
-were set by hand, and 032 will not guess what they should say. Change each named row to a status the new schema
-allows -- initialized, active, retired, erased, sealed -- then run the command again. Nothing has been changed.
-```
-
-Nothing has been changed. Decide which status tells the truth about each named
-volume and set it with `sqlite3`, the same way as for migration 026 above
-(`sqlite3 "$DB" "UPDATE volumes SET status = 'retired' WHERE id = 7"`). Only
-`sealed` counts as a copy, so choose it only for a volume whose seal you can
-stand behind; `volume verify` checks one afterwards.
-
-### `migration 033 cannot run`
-
-Migration 033 removes three cartridge columns no tapectl release has ever
-written or read: `total_bytes_written`, `total_bytes_read` and `error_history`
-(ADR-0012, 2026-10-07). A cartridge with a value in one of them other than its
-default (0, 0, NULL; NULL counts as unwritten everywhere, and an empty text
-is a value) had it set by hand, and 033 will not drop it silently:
-
-```text
-error: failed to open database: migration error: migration 033 cannot run: total_bytes_written, total_bytes_read
-or error_history is set on 1 cartridge row(s) (id 4). Migration 033 removes these three columns from the schema.
-No tapectl release has ever written them, so these values were set by hand, and 033 will not drop them silently.
-Copy them somewhere if they matter, set each named row back to total_bytes_written = 0, total_bytes_read = 0,
-error_history = NULL, then run the command again. Nothing has been changed.
-```
-
-Nothing has been changed. Read the values first if you want to keep them
-(`sqlite3 "$DB" "SELECT id, barcode, total_bytes_written, total_bytes_read,
-error_history FROM cartridges WHERE id = 4"`), then reset them:
-
-```bash
-sqlite3 "$DB" "UPDATE cartridges SET total_bytes_written = 0, total_bytes_read = 0, error_history = NULL WHERE id = 4"
-```
+A `config.toml` carried over from 1.x names a key that 2.0.0 no longer has: the `[dar]` table
+(now `[tar]` with the same `binary` key, [Configuration](configuration.md)),
+`allow_spanning` (every unit continues on the next cartridge at the early warning, with no
+opt-in), `preserve_fsa` (tar keeps no `chattr` flags), a compression other than `none`,
+`gzip`, `xz` or `zstd`. The parser's message names the key and the line; delete it. A home
+whose catalog is from 1.x is refused first (above).
 
 ---
 
@@ -3113,8 +2965,7 @@ mode check nothing.
 ```
 
 You gave `--restore` no `--unit` and no `--all`, and the first envelope your key
-opened lists one unit, so the script restored that one. On a tape written by 1.2.0 or
-later it then reads the remaining envelopes forward (before any slice is read) and
+opened lists one unit, so the script restored that one. It then reads the remaining envelopes forward (before any slice is read) and
 says here what else your key opened. An operator or escrow key opens every tenant's
 envelope. Look first (`./RESTORE.sh --list --key …`), then restore everything into
 a new, empty directory (`./RESTORE.sh --restore --key … --all --to /another/destination`).
@@ -3126,7 +2977,7 @@ to a larger disk to see it. `--no-space-check` does not override that skip.
 ### RESTORE.sh: `this tape requires feature(s) …`
 
 ```text
-FATAL: this tape requires feature(s) short-seal, which this script does not know
+FATAL: this tape requires feature(s) <name>, which this script does not know
 ```
 
 A tape written by a newer tapectl says in File 0 (and its seal marker) what a
@@ -3134,8 +2985,7 @@ reader must understand, as `requires = [...]`. A RESTORE.sh or tapectl that
 does not know a feature refuses rather than misread the tape. Use the
 RESTORE.sh on that tape (file 2), which knows, or a newer tapectl. tapectl
 itself refuses the same way, before a scratch directory, a key or a slice:
-`restore raw-volume` and `catalog rebuild`, and from the release after 1.2.0
-(#476) also `restore unit`, `restore file`, `restore volume`, `volume verify`,
+`restore raw-volume` and `catalog rebuild`, and also `restore unit`, `restore file`, `restore volume`, `volume verify`,
 `volume read-slices`, `volume compact-read`, `volume compact` and `volume
 resume`. `volume verify` exits 3 and records nothing for a File 0 it refuses,
 and reports a seal that needs an unknown feature as unreadable. Either way it
@@ -3145,23 +2995,21 @@ is inconclusive, never a reason to quarantine the cartridge.
 
 A key matched the envelope (age got past its header) but the payload would
 not decrypt, or the envelope's bytes do not match the front index. That is
-damage, not a wrong key: another key will not help. (A RESTORE.sh from a tape
-written by 1.2.0 or later says "a key matched" only when one did. When the envelopes
+damage, not a wrong key: another key will not help. (A RESTORE.sh says
+"a key matched" only when one did. When the envelopes
 could not be read or failed their hash and no key opened any of them, it says so
 and suggests other keys: it is then damage, a key that is not a recipient, or
 both.) The operator envelope has
 a backup copy on every tape, which an operator or escrow key opens
-(`--find-envelope` tries it); otherwise use another copy of the volume. Since 1.1.0
-every tenant envelope has a backup too.
+(`--find-envelope` tries it); otherwise use another copy of the volume. Every
+tenant envelope has a backup too.
 
 `catalog rebuild` treats a pair that is unreadable in both copies by kind (#451).
 The operator envelope's pair lost: the rebuild refuses (it names every unit and
-carries catalog.db). A tenant envelope's pair lost on a tape whose catalog.db
-names each unit's owner (written after 2026-09-11): the rebuild goes on, warns
+carries catalog.db). A tenant envelope's pair lost (the operator's catalog.db
+names each unit's owner): the rebuild goes on, warns
 naming the envelope and its copies' positions, and records every unit (`--json`:
-`unreadable_tenant_envelopes`). On an older tape, or one with no catalog.db, the
-tenant envelopes are the only record of ownership, so the rebuild refuses; use
-another copy of the volume. In every case RESTORE.sh (tape file 2) with the
+`unreadable_tenant_envelopes`). In every case RESTORE.sh (tape file 2) with the
 owner's key or the escrow key restores what still opens.
 
 ### RESTORE.sh: `this tape is layout_version N`
@@ -3398,8 +3246,9 @@ location target, a rewrite's hold); a bare `tapectl stage clean` releases what
 is already on enough tapes and keeps the rest.
 
 `status` replaced `report summary`, and `stage list --owing` replaced `report
-pending`; both old spellings are refused by name
-([renamed](#tapectl-old-was-renamed-in-190-use-tapectl-new)). A script that read
+pending`; both old spellings are an
+unrecognized subcommand
+([old spellings](#unrecognized-subcommand-or-unexpected-argument-from-a-script-written-for-1x)). A script that read
 `report summary --json` reads `status --json` now, a different document: the
 home, the running sessions, `units` by state, `due_verify` and `next`. The
 operator guide lists every `--json` field that changed, under
