@@ -198,7 +198,7 @@ sha256, MANIFEST, the front index, the seal, RECOVERY.md, the file table and id 
 own RESTORE.sh under the heir harness).
 
 **The heir path's only test with real tools is the mhvtl gate** (ADR-0012 item 70,
-#457). `tests/heir_restore_sh.rs` runs RESTORE.sh with `mt`, `dd` and `age` faked (CI
+#457). `tests/heir_restore.rs` (with `heir_restore_s6.rs`) runs RESTORE.sh with `mt`, `dd` and `age` faked (CI
 has no age CLI); only the gate's RESTORE.sh legs (`heir_*`) and home2's real-drive
 proof run it with the real `age`, `mt`, `tar` and decompressors. A release is not proven on
 the heir path until the gate has run; each run record names the age version it used
