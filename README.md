@@ -39,15 +39,16 @@ You do not need this repository to get the data back.
 
 ## Status
 
-tapectl 1.9.2 is the current release. It is young: in real
-use since 1.0.0 (2026-10-01), and proven on one drive model, an HP LTO-6. Other drives
-have been exercised only in a virtual tape library (mhvtl). 1.9.0 renamed some commands
-and flags (`stage list` for `staging status`, `drive add` for `backend add`, …): an old
-spelling is refused by name, naming the new one ([release notes](docs/releases/1.9.0.md)).
-1.9.1 added `tapectl setup` and a static binary on each release ([its notes](docs/releases/1.9.1.md)).
+tapectl 2.0.0 writes **Layout Version 3** and is a new start: it reads and writes nothing
+else, opens no catalog of tapectl 1.x, and has no upgrade from it ([release
+notes](docs/releases/2.0.0.md)). It is young: its predecessors were in real use since 1.0.0
+(2026-10-01), proven on one drive model, an HP LTO-6, and other drives have been exercised
+only in a virtual tape library (mhvtl). The cartridges of a 2.0.0 install count as
+production when the acceptance run's restore drill passes on the real drive
+([docs/handoff.md](docs/handoff.md)); until then they are test articles.
 
-The newest features each passed an acceptance run on a real HP LTO-6 drive before their
-release was tagged: the short seal (1.6.0, 2026-10-22), spanning (1.7.0, 2026-10-27) and
+Before 2.0.0, the newest features each passed an acceptance run on a real HP LTO-6 drive
+before their release was tagged: the short seal (1.6.0, 2026-10-22), spanning (1.7.0, 2026-10-27) and
 Logical Block Protection (1.8.0, 2026-10-29). Before them, from the full real-drive
 validation of 2026-09-10 on, it was proven end to end on the same drive: writes,
 verification, every restore path including the heir's script off the tape, and catalog
@@ -74,9 +75,9 @@ is a decision recorded in the [ADRs](docs/adr/). The last full test run passed a
   written in one session, which ends with a seal marker that binds the front index.
   A tape is recorded as sealed only when its seal binds its front index and the
   read-back agrees, and a sealed tape is never appended to. A write that reaches the
-  drive's early warning finishes the slice in flight and seals the tape short: a unit
-  it did not finish stays staged and is written whole on the next tape. A unit is never
-  split across tapes unless it opts into spanning. `--full-confirm` reads every byte
+  drive's early warning finishes the slice in flight and seals the tape short: the
+  slices it did not write stay staged and are written first on the next tape, so any
+  unit may continue on the next cartridge, with no opt-in. `--full-confirm` reads every byte
   back at write time; otherwise the `volume verify` that follows is the tape's first
   full read-back, and `audit` names the tape (`no_full_verify`) until one passes.
 - **The drive checks every block.** On a drive with Logical Block Protection, the drive
@@ -165,13 +166,17 @@ resume, reinstall, upgrade, move to a new host, or uninstall. To build by hand:
 
 ## Upgrading
 
-An upgrade is done in place, from a checkout of the new release tag:
+An upgrade in place is from 2.0.0 on, from a checkout of the new release tag:
 `scripts/first-run.sh --upgrade`. It backs the catalog up with the old binary and keeps
-that binary, installs the new one (the catalog migrates at its first open, and there is
-no downgrade past a migration), stops at each newer release's own steps, rehearses on a
-test cartridge, regenerates the Heir Kit and prints the way back.
-[docs/install.md, "Upgrading in place"](docs/install.md#10-upgrading-in-place) has the
-steps.
+that binary, installs the new one (there is no downgrade past a migration), stops at each
+newer release's own steps, rehearses on a test cartridge, regenerates the Heir Kit and
+prints the way back. [docs/install.md, "Upgrading in place"](docs/install.md#10-upgrading-in-place)
+has the steps.
+
+**There is no upgrade from 1.x.** 2.0.0 reads and writes Layout 3 and one baseline schema
+only: from a 1.x install the way is a fresh start with a new catalog, new keys, new units
+and erased cartridges (the same section; [docs/handoff.md](docs/handoff.md) on home2). A
+Layout 2 tape is read with tapectl 1.9.2 or its own `RESTORE.sh`.
 
 ## Documentation
 
@@ -189,7 +194,7 @@ steps.
 | Make sense of a refusal or an error | [Troubleshooting](docs/troubleshooting.md) |
 | Look up a command or flag | [Command reference](docs/cli/README.md) |
 | See what a release changed | [Release notes](docs/releases/) |
-| Know exactly what is on a tape | [On-tape format v2](docs/design/volume-format-v2.md) |
+| Know exactly what is on a tape | [On-tape format v3](docs/design/volume-format-v3.md) |
 | Build, test or change tapectl | [Development](docs/development.md) |
 
 The full index, including design records and test procedures, is
@@ -204,7 +209,7 @@ writes Layout 3 only:
 
 | File | Contents | Encrypted? |
 |---|---|---|
-| 0 | ID thunk: label, uuid, the tapectl version that wrote it, `requires` (the features a reader must know, such as `short-seal` and `spanning`), where the index and the seal are, the cartridge's identity | No |
+| 0 | ID thunk: label, uuid, the tapectl version that wrote it, `requires` (the features a reader must know: empty in Layout 3), where the index and the seal are, the cartridge's identity | No |
 | 1 | Recovery guide (Markdown, written for a human or an AI assistant) | No |
 | 2 | `RESTORE.sh` — scripted recovery | No |
 | 3 | Front index: every file's position, type, size and ciphertext sha256 | No |

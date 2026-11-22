@@ -15,10 +15,10 @@ the repository, grouped by what you are trying to do.
 | [Operator guide](operator-guide.md) | Day-to-day operation: archiving, second copies, restores, tape-only units, retiring and compacting volumes, cartridge tracking, warehouse copies, the maintenance cadence. |
 | [Configuration](configuration.md) | Every `config.toml` key with its default, the per-unit `.tapectl-unit.toml`, archive sets and policy resolution, environment variables. |
 | [Keys and recovery](keys-and-recovery.md) | Primary, backup and escrow keys; who can decrypt what; the Heir Kit; restoring with tapectl, with only a key and a tape, and rebuilding a lost catalog. |
-| [Troubleshooting](troubleshooting.md) | What to do after each exit code, how confirmation works, and every refusal you are likely to meet — what it means and what to do, a renamed command's refusal included. |
+| [Troubleshooting](troubleshooting.md) | What to do after each exit code, how confirmation works, and every refusal you are likely to meet — what it means and what to do. |
 | [Command reference](cli/README.md) | Every command, subcommand and flag, generated from the binary's own definitions. |
 | [Man pages](man/README.md) | The same reference as `man` pages (`man -l docs/man/tapectl.1`). From 1.9.0 `scripts/install-systemd.sh` installs them, with bash completion for `tapectl` and `tapectl-op`. |
-| [Release notes](releases/) | What each release changes for an operator: on-tape format, catalog migrations, exit codes, config keys, known open items ([1.1.0](releases/1.1.0.md), [1.1.1](releases/1.1.1.md), [1.1.2](releases/1.1.2.md), [1.2.0](releases/1.2.0.md), [1.3.0](releases/1.3.0.md), [1.4.0](releases/1.4.0.md), [1.5.0](releases/1.5.0.md), [1.6.0](releases/1.6.0.md), [1.7.0](releases/1.7.0.md), [1.7.1](releases/1.7.1.md), [1.7.2](releases/1.7.2.md), never tagged on its own and contained in [1.8.0](releases/1.8.0.md), [1.8.1](releases/1.8.1.md), [1.9.0](releases/1.9.0.md), which renamed some commands and flags and refuses the old spellings by name, [1.9.1](releases/1.9.1.md), which adds `tapectl setup` and a static release binary, [1.9.2](releases/1.9.2.md), the SQLite inside it updated). Read them from your version to the target before [an upgrade](install.md#10-upgrading-in-place). |
+| [Release notes](releases/) | What each release changes for an operator: on-tape format, catalog migrations, exit codes, config keys, known open items ([1.1.0](releases/1.1.0.md), [1.1.1](releases/1.1.1.md), [1.1.2](releases/1.1.2.md), [1.2.0](releases/1.2.0.md), [1.3.0](releases/1.3.0.md), [1.4.0](releases/1.4.0.md), [1.5.0](releases/1.5.0.md), [1.6.0](releases/1.6.0.md), [1.7.0](releases/1.7.0.md), [1.7.1](releases/1.7.1.md), [1.7.2](releases/1.7.2.md), never tagged on its own and contained in [1.8.0](releases/1.8.0.md), [1.8.1](releases/1.8.1.md), [1.9.0](releases/1.9.0.md), which renamed some commands and flags, [1.9.1](releases/1.9.1.md), which adds `tapectl setup` and a static release binary, [1.9.2](releases/1.9.2.md), the SQLite inside it updated, [2.0.0](releases/2.0.0.md), Layout Version 3, with no upgrade from 1.x). Read them from your version to the target before [an upgrade](install.md#10-upgrading-in-place). |
 
 ## The tape format and the design
 
@@ -29,7 +29,7 @@ the repository, grouped by what you are trying to do.
 | [Implementation plan for 2.0.0](design/v3-implementation-plan.md) | The staged build of Layout 3, its decisions D1 to D22 and the task behind each change. |
 | [On-tape format v2](design/volume-format-v2.md), [v2 open questions](design/v2-open-questions.md), [v2 implementation plan](design/v2-implementation-plan.md) | Layout 2, which tapectl 1.x wrote: history, kept to read a tape of that layout (with tapectl 1.9.2 or its own `RESTORE.sh`). |
 | [Threat model and boundaries](design/threat-model.md) | Who the adversary is and is not; integrity versus authenticity (the seal is not a signature); the st/SG boundary and the synchronous seal filemark; the power baseline; how the format grows; one cartridge, one recovery unit. |
-| [Architecture decisions](adr/) | ADR-0001 … ADR-0013: the rules and why (escrow, consent tiers, cartridge identity, generations, …). |
+| [Architecture decisions](adr/) | ADR-0001 … ADR-0014: the rules and why (escrow, consent tiers, cartridge identity, generations, …). |
 | [Vocabulary](../CONTEXT.md) | The project's defined terms. |
 | [Original design document](../tapectl-design-v4_0.md) | Design v4.0 — still the reference for whatever the documents above do not cover; read it with the errata. |
 | [Design errata](design-errata.md) | Where the original design document is superseded. |
@@ -53,7 +53,7 @@ Dated records are kept as history, not instructions: hardware session journals
 ([audits/](audits/)), research notes ([research/](research/)), the questions
 unattended runs deferred to the maintainer, all since answered
 ([decisions-pending.md](decisions-pending.md)), and the maintainer handoff
-([handoff.md](handoff.md)).
+(handoff.md: the operator's steps on home2 for 2.0.0).
 
 ## Keeping the docs honest
 
