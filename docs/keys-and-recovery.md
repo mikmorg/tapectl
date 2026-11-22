@@ -60,13 +60,9 @@ tenant "family" created (id=2) with primary and backup keys
 
 ```text
 $ tapectl key list --tenant family
-+----------------+---------+--------+--------+-----------------------------+---------------------+
-| Alias          | Type    | Active | Escrow | Fingerprint                 | Created             |
-+----------------+---------+--------+--------+-----------------------------+---------------------+
-| family-backup  | backup  | yes    |        | age1k83yzew0lqgc2ghf7ktc... | 2026-09-29 08:19:49 |
-+----------------+---------+--------+--------+-----------------------------+---------------------+
-| family-primary | primary | yes    |        | age194da4h246gzse65r0a3k... | 2026-09-29 08:19:49 |
-+----------------+---------+--------+--------+-----------------------------+---------------------+
+Alias            Type      Active   Escrow   Fingerprint                   Created
+family-backup    backup    yes               age1d8yanmpas0mk39v4zk7s...   2026-11-22 01:50 UTC
+family-primary   primary   yes               age1hnzyknmslsdeek3dfv65...   2026-11-22 01:50 UTC
 ```
 
 The names *primary* and *backup* are labels, not a hierarchy. Both pairs are
@@ -161,7 +157,7 @@ opens every tape.
 `init` mints it and prints the secret **once**:
 
 ```text
-$ tapectl init --operator mike
+$ tapectl init --operator alice
 
 ================================================================================
   ESCROW IDENTITY GENERATED -- THIS SECRET IS SHOWN EXACTLY ONCE, RIGHT NOW
@@ -182,7 +178,7 @@ $ tapectl init --operator mike
 
   Public key (already saved to disk and the database -- safe to keep there):
 
-    age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
+    age1eq8l4a5alxscskaykt8q2cf9nk0jr3evavltj0akve9xawf3ts9qusrs36
 
 ================================================================================
 ```
@@ -261,9 +257,9 @@ So:
 
 ```text
 $ tapectl db backup /tmp/tour/backup
-database backed up to /tmp/tour/backup/tapectl-20261105T023058Z.db (464.0 KiB); private keys not included — pass --include-keys to copy them
+database backed up to /tmp/tour/backup/tapectl-20261122T015152Z.db (520.0 KiB); private keys not included — pass --include-keys to copy them
 $ tapectl db backup /tmp/tour/backup/tapectl.db --include-keys
-database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys copied to /tmp/tour/backup/tapectl.keys/ (276 B) — treat that directory as secret
+database backed up to /tmp/tour/backup/tapectl.db (520.0 KiB); private keys copied to /tmp/tour/backup/tapectl.keys/ (891 B) — treat that directory as secret
 ```
 
 Given a directory, `db backup` writes a dated file in it,
@@ -453,9 +449,9 @@ $ tapectl key escrow-kit ~/heir-kit
 heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
-  catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
-  tapectl-X.Y.Z    the program that made this kit, 39.3 MiB, sha256 3a7bd3e2… (named on the sheet)
-note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/vX.Y.Z/tapectl-X.Y.Z-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
+  catalog.db.age   encrypted catalog, 776.5 KiB, covering 1 sealed volume
+  tapectl-2.0.0    the program that made this kit, 89.5 MiB, sha256 f52a1c894bed… (named on the sheet) (named on the sheet)
+note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/v2.0.0/tapectl-2.0.0-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -793,16 +789,16 @@ is the same procedure for a service-user host.
    no command can undo that (you would have to delete the new home and start
    again).
    ```bash
-   tapectl init --operator mike --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
+   tapectl init --operator alice --escrow-public-key age1eq8l4a5alxscskaykt8q2cf9nk0jr3evavltj0akve9xawf3ts9qusrs36
    ```
    From the recorded session, which rebuilt into a separate `--home ~/.tapectl-rebuilt`
    (on a real rebuild, use your normal home):
    ```text
    tapectl initialized at ~/.tapectl-rebuilt
-     operator: mike
+     operator: alice
      database: ~/.tapectl-rebuilt/tapectl.db
      config:   ~/.tapectl-rebuilt/config.toml
-     escrow:   adopted age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7 (imported — its secret lives on the heir kit, not here)
+     escrow:   adopted age1eq8l4a5alxscskaykt8q2cf9nk0jr3evavltj0akve9xawf3ts9qusrs36 (imported — its secret lives on the heir kit, not here)
      tar:      tar (GNU tar) 1.35 (found at /usr/bin/tar)
 
    next steps:
@@ -1198,8 +1194,8 @@ go back into `keys/` (runbooks C and D).
    nothing:
 
    ```bash
-   tapectl --dry-run init --operator mike --operator-key /srv/adopt-keys/mike.key --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
-   tapectl init --operator mike --operator-key /srv/adopt-keys/mike.key --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
+   tapectl --dry-run init --operator mike --operator-key /srv/adopt-keys/mike.key --escrow-public-key age1eq8l4a5alxscskaykt8q2cf9nk0jr3evavltj0akve9xawf3ts9qusrs36
+   tapectl init --operator mike --operator-key /srv/adopt-keys/mike.key --escrow-public-key age1eq8l4a5alxscskaykt8q2cf9nk0jr3evavltj0akve9xawf3ts9qusrs36
    tapectl --dry-run tenant add family -d "family photos and letters" --adopt-key /srv/adopt-keys/family.key
    tapectl tenant add family -d "family photos and letters" --adopt-key /srv/adopt-keys/family.key
    ```
