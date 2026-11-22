@@ -3465,9 +3465,7 @@ naming it (for example
 version exists, the unit's policy is resolved before any coverage is checked,
 even under `--force`. A policy that cannot be resolved, such as a dotfile with an invalid
 `[policy]` value or a unit whose archive set the catalog no longer has, is an
-error rather than a shortfall. Fix what it names, then run the command again:
-
-(This page does not show that error: a run with a dotfile `[policy] compression = "bogus"` did not reproduce it, so no output is quoted.)
+error rather than a shortfall. Fix what it names, then run the command again.
 
 A version that no current version supersedes is different. Marking it would
 release the unit's only current version, which is not a shortfall to accept at
