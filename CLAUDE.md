@@ -46,6 +46,10 @@ Rules that outlived the history:
 - **Never argue a design choice from what `keepsake` holds** (item 281), and never bend the
   format to home2's older tools (item 273). Weigh a format choice by what one slice gives
   the stock tools alone, with no file table.
+- **The recorded tape** (`tests/fixtures/recorded-2.0.0/`, read by `tests/recorded_tape.rs` in
+  plain `cargo test`; #552): a tape 2.0.0 wrote on mhvtl, restored, rebuilt and verified by every
+  later build, its own RESTORE.sh included. A build that cannot read it is a format break, the
+  CTO's decision; it is never re-recorded to make a test pass.
 - **Prove a RESTORE.sh change** in the `tapectl-u26` container (`/scratch/tapectl-u26`) as
   uid 1000, and in a PR's CI: Ubuntu 26.04's uutils hang on `tail -c 1 <fifo` and enlarge
   pipes to 1 MiB where GNU coreutils do not (item 184), and root hides it.
