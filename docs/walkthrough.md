@@ -38,7 +38,7 @@ by state, and the next command to run. The session below looks at it three times
 9. [Audit, and the second copy](#9-audit-and-the-second-copy)
 10. [Find things](#10-find-things)
 11. [Restore](#11-restore)
-12. [Staging, after the second copy](#12-staging-after-the-second-copy)
+12. [Staging, after the copies](#12-staging-after-the-copies)
 13. [The Heir Kit and a catalog backup](#13-the-heir-kit-and-a-catalog-backup)
 14. [Rehearse a disaster](#14-rehearse-a-disaster)
 15. [Where next](#15-where-next)
@@ -74,17 +74,27 @@ tapectl init --operator alice
 ```
 
 ```text
+
 ================================================================================
   ESCROW IDENTITY GENERATED -- THIS SECRET IS SHOWN EXACTLY ONCE, RIGHT NOW
 ================================================================================
-  ...
+
+  tapectl does NOT store this secret anywhere: not in the database, not in
+  a config file, not in any file on this machine. Close this terminal without
+  transcribing it and it is gone forever -- the escrow recipient becomes
+  useless for every future encryption it was meant to protect.
+
+  Per ADR-0005: copy the secret below onto paper NOW. Store that paper in at
+  least two independent physical locations. Verify the transcription
+  character-by-character before doing anything else.
+
   SECRET -- transcribe this line:
 
     AGE-SECRET-KEY-1…(redacted)
 
   Public key (already saved to disk and the database -- safe to keep there):
 
-    age1eykxeg5equrmykz4a9xa98ak0qamfhgsy4qn5mlc4zr3m0w2kahqp3xx8a
+    age1eq8l4a5alxscskaykt8q2cf9nk0jr3evavltj0akve9xawf3ts9qusrs36
 
 ================================================================================
 
@@ -92,7 +102,7 @@ tapectl initialized at ~/.tapectl
   operator: alice
   database: ~/.tapectl/tapectl.db
   config:   ~/.tapectl/config.toml
-  escrow:   age1eykxeg5equrmykz4a9xa98ak0qamfhgsy4qn5mlc4zr3m0w2kahqp3xx8a
+  escrow:   age1eq8l4a5alxscskaykt8q2cf9nk0jr3evavltj0akve9xawf3ts9qusrs36
             (the SECRET was printed above — transcribe it now onto paper; ADR-0005)
   tar:      tar (GNU tar) 1.35 (found at /usr/bin/tar)
 
@@ -140,7 +150,7 @@ tapectl config check
 
 ```text
 config: valid
-home: ~/.tapectl (this account's ~/.tapectl)
+home: ~/.tapectl (named by --home)
 tar: tar (GNU tar) 1.35 at '/usr/bin/tar' (meets the writer's floor, GNU tar 1.35 with ACL support)
 staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
@@ -216,8 +226,8 @@ tenant "family" created (id=2) with primary and backup keys
 tenant "work" created (id=3) with primary and backup keys
 
 Alias            Type      Active   Escrow   Fingerprint                   Created
-family-backup    backup    yes               age1qsua3yfupp425ta6u75s...   2026-11-05 03:41 UTC
-family-primary   primary   yes               age1s8vavv8r9rh78hrsnutt...   2026-11-05 03:41 UTC
+family-backup    backup    yes               age1d8yanmpas0mk39v4zk7s...   2026-11-22 01:50 UTC
+family-primary   primary   yes               age1hnzyknmslsdeek3dfv65...   2026-11-22 01:50 UTC
 ```
 
 Without `--tenant`, `key list` lists every tenant's keys, with a Tenant column.
@@ -246,12 +256,11 @@ tapectl unit list
 added collection "photos" (root /media/family/photos, tenant family, a unit per folder 1 level below the root) to ~/.tapectl/config.toml
 its sync, as `tapectl collection sync` would run it now:
 collection "photos" (dry run): would create 2; 0 refused · 0 moved, 0 reactivated, 0 missing · 2 pending (2 never archived)
-
 collection "photos": 2 created; 0 refused · 0 moved, 0 reactivated, 0 missing · 2 pending (2 never archived)
 unit "family/letters" initialized (id=3)
 unit "work/invoices-2024" initialized (id=4)
 
-Name                 Status   Tenant   Path                               Tags
+Name                 Status   Tenant   Path                                                                   Tags
 family/letters       active   family   /media/family/letters              letters
 photos/2019-italy    active   family   /media/family/photos/2019-italy
 photos/2020-garden   active   family   /media/family/photos/2020-garden
@@ -272,7 +281,7 @@ tapectl status
 ```
 
 ```text
-home: ~/.tapectl (this account's ~/.tapectl)
+home: ~/.tapectl (named by --home)
 session logs: ~/.tapectl/logs
 running: nothing
 units: 4 active
@@ -302,7 +311,7 @@ tapectl snapshot create family/letters photos/2019-italy photos/2020-garden work
 snapshot created: family/letters v1 (2 files, 235 B)
 snapshot created: photos/2019-italy v1 (4 files, 1.1 MiB)
 snapshot created: photos/2020-garden v1 (3 files, 586.2 KiB)
-snapshot created: work/invoices-2024 v1 (2 files, 219 B)
+snapshot created: work/invoices-2024 v1 (2 files, 222 B)
 ```
 
 (Each count includes the unit's own `.tapectl-unit.toml`.)
@@ -333,24 +342,29 @@ staging work/invoices-2024 (4 of 4)
 staged work/invoices-2024 (stage set 4)
 staged: family/letters (1 slice, 10.0 KiB stream, 10.7 KiB encrypted)
 staged: photos/2019-italy (1 slice, 1.1 MiB stream, 1.1 MiB encrypted)
-staged: photos/2020-garden (1 slice, 600.0 KiB stream, 600.7 KiB encrypted)
-staged: work/invoices-2024 (1 slice, 10.0 KiB stream, 10.6 KiB encrypted)
+staged: photos/2020-garden (1 slice, 600.0 KiB stream, 600.8 KiB encrypted)
+staged: work/invoices-2024 (1 slice, 10.0 KiB stream, 10.7 KiB encrypted)
 
 volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
   photos/2019-italy v1: 1 slice, 1.1 MiB
-  photos/2020-garden v1: 1 slice, 600.7 KiB
+  photos/2020-garden v1: 1 slice, 600.8 KiB
   family/letters v1: 1 slice, 10.7 KiB
-  work/invoices-2024 v1: 1 slice, 10.6 KiB
+  work/invoices-2024 v1: 1 slice, 10.7 KiB
 
 total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
 estimated tapes: 1 (at the 97% fill ceiling)
-cross-volume index: about 2.3 KiB per tape, 4.6 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
+plan order: one write of everything staged plans these, in this order (an estimate: each unit's slices block-padded, the volume's own files not counted; every unit continues on the next cartridge where the drive's early warning ends the tape, ADR-0012 items 288 and 289):
+  family/letters v1: queued, slice 1, under the fill ceiling
+  photos/2019-italy v1: queued, slice 1, under the fill ceiling
+  photos/2020-garden v1: queued, slice 1, under the fill ceiling
+  work/invoices-2024 v1: queued, slice 1, under the fill ceiling
+cross-volume index: about 2.5 KiB per tape, 5.0 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
 
 Stage Set   Unit                 Version   Status   Slices   Size        Copies   Staged
-1           family/letters       v1        staged   1        10.7 KiB    0 of 2   2026-11-05 03:41 UTC
-2           photos/2019-italy    v1        staged   1        1.1 MiB     0 of 2   2026-11-05 03:41 UTC
-3           photos/2020-garden   v1        staged   1        600.7 KiB   0 of 2   2026-11-05 03:42 UTC
-4           work/invoices-2024   v1        staged   1        10.6 KiB    0 of 2   2026-11-05 03:42 UTC
+1           family/letters       v1        staged   1        10.7 KiB    0 of 2   2026-11-22 01:45 UTC
+2           photos/2019-italy    v1        staged   1        1.1 MiB     0 of 2   2026-11-22 01:45 UTC
+3           photos/2020-garden   v1        staged   1        600.8 KiB   0 of 2   2026-11-22 01:45 UTC
+4           work/invoices-2024   v1        staged   1        10.7 KiB    0 of 2   2026-11-22 01:45 UTC
 ```
 
 `volume plan` is an estimate, and it needs no drive. It plans as many copies as the
@@ -370,23 +384,25 @@ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
 ```
 
 ```text
-cartridge L8-0001 auto-registered from MAM (chip serial E01010L8_1775794348; barcode L8-0001, the volume's label)
+L8-0001: blank proven by this catalog's verified erase on 2026-11-22 01:45:44 UTC (cartridge E01001L8_1775794348, short erase, nothing written to it since) -- no --force needed
+volume "L8-0001" bound to cartridge L8-0001
+  its barcode is now L8-0001, the volume's label (it wore its chip serial E01001L8_1775794348 as a placeholder)
 volume "L8-0001" initialized (id=1); writing it now. If the write does not complete the volume stays initialized, and what to run next is said when it stops.
 medium: LTO-8, 2.0 GB (the cartridge chip's medium density code 0x5e; capacity from the drive's capacity_override)
 about to write to volume "L8-0001":
   family/letters v1: 1 slices, 10.7 KiB
   photos/2019-italy v1: 1 slices, 1.1 MiB
-  photos/2020-garden v1: 1 slices, 600.7 KiB
-  work/invoices-2024 v1: 1 slices, 10.6 KiB
+  photos/2020-garden v1: 1 slices, 600.8 KiB
+  work/invoices-2024 v1: 1 slices, 10.7 KiB
 
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
 sealed and confirmed: 4 units, 4 slices, 1.7 MiB; full readback passed
 staging kept for 4 units still short of their policy; the next copy reuses their staged slices:
-  unit photos/2020-garden has 1 copy, needs 2
-  unit photos/2019-italy has 1 copy, needs 2
   unit family/letters has 1 copy, needs 2
   unit work/invoices-2024 has 1 copy, needs 2
+  unit photos/2020-garden has 1 copy, needs 2
+  unit photos/2019-italy has 1 copy, needs 2
 volume "L8-0001" moved to "home-rack"
   cartridge "L8-0001" moved with it
 next: tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>
@@ -428,34 +444,47 @@ Volume: L8-0001
   Media:       LTO-8
   Capacity:    3.5 MiB / 2.0 GB (0.2%)
   Cartridge:   L8-0001
-               serial E01010L8_1775794348
+               serial E01001L8_1775794348
   Location:    home-rack
-  Created:     2026-11-05 03:42 UTC
-  First write: 2026-11-05 03:42 UTC (started)
-  Last write:  2026-11-05 03:42 UTC (completed)
-  Sealed:      2026-11-05 03:42 UTC
-  …
+  Created:     2026-11-22 01:45 UTC
+  First write: 2026-11-22 01:45 UTC (started)
+  Last write:  2026-11-22 01:45 UTC (completed)
+  Sealed:      2026-11-22 01:45 UTC
+  Write check: none (Logical Block Protection did not run: st cannot carry a 524292-byte block on this host's SCSI path (Device or resource busy (os error 16))); as strong as a write by tapectl 1.7.1
+  Feed ratio:  52.9819 (above 1.05, not judged: warning suppressed (capacity_override) — a drive that declares its own capacity reports a figure unrelated to the write), recorded 2026-11-22 01:45:46
 
-Units carried: 4 (1.7 MiB across 2 tenants, 2026-11-05 03:41 UTC)
+Units carried: 4 (1.7 MiB across 2 tenants, 2026-11-22 01:45 UTC)
     photos/2019-italy v1 (family) — 1.1 MiB
-    photos/2020-garden v1 (family) — 600.7 KiB
+    photos/2020-garden v1 (family) — 600.8 KiB
     family/letters v1 (family) — 10.7 KiB
-    work/invoices-2024 v1 (work) — 10.6 KiB
+    work/invoices-2024 v1 (work) — 10.7 KiB
 
 Writes:
-    work/invoices-2024 v1: completed (2026-11-05 03:42 UTC)
-    photos/2020-garden v1: completed (2026-11-05 03:42 UTC)
-    photos/2019-italy v1: completed (2026-11-05 03:42 UTC)
-    family/letters v1: completed (2026-11-05 03:42 UTC)
+    work/invoices-2024 v1: completed (2026-11-22 01:45 UTC)
+    photos/2020-garden v1: completed (2026-11-22 01:45 UTC)
+    photos/2019-italy v1: completed (2026-11-22 01:45 UTC)
+    family/letters v1: completed (2026-11-22 01:45 UTC)
 
 Verification history:
-    [full] passed: started 2026-11-05 03:42 UTC, completed 2026-11-05 03:42 UTC (15/15 slices passed)
+    [full] passed: started 2026-11-22 01:45 UTC, completed 2026-11-22 01:45 UTC (15/15 slices passed)
 
 Warehouse deposits: none
+
+Phase timings (volume write, session 20261122T014545Z-volume-write-L8-0001-2470598):
+    2026-11-22 01:45:45  contact-open        19 ms
+    2026-11-22 01:45:45  build              103 ms
+    2026-11-22 01:45:45  prewrite-check      38 ms   510.4 KiB
+    2026-11-22 01:45:45  positioning        273 ms   510.4 KiB
+    2026-11-22 01:45:46  plan                 5 ms
+    2026-11-22 01:45:46  write              350 ms     2.2 MiB
+    2026-11-22 01:45:46  seal                30 ms
+    2026-11-22 01:45:46  confirm            172 ms     9.0 MiB
+    2026-11-22 01:45:46  health-sweep       167 ms
 ```
 
-(The lines cut at `…` are the write check and the drive's feed ratio; the phase
-timings of the write follow the deposits.) The one verification is the write's own
+(`Write check` says the virtual drive could not take Logical Block Protection, and the
+`Feed ratio` line is suppressed because the drive's capacity is overridden; on a real drive
+they read as the guide says. The phase timings of the write follow the deposits.) The one verification is the write's own
 full confirm; its 15 files are every file on the tape, the front index and the seal
 marker among them. A volume written without `--full-confirm` gets a `quick` entry
 instead, which reads none of the data, and until a full read-back passes `audit`
@@ -499,54 +528,78 @@ that.
 
 ```bash
 tapectl volume write L8-0002 --init --full-confirm --move-to offsite
-tapectl audit
+```
+
+The run this page was made from had one virtual cartridge, and tapectl refuses to erase a
+volume that is a live copy, so the second copy could not be written there and its output
+is described, not shown. It is the first copy's output with a second label and one more
+step: the write ends by naming the staging it released (`staging released:`, with the
+stage sets and bytes freed) and says `next: nothing to do; every unit written has its
+policy's copies`. After it, `audit` has no violations and exits 1 on warnings alone (the
+missing Heir Kit and the unrecorded heir drill), `report copies` reads `2 copies, 2
+locations` for every unit, and `status` shows `staged 0` and `under-copied 0`. With the one
+copy that exists here, they read:
+
+```bash
 tapectl report copies
 tapectl status
 ```
 
 ```text
-cartridge L8-0002 auto-registered from MAM (chip serial E01011L8_1775794348; barcode L8-0002, the volume's label)
-volume "L8-0002" initialized (id=2); writing it now. If the write does not complete the volume stays initialized, and what to run next is said when it stops.
-medium: LTO-8, 2.0 GB (the cartridge chip's medium density code 0x5e; capacity from the drive's capacity_override)
-...
-volume "L8-0002" write completed
-sealed and confirmed: 4 units, 4 slices, 1.7 MiB; full readback passed
-staging released: 4 stage sets, 1.7 MiB freed (every unit written has its policy's copies)
-volume "L8-0002" moved to "offsite"
-  cartridge "L8-0002" moved with it
-next: nothing to do; every unit written has its policy's copies
+  family/letters: 1 copy, 1 location [tapes holding any version: L8-0001]
+  photos/2019-italy: 1 copy, 1 location [tapes holding any version: L8-0001]
+  photos/2020-garden: 1 copy, 1 location [tapes holding any version: L8-0001]
+  work/invoices-2024: 1 copy, 1 location [tapes holding any version: L8-0001]
 
-WARNINGS (2):
-  [escrow_kit_missing] archive: 2 sealed volumes exist but no heir kit has ever been generated — nothing off-site can decrypt them
-  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
-audit: 0 violations, 2 warnings (exit 1)
-for the fixes: tapectl audit --action-plan
-
-  family/letters: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  photos/2019-italy: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  photos/2020-garden: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  work/invoices-2024: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-
-home: ~/.tapectl (this account's ~/.tapectl)
+home: ~/.tapectl (named by --home)
 session logs: ~/.tapectl/logs
 running: nothing
 recent:
-  …
+  2026-11-22 01:45 UTC  volume write L8-0001  — ok
+      contact-open        19 ms
+      build              103 ms
+      prewrite-check      38 ms   510.4 KiB
+      positioning        273 ms   510.4 KiB
+      plan                 5 ms
+      write              350 ms     2.2 MiB
+      seal                30 ms
+      confirm            172 ms     9.0 MiB
+      health-sweep       167 ms
+  2026-11-22 01:45 UTC  cartridge erase  — ok
+  2026-11-22 01:45 UTC  stage create family/letters +3 more  — ok
+      check                2 ms
+      archive             37 ms    10.0 KiB
+      recheck              4 ms
+      finalize             6 ms
+      check                1 ms
+      archive            493 ms     1.1 MiB
+      recheck              3 ms
+      finalize             6 ms
+      check                1 ms
+      archive            264 ms   600.0 KiB
+      recheck              3 ms
+      finalize             6 ms
+      check                1 ms
+      archive             35 ms    10.0 KiB
+      recheck              3 ms
+      finalize             6 ms
 units: 4 active
   State          Units
   pending        0
-  staged         0, awaiting a write
-  under-copied   0, below their copy floor
+  staged         4, awaiting a write
+  under-copied   4, below their copy floor
 volumes due a verify: none
-next: nothing to do
+next:
+  tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <a short location>
 ```
 
-The violations are gone, and so is the staging: this copy brought every unit to its
-copy floor, so each released its staged slices. The two warnings left, the missing
-Heir Kit (step 13) and the heir drill nobody has recorded yet (`tapectl drill record`, after
-running `RESTORE.sh` as an heir would; step 14 rehearses the recovery), stay until then. No volume is due a verify: both were read back in
-full as they were written. A year on (`verify_interval_days`, 365 by default), `status`
-names each one again, and `tapectl volume verify <LABEL>` reads it back in full.
+The violations go once the second copy is written, and so does the staging: that write
+brings every unit to its copy floor, so each releases its staged slices. The two warnings
+left, the missing Heir Kit (step 13) and the heir drill nobody has recorded yet
+(`tapectl drill record`, after running `RESTORE.sh` as an heir would; step 14 rehearses
+the recovery), stay until then. A volume read back in full as it was written is not due a
+verify; a year on (`verify_interval_days`, 365 by default), `status` names it again, and
+`tapectl volume verify <LABEL>` reads it back in full.
 
 ## 10. Find things
 
@@ -559,8 +612,8 @@ tapectl catalog locate family/letters
 
 ```text
 Path                       Size    Modified               Sha256
-  .tapectl-unit.toml       188 B   2026-11-05 03:41 UTC   82e3b47e691e...
-  1998-letter-to-mum.txt   47 B    2026-11-05 03:41 UTC   e0616014b303...
+  .tapectl-unit.toml       188 B   2026-11-22 01:45 UTC   be5f3e6b52fa...
+  1998-letter-to-mum.txt   47 B    2026-11-22 01:45 UTC   717bcaf177e0...
 
   family/letters v1: 1998-letter-to-mum.txt (47 B)
 1 result
@@ -569,8 +622,7 @@ Path                       Size    Modified               Sha256
 1 result
 
 Volume    Status   Condition   Location    Snapshot   Slices   Holds   Written                Serviceable   Warehouse   Escrow   Verified
-L8-0001   sealed   ok          home-rack   1          1        whole   2026-11-05 03:42 UTC   yes           -           yes      0d ago
-L8-0002   sealed   ok          offsite     1          1        whole   2026-11-05 03:42 UTC   yes           -           yes      0d ago
+L8-0001   sealed   ok          home-rack   1          1        whole   2026-11-22 01:45 UTC   yes           -           yes      0d ago
 
 note: "Verified" is this catalog's last-known record of each copy's most recent PASSED full readback (a full `volume verify`, or a write's full confirm; a quick one reads none of the copy's bytes and does not count) — not a check of the tape performed just now. "never" means no passed full readback is on record, not that the copy is bad; an aged value does not mean the tape has since failed. Re-run `tapectl volume verify <label>` to refresh it.
 ```
@@ -585,59 +637,71 @@ that holds it. `catalog locate` answers "which tape, and where is it?".
 
 ## 11. Restore
 
-Load either copy and name that one with `--from`: restore checks the loaded tape
+Load a copy and name it with `--from`: restore checks the loaded tape
 against it before reading anything, and refuses a different one. Here that is
-L8-0002. One file, named by its unit and its path in the unit:
+L8-0001, the only one this run had. One file, named by its unit and its path in the unit:
 
 ```bash
-tapectl restore file family/letters 1998-letter-to-mum.txt --from L8-0002 --to /tmp/restore
+tapectl restore file family/letters 1998-letter-to-mum.txt --from L8-0001 --to /tmp/restore
 ```
 
 ```text
-note: restoring as a non-root user, so the restored files are owned by you, not by the owners the archive recorded
-restored "1998-letter-to-mum.txt" from "family/letters" on L8-0002 to /tmp/restore
+restored "1998-letter-to-mum.txt" from "family/letters" on L8-0001 to /tmp/restore
+owners are restored by number, as the stream has them; the host that wrote them called them:
+  user 1000 = alice
+  group 1000 = alice
 ```
 
-The `note:` goes to stderr: only root can give restored files back their archived
-owners, so as yourself they come back owned by you.
+The lines after `restored` are the unit's id map, which a restore prints and never acts
+on: files come back by number, and only root can give them back their archived owners, so
+as yourself they come back owned by you. (The names are those of the writing host's
+account, shown here as `alice`.)
 
 A whole unit (`--dry-run` first shows what would happen):
 
 ```bash
-tapectl restore unit family/letters --from L8-0002 --to /tmp/restore/unit --dry-run
-tapectl restore unit family/letters --from L8-0002 --to /tmp/restore/unit
+tapectl restore unit family/letters --from L8-0001 --to /tmp/restore/unit --dry-run
+tapectl restore unit family/letters --from L8-0001 --to /tmp/restore/unit
 diff -r /media/family/letters /tmp/restore/unit && echo identical
 ```
 
 ```text
-would restore "family/letters" v1 from L8-0002 (1 slice) to /tmp/restore/unit
-note: restoring as a non-root user, so the restored files are owned by you, not by the owners the archive recorded
-restored "family/letters" v1 from L8-0002 (1 slice) to /tmp/restore/unit
+would restore "family/letters" v1 from L8-0001 (1 slice) to /tmp/restore/unit
+restored "family/letters" v1 from L8-0001 (1 slice) to /tmp/restore/unit
+owners are restored by number, as the stream has them; the host that wrote them called them:
+  user 1000 = alice
+  group 1000 = alice
 identical
 ```
 
 Restoring does not need tapectl at all: every tape carries `RESTORE.sh` and a guide.
 See [Keys and recovery](keys-and-recovery.md).
 
-## 12. Staging, after the second copy
+## 12. Staging, after the copies
 
-Staging is already empty:
+Staging holds what a unit still owes a copy:
 
 ```bash
 tapectl stage list
 ```
 
 ```text
-nothing is held in staging
+Stage Set   Unit                 Version   Status   Slices   Size        Copies   Staged
+1           family/letters       v1        staged   1        10.7 KiB    1 of 2   2026-11-22 01:45 UTC
+2           photos/2019-italy    v1        staged   1        1.1 MiB     1 of 2   2026-11-22 01:45 UTC
+3           photos/2020-garden   v1        staged   1        600.8 KiB   1 of 2   2026-11-22 01:45 UTC
+4           work/invoices-2024   v1        staged   1        10.7 KiB    1 of 2   2026-11-22 01:45 UTC
 ```
 
-A write releases staging unit by unit: each unit the copy brings to its copy floor
-gives up its staged slices, and a unit still short keeps them for the next copy. So
-nothing needs cleaning between or after copies. `stage list --all` adds the released
-stage sets as history. `tapectl stage clean` remains for what a write leaves behind
-by itself: it sweeps every stage set whose staging failed, since those hold nothing a
-copy needs, and the leftovers of killed runs; it too keeps any unit still short of its
-copies.
+(After the second copy, which this run could not write, `stage list` prints
+`nothing is held in staging`, and the `Copies` column above would have read `2 of 2`
+before the stage sets were released.) A write releases staging unit by unit: each unit the
+copy brings to its copy floor gives up its staged slices, and a unit still short keeps them
+for the next copy. So nothing needs cleaning between or after copies. `stage list --all`
+adds the released stage sets as history. `tapectl stage clean` remains for what a write
+leaves behind by itself: it sweeps every stage set whose staging failed, since those hold
+nothing a copy needs, and the leftovers of killed runs; it too keeps any unit still short of
+its copies.
 
 ## 13. The Heir Kit and a catalog backup
 
@@ -652,9 +716,9 @@ tapectl key escrow-kit ~/heir-kit
 heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
-  catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
-  tapectl-X.Y.Z    the program that made this kit, …, sha256 … (named on the sheet)
-note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/vX.Y.Z/tapectl-X.Y.Z-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
+  catalog.db.age   encrypted catalog, 776.5 KiB, covering 1 sealed volume
+  tapectl-2.0.0    the program that made this kit, 89.5 MiB, sha256 f52a1c894bed… (named on the sheet) (named on the sheet)
+note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/v2.0.0/tapectl-2.0.0-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -682,13 +746,13 @@ tapectl db backup /mnt/backup
 ```
 
 ```text
-database backed up to /mnt/backup/tapectl-20261105T034233Z.db (728.0 KiB); private keys not included — pass --include-keys to copy them
+database backed up to /mnt/backup/tapectl-20261122T014613Z.db (776.0 KiB); private keys not included — pass --include-keys to copy them
 ```
 
 The directory (`/mnt/backup` here) must already exist; `db backup` creates none. A
 file name works too, and a file that already exists is refused, never overwritten.
 With `--include-keys` the private keys are copied beside the file, into
-`/mnt/backup/tapectl-20261105T034233Z.keys/`, and that directory must be kept as
+`/mnt/backup/tapectl-20261122T014613Z.keys/`, and that directory must be kept as
 secret as the keys themselves.
 
 ## 14. Rehearse a disaster
@@ -699,7 +763,7 @@ On a fresh machine, start a new home that **adopts** the original escrow identit
 from a tape with the escrow secret you wrote down:
 
 ```bash
-tapectl init --operator alice --escrow-public-key age1eykxeg5equrmykz4a9xa98ak0qamfhgsy4qn5mlc4zr3m0w2kahqp3xx8a
+tapectl init --operator alice --escrow-public-key age1eq8l4a5alxscskaykt8q2cf9nk0jr3evavltj0akve9xawf3ts9qusrs36
 tapectl drive add --name lto8 --device-tape "$TAPE"
 tapectl catalog rebuild --from-volume --key escrow.key
 tapectl unit list
@@ -714,29 +778,30 @@ tapectl initialized at ~/.tapectl
   operator: alice
   database: ~/.tapectl/tapectl.db
   config:   ~/.tapectl/config.toml
-  escrow:   adopted age1eykxeg5equrmykz4a9xa98ak0qamfhgsy4qn5mlc4zr3m0w2kahqp3xx8a (imported — its secret lives on the heir kit, not here)
+  escrow:   adopted age1eq8l4a5alxscskaykt8q2cf9nk0jr3evavltj0akve9xawf3ts9qusrs36 (imported — its secret lives on the heir kit, not here)
   tar:      tar (GNU tar) 1.35 (found at /usr/bin/tar)
 
 next steps:
-  …
+  a tenant, whose data is archived    tapectl tenant add <TENANT>
+  the tape drive                      tapectl drive add --name <NAME> --device-tape /dev/tape/by-id/<DRIVE>-nst
+  what to archive, a folder of units  tapectl collection add <NAME> <ROOT> --tenant <TENANT>
+  or one folder as a unit             tapectl unit init <PATH> --tenant <TENANT>
+  where copies are kept               tapectl location add <PLACE>
+  a copy, once units are staged       tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <PLACE>
+`tapectl status` shows where things stand and the next command at every step.
 
 generation LTO-8, read from the drive attached at /dev/tape/by-id/scsi-XYZZY_A2-nst (model IBM ULT3580-TD8)
 drive "lto8" added to ~/.tapectl/config.toml (LTO-8, tape=/dev/tape/by-id/scsi-XYZZY_A2-nst, sg=/dev/sg4 (derived from device_tape))
 verify it with: tapectl config check
 
-rebuilt from volume "L8-0002" (uuid 9c3e2533-2b67-4d1d-ae22-def47129577b), 3 envelopes opened
-  on tape: written 2026-11-05 03:42:18 UTC, sealed 2026-11-05 03:42:19 UTC, chip load count at write 1
+rebuilt from volume "L8-0001" (uuid 159ff100-a166-465b-8e1e-e7962990952b), 3 envelopes opened
+  on tape: written 2026-11-22 01:45:45 UTC, sealed 2026-11-22 01:45:46 UTC, chip load count at write 1313
   inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
             4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
-  cartridge "L8-0002" registered from this tape's own identity and bound
+  cartridge "L8-0001" registered from this tape's own identity and bound
   file tables: 4 stage sets got theirs (and the id map) back from the operator envelope, so a copy written from them carries them again
-  cross-volume index: this tape names 1 other volume this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); load each and run `tapectl catalog rebuild --from-volume --key <key>`:
-    L8-0001  (uuid 45ae9801-8301-457d-847c-0b70c09177e7; cartridge serial E01010L8_1775794348; LTO-8; sealed 2026-11-05T03:42:07Z)
-      family: family/letters v1
-      family: photos/2019-italy v1
-      family: photos/2020-garden v1
-      work: work/invoices-2024 v1
-  the slice hashes recorded are the tape's own claim; run `tapectl volume verify L8-0002` to check them
+  cross-volume index: names no other volume that this catalog lacks
+  the slice hashes recorded are the tape's own claim; run `tapectl volume verify L8-0001` to check them
   escrow receipts: 4 stage sets carried theirs on the tape
 
 Name                 Status   Tenant   Path   Tags
@@ -746,11 +811,12 @@ photos/2020-garden   active   family
 work/invoices-2024   active   work
 ```
 
-Every unit, tenant and file row is back, read from the tape itself. The tape's
-cross-volume index names the one tape still to rebuild, L8-0001, and what it holds.
-The cartridge is registered with the tape's volume label, L8-0002, as its barcode, as
-`volume init` gives a new cartridge one; its chip serial stays its identity.
-Repeat `catalog rebuild` for each tape, then `volume verify` them. The full procedure, and
+Every unit, tenant and file row is back, read from the tape itself. The cartridge is
+registered with the tape's volume label, L8-0001, as its barcode, as `volume init` gives a
+new cartridge one; its chip serial stays its identity. With a second tape, the first one's
+cross-volume index would name it here, with the units it holds, as a tape still to rebuild
+(this run had one tape, so the line says there is none). Repeat `catalog rebuild` for each
+tape, then `volume verify` them. The full procedure, and
 what a rebuilt catalog does not know, is in [Keys and recovery](keys-and-recovery.md).
 
 ## 15. Where next
