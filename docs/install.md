@@ -99,7 +99,7 @@ Staging and backups need thought on any host whose root filesystem is small. Ste
 proposes the directory `config.toml` already names when the service user can write
 it, and after a fresh `init` that is `<home>/staging`, on whatever filesystem holds
 the home. Only when that directory is missing or not writable (a regenerated config,
-a home from an older tapectl) does it propose `/scratch/tapectl-staging`, if
+a config written by hand) does it propose `/scratch/tapectl-staging`, if
 `/scratch` exists. Pass `--staging` (or set `STAGING_DIR` in a profile) to put it on
 a big disk; that wins over both. See §7 for `--backup-dir`.
 
@@ -442,7 +442,7 @@ step 7 does run `init` interactively, it asks for an existing escrow **public**
 key to adopt (`age1…`, or a `.pub` path). Answer with the one on the heir kit's
 cover sheet and `init` registers it instead of minting a new identity. **Under
 `--auto` there is no such prompt**: the key comes from the profile's
-`ESCROW_PUBLIC_KEY` or from `--escrow-public-key` (both since 1.1.0), and when
+`ESCROW_PUBLIC_KEY` or from `--escrow-public-key`, and when
 neither is set step 7 refuses rather than mint one, unless `--mint-escrow` is on
 the command line (ADR-0012 item 188; never pass it on a reinstall). On a
 reinstall, set one of them, run step 7 without `--auto`, or run `init` by hand
@@ -898,7 +898,23 @@ below are the two versions, such as `2.0.0` and `2.0.1`.
 (ADR-0012 item 258(c)): 2.0.0 reads and writes Layout 3 and one baseline schema
 only. `--upgrade` refuses an installed tapectl below 2.0.0 by name, and the way
 from 1.x is a fresh start: a new catalog, new keys, new units and new cartridges.
-A Layout 2 tape is read with 1.9.2 or with its own `RESTORE.sh`. The harness
+A Layout 2 tape is read with 1.9.2 or with its own `RESTORE.sh`.
+
+**A fresh start over a 1.x install** (ADR-0012 items 244, 245, 269), in this order:
+
+1. `scripts/install-systemd.sh --uninstall`, and check that nothing of tapectl is running.
+2. Build the host's tar if its own is below the floor ("The writer's tar", §1).
+3. Move the old home, the old backups and the old staging aside: a 1.x catalog is refused,
+   and step 7 runs `init` only when the home has no catalog. Keep tapectl 1.9.2 for as long
+   as a Layout 2 tape of yours is unread.
+4. Keep the escrow identity if its paper passes `age-keygen -y` (give the public key as
+   `ESCROW_PUBLIC_KEY`, §6); every other key is new. Delete the units' `.tapectl-unit.toml`
+   dotfiles first, so that `collection sync` mints new unit identities.
+5. Run `scripts/first-run.sh` from step 1 (§2). A cartridge of Layout 2 in the drive is
+   refused at step 13's `volume init` and `cartridge erase` offers to erase it: type its
+   label. Nothing of it is read.
+
+`docs/handoff.md` is this path on home2. The harness
 that proves this procedure on mhvtl, `scripts/upgrade-mhvtl.sh`, installs the
 previous release tag and upgrades it, so it needs a v2.x tag to start from: while
 the newest tag before HEAD is below `v2.0.0` it exits at once with a message
@@ -964,8 +980,7 @@ the new one wrote in between.
 
 The binary alone is not the whole rollback. Step 6 installed `<new>`'s wrappers
 (`/usr/local/lib/tapectl/`, among them the daily backup's), and a wrapper may call
-a spelling `<old>` does not have: `1.8.1` needs `db backup --to FILE`, where later
-releases take the path. After a rollback to `<old>` with `<new>`'s wrapper in place
+a spelling `<old>` does not have, as a release that renamed a flag did. After a rollback to `<old>` with `<new>`'s wrapper in place
 every nightly backup fails, in the journal only. So `<old>`'s own step 14 puts its
 wrappers back, from a checkout of `<old>`'s tag, before the timers start again.
 Step 13 prints the commands with your arguments.

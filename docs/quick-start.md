@@ -5,12 +5,17 @@ tape, encrypted, in two copies, in two places. tapectl runs as your own account:
 service user, and nothing runs as root except the few lines `tapectl setup` prints
 for you at the end.
 
+tapectl 2.0 starts from nothing: it writes tapes of Layout Version 3 and opens no
+catalog or tape of tapectl 1.x (a 1.x catalog is refused by name, and a 1.x tape is read
+with tapectl 1.9.2 or the `RESTORE.sh` on the tape itself). Run `tapectl setup` on a
+machine, or a home, that has never had one.
+
 A host run by a dedicated service user (the layout home2 uses) is installed by
 `scripts/first-run.sh` instead: see [Installing tapectl](install.md).
 
 ## 1. Install
 
-Each release from 1.9.1 carries a static build for Linux on x86_64,
+Each release carries a static build for Linux on x86_64,
 `tapectl-<X.Y.Z>-x86_64-linux-musl`, beside a `SHA256SUMS` file, on the
 [releases page](https://github.com/mikmorg/tapectl/releases/latest). It needs no
 library from your machine. Download both into one directory, check it, and put it
