@@ -3941,3 +3941,17 @@ the CTO chose to archive it.
      tar exits 0, and never touches the root of a destination that was not empty; RESTORE.sh's
      tar already applies it to an empty `--to` (measured with GNU tar 1.35, 2026-11-21). This
      is an on-tape change under item 243.
+
+## Amendment, 2026-11-22: RESTORE.sh's pin moves for a check uutils broke
+
+Ruled 2026-11-22 (question 54). T6.4's recorded tape, run in the `tapectl-u26` container,
+showed that under `LC_ALL=C` uutils' `sha256sum -c` shell-quotes a name with a space, a
+shell character or a non-ASCII byte, where GNU's prints it bare; RESTORE.sh's file check
+matched names from that output, so on Ubuntu 26.04 every such file read DAMAGED and the
+restore ended RESTORE INCOMPLETE with the files correct. The CTO ratified the re-pin.
+
+307. **RESTORE.sh's sha256 pin moves** from `96d4a663…04df4` to `1aa02316…5288e`, under
+     item 243's on-tape authorization, for this fix alone (#552 T6.4-1): the file check pairs
+     `sha256sum -c --strict`'s lines with its rows by position and reads no name back; a row
+     not positively passed is hashed alone. Nothing else in the script changes. The recorded
+     tape of T6.4 is recorded after it.
