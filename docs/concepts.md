@@ -13,10 +13,11 @@ is written on a tape. It is not a tutorial: for a first run end to end, see
 > `scripts/first-run.sh`, tapectl runs as a service user, so the same command is
 > `tapectl-op …` (or `sudo -u tapectl -H tapectl …`).
 
-The examples are real output from a session on a virtual tape library. It used
-the operator `mike`, two tenants (`family` and `work`), units under `/media`, and
-two LTO-8 volumes, `L8-0001` and `L8-0002`, kept at the locations `home-rack`
-and `offsite`.
+The examples are real output from a session on a virtual tape library (paths shortened to
+`~/.tapectl`, `/media` and `/tmp/restore`; the library's one cartridge held one volume,
+`L8-0001`, so what a second copy prints is described where it matters, not shown). It used
+the operator `alice`, two tenants (`family` and `work`), units under `/media`, and
+the locations `home-rack` and `offsite`.
 
 ## Contents
 
@@ -86,13 +87,20 @@ $ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
 about to write to volume "L8-0001":
   family/letters v1: 1 slices, 10.7 KiB
   photos/2019-italy v1: 1 slices, 1.1 MiB
-  photos/2020-garden v1: 1 slices, 600.7 KiB
-  work/invoices-2024 v1: 1 slices, 10.6 KiB
+  photos/2020-garden v1: 1 slices, 600.8 KiB
+  work/invoices-2024 v1: 1 slices, 10.7 KiB
 
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
 sealed and confirmed: 4 units, 4 slices, 1.7 MiB; full readback passed
-...
+staging kept for 4 units still short of their policy; the next copy reuses their staged slices:
+  unit family/letters has 1 copy, needs 2
+  unit work/invoices-2024 has 1 copy, needs 2
+  unit photos/2020-garden has 1 copy, needs 2
+  unit photos/2019-italy has 1 copy, needs 2
+volume "L8-0001" moved to "home-rack"
+  cartridge "L8-0001" moved with it
+next: tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>
 ```
 
 ### Why staging exists
@@ -118,13 +126,18 @@ because tape punishes surprises.
   $ tapectl volume plan
   volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
     photos/2019-italy v1: 1 slice, 1.1 MiB
-    photos/2020-garden v1: 1 slice, 600.7 KiB
+    photos/2020-garden v1: 1 slice, 600.8 KiB
     family/letters v1: 1 slice, 10.7 KiB
-    work/invoices-2024 v1: 1 slice, 10.6 KiB
+    work/invoices-2024 v1: 1 slice, 10.7 KiB
 
   total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
   estimated tapes: 1 (at the 97% fill ceiling)
-  cross-volume index: about 2.3 KiB per tape, 4.6 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
+  plan order: one write of everything staged plans these, in this order (an estimate: each unit's slices block-padded, the volume's own files not counted; every unit continues on the next cartridge where the drive's early warning ends the tape, ADR-0012 items 288 and 289):
+    family/letters v1: queued, slice 1, under the fill ceiling
+    photos/2019-italy v1: queued, slice 1, under the fill ceiling
+    photos/2020-garden v1: queued, slice 1, under the fill ceiling
+    work/invoices-2024 v1: queued, slice 1, under the fill ceiling
+  cross-volume index: about 2.5 KiB per tape, 5.0 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
   ```
 
 - **A unit may continue on the next cartridge.** The plan fills a tape from the queue
@@ -180,7 +193,7 @@ tenant "family" created (id=2) with primary and backup keys
 ```
 
 **The operator tenant.** [`init`](cli/init.md) creates a special tenant named
-after you (`--operator mike`). The operator's keys can decrypt everything on
+after you (`--operator alice`). The operator's keys can decrypt everything on
 every tape, alongside each tenant's own keys and the permanent escrow recipient
 (see [Keys, briefly](#keys-briefly)). You do not archive units into the operator
 tenant; it exists so that you, the person running the system, can always read
@@ -189,9 +202,9 @@ and rebuild what you wrote.
 ```text
 $ tapectl tenant list
 Name     Status   Operator   Created                Description
-family   active              2026-11-05 02:37 UTC   family photos and letters
-mike     active   yes        2026-11-05 02:37 UTC   System operator
-work     active              2026-11-05 02:37 UTC   business records
+alice    active   yes        2026-11-22 01:45 UTC   System operator
+family   active              2026-11-22 01:45 UTC   family photos and letters
+work     active              2026-11-22 01:45 UTC   business records
 ```
 
 ### Unit
@@ -310,7 +323,7 @@ an unchanged directory creates nothing:
 
 ```text
 $ tapectl snapshot create films/heat-1995
-snapshot created: films/heat-1995 v1 (2 files, 212 B)
+snapshot created: films/heat-1995 v1 (3 files, 392 B)
 $ tapectl snapshot create films/heat-1995
 unit "films/heat-1995" is unchanged since v1; no snapshot created
 ```
@@ -485,7 +498,7 @@ receives recorded deposits of sealed volumes rather than cartridges).
 
 ```text
 $ tapectl location add offsite -d "a fire-safe box at a relative's house"
-location "offsite" added (id=2, kind=shelf)
+location "offsite" added (id=1, kind=shelf)
 ```
 
 A cartridge's place is a location, never a status. A new volume starts where
@@ -498,9 +511,9 @@ thing from different ends: they move the cartridge and every volume on it
 together, in one transaction, so the shelf and the catalog cannot disagree.
 
 ```text
-$ tapectl volume move L8-0002 --to offsite
-volume "L8-0002" moved to "offsite"
-  cartridge "L8-0002" moved with it
+$ tapectl volume move L8-0001 --to offsite
+volume "L8-0001" moved to "offsite"
+  cartridge "L8-0001" moved with it
 ```
 
 Locations are something only you know. Nothing on the tape records where the
@@ -552,14 +565,14 @@ audit: 4 violations, 2 warnings (exit 2)
 for the fixes: tapectl audit --action-plan
 ```
 
-After writing `L8-0002` and moving it offsite:
+With one copy `report copies` says so (this run had one cartridge, so what a second copy prints is described, not shown: `2 copies, 2 locations` for each unit, with both labels in the brackets):
 
 ```text
 $ tapectl report copies
-  family/letters: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  photos/2019-italy: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  photos/2020-garden: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  work/invoices-2024: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
+  family/letters: 1 copy, 1 location [tapes holding any version: L8-0001]
+  photos/2019-italy: 1 copy, 1 location [tapes holding any version: L8-0001]
+  photos/2020-garden: 1 copy, 1 location [tapes holding any version: L8-0001]
+  work/invoices-2024: 1 copy, 1 location [tapes holding any version: L8-0001]
 ```
 
 [`catalog locate`](cli/catalog.md#tapectl-catalog-locate) shows each copy of a
@@ -709,17 +722,9 @@ ACTION PLAN (3 fixes):
 audit: 4 violations, 2 warnings (exit 2)
 ```
 
-Once `L8-0002` was written and moved offsite, only the heir-kit warning was
-left, so `audit` exited 1:
-
-```text
-$ tapectl audit
-WARNINGS (2):
-  [escrow_kit_missing] archive: 2 sealed volumes exist but no heir kit has ever been generated — nothing off-site can decrypt them
-  [drill_age] archive: no heir drill is recorded: nothing shows that RESTORE.sh restores a tape with the stock tools alone
-audit: 0 violations, 2 warnings (exit 1)
-for the fixes: tapectl audit --action-plan
-```
+Once a second copy is written and moved offsite, the violations go and `audit` exits 1 on the
+warnings alone (the missing heir kit, and the heir drill nobody has recorded). This run had one
+cartridge, so that audit is described, not shown.
 
 The commands that do give things up enforce the same coverage facts
 themselves, in tiers. Staleness is shown but never gates. A shortfall is
@@ -909,16 +914,16 @@ or by the session itself when a write fails or its readback finds a mismatch).
 $ tapectl volume info L8-0001
 ...
 Writes:
-    work/invoices-2024 v1: completed (2026-11-05 03:42 UTC)
-    photos/2020-garden v1: completed (2026-11-05 03:42 UTC)
-    photos/2019-italy v1: completed (2026-11-05 03:42 UTC)
-    family/letters v1: completed (2026-11-05 03:42 UTC)
+    work/invoices-2024 v1: completed (2026-11-22 01:45 UTC)
+    photos/2020-garden v1: completed (2026-11-22 01:45 UTC)
+    photos/2019-italy v1: completed (2026-11-22 01:45 UTC)
+    family/letters v1: completed (2026-11-22 01:45 UTC)
 ```
 
 ## What is on a tape
 
 A sealed tape is one partition of numbered tape files, in a fixed order, written
-in 512 KiB blocks. The session's `L8-0002` had 15 files: two tenants' envelopes,
+in 512 KiB blocks. The session's `L8-0001` had 15 files: two tenants' envelopes,
 the operator's, a backup of each, and four slices.
 
 | File | Zone | On tape | What it holds |
@@ -938,7 +943,7 @@ or cut short, only trailing slices are lost. Everything needed to find and
 decrypt what did land survives.
 
 [`volume identify`](cli/volume.md#tapectl-volume-identify) prints File 0; for
-`L8-0002` its `[layout]` table read `front_index = 3`, `seal_marker = 14`,
+`L8-0001` its `[layout]` table read `front_index = 3`, `seal_marker = 14`,
 `total_files = 15`.
 
 ### What is plaintext
@@ -987,11 +992,11 @@ A sealed volume promises two things and withholds a third:
    survive a lost database only through [`db backup`](cli/db.md#tapectl-db-backup)
    and the heir kit.
 
-That is why, in the session, `unit list` on a catalog rebuilt from `L8-0002`
+That is why, in the session, `unit list` on a catalog rebuilt from `L8-0001`
 showed all four units and their tenants but empty Path and Tags columns.
 
 The full byte format is in
-[docs/design/volume-format-v2.md](design/volume-format-v2.md).
+[docs/design/volume-format-v3.md](design/volume-format-v3.md).
 
 ## Keys, briefly
 
