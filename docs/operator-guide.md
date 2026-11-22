@@ -433,31 +433,31 @@ snapshot created: work/invoices-2024 v1 (2 files, 219 B)
 
 $ tapectl stage create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
 ...
-staged: family/letters (1 slice, 1.1 KiB stream, 1.8 KiB encrypted)
+staged: family/letters (1 slice, 10.0 KiB stream, 10.7 KiB encrypted)
 staged: photos/2019-italy (1 slice, 1.1 MiB stream, 1.1 MiB encrypted)
-staged: photos/2020-garden (1 slice, 587.3 KiB stream, 588.2 KiB encrypted)
-staged: work/invoices-2024 (1 slice, 1.1 KiB stream, 1.7 KiB encrypted)
+staged: photos/2020-garden (1 slice, 600.0 KiB stream, 600.7 KiB encrypted)
+staged: work/invoices-2024 (1 slice, 10.0 KiB stream, 10.6 KiB encrypted)
 
 $ tapectl volume plan
 volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
   photos/2019-italy v1: 1 slice, 1.1 MiB
-  photos/2020-garden v1: 1 slice, 588.2 KiB
-  family/letters v1: 1 slice, 1.8 KiB
-  work/invoices-2024 v1: 1 slice, 1.7 KiB
+  photos/2020-garden v1: 1 slice, 600.7 KiB
+  family/letters v1: 1 slice, 10.7 KiB
+  work/invoices-2024 v1: 1 slice, 10.6 KiB
 
 total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
 estimated tapes: 1 (at the 97% fill ceiling)
-cross-volume index: about 2.8 KiB per tape, 5.5 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
+cross-volume index: about 2.3 KiB per tape, 4.6 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
 
 $ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
 cartridge L8-0001 auto-registered from MAM (chip serial E01010L8_1775794348; barcode L8-0001, the volume's label)
 volume "L8-0001" initialized (id=1); writing it now. If the write does not complete the volume stays initialized, and what to run next is said when it stops.
 medium: LTO-8, 2.0 GB (the cartridge chip's medium density code 0x5e; capacity from the drive's capacity_override)
 about to write to volume "L8-0001":
-  family/letters v1: 1 slices, 1.8 KiB
+  family/letters v1: 1 slices, 10.7 KiB
   photos/2019-italy v1: 1 slices, 1.1 MiB
-  photos/2020-garden v1: 1 slices, 588.2 KiB
-  work/invoices-2024 v1: 1 slices, 1.7 KiB
+  photos/2020-garden v1: 1 slices, 600.7 KiB
+  work/invoices-2024 v1: 1 slices, 10.6 KiB
 
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
@@ -833,7 +833,7 @@ Phase timings (volume write, session 20260930T120001Z-volume-write-L6-0001-4242)
 
 and each stage report (`<home>/stage-reports/`) ends with a `Phase timings:`
 section for the stage it describes. `volume info --json` does not carry them;
-they are in the `phase_timings` table (migration 028) for scripts.
+they are in the `phase_timings` table for scripts.
 
 Each session log now ends with how the command ended — `session result: ok`,
 or `session result: failed — <the error>` — just before its `session end` line
@@ -1534,10 +1534,10 @@ walkthrough's session, before the first copy:
 ```text
 $ tapectl stage list --owing
 Stage Set   Unit                 Version   Status   Slices   Size        Copies   Staged
-1           family/letters       v1        staged   1        1.7 KiB     0 of 2   2026-11-05 02:28 UTC
+1           family/letters       v1        staged   1        10.7 KiB    0 of 2   2026-11-05 02:28 UTC
 2           photos/2019-italy    v1        staged   1        1.1 MiB     0 of 2   2026-11-05 02:28 UTC
-3           photos/2020-garden   v1        staged   1        588.1 KiB   0 of 2   2026-11-05 02:28 UTC
-4           work/invoices-2024   v1        staged   1        1.7 KiB     0 of 2   2026-11-05 02:28 UTC
+3           photos/2020-garden   v1        staged   1        600.7 KiB   0 of 2   2026-11-05 02:28 UTC
+4           work/invoices-2024   v1        staged   1        10.6 KiB    0 of 2   2026-11-05 02:28 UTC
 ```
 
 A stage set that already has all its copies but is still held (a write passed
@@ -2316,12 +2316,12 @@ Under `--json` an error is JSON too: one document on stdout,
 the usual `error:` line still on stderr. A refusal that carries a report (a
 retirement's impact, a consent refused) is that report's document with `error`
 and `exit_code` beside its keys. A usage error clap finds is the same document.
-An old spelling refuses the same way:
+A spelling 1.x had and 2.0.0 does not is a usage error of the same shape:
 
 ```text
 $ tapectl --json report pending
 {
-  "error": "`tapectl report pending` was renamed in 1.9.0: use `tapectl stage list --owing`",
+  "error": "unrecognized subcommand 'pending'\n\nUsage: tapectl report [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.",
   "exit_code": 2
 }
 ```
@@ -3931,14 +3931,14 @@ the only journal rows are the few events `init` wrote (three here, from
 
 ```text
 $ tapectl db stats
-database: 464.0 KiB, 42 tables, 116 pages
+database: 520.0 KiB, 49 tables, 130 pages
 table sizes (measured by SQLite's dbstat: the pages each table and its indexes occupy):
   units                           0 rows     24.0 KiB
   cartridges                      0 rows     20.0 KiB
   events                          3 rows     20.0 KiB
   ...
 journal growth, trailing 90 days (rows exact; bytes derived: the bytes in use on each table's and its indexes' pages, shared among its rows by stored length):
-  events                          3 rows        493 B  ~  175.7 KiB/year
+  events                          3 rows        484 B  ~  172.5 KiB/year
   cartridge_contacts              0 rows          0 B  ~        0 B/year
   ...
 note: the journals go back only 1.0 days (counted as at least one), so each /year figure is that span's pace scaled to a year

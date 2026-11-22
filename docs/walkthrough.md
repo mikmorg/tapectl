@@ -331,26 +331,26 @@ staging photos/2020-garden (3 of 4)
 staged photos/2020-garden (stage set 3)
 staging work/invoices-2024 (4 of 4)
 staged work/invoices-2024 (stage set 4)
-staged: family/letters (1 slice, 1.1 KiB stream, 1.8 KiB encrypted)
+staged: family/letters (1 slice, 10.0 KiB stream, 10.7 KiB encrypted)
 staged: photos/2019-italy (1 slice, 1.1 MiB stream, 1.1 MiB encrypted)
-staged: photos/2020-garden (1 slice, 587.3 KiB stream, 588.2 KiB encrypted)
-staged: work/invoices-2024 (1 slice, 1.1 KiB stream, 1.7 KiB encrypted)
+staged: photos/2020-garden (1 slice, 600.0 KiB stream, 600.7 KiB encrypted)
+staged: work/invoices-2024 (1 slice, 10.0 KiB stream, 10.6 KiB encrypted)
 
 volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
   photos/2019-italy v1: 1 slice, 1.1 MiB
-  photos/2020-garden v1: 1 slice, 588.2 KiB
-  family/letters v1: 1 slice, 1.8 KiB
-  work/invoices-2024 v1: 1 slice, 1.7 KiB
+  photos/2020-garden v1: 1 slice, 600.7 KiB
+  family/letters v1: 1 slice, 10.7 KiB
+  work/invoices-2024 v1: 1 slice, 10.6 KiB
 
 total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
 estimated tapes: 1 (at the 97% fill ceiling)
-cross-volume index: about 2.8 KiB per tape, 5.5 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
+cross-volume index: about 2.3 KiB per tape, 4.6 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
 
 Stage Set   Unit                 Version   Status   Slices   Size        Copies   Staged
-1           family/letters       v1        staged   1        1.8 KiB     0 of 2   2026-11-05 03:41 UTC
+1           family/letters       v1        staged   1        10.7 KiB    0 of 2   2026-11-05 03:41 UTC
 2           photos/2019-italy    v1        staged   1        1.1 MiB     0 of 2   2026-11-05 03:41 UTC
-3           photos/2020-garden   v1        staged   1        588.2 KiB   0 of 2   2026-11-05 03:42 UTC
-4           work/invoices-2024   v1        staged   1        1.7 KiB     0 of 2   2026-11-05 03:42 UTC
+3           photos/2020-garden   v1        staged   1        600.7 KiB   0 of 2   2026-11-05 03:42 UTC
+4           work/invoices-2024   v1        staged   1        10.6 KiB    0 of 2   2026-11-05 03:42 UTC
 ```
 
 `volume plan` is an estimate, and it needs no drive. It plans as many copies as the
@@ -374,10 +374,10 @@ cartridge L8-0001 auto-registered from MAM (chip serial E01010L8_1775794348; bar
 volume "L8-0001" initialized (id=1); writing it now. If the write does not complete the volume stays initialized, and what to run next is said when it stops.
 medium: LTO-8, 2.0 GB (the cartridge chip's medium density code 0x5e; capacity from the drive's capacity_override)
 about to write to volume "L8-0001":
-  family/letters v1: 1 slices, 1.8 KiB
+  family/letters v1: 1 slices, 10.7 KiB
   photos/2019-italy v1: 1 slices, 1.1 MiB
-  photos/2020-garden v1: 1 slices, 588.2 KiB
-  work/invoices-2024 v1: 1 slices, 1.7 KiB
+  photos/2020-garden v1: 1 slices, 600.7 KiB
+  work/invoices-2024 v1: 1 slices, 10.6 KiB
 
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
@@ -438,9 +438,9 @@ Volume: L8-0001
 
 Units carried: 4 (1.7 MiB across 2 tenants, 2026-11-05 03:41 UTC)
     photos/2019-italy v1 (family) — 1.1 MiB
-    photos/2020-garden v1 (family) — 588.2 KiB
-    family/letters v1 (family) — 1.8 KiB
-    work/invoices-2024 v1 (work) — 1.7 KiB
+    photos/2020-garden v1 (family) — 600.7 KiB
+    family/letters v1 (family) — 10.7 KiB
+    work/invoices-2024 v1 (work) — 10.6 KiB
 
 Writes:
     work/invoices-2024 v1: completed (2026-11-05 03:42 UTC)

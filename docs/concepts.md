@@ -79,15 +79,15 @@ $ tapectl snapshot create family/letters
 snapshot created: family/letters v1 (2 files, 235 B)
 
 $ tapectl stage create family/letters
-staged: family/letters (1 slice, 1.1 KiB stream, 1.8 KiB encrypted)
+staged: family/letters (1 slice, 10.0 KiB stream, 10.7 KiB encrypted)
 
 $ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
 ...
 about to write to volume "L8-0001":
-  family/letters v1: 1 slices, 1.8 KiB
+  family/letters v1: 1 slices, 10.7 KiB
   photos/2019-italy v1: 1 slices, 1.1 MiB
-  photos/2020-garden v1: 1 slices, 588.1 KiB
-  work/invoices-2024 v1: 1 slices, 1.8 KiB
+  photos/2020-garden v1: 1 slices, 600.7 KiB
+  work/invoices-2024 v1: 1 slices, 10.6 KiB
 
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
@@ -116,13 +116,13 @@ because tape punishes surprises.
   $ tapectl volume plan
   volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
     photos/2019-italy v1: 1 slice, 1.1 MiB
-    photos/2020-garden v1: 1 slice, 588.1 KiB
-    family/letters v1: 1 slice, 1.7 KiB
-    work/invoices-2024 v1: 1 slice, 1.7 KiB
+    photos/2020-garden v1: 1 slice, 600.7 KiB
+    family/letters v1: 1 slice, 10.7 KiB
+    work/invoices-2024 v1: 1 slice, 10.6 KiB
 
-  total: 4 slices, 1.7 MiB x 2 = 3.3 MiB
+  total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
   estimated tapes: 1 (at the 97% fill ceiling)
-  cross-volume index: about 2.8 KiB per tape, 5.5 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
+  cross-volume index: about 2.3 KiB per tape, 4.6 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
   ```
 
 - **Stage once, write many.** A stage set stays on disk after it is written, so

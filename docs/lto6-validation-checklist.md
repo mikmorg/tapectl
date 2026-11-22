@@ -5,7 +5,7 @@ for validating tapectl against a real drive and cartridge, re-runnable for any n
 cartridge batch, or host. Every item below has been run on real hardware at least once;
 the record for each is named so a re-run can be compared with it. The pre-2026-09
 version of this file (v1's "layered EOT recovery" and `/dev/nst0` addressing) is
-superseded: Layout v2 has no end-of-tape salvage (ADR-0007), and no device is ever
+superseded: Layout 3 has no end-of-tape salvage (ADR-0007), and no device is ever
 addressed by number.
 
 **The validation drive:** the HP Ultrium 6-SCSI, serial HUJ808A5L4, at
@@ -56,7 +56,7 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
       `docs/lto6-session-journal-2026-09-10.md`.)
 - [ ] Compression as found: `sg_logs`/mode page 0x0f `DCE`. tapectl disables it per
       write; the record shows `DCE 1→0` verified.
-- [ ] GNU `tar` and `age` present (RESTORE.sh and the rehearsals need them; dar is no longer used).
+- [ ] GNU `tar` and `age` present (RESTORE.sh and the rehearsals need them; `tar` must be GNU tar 1.35 or later with ACL support on the host that writes).
 - [ ] The mhvtl gate is GREEN on this checkout (`TAPECTL_GATE_TAPE="$(readlink -f
       /dev/tape/by-id/scsi-XYZZY_A2-nst)" TAPECTL_GATE_TAPE_TD6="$(readlink -f
       /dev/tape/by-id/scsi-XYZZY_A3-nst)" TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`;
@@ -119,8 +119,10 @@ TAPECTL_BIN=/usr/local/bin/tapectl scripts/lifecycle-suite.sh --scenario first-y
 
 ## End of tape (measured once; re-run only for a new drive or media type)
 
-There is no EOT salvage in Layout v2: a real EOT is a clean abort to an unsealed tape,
-and the pre-flight gate (generation table × the fill ceiling, 97% by default) is the capacity defence. What
+There is no EOT salvage in Layout 3. A write ends at the drive's early warning with a short seal
+(the next section; item 288), a real EOT reached any other way is a clean abort to an unsealed
+tape, and the pre-flight gate (generation table × the fill ceiling, 97% by default) is the
+capacity defence. What
 to measure is where the drive stops host writes, with `scripts/lto-profile.sh` (the fill is its last
 measurement; `scripts/lto6-fill.sh` remains as a wrapper that runs the fill alone, and
 `scripts/lto6-measure.sh` as one that runs the minutes-long measurements alone):
@@ -289,8 +291,8 @@ behaviour every write has. It uses the one test cartridge, EW7VWMVKF6, as two vo
 - **Tape 2:** the same cartridge is written again as a whole copy, and the held restore finishes
   from scratch plus tape 2.
 
-`--stream-tapes` and tapectl's continuation row (a range K1+1..N) need two cartridges and are
-proven on mhvtl only (item 136; the gate's `span_*` checks).
+tapectl's continuation row (a range K1+1..N) needs two cartridges and is proven on mhvtl
+only (item 136; the gate's `span_*` checks).
 `scripts/span-acceptance.sh` runs it in a throwaway home. `--print-plan` prints the operator's
 part and the drive time without touching anything.
 

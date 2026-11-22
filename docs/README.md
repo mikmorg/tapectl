@@ -52,8 +52,8 @@ Dated records are kept as history, not instructions: hardware session journals
 (`mhvtl-baseline-recordings.txt`), run reports ([runs/](runs/)), review audits
 ([audits/](audits/)), research notes ([research/](research/)), the questions
 unattended runs deferred to the maintainer, all since answered
-([decisions-pending.md](decisions-pending.md)), and the maintainer handoff
-(handoff.md: the operator's steps on home2 for 2.0.0).
+([decisions-pending.md](decisions-pending.md)), and
+the operator's handoff ([handoff.md](handoff.md)).
 
 ## Keeping the docs honest
 
