@@ -2012,6 +2012,73 @@ fn a_copy_of_a_slice_cut_short_while_its_bytes_stream_whole_is_the_work_director
     }
 }
 
+/// The plain cut is hashed as it streams into the work directory too: a copy
+/// cut short while every byte streamed whole is caught by tee's words (a
+/// full work directory, which ends the run) or by its length (the decoded
+/// length the manifest states), for a plain unit and a compressed one. It
+/// never reaches tar as a slice that passed.
+#[test]
+fn a_plain_cut_cut_short_while_its_bytes_stream_whole_is_caught() {
+    for alg in [None, Some("xz")] {
+        for loud in [true, false] {
+            let (t, who) = match alg {
+                None => (two(), Who::TenantB),
+                Some(a) => (compressed(a), Who::TenantA),
+            };
+            let h = Heir::of(t);
+            short_tee(&h, "slice.plain", loud);
+            let dest = h.dest("out");
+            let o = h.run(&[
+                "--restore",
+                "--key",
+                &key(&h, who),
+                "--to",
+                dest.to_str().unwrap(),
+            ]);
+            let all = o.all();
+            assert!(
+                h.root.path().join("tmp/tee.cut").exists(),
+                "{alg:?} loud={loud}: the cut went through tee: {all}"
+            );
+            assert_eq!(o.code, 1, "{alg:?} loud={loud}: {all}");
+            assert!(
+                !all.contains("RESTORE COMPLETE"),
+                "{alg:?} loud={loud}: {all}"
+            );
+            if loud {
+                assert!(
+                    o.stderr.contains("FATAL: writing slice")
+                        && o.stderr.contains("No space left on device")
+                        && o.stderr.contains("is full or not writable"),
+                    "{alg:?}: {}",
+                    o.stderr
+                );
+                assert!(
+                    !o.stderr.contains("decoded length"),
+                    "{alg:?}: {}",
+                    o.stderr
+                );
+            } else {
+                assert!(
+                    o.stderr
+                        .contains("its decoded length is 1000 bytes and the manifest says"),
+                    "{alg:?}: {}",
+                    o.stderr
+                );
+                assert!(
+                    o.stdout.contains("RESTORE INCOMPLETE"),
+                    "{alg:?}: {}",
+                    o.stdout
+                );
+            }
+            assert!(
+                !all.contains("could not decrypt"),
+                "{alg:?} loud={loud}: {all}"
+            );
+        }
+    }
+}
+
 // ---- the low findings of #525 and the rest of the traps ----
 
 /// A2: the script keeps no process id to kill at the end.

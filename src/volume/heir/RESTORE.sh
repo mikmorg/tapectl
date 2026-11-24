@@ -1809,11 +1809,12 @@ absent_follows() { # <slice> <slice it follows>
 # Check slice $1 from the tape and leave its plain cut in slice.plain, or mark
 # it bad and return 1. A slice is checked against the front index (hash of
 # the file as written), then against the manifest after decryption (length
-# and hash of the cut, after decompression). Nothing the tape or age or a
-# decompressor says about its own exit status is the verdict; the lengths and
-# hashes are.
+# and hash of the cut, after decompression). Each hash is taken as the bytes
+# stream into the work directory, and each copy's length is checked beside
+# it. Nothing the tape or age or a decompressor says about its own exit
+# status is the verdict; the lengths and hashes are.
 prepare_slice() { # <slice number>
-  local k=$1 pos="${SL_HERE[$1]:-}" enc=${SL_ENC[$1]} arc="" got="" text="" why="" want_h rc=0
+  local k=$1 pos="${SL_HERE[$1]:-}" enc=${SL_ENC[$1]} arc="" got="" text="" why="" want_h rc=0 msg="" sum=""
   rm -f "$WORK/slice.enc" "$WORK/slice.plain" "$WORK/age.rc"
   FEEDING=$k
   if [ -z "$pos" ] && [ "$QUIT" = 0 ]; then
@@ -1852,24 +1853,33 @@ prepare_slice() { # <slice number>
   if [ "$FETCH_GOT" != "$enc" ]; then
     die_io "writing slice $k into the work directory failed" "the copy holds ${FETCH_GOT:-no} of the $enc bytes read from tape file $pos" "$WORK"
   fi
+  # The plain cut is written by tee and hashed as it streams: slice.plain is
+  # not read back to be hashed. tee's and sha256sum's words (a work directory
+  # that cannot take the cut) are in msg; age's and the decompressor's in
+  # their files, as before.
+  rm -f "$WORK/stream.sha"
   if [ -z "$COMP" ]; then
-    {
-      rc=0
-      age -d "${AGE_ARGS[@]}" <"$WORK/slice.enc" >"$WORK/slice.plain" 2>"$WORK/age.err" || rc=$?
-      echo "$rc" >"$WORK/age.rc"
-    } || true
-  else
-    {
+    msg=$({
       {
         rc=0
         age -d "${AGE_ARGS[@]}" <"$WORK/slice.enc" 2>"$WORK/age.err" || rc=$?
         echo "$rc" >"$WORK/age.rc"
-      } | "$DECOMP" -dc >"$WORK/slice.plain" 2>"$WORK/decomp.err"
-    } || true
+      } | tee "$WORK/slice.plain" | sha256sum >"$WORK/stream.sha"
+    } 2>&1) || true
+  else
+    msg=$({
+      {
+        rc=0
+        age -d "${AGE_ARGS[@]}" <"$WORK/slice.enc" 2>"$WORK/age.err" || rc=$?
+        echo "$rc" >"$WORK/age.rc"
+      } | "$DECOMP" -dc 2>"$WORK/decomp.err" | tee "$WORK/slice.plain" | sha256sum >"$WORK/stream.sha"
+    } 2>&1) || true
   fi
   rm -f "$WORK/slice.enc"
   arc=$(cat "$WORK/age.rc" 2>/dev/null || echo 1)
   text="$(cat "$WORK/age.err" "$WORK/decomp.err" 2>/dev/null || true)"
+  [ -z "$msg" ] || text="${text:+$text
+}$msg"
   if is_full_text "$text"; then
     feeder_fatal "writing slice $k into the work directory failed: $(printf '%s' "$text" | head -n 1). The work directory $WORK is full or not writable. Nothing on the tape is wrong: free space there or give --work DIR on a larger disk."
   fi
@@ -1889,7 +1899,9 @@ prepare_slice() { # <slice number>
     rm -f "$WORK/slice.plain"
     return 1
   fi
-  if [ "$(sha_of_file "$WORK/slice.plain")" != "${SL_SHAP[$k]}" ]; then
+  sum=$(cat "$WORK/stream.sha" 2>/dev/null || true)
+  sum=${sum%% *}
+  if [ "${sum#\\}" != "${SL_SHAP[$k]}" ]; then
     mark_bad "$k" "its plain cut does not match the manifest's sha256"
     rm -f "$WORK/slice.plain"
     return 1
