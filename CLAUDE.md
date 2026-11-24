@@ -22,10 +22,10 @@ an earlier one) → `docs/design/v3-implementation-plan.md` (the build plan). La
 set, the set wins.
 
 `tapectl-design-v4_0.md` remains the reference for everything those do NOT cover,
-read **together with `docs/design-errata.md`** (the complete list of
-superseded/recast sections — note §2.6/§8.1–§8.8 are superseded wholesale by v2,
-and §2.9/Appendix C end-of-tape salvage is rejected outright). `CONTEXT.md` is the
-vocabulary.
+read **together with `docs/design-errata.md`** (the complete list of superseded/recast
+sections, brought to ADR-0012 item 309 and Layout 3 — note §2.6/§8.1–§8.8 are superseded
+wholesale by Layout 3 (`volume-format-v3.md`), dar wherever v4.0 names it by GNU tar, and
+§2.9/Appendix C end-of-tape salvage is rejected outright). `CONTEXT.md` is the vocabulary.
 
 ## Where the history is, and the rules it left
 
