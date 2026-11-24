@@ -2081,12 +2081,29 @@ fn a_plain_cut_cut_short_while_its_bytes_stream_whole_is_caught() {
 
 // ---- the low findings of #525 and the rest of the traps ----
 
-/// A2: the script keeps no process id to kill at the end.
+/// A2: the script keeps no list of process ids to kill at the end. The one
+/// it kills is the read ahead's (`ahead_kill`): a job this shell has not yet
+/// waited for, so its id cannot have passed to another process, and its
+/// process group.
 #[test]
 fn the_script_never_kills_a_process_id_it_remembers() {
     let text = tapectl::volume::heir::RESTORE_SH;
     assert!(!text.contains("BG_PIDS"), "no list of process ids");
     assert!(!text.contains("kill -KILL"), "no SIGKILL at exit");
+    let body = text
+        .split("\nahead_kill() {\n")
+        .nth(1)
+        .and_then(|r| r.split("\n}\n").next())
+        .expect("ahead_kill");
+    assert!(body.contains("kill -TERM"), "the positive control: {body}");
+    let outside = text.replace(body, "");
+    for line in outside.lines() {
+        let code = line.split('#').next().unwrap_or("");
+        assert!(
+            !code.contains("kill -") && !code.contains("kill \""),
+            "only ahead_kill kills: {line}"
+        );
+    }
     assert!(
         !text.contains("mkfifo"),
         "no FIFO to read, or to fail on exFAT"
@@ -6239,4 +6256,386 @@ fn the_next_slice_is_read_from_the_tape_while_one_is_decrypted() {
         at_end.iter().enumerate().any(|(i, n)| *n == i + 2),
         "slice k+1's read begins before slice k's decryption ends, at least once: {at_end:?} {evs:?}"
     );
+}
+
+/// The data slices unit B's whole restore reads, in order, on a clean run.
+fn unit_b_reads(t: &Tape) -> Vec<usize> {
+    let h = Heir::of(t);
+    let (o, _) = restore_unit_b(&h);
+    assert_eq!(o.code, 0, "{}", o.all());
+    data_reads(t, &h)
+}
+
+/// The positive control of a read ahead: the read of tape file `pos` began
+/// before the `nth` slice decryption (from 1) ended.
+fn read_began_during_decrypt(evs: &[Event], pos: usize, nth: usize) -> bool {
+    let at = evs
+        .iter()
+        .position(|e| matches!(e, Event::Dd(p, _) if *p == pos));
+    let end = evs
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| **e == Event::AgeEnd)
+        .nth(nth - 1)
+        .map(|(i, _)| i);
+    matches!((at, end), (Some(a), Some(e)) if a < e)
+}
+
+/// A slice read ahead that fails is judged in the words of a read made when
+/// it is asked for, and the verdict is that slice's: the tape cannot give it,
+/// its bytes are not the front index's, the work directory fills while it is
+/// read ahead, or its copy is cut short while every byte streams whole.
+#[test]
+fn a_slice_read_ahead_that_fails_has_the_verdict_of_a_read_made_then() {
+    let t = two();
+    let reads = unit_b_reads(t);
+    let p = reads[1];
+    let enc = t.size_of(p);
+    // The tape cannot give it.
+    let h = Heir::of(t);
+    log_reads_and_decrypts(&h, "0.3");
+    std::fs::write(h.root.path().join("files").join(format!(".fail.{p}")), "").unwrap();
+    let (o, _) = restore_unit_b(&h);
+    assert!(
+        read_began_during_decrypt(&events(&h), p, 1),
+        "{:?}",
+        events(&h)
+    );
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains(&format!(
+            "NOTE: reading tape file {p} failed: dd: error reading"
+        )) && o
+            .stderr
+            .contains(&format!("slice 2: the tape could not be read at file {p}")),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        !o.stderr.contains("differs from the front index"),
+        "{}",
+        o.stderr
+    );
+    // Its bytes are not the ones the front index lists.
+    let h = Heir::of(t);
+    log_reads_and_decrypts(&h, "0.3");
+    h.flip(p, 100);
+    let (o, _) = restore_unit_b(&h);
+    assert!(
+        read_began_during_decrypt(&events(&h), p, 1),
+        "{:?}",
+        events(&h)
+    );
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains(&format!(
+            "slice 2: file {p} differs from the front index's hash"
+        )),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        !o.stderr.contains("could not be read at file"),
+        "{}",
+        o.stderr
+    );
+    // The work directory fills while it is read ahead: the run ends, and the
+    // tape is not blamed.
+    let h = Heir::of(t);
+    log_reads_and_decrypts(&h, "0.3");
+    let real = heir::host_tool("tee").unwrap();
+    h.put_tool(
+        "tee",
+        &format!(
+            "#!/bin/bash\ncase \"$1\" in\n  *slice.enc.next) ;;\n  *) exec {real} \"$@\" ;;\nesac\ncat >/dev/null\necho \"tee: $1: No space left on device\" >&2\nexit 1\n",
+            real = real.display()
+        ),
+    );
+    let (o, _) = restore_unit_b(&h);
+    assert!(
+        read_began_during_decrypt(&events(&h), p, 1),
+        "{:?}",
+        events(&h)
+    );
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains(&format!(
+            "FATAL: reading tape file {p} into the work directory failed: tee: "
+        )) && o
+            .stderr
+            .contains("cannot take it: it is full, or not writable"),
+        "{}",
+        o.stderr
+    );
+    for bad_words in [
+        "could not be read at file",
+        "differs from the front index",
+        "RESTORE COMPLETE",
+    ] {
+        assert!(!o.all().contains(bad_words), "{bad_words}: {}", o.all());
+    }
+    // Its copy is cut short while every byte streams whole, loudly or not.
+    for loud in [true, false] {
+        let h = Heir::of(t);
+        log_reads_and_decrypts(&h, "0.3");
+        short_tee(&h, "slice.enc.next", loud);
+        let (o, _) = restore_unit_b(&h);
+        assert!(
+            h.root.path().join("tmp/tee.cut").exists(),
+            "loud={loud}: {}",
+            o.all()
+        );
+        assert!(
+            read_began_during_decrypt(&events(&h), p, 1),
+            "{:?}",
+            events(&h)
+        );
+        assert_eq!(o.code, 1, "loud={loud}: {}", o.all());
+        let words = if loud {
+            format!("FATAL: reading tape file {p} into the work directory failed: tee: ")
+        } else {
+            format!(
+                "FATAL: writing slice 2 into the work directory failed: the copy holds 1000 of the {enc} bytes read from tape file {p}"
+            )
+        };
+        assert!(o.stderr.contains(&words), "loud={loud}: {}", o.stderr);
+        assert!(
+            o.stderr
+                .contains("cannot take it: it is full, or not writable"),
+            "loud={loud}: {}",
+            o.stderr
+        );
+        for bad_words in [
+            "could not be read at file",
+            "differs from the front index",
+            "could not decrypt",
+            "RESTORE COMPLETE",
+        ] {
+            assert!(
+                !o.all().contains(bad_words),
+                "loud={loud} {bad_words}: {}",
+                o.all()
+            );
+        }
+    }
+}
+
+/// The processes of a run still alive: each one whose environment names this
+/// run's directory tape and whose name is one of the tools a read runs.
+fn live_tools(h: &Heir) -> Vec<(u32, String)> {
+    let mark = format!("FAKE_TAPE={}", h.root.path().join("state").display());
+    let mut out = Vec::new();
+    for e in std::fs::read_dir("/proc").unwrap() {
+        let name = e.unwrap().file_name().to_string_lossy().into_owned();
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
+            continue;
+        };
+        if !env.split(|b| *b == 0).any(|v| v == mark.as_bytes()) {
+            continue;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        let comm = comm.trim().to_string();
+        if [
+            "dd",
+            "dd.fake",
+            "sleep",
+            "head",
+            "tee",
+            "sha256sum",
+            "cat",
+            "mt",
+        ]
+        .contains(&comm.as_str())
+        {
+            out.push((pid, comm));
+        }
+    }
+    out
+}
+
+/// TERM while a slice is being read ahead: the run ends as a kill does, the
+/// work directory is gone, and nothing of the read is left running (the read
+/// is a process group of its own, stopped and waited for on the way out).
+#[test]
+fn a_kill_while_a_slice_is_read_ahead_leaves_no_process_of_it_behind() {
+    let t = two();
+    let reads = unit_b_reads(t);
+    let p = reads[1];
+    let h = Heir::of(t);
+    log_reads_and_decrypts(&h, "0.3");
+    let dest = h.dest("out");
+    let kb = key(&h, Who::TenantB);
+    let slow = format!("{p}:20");
+    let args = ["--restore", "--key", &kb, "--to", dest_str(&dest)];
+    let mut r = h.spawn(&args, &[("FAKE_DD_SLOW", slow.as_str())]);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !h.root.path().join("state/dd.slow").exists() {
+        assert!(std::time::Instant::now() < until, "{}", r.text());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let evs = events(&h);
+    let dd_pid = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::Dd(q, pid) if *q == p => Some(*pid),
+            _ => None,
+        })
+        .expect("the read of slice 2 began");
+    // Positive control: the read ahead runs, and the scan sees it.
+    assert!(
+        std::path::Path::new(&format!("/proc/{dd_pid}")).exists(),
+        "the read of tape file {p} is running"
+    );
+    assert!(
+        live_tools(&h).iter().any(|(pid, _)| *pid == dd_pid),
+        "{:?}",
+        live_tools(&h)
+    );
+    r.signal("TERM");
+    let o = r.finish();
+    assert_eq!(o.code, 143, "{}", o.all());
+    assert!(
+        !std::path::Path::new(&format!("/proc/{dd_pid}")).exists(),
+        "the read ahead's dd ({dd_pid}) is gone when the run has ended: {}",
+        o.all()
+    );
+    assert_eq!(live_tools(&h), vec![], "{}", o.all());
+    assert!(no_work_dir_in(&dest), "{}", o.all());
+    assert!(!o.all().contains("Terminated"), "{}", o.all());
+}
+
+/// A read ahead still running when the next slice asked for is not on the
+/// cartridge in the drive: slice 2 (the first of the long file's run, 2 to 4)
+/// fails to decrypt while slice 3 is read ahead, slowly, so the restore goes
+/// on to slice 5, which is on the next tape. At that prompt the read ahead
+/// has been waited for: no slice file waits in the work directory (item 267),
+/// no read of it is running, and nothing touches the tape while it waits.
+#[test]
+fn a_read_ahead_in_flight_before_a_swap_ends_before_the_prompt() {
+    let t = span3();
+    let h = Heir::of_series(&[&t[0], &t[1], &t[2]]);
+    log_reads_and_decrypts(&h, "0.3");
+    h.put_tool(
+        "age",
+        &format!(
+            "#!/bin/bash\ncase \"$(ls -l /proc/$$/fd/0 2>/dev/null)\" in\n  *slice.enc) ;;\n  *) exec {real} \"$@\" ;;\nesac\nn=$(cat \"$FAKE_TAPE/age.n\" 2>/dev/null || echo 0)\nn=$((n + 1))\necho \"$n\" >\"$FAKE_TAPE/age.n\"\necho \"age-start $(date +%s.%N)\" >>\"$FAKE_TAPE/events\"\nif [ \"$n\" = 2 ]; then\n  cat >/dev/null\n  echo 'age: error: the slice broke' >&2\n  echo \"age-end $(date +%s.%N)\" >>\"$FAKE_TAPE/events\"\n  exit 1\nfi\nrc=0\n{real} \"$@\" || rc=$?\necho \"age-end $(date +%s.%N)\" >>\"$FAKE_TAPE/events\"\nexit $rc\n",
+            real = heir::heir_age_binary().display()
+        ),
+    );
+    let p3 = positions(&t[0], 3, 3)[0];
+    let slow = format!("{p3}:2");
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let args = restore_all(&ka, &dest);
+    let mut r = h.spawn(&args, &[("FAKE_DD_SLOW", slow.as_str())]);
+    let mut asked = 0;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(200);
+    let code = loop {
+        let text = r.text();
+        let n = text.matches(heir::PROMPT).count();
+        if n > asked {
+            asked = n;
+            if asked == 1 {
+                // Positive control: slice 3 was read ahead (its slow read began
+                // while slice 2 decrypted).
+                let evs = events(&h);
+                assert!(read_began_during_decrypt(&evs, p3, 2), "{evs:?}");
+                let dd_pid = evs
+                    .iter()
+                    .find_map(|e| match e {
+                        Event::Dd(q, pid) if *q == p3 => Some(*pid),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(
+                    !std::path::Path::new(&format!("/proc/{dd_pid}")).exists(),
+                    "the read ahead of slice 3 has ended at the prompt"
+                );
+                assert_eq!(live_tools(&h), vec![], "{text}");
+                let work = std::fs::read_dir(&dest)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| {
+                        p.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".tapectl-work")
+                    })
+                    .expect("the work directory");
+                for e in std::fs::read_dir(&work).unwrap() {
+                    let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                    assert!(!name.starts_with("slice."), "{name} waits at the prompt");
+                }
+                let before = h.ops();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                assert_eq!(h.ops(), before, "no mt or dd while the prompt waits");
+            }
+            h.load(["HEIR02", "HEIR03"][asked - 1]);
+            r.type_line("");
+        }
+        if let Some(code) = r.try_wait() {
+            break code;
+        }
+        assert!(std::time::Instant::now() < until, "{}", r.text());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let all = r.text();
+    assert_eq!(asked, 2, "{all}");
+    assert_eq!(code, 1, "{all}");
+    assert!(all.contains("slice 2: age could not decrypt it"), "{all}");
+    assert!(
+        all.contains("slice 3: part of the long member whose first slice is bad"),
+        "{all}"
+    );
+    assert!(list_of(&dest).iter().any(|p| p == LARGE), "{all}");
+    assert!(no_work_dir_in(&dest), "{all}");
+}
+
+/// Named paths read ahead too: the next slice a wanted member needs is read
+/// while the one before it decrypts, each slice once, and the files are right.
+#[test]
+fn named_paths_read_the_next_slice_they_need_while_one_is_decrypted() {
+    let t = two();
+    let h = Heir::of(t);
+    let k = key(&h, Who::TenantB);
+    let rows = list_rows(&h, &k, UNIT_B);
+    let first = format!("inner/{UNIT_B}-deep.dat");
+    let (_, s1, _, _) = row(&rows, &first);
+    let (_, s2, _, _) = row(&rows, "notes.txt");
+    assert_ne!(s1, s2, "two slices");
+    let mut want = vec![slice_pos(t, UNIT_B, *s1), slice_pos(t, UNIT_B, *s2)];
+    want.sort_unstable();
+    log_reads_and_decrypts(&h, "0.3");
+    h.reset_ops();
+    let dest = h.dest("two");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &k,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        "notes.txt",
+        "--path",
+        &first,
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_eq!(data_reads(t, &h), want, "each slice once: {:?}", h.ops());
+    assert!(
+        read_began_during_decrypt(&events(&h), want[1], 1),
+        "{:?}",
+        events(&h)
+    );
+    let got = heir::tree(&dest);
+    assert_eq!(got.len(), 2, "{:?}", got.keys());
+    for (path, bytes) in unit_files(t, UNIT_B) {
+        if let Some(have) = got.get(path) {
+            assert_eq!(have, bytes, "{path}");
+        }
+    }
 }
