@@ -169,6 +169,9 @@ pub struct Shape {
     /// Add to each BIG unit a file whose name holds the raw control bytes
     /// ESC and BEL ([`CONTROL_NAME`]), which no escape of 1.5 covers.
     pub control_names: bool,
+    /// Edit each staging's file table (`tables/`) before the build, to give
+    /// a tape a table no writer makes (a crafted envelope's).
+    pub table_edit: Option<fn(&Path)>,
 }
 
 /// A name holding a terminal escape sequence: ESC ] 0 ; ... BEL.
@@ -240,6 +243,7 @@ impl Shape {
             quoted_names: false,
             links: 0,
             control_names: false,
+            table_edit: None,
         }
     }
     /// One big unit of tenant A, compressed.
@@ -258,6 +262,7 @@ impl Shape {
             quoted_names: false,
             links: 0,
             control_names: false,
+            table_edit: None,
         }
     }
 }
@@ -527,6 +532,11 @@ fn write_tape(
         Some(idx)
     };
     let tables = write::generate_tables(&h.conn, &bu, &work.path().join("tables")).unwrap();
+    if let Some(edit) = shape.table_edit {
+        for t in tables.values() {
+            edit(&t.file_table);
+        }
+    }
     let catalog_db = work.path().join("catalog.db");
     db::ontape_catalog::write(&h.conn, &ids, &catalog_db).unwrap();
     let mut tenant_ids: Vec<i64> = bu.iter().map(|u| u.tenant_id).collect();

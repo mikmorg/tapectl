@@ -7069,3 +7069,115 @@ fn a_control_byte_in_a_name_is_printed_escaped_and_the_listed_form_restores_it()
         );
     }
 }
+
+// ---- #606 C-2: a file-table path that leaves --to is refused before anything is written ----
+
+/// Add to unit A's file table a copy of its first row of `kind` with the path
+/// (or, for `h`, the hard link's target) `bad`.
+fn craft_row(table: &Path, kind: &str, bad: &str) {
+    let text = std::fs::read_to_string(table).unwrap();
+    if !text.contains(&format!("{UNIT_A}-small.txt")) {
+        return;
+    }
+    let row = text
+        .lines()
+        .find(|l| l.starts_with(&format!("{kind}\t")))
+        .unwrap_or_else(|| panic!("no {kind} row"));
+    let mut f: Vec<String> = row.split('\t').map(str::to_string).collect();
+    if kind == "h" {
+        f[7] = bad.to_string();
+    } else {
+        f[6] = bad.to_string();
+    }
+    let mut out = text.clone();
+    out.push_str(&f.join("\t"));
+    out.push('\n');
+    std::fs::write(table, out).unwrap();
+}
+
+fn t_abs(p: &Path) {
+    craft_row(p, "f", "/abs-sentinel.txt")
+}
+fn t_dotdot(p: &Path) {
+    craft_row(p, "f", "../../sentinel.txt")
+}
+fn t_dotdot_x(p: &Path) {
+    craft_row(p, "f", "\\x2e\\x2e/\\x2e\\x2e/sentinel.txt")
+}
+fn t_slash_x(p: &Path) {
+    craft_row(p, "f", "inner\\x2fslash.txt")
+}
+fn t_round(p: &Path) {
+    craft_row(p, "f", "caf\\x41.txt")
+}
+fn t_link(p: &Path) {
+    craft_row(p, "h", "../../sentinel.txt")
+}
+
+/// #606 C-2: a file-table row whose path, or hard link's target, begins with
+/// `/`, holds a `..` component (plainly or as `\x2e\x2e`), holds a `/` written
+/// `\x2f`, or is not written as 1.5 writes a path, makes the unit's table
+/// refused by name before anything is removed, made or linked: nothing of
+/// that unit is written under `--to`, nothing beside `--to` or above it is
+/// made or removed, and `--all` goes on to the next unit.
+#[test]
+fn a_table_path_that_leaves_to_is_refused_and_nothing_outside_to_is_touched() {
+    let cases: [(fn(&Path), &str); 6] = [
+        (t_abs, "it begins with /"),
+        (t_dotdot, "it has a .. component"),
+        (t_dotdot_x, "it has a .. component"),
+        (t_slash_x, "a / in it is written \\x2f"),
+        (t_round, "it is not written as a path is written"),
+        (t_link, "its hard link's target: it has a .. component"),
+    ];
+    for (edit, why) in cases {
+        let mut shape = Shape::two();
+        shape.table_edit = Some(edit);
+        let t = Tape::build(&shape);
+        let h = Heir::of(&t);
+        let ke = key(&h, Who::Escrow);
+        let up = h.dest("up");
+        let boxed = up.join("box");
+        std::fs::create_dir_all(&boxed).unwrap();
+        std::fs::write(up.join("sentinel.txt"), b"keep up").unwrap();
+        std::fs::write(boxed.join("sentinel.txt"), b"keep box").unwrap();
+        let to = boxed.join("to");
+        let listing = |d: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        let o = h.run(&restore_all(&ke, &to));
+        let all = o.all();
+        assert_eq!(o.code, 1, "{why}: {all}");
+        assert!(
+            o.stderr.contains(&format!(
+                "the file table of unit {UNIT_A} holds a path this script will not write"
+            )) && o.stderr.contains(why),
+            "{why}: {}",
+            o.stderr
+        );
+        assert!(
+            o.stdout.contains(&format!(
+                "RESTORE INCOMPLETE: the file table of unit(s) {UNIT_A} holds a path"
+            )),
+            "{why}: {all}"
+        );
+        assert!(
+            !to.join(UNIT_A).exists(),
+            "{why}: nothing of unit A under --to"
+        );
+        assert_restored(&t, UNIT_B, &to.join(UNIT_B));
+        assert_eq!(listing(&boxed), ["sentinel.txt", "to"], "{why}");
+        assert_eq!(listing(&up), ["box", "sentinel.txt"], "{why}");
+        assert_eq!(
+            std::fs::read(boxed.join("sentinel.txt")).unwrap(),
+            b"keep box"
+        );
+        assert_eq!(std::fs::read(up.join("sentinel.txt")).unwrap(), b"keep up");
+        assert!(!Path::new("/abs-sentinel.txt").exists());
+    }
+}
