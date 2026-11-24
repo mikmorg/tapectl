@@ -783,15 +783,40 @@ ahead_take() { # <slice> <tape file>
 }
 
 # The way out: the job and every tool in its process group are stopped, and
-# waited for until none is left, before the work directory is removed. Its
-# process id is one this shell has not yet waited for, so it is still the
-# job's own.
+# waited for until none is left running, before the work directory is
+# removed. Its process id is one this shell has not yet waited for, so it is
+# still the job's own.
+# Is a process of the job's group still running? The kill orphans the job's
+# tools, and where nothing reaps orphans (a container whose first process does
+# not) each stays a zombie, which still answers kill -0 for the group but has
+# closed every file it had, the tape included: a zombie is not running. Read
+# from /proc/PID/stat (the state, then the parent, then the group, after the
+# name's last ") "); kill -0 only where /proc cannot be read.
+ahead_running() {
+  local f st rest state grp
+  if [ ! -r /proc/self/stat ]; then
+    kill -0 -- "-$AHEAD_PID" 2>/dev/null
+    return
+  fi
+  for f in /proc/[0-9]*/stat; do
+    st=""
+    read -r st 2>/dev/null <"$f" || [ -n "$st" ] || continue
+    rest=${st##*) }
+    state=${rest%% *}
+    rest=${rest#* }
+    rest=${rest#* }
+    grp=${rest%% *}
+    if [ "$grp" = "$AHEAD_PID" ] && [ "$state" != Z ] && [ "$state" != X ]; then return 0; fi
+  done
+  return 1
+}
+
 ahead_kill() {
   local n=0
   if [ -n "$AHEAD_PID" ]; then
     kill -TERM -- "-$AHEAD_PID" 2>/dev/null || kill -TERM "$AHEAD_PID" 2>/dev/null || true
     wait "$AHEAD_PID" 2>/dev/null || true
-    while kill -0 -- "-$AHEAD_PID" 2>/dev/null && [ "$n" -lt 600 ]; do
+    while ahead_running && [ "$n" -lt 600 ]; do
       sleep 0.1 2>/dev/null || sleep 1
       n=$((n + 1))
     done

@@ -2090,13 +2090,19 @@ fn the_script_never_kills_a_process_id_it_remembers() {
     let text = tapectl::volume::heir::RESTORE_SH;
     assert!(!text.contains("BG_PIDS"), "no list of process ids");
     assert!(!text.contains("kill -KILL"), "no SIGKILL at exit");
-    let body = text
-        .split("\nahead_kill() {\n")
-        .nth(1)
-        .and_then(|r| r.split("\n}\n").next())
-        .expect("ahead_kill");
-    assert!(body.contains("kill -TERM"), "the positive control: {body}");
-    let outside = text.replace(body, "");
+    let body = |name: &str| {
+        text.split(&format!("\n{name}() {{\n"))
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .unwrap_or_else(|| panic!("{name}"))
+    };
+    let (kill, running) = (body("ahead_kill"), body("ahead_running"));
+    assert!(kill.contains("kill -TERM"), "the positive control: {kill}");
+    assert!(
+        running.contains("kill -0") && !running.contains("kill -TERM"),
+        "ahead_running only asks: {running}"
+    );
+    let outside = text.replace(kill, "").replace(running, "");
     for line in outside.lines() {
         let code = line.split('#').next().unwrap_or("");
         assert!(
