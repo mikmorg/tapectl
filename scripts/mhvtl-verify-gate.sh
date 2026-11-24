@@ -11,7 +11,8 @@
 #      cartridge), --where, --find; and, for a unit that continues on another cartridge, one
 #      prompt (ENTER: loaded; done or end of input: "I do not have it"; quit). A unit stored with
 #      compression is read with the real gzip, xz or zstd. heir_restore_tmpdir (#561) restores
-#      with TMPDIR a directory the script cannot write: the work directory is made in --to.
+#      with TMPDIR a directory the script cannot write: the work directory is made in --to;
+#      heir_restore_tmpdir_root_mtime holds that tree's root to its recorded mtime.
 #      heir_restage_dotfile (#528) restores, from its own tape, a unit staged again after `unit tag`
 #      rewrote its dotfile (a home of its own, on two of the span leg's cartridges). In the same
 #      home, heir_inner_tar (#556) loses the first slice of a tar file's run: none of the inner
@@ -50,8 +51,8 @@
 # heir_restore_symlinks, and added heir_verify, heir_list, heir_path, heir_find_path,
 # heir_long_member, span_heir_start_later, span_heir_second_run, span_heir_not_have and
 # heir_{gzip,xz,zstd}_{restore,path}: 78 checks. The open issues before 2.0.0's tag added
-# heir_restore_tmpdir (#561), span_heir_wrong_cartridge (#521), heir_restage_dotfile (#528),
-# heir_inner_tar and heir_lost_link_target (#556): 83.
+# heir_restore_tmpdir and heir_restore_tmpdir_root_mtime (#561), span_heir_wrong_cartridge (#521),
+# heir_restage_dotfile (#528), heir_inner_tar and heir_lost_link_target (#556): 84.
 # #400 is not exercisable on mhvtl, see its section.
 #
 # The tools it names: tar (GNU tar 1.35, built with ACL support, is the writer's floor; the
@@ -1257,12 +1258,9 @@ WATCH
 # heir_restore_tmpdir (#561; ADR-0012 items 270-271): heir_restore's case, unitA whole, with TMPDIR
 # set, for the RESTORE.sh process only, to a directory the script cannot write. The work directory
 # is made inside --to (the tar stand-in above sees it there while tar runs, and the envelope's tar
-# is given a -C inside it), TMPDIR decides nothing, and nothing is written under it. The restored
-# root keeps the root member's recorded mtime (ADR-0012 item 303; tests/heir_restore_s6.rs
-# an_empty_to_gets_the_unit_roots_recorded_mode_and_mtime) as heir_restore's tree does: the
-# control for that check is heir_restore's own tree.
+# is given a -C inside it), TMPDIR decides nothing, and nothing is written under it.
 step_heir_restore_tmpdir() {
-    local d="$HEIR/recovered-tmpdir" ro="$HEIR/tmpdir-unwritable" log="$RUN/heir-tmpdir.watch" out rc before after want
+    local d="$HEIR/recovered-tmpdir" ro="$HEIR/tmpdir-unwritable" log="$RUN/heir-tmpdir.watch" out rc before after
     heir_hook_ready && mkdir -p "$HEIR_HOOK/tar-watch" && heir_write_watcher "$HEIR_HOOK/tar-watch/tar" \
         || { echo "cannot write the tar stand-in under $HEIR_HOOK"; return 1; }
     rm -rf "$d" "$ro"
@@ -1295,12 +1293,23 @@ step_heir_restore_tmpdir() {
     [ -z "$(find "$ro" -mindepth 1 -print -quit)" ] || { echo "heir_restore_tmpdir: $ro is not empty:"; find "$ro" -mindepth 1; return 1; }
     after="$(stat -c '%Y.%Z' "$ro")" || return 1
     [ "$before" = "$after" ] || { echo "heir_restore_tmpdir: $ro changed (mtime.ctime $before, now $after)"; return 1; }
-    # The root's recorded mtime. The control: heir_restore's tree, restored with the default TMPDIR.
+    : >"$RUN/heir-tmpdir.passed"
+}
+# heir_restore_tmpdir_root_mtime (#561 with ADR-0012 item 303): the tree heir_restore_tmpdir restored
+# keeps the root member's recorded mtime, as heir_restore's tree does (tests/heir_restore_s6.rs
+# an_empty_to_gets_the_unit_roots_recorded_mode_and_mtime). RESTORE.sh's cleanup keeps it across the
+# removal of the work directory from --to with a reference file it makes in ${TMPDIR:-/tmp}, so
+# with an unwritable TMPDIR it is lost. A leg of its own, so that heir_restore_tmpdir's verdict is
+# #561's criteria alone. The control: heir_restore's tree, restored with the default TMPDIR.
+step_heir_restore_tmpdir_root_mtime() {
+    local d="$HEIR/recovered-tmpdir" want
+    [ -f "$RUN/heir-tmpdir.passed" ] || { echo "heir_restore_tmpdir did not pass: no tree of its to read"; return 1; }
     want="$(stat -c %Y "$SRC/unitA")" || return 1
     [ -d "$HEIR/recovered" ] && [ "$(stat -c %Y "$HEIR/recovered")" = "$want" ] \
         || { echo "control: heir_restore's tree $HEIR/recovered does not have the source root's mtime $want, so this check proves nothing"; return 1; }
+    echo "control: heir_restore's tree has the source root's mtime $want"
     [ "$(stat -c %Y "$d")" = "$want" ] \
-        || { echo "heir_restore_tmpdir: the restored root's mtime is $(stat -c %Y "$d"), want the source root's $want (heir_restore's tree has it)"; return 1; }
+        || { echo "heir_restore_tmpdir_root_mtime: the root restored with TMPDIR unwritable has mtime $(stat -c %Y "$d"), want the source root's $want"; return 1; }
 }
 echo "gate: leg 2 — heir leg (RESTORE.sh of Layout 3, no tapectl)"
 check heir_extract_script step_heir_extract
@@ -1310,6 +1319,7 @@ check heir_verify         step_heir_verify
 check heir_list           step_heir_list
 check heir_restore        step_heir_restore
 check heir_restore_tmpdir step_heir_restore_tmpdir
+check heir_restore_tmpdir_root_mtime step_heir_restore_tmpdir_root_mtime
 check heir_restore_symlinks step_heir_restore_symlinks
 
 # heir_file_check (ADR-0012 item 103; Layout 3: the file table's sha256): the RESTORE.sh on the tape
@@ -4467,7 +4477,7 @@ PY
 check lbp_page_clear_after_every_command step_lbp_page_clear_after_every_command
 
 # ---------- the checks the gate must have run, by name ----------
-# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 83). The verdict compares the run to this
+# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 84). The verdict compares the run to this
 # list by NAME, never by a total: a check named here that did not run is a FAIL (a leg that was
 # edited out, or a run that stopped early, cannot read GREEN), and so is a check that ran and is
 # not named here. TAPECTL_GATE_SPAN_ONLY judges the span_* names alone.
@@ -4476,7 +4486,8 @@ GATE_EXPECTED_CHECKS=(
     volume_write sealed_at_recorded lbp_fallback_recorded volume_verify empty_drive_refused
     evidence_row restore_diff restore_multislice_unit restore_symlink_unit crosskey_rejected
     no_plaintext_leak heir_extract_script heir_info heir_find_envelope heir_verify heir_list
-    heir_restore heir_restore_tmpdir heir_restore_symlinks heir_file_check heir_path heir_long_member heir_where
+    heir_restore heir_restore_tmpdir heir_restore_tmpdir_root_mtime heir_restore_symlinks heir_file_check
+    heir_path heir_long_member heir_where
     heir_find heir_find_path heir_paths_from_copy resume_bot resume_midwrite resume_verify
     resume_restore resume_after_crash tier3_floor_unconfirmed health_by_id_device
     health_by_id_restore log_page_sweep_complete log_page_read_once log_page_raw_kept
