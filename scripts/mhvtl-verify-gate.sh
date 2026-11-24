@@ -3942,7 +3942,7 @@ check span_three_tapes step_span_three_tapes
 
 # span_heir_wrong_cartridge (#521; R8): span_heir_tapes_1_3's restore (sb-span, started on tape 1),
 # whose one prompt is first answered with cartridges the script cannot use: a blank one (this leg's
-# own, erased in the drive), then a tapectl tape of another home that holds none of sb-span's slices
+# own, erased in the drive; mhvtl's read of its first file is an I/O error), then a tapectl tape of another home that holds none of sb-span's slices
 # (SPF-0001, span_floor_target_1's). Each is refused with its NOTE, nothing is taken from it, and
 # the prompt is asked again, for the same slice; then tape 3 is loaded and taken. Nothing restored
 # before the first prompt is removed (the same files, by inode, at every prompt and at the end), the
@@ -4007,7 +4007,9 @@ out = open(f"{h}/wrong.out").read()
 seg = out.split(prompt)
 assert len(seg) == 4, f"the prompt text appears {len(seg) - 1} times, want 3"
 want = [
-    ["NOTE: this cartridge is blank: nothing can be read at its first file. Nothing is taken from it."],
+    # mhvtl answers a read of an erased cartridge's first file with an I/O error (its blank
+    # check), not with no bytes: the script's "unreadable" refusal, not its "blank" one.
+    ["NOTE: this cartridge is unreadable: its first file cannot be read (", "Nothing is taken from it."],
     ["NOTE: This cartridge (label SPF-0001) lists no data slice with the sha256 of slice %d " % k, "Nothing is taken from it."],
     ["This cartridge identifies as: SPA-0003"],
 ]
