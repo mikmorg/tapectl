@@ -2459,8 +2459,8 @@ fn only_session_log(home: &std::path::Path, needle: &str) -> String {
     std::fs::read_to_string(&logs[0]).expect("read session log")
 }
 
-/// Issue #386: `stage create --json` prints one document, the same five
-/// keys per unit, while the session log under `<home>/logs/` records every
+/// Issue #386: `stage create --json` prints one document, the same six
+/// keys per unit (#542 added `left_out`), while the session log under `<home>/logs/` records every
 /// phase with UTC timestamps, and progress (plain lines, stderr not being a
 /// terminal) never reaches stdout. A one-second interval makes a line
 /// likely; the assertions do not depend on one being printed. ADR-0012 item
@@ -2497,6 +2497,7 @@ fn stage_create_json_is_one_array_and_its_session_is_logged() {
     assert_eq!(
         keys,
         [
+            "left_out",
             "num_slices",
             "stage_set_id",
             "stream_bytes",
