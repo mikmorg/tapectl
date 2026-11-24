@@ -12,6 +12,8 @@
 #      prompt (ENTER: loaded; done or end of input: "I do not have it"; quit). A unit stored with
 #      compression is read with the real gzip, xz or zstd. heir_restore_tmpdir (#561) restores
 #      with TMPDIR a directory the script cannot write: the work directory is made in --to.
+#      heir_restage_dotfile (#528) restores, from its own tape, a unit staged again after `unit tag`
+#      rewrote its dotfile (a home of its own, on two of the span leg's cartridges).
 #   3. Negative leg: cross-tenant decrypt must fail; raw media must not
 #      contain plaintext canaries or a plaintext tar stream
 #   4. Evidence leg: verify must leave a verification_sessions row (ADR-0001)
@@ -45,7 +47,8 @@
 # heir_restore_symlinks, and added heir_verify, heir_list, heir_path, heir_find_path,
 # heir_long_member, span_heir_start_later, span_heir_second_run, span_heir_not_have and
 # heir_{gzip,xz,zstd}_{restore,path}: 78 checks. The open issues before 2.0.0's tag added
-# heir_restore_tmpdir (#561) and span_heir_wrong_cartridge (#521): 80. #400 is not exercisable on mhvtl, see its section.
+# heir_restore_tmpdir (#561), span_heir_wrong_cartridge (#521) and heir_restage_dotfile (#528): 81.
+# #400 is not exercisable on mhvtl, see its section.
 #
 # The tools it names: tar (GNU tar 1.35, built with ACL support, is the writer's floor; the
 # config it writes names [tar] binary, never [dar]), age, gzip, xz, zstd (the heir's real
@@ -3072,7 +3075,7 @@ sp_prepare() {
         SP_FREE+=("$slot")
         SP_TAG[$slot]="$(sed -n 's/.*VolumeTag *= *\([A-Z0-9]*\).*/\1/p' <<<"$line")"
     done < <(grep -E "Storage Element [0-9]+:Full" <<<"$status" | grep "VolumeTag=[EF][0-9]*$GEN")
-    [ "${#SP_FREE[@]}" -ge 8 ] || { SP_PREP="the library has ${#SP_FREE[@]} free $GEN data cartridges; the leg needs 8"; return 1; }
+    [ "${#SP_FREE[@]}" -ge 10 ] || { SP_PREP="the library has ${#SP_FREE[@]} free $GEN data cartridges; the leg needs 10 (2 for home X)"; return 1; }
 }
 sp_ready() {
     [ -z "$SP_PREP" ] || { echo "the span leg could not be prepared: $SP_PREP"; return 1; }
@@ -4023,6 +4026,134 @@ PY
 }
 check span_heir_wrong_cartridge step_span_heir_wrong_cartridge
 
+# ---------- heir_restage_dotfile, heir_inner_tar, heir_lost_link_target: home X, on the span leg's cartridges ----------
+# The open issues' heir legs that need tapes of their own (#528, #556), read by RESTORE.sh with the
+# real age, tar, mt, dd and sha256sum. One throwaway home (tenant alice, 1M slices, a copy target of
+# 1) and two cartridges from the span leg's pool, made by the first of these legs to run (the others
+# find it ready; a failure there fails each of them, the first's log named), as the compressed tape
+# is. HX-0001 holds hx-inner, hx-link and hx-tag; then hx-tag's dotfile is rewritten by `unit tag`,
+# its version 1 is released and staged again, and HX-0002 is written from that second staging.
+# The slice a file is in is asked of --list, the tape file of a slice of the catalog, never assumed.
+HX="$SP/x"
+HX_TAG="gate-retag"
+HX_KEY="$HX/home/keys/alice-primary.age.key"
+HXC() { "$BIN" --home "$HX/home" "$@"; }
+hx_sh() { # hx_sh <heir dir> RESTORE.sh-args...: that RESTORE.sh, against this gate's drive
+    local d="$1"
+    shift
+    (cd "$d" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh "$@")
+}
+# heir_sh_hooked for a RESTORE.sh in <heir dir>: the dd stand-in first on PATH, a byte of tape file
+# <fault pos> flipped as it is read ("none": no fault), the flips to <fault log>, every read's tape
+# file to <trace log>.
+hx_sh_hooked() { # hx_sh_hooked <heir dir> <fault pos|none> <fault log> <trace log> RESTORE.sh-args...
+    local d="$1" pos="$2" flog="$3" tlog="$4"
+    shift 4
+    heir_hook_ready || { echo "cannot write the stand-ins under $HEIR_HOOK"; return 1; }
+    : >"$flog"; : >"$tlog"
+    (cd "$d" && env "PATH=$HEIR_HOOK:$PATH" "REAL_DD=$(command -v dd)" "REAL_MT=$(command -v mt-st || command -v mt)" \
+        "FAULT_POS=$pos" "FAULT_LOG=$flog" "TRACE_LOG=$tlog" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh "$@")
+}
+# "<kind> <slice> <bytes> [<first name>]" of one path in a unit's --list (the path as printed): the
+# slice the member begins in, and for a hard link (h) the name archived first.
+hx_list_row() { # hx_list_row <heir dir> <unit> <path as printed>
+    local out
+    out="$(hx_sh "$1" --list --key "$HX_KEY" --unit "$2" 2>&1)" || { printf '%s\n' "$out" >&2; return 1; }
+    awk -v want="$3" '{ k = $1; s = $2; b = $3; p = $0; t = ""; sub(/^ *[a-z] +[0-9]+ +[0-9]+  /, "", p)
+        i = index(p, "  -> "); if (i) { t = substr(p, i + 5); p = substr(p, 1, i - 1) }
+        if (length(k) == 1 && s ~ /^[0-9]+$/ && b ~ /^[0-9]+$/ && p == want) { print k, s, b, t; found = 1; exit } }
+        END { exit found ? 0 : 1 }' <<<"$out"
+}
+hx_make() {
+    local u
+    rm -rf "$HX" && mkdir -p "$HX/src/hx-inner" "$HX/src/hx-link" "$HX/src/hx-tag" "$HX/inner/payload" "$HX/heir1" "$HX/heir2" || return 1
+    # hx-inner (#556 a): a real tar archive as a plain file, larger than a slice (a run), between two
+    # files of a slice each; members of the inner archive lie in each piece of the run.
+    head -c 700000 /dev/urandom >"$HX/src/hx-inner/a-first.bin"
+    head -c 1100000 /dev/urandom >"$HX/inner/payload/inner1.bin"
+    head -c 200000 /dev/urandom >"$HX/inner/payload/inner3.bin"
+    echo "a member of the inner archive, never of the unit" >"$HX/inner/payload/INNER-NOTE.txt"
+    tar -C "$HX/inner" -cf "$HX/src/hx-inner/b-old-backup.tar" payload/inner1.bin payload/inner3.bin payload/INNER-NOTE.txt \
+        || { echo "cannot make the inner archive"; return 1; }
+    head -c 700000 /dev/urandom >"$HX/src/hx-inner/c-last.bin"
+    # hx-link (#556 b): a file of a slice each, the first name of a hard link in the second, its
+    # other name sorted after the third.
+    for u in a-pad b-first c-other; do head -c 700000 /dev/urandom >"$HX/src/hx-link/$u.bin"; done
+    ln "$HX/src/hx-link/b-first.bin" "$HX/src/hx-link/d-link.bin" || return 1
+    # hx-tag (#528): small, one slice.
+    echo "a unit whose dotfile is rewritten after it is written" >"$HX/src/hx-tag/note.txt"
+    head -c 100000 /dev/urandom >"$HX/src/hx-tag/data.bin"
+    sp_home HXC "$HX" gate-x 1 && HXC config set defaults.slice_size 1M || { echo "home X's slice size was refused"; return 1; }
+    sp_units HXC "$HX" hx-inner hx-link hx-tag || return 1
+    cp -p "$HX/src/hx-tag/.tapectl-unit.toml" "$HX/hx-tag.dotfile.first" || return 1
+    sp_assign HX-0001 && sp_new_volume HXC "$HX" HX-0001 && sp_write HXC HX-0001 "$HX/w1" && sp_restore_sh "$HX/heir1" || return 1
+    cmp -s "$HX/heir1/RESTORE.sh" "$GATE_REPO/src/volume/heir/RESTORE.sh" \
+        || { echo "the RESTORE.sh on HX-0001 is not src/volume/heir/RESTORE.sh"; return 1; }
+    # #528: the dotfile rewritten (a tag is not content: no new version), version 1 released and
+    # staged again, and the second staging written to its own tape.
+    HXC unit tag hx-tag --add "$HX_TAG" && HXC stage clean --unit hx-tag --version 1 && HXC stage create hx-tag --version 1 \
+        || { echo "unit tag, stage clean or stage create --version 1 of hx-tag failed"; return 1; }
+    sp_assign HX-0002 && sp_new_volume HXC "$HX" HX-0002 && sp_write HXC HX-0002 "$HX/w2" && sp_restore_sh "$HX/heir2" || return 1
+    cmp -s "$HX/heir2/RESTORE.sh" "$GATE_REPO/src/volume/heir/RESTORE.sh" \
+        || { echo "the RESTORE.sh on HX-0002 is not src/volume/heir/RESTORE.sh"; return 1; }
+}
+hx_prepare() {
+    sp_ready || return 1
+    [ -f "$HX/ready" ] && return 0
+    if [ -f "$RUN/hx.failed" ]; then
+        echo "home X's tapes could not be made: see the log of the first of heir_restage_dotfile, heir_inner_tar, heir_lost_link_target that ran"
+        return 1
+    fi
+    if hx_make; then : >"$HX/ready"; return 0; fi
+    : >"$RUN/hx.failed"
+    return 1
+}
+
+# heir_restage_dotfile (#528; ADR-0012 item 254): a unit staged and written (HX-0001), then `unit tag`
+# rewrites its dotfile, the same version is staged again and that staging written to HX-0002. HX-0002's
+# own RESTORE.sh restores the unit with the real tools: RESTORE COMPLETE, every file checked, no
+# damaged-file list, and the restored dotfile is the NEW one (tests/heir_restore.rs
+# a_tape_written_from_a_restage_after_a_dotfile_edit_restores_complete). The positive control: the
+# edit really changed the dotfile, which now names the tag; and the catalog shows the version staged
+# twice, each tape written from its own staging, each staging's table with its own dotfile's sha256.
+step_heir_restage_dotfile() {
+    local d="$HX/heir2/restored-tag" first new out rc
+    hx_prepare || return 1
+    first="$HX/hx-tag.dotfile.first"; new="$HX/src/hx-tag/.tapectl-unit.toml"
+    if cmp -s "$first" "$new"; then echo "control: unit tag left the dotfile as it was"; return 1; fi
+    grep -F "\"$HX_TAG\"" "$new" >/dev/null || { echo "control: the rewritten dotfile does not name the tag $HX_TAG"; cat "$new"; return 1; }
+    python3 - "$HX/home/tapectl.db" "$(sha256sum <"$first" | cut -c1-64)" "$(sha256sum <"$new" | cut -c1-64)" <<'PY' || return 1
+import sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+h_first, h_new = sys.argv[2], sys.argv[3]
+def q(sql, *a): return c.execute(sql, a).fetchall()
+sets = [i for (i,) in q("""SELECT ss.id FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+    JOIN units u ON u.id = s.unit_id WHERE u.name = 'hx-tag' AND s.version = 1 ORDER BY ss.id""")]
+assert len(sets) == 2, f"hx-tag v1 has stage sets {sets}, want two: the version was not staged again"
+assert q("SELECT COUNT(*) FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = 'hx-tag'")[0][0] == 1, "the tag minted a new version"
+written = dict(q("""SELECT v.label, w.stage_set_id FROM writes w JOIN volumes v ON v.id = w.volume_id
+    JOIN snapshots s ON s.id = w.snapshot_id JOIN units u ON u.id = s.unit_id
+    WHERE u.name = 'hx-tag' AND w.status = 'completed'"""))
+assert written == {"HX-0001": sets[0], "HX-0002": sets[1]}, f"hx-tag's writes {written}, want HX-0001 from set {sets[0]} and HX-0002 from {sets[1]}"
+dot = dict(q("""SELECT sf.stage_set_id, lower(hex(sf.sha256)) FROM stage_files sf JOIN paths p ON p.id = sf.path_id
+    WHERE p.path = '.tapectl-unit.toml' AND sf.stage_set_id IN (?, ?)""", *sets))
+assert dot == {sets[0]: h_first, sets[1]: h_new}, f"the dotfile's sha256 in each staging's table: {dot}, want {h_first} then {h_new}"
+print(f"hx-tag v1 staged as sets {sets}; HX-0001 from the first, HX-0002 from the second; each table states its own dotfile")
+PY
+    sp_load HX-0002 || return 1
+    out="$(hx_sh "$HX/heir2" --restore --unit hx-tag --key "$HX_KEY" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 20
+    [ "$rc" -eq 0 ] || { echo "heir_restage_dotfile: HX-0002's restore of hx-tag exited $rc, want 0"; return 1; }
+    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "heir_restage_dotfile: no RESTORE COMPLETE"; return 1; }
+    grep -E "File check: all [1-9][0-9]* regular file\\(s\\) match the sha256 in the unit's file table\\." >/dev/null <<<"$out" \
+        || { echo "heir_restage_dotfile: no file-check match line"; return 1; }
+    [ ! -e "$d/.tapectl-damaged-files.txt" ] || { echo "heir_restage_dotfile: a damaged-file list:"; cat "$d/.tapectl-damaged-files.txt"; return 1; }
+    diff -r "$HX/src/hx-tag" "$d" || { echo "heir_restage_dotfile: the restored tree differs from the source"; return 1; }
+    cmp "$new" "$d/.tapectl-unit.toml" || { echo "heir_restage_dotfile: the restored dotfile is not the new one"; return 1; }
+    if cmp -s "$first" "$d/.tapectl-unit.toml"; then echo "heir_restage_dotfile: the restored dotfile is the first one"; return 1; fi
+}
+check heir_restage_dotfile step_heir_restage_dotfile
+
 # The gate's own cartridge back in the drive. When every span check passed, the leg's bulk
 # (sources, staging, restored trees) is removed and the logs, JSON reports and catalogs stay;
 # after a failure all of it is kept, so the failure can be read from what it left.
@@ -4200,7 +4331,7 @@ PY
 check lbp_page_clear_after_every_command step_lbp_page_clear_after_every_command
 
 # ---------- the checks the gate must have run, by name ----------
-# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 80). The verdict compares the run to this
+# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 81). The verdict compares the run to this
 # list by NAME, never by a total: a check named here that did not run is a FAIL (a leg that was
 # edited out, or a run that stopped early, cannot read GREEN), and so is a check that ran and is
 # not named here. TAPECTL_GATE_SPAN_ONLY judges the span_* names alone.
@@ -4219,7 +4350,7 @@ GATE_EXPECTED_CHECKS=(
     heir_xz_path heir_zstd_restore heir_zstd_path span_rows span_heir_tapes_1_3 span_heir_tape_2
     span_heir_stream_swap span_heir_start_later span_heir_second_run span_heir_not_have
     span_restore_unit span_retire_floors span_floor_target_1 span_rebuild_tape_3
-    span_three_tapes span_heir_wrong_cartridge rust_e2e rust_motions rust_lbp perf_write_2g
+    span_three_tapes span_heir_wrong_cartridge heir_restage_dotfile rust_e2e rust_motions rust_lbp perf_write_2g
     lbp_page_clear_after_every_command
 )
 
