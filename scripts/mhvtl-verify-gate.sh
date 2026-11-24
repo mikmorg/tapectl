@@ -15,7 +15,8 @@
 #      heir_restage_dotfile (#528) restores, from its own tape, a unit staged again after `unit tag`
 #      rewrote its dotfile (a home of its own, on two of the span leg's cartridges). In the same
 #      home, heir_inner_tar (#556) loses the first slice of a tar file's run: none of the inner
-#      archive's members is extracted.
+#      archive's members is extracted; heir_lost_link_target (#556) loses a hard link's first name:
+#      both names are listed.
 #   3. Negative leg: cross-tenant decrypt must fail; raw media must not
 #      contain plaintext canaries or a plaintext tar stream
 #   4. Evidence leg: verify must leave a verification_sessions row (ADR-0001)
@@ -49,8 +50,8 @@
 # heir_restore_symlinks, and added heir_verify, heir_list, heir_path, heir_find_path,
 # heir_long_member, span_heir_start_later, span_heir_second_run, span_heir_not_have and
 # heir_{gzip,xz,zstd}_{restore,path}: 78 checks. The open issues before 2.0.0's tag added
-# heir_restore_tmpdir (#561), span_heir_wrong_cartridge (#521), heir_restage_dotfile (#528) and
-# heir_inner_tar (#556): 82.
+# heir_restore_tmpdir (#561), span_heir_wrong_cartridge (#521), heir_restage_dotfile (#528),
+# heir_inner_tar and heir_lost_link_target (#556): 83.
 # #400 is not exercisable on mhvtl, see its section.
 #
 # The tools it names: tar (GNU tar 1.35, built with ACL support, is the writer's floor; the
@@ -4237,6 +4238,58 @@ PY
 }
 check heir_inner_tar step_heir_inner_tar
 
+# heir_lost_link_target (#556 b; volume-format-v3.md 1.6 and 7.2: a link member is fed only when its
+# target's member is): hx-link's b-first.bin is the first name of a hard link whose other name,
+# d-link.bin, is an h member in a later, intact slice. b-first.bin's slice is made bad as it is
+# read. RESTORE.sh's members_in_slices lists a hard-linked name whose first name begins in a slice
+# left out ("tar cannot make it"), and its file check covers h rows: both names are listed damaged,
+# neither is on disk, the other files are whole, and the run ends RESTORE INCOMPLETE: 2 path(s),
+# exit 1 (tests/heir_restore.rs a_bad_slice_is_left_out_its_files_are_listed_and_the_rest_restores,
+# tests/heir_restore_s6.rs a_fresh_no_file_check_restore_lists_a_hard_link_whose_first_name_was_not_read).
+# The rows (f in a slice past the first, h -> b-first.bin in another) are asked of --list. The
+# control: with no fault the two names come back as one file.
+step_heir_lost_link_target() {
+    local d out rc k s b t kh sh bh th sa sc bad a c x
+    hx_prepare || return 1
+    sp_load HX-0001 || return 1
+    read -r k s b t < <(hx_list_row "$HX/heir1" hx-link b-first.bin)
+    read -r kh sh bh th < <(hx_list_row "$HX/heir1" hx-link d-link.bin)
+    read -r a sa x x < <(hx_list_row "$HX/heir1" hx-link a-pad.bin)
+    read -r a sc x x < <(hx_list_row "$HX/heir1" hx-link c-other.bin)
+    [ "$k" = f ] && [ -n "$s" ] && [ "$s" -gt 1 ] \
+        || { echo "heir_lost_link_target: b-first.bin is '$k $s' in hx-link's --list, want an f row past slice 1 (the root's and the dotfile's)"; return 1; }
+    # An h row states its target's size (volume-format-v3.md 1.6).
+    [ "$kh" = h ] && [ "$th" = b-first.bin ] && [ -n "$sh" ] && [ "$sh" != "$s" ] && [ "$bh" = "$b" ] \
+        || { echo "heir_lost_link_target: d-link.bin is '$kh $sh $bh -> $th', want an h row to b-first.bin ($b bytes) in a slice other than $s"; return 1; }
+    [ -n "$sa" ] && [ -n "$sc" ] && [ "$sa" != "$s" ] && [ "$sc" != "$s" ] \
+        || { echo "heir_lost_link_target: a-pad.bin ($sa) or c-other.bin ($sc) shares slice $s with b-first.bin"; return 1; }
+    bad="$(gate_slice_pos "$HX/home/tapectl.db" HX-0001 hx-link "$s")"
+    [ -n "$bad" ] || { echo "heir_lost_link_target: no tape file for slice $s of hx-link on HX-0001"; return 1; }
+    # The control: no fault, the two names are one file.
+    d="$HX/heir1/link-clean"
+    out="$(hx_sh "$HX/heir1" --restore --unit hx-link --key "$HX_KEY" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 8
+    [ "$rc" -eq 0 ] && grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "control: hx-link with no fault exited $rc or is not complete"; return 1; }
+    diff -r "$HX/src/hx-link" "$d" || { echo "control: hx-link with no fault differs from the source"; return 1; }
+    a="$(stat -c %i "$d/b-first.bin")" && c="$(stat -c %i "$d/d-link.bin")" && [ "$a" = "$c" ] \
+        || { echo "control: b-first.bin and d-link.bin are two files after a clean restore"; return 1; }
+    # The first name's slice bad.
+    d="$HX/heir1/link-bad"
+    out="$(hx_sh_hooked "$HX/heir1" "$bad" "$HX/link.fault" "$HX/link.trace" --restore --unit hx-link --key "$HX_KEY" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 20
+    grep -Fx "flipped one byte of tape file $bad" "$HX/link.fault" >/dev/null \
+        || { echo "control: the stand-in did not flip a byte of tape file $bad, so the run proves nothing"; return 1; }
+    [ "$rc" -eq 1 ] || { echo "heir_lost_link_target: exited $rc with slice $s bad, want 1"; return 1; }
+    grep -F "RESTORE INCOMPLETE: 2 path(s)" >/dev/null <<<"$out" || { echo "heir_lost_link_target: no 'RESTORE INCOMPLETE: 2 path(s)'"; return 1; }
+    [ -f "$d/.tapectl-damaged-files.txt" ] && [ "$(tail -n +2 "$d/.tapectl-damaged-files.txt" | sort)" = "$(printf 'b-first.bin\nd-link.bin')" ] \
+        || { echo "heir_lost_link_target: the damaged-file list names '$(tail -n +2 "$d/.tapectl-damaged-files.txt" 2>/dev/null | tr '\n' ' ')', want exactly b-first.bin and d-link.bin"; return 1; }
+    for a in b-first.bin d-link.bin; do
+        [ ! -e "$d/$a" ] || { echo "heir_lost_link_target: $a is on disk although b-first.bin's slice was bad"; return 1; }
+    done
+    sp_partition "$HX/src/hx-link" "$d" b-first.bin d-link.bin || return 1
+}
+check heir_lost_link_target step_heir_lost_link_target
+
 # The gate's own cartridge back in the drive. When every span check passed, the leg's bulk
 # (sources, staging, restored trees) is removed and the logs, JSON reports and catalogs stay;
 # after a failure all of it is kept, so the failure can be read from what it left.
@@ -4414,7 +4467,7 @@ PY
 check lbp_page_clear_after_every_command step_lbp_page_clear_after_every_command
 
 # ---------- the checks the gate must have run, by name ----------
-# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 82). The verdict compares the run to this
+# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 83). The verdict compares the run to this
 # list by NAME, never by a total: a check named here that did not run is a FAIL (a leg that was
 # edited out, or a run that stopped early, cannot read GREEN), and so is a check that ran and is
 # not named here. TAPECTL_GATE_SPAN_ONLY judges the span_* names alone.
@@ -4433,7 +4486,8 @@ GATE_EXPECTED_CHECKS=(
     heir_xz_path heir_zstd_restore heir_zstd_path span_rows span_heir_tapes_1_3 span_heir_tape_2
     span_heir_stream_swap span_heir_start_later span_heir_second_run span_heir_not_have
     span_restore_unit span_retire_floors span_floor_target_1 span_rebuild_tape_3
-    span_three_tapes span_heir_wrong_cartridge heir_restage_dotfile heir_inner_tar rust_e2e rust_motions rust_lbp perf_write_2g
+    span_three_tapes span_heir_wrong_cartridge heir_restage_dotfile heir_inner_tar
+    heir_lost_link_target rust_e2e rust_motions rust_lbp perf_write_2g
     lbp_page_clear_after_every_command
 )
 
