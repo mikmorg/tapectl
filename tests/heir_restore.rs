@@ -6426,6 +6426,19 @@ fn a_slice_read_ahead_that_fails_has_the_verdict_of_a_read_made_then() {
     }
 }
 
+/// Is process `pid` running: there, and not a zombie? Where nothing reaps
+/// orphans (docker's PID 1 without `--init`), a killed tool stays a zombie,
+/// which holds no file open, the tape included.
+fn running(pid: u32) -> bool {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let state = s
+        .rfind(") ")
+        .and_then(|i| s[i + 2..].split_whitespace().next());
+    !matches!(state, None | Some("Z") | Some("X"))
+}
+
 /// The processes of a run still alive: each one whose environment names this
 /// run's directory tape and whose name is one of the tools a read runs.
 fn live_tools(h: &Heir) -> Vec<(u32, String)> {
@@ -6491,10 +6504,7 @@ fn a_kill_while_a_slice_is_read_ahead_leaves_no_process_of_it_behind() {
         })
         .expect("the read of slice 2 began");
     // Positive control: the read ahead runs, and the scan sees it.
-    assert!(
-        std::path::Path::new(&format!("/proc/{dd_pid}")).exists(),
-        "the read of tape file {p} is running"
-    );
+    assert!(running(dd_pid), "the read of tape file {p} is running");
     assert!(
         live_tools(&h).iter().any(|(pid, _)| *pid == dd_pid),
         "{:?}",
@@ -6504,7 +6514,7 @@ fn a_kill_while_a_slice_is_read_ahead_leaves_no_process_of_it_behind() {
     let o = r.finish();
     assert_eq!(o.code, 143, "{}", o.all());
     assert!(
-        !std::path::Path::new(&format!("/proc/{dd_pid}")).exists(),
+        !running(dd_pid),
         "the read ahead's dd ({dd_pid}) is gone when the run has ended: {}",
         o.all()
     );
@@ -6557,7 +6567,7 @@ fn a_read_ahead_in_flight_before_a_swap_ends_before_the_prompt() {
                     })
                     .unwrap();
                 assert!(
-                    !std::path::Path::new(&format!("/proc/{dd_pid}")).exists(),
+                    !running(dd_pid),
                     "the read ahead of slice 3 has ended at the prompt"
                 );
                 assert_eq!(live_tools(&h), vec![], "{text}");
