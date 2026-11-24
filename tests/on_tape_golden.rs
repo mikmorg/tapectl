@@ -2215,11 +2215,11 @@ where the tape is restored:
   owner, the ACL nor any extended attribute, and does not say so.
 - The ID MAP says who the numbers were: for each unit, the names the
   computer that wrote the tape gave each user and group number its files
-  carry (or none). The map always holds the numbers. It holds a name only
-  where the writing computer's `/etc/passwd` or `/etc/group` had one:
-  tapectl's released program finds names in those two files and in no
-  directory service, so a name from LDAP, sssd or systemd's dynamic users
-  is recorded empty. RESTORE.sh prints it after each unit it restores,
+  carry (or none). The map always holds the numbers. tapectl's released
+  program reads names from `/etc/passwd` and `/etc/group` only (and from an
+  `nscd`, where one runs), so a name that only a directory service (LDAP,
+  sssd) or systemd's dynamic users would give is recorded empty unless an
+  `nscd` answers for it. RESTORE.sh prints it after each unit it restores,
   headed "Who the ids were", and it is the file `tables/NAME.ids.tsv` in
   your envelope. It is information: a restore shows it and never acts on it.
 - A tar restores a file's contents, its times and its permission bits as
@@ -4127,11 +4127,11 @@ where the tape is restored:
   owner, the ACL nor any extended attribute, and does not say so.
 - The ID MAP says who the numbers were: for each unit, the names the
   computer that wrote the tape gave each user and group number its files
-  carry (or none). The map always holds the numbers. It holds a name only
-  where the writing computer's `/etc/passwd` or `/etc/group` had one:
-  tapectl's released program finds names in those two files and in no
-  directory service, so a name from LDAP, sssd or systemd's dynamic users
-  is recorded empty. RESTORE.sh prints it after each unit it restores,
+  carry (or none). The map always holds the numbers. tapectl's released
+  program reads names from `/etc/passwd` and `/etc/group` only (and from an
+  `nscd`, where one runs), so a name that only a directory service (LDAP,
+  sssd) or systemd's dynamic users would give is recorded empty unless an
+  `nscd` answers for it. RESTORE.sh prints it after each unit it restores,
   headed "Who the ids were", and it is the file `tables/NAME.ids.tsv` in
   your envelope. It is information: a restore shows it and never acts on it.
 - A tar restores a file's contents, its times and its permission bits as
