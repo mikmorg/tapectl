@@ -492,9 +492,12 @@ extract_restore_sh() { # <dir>: RESTORE.sh off the loaded tape, as File 1 tells 
     chmod +x "$1/RESTORE.sh"
     bash -n "$1/RESTORE.sh" || fail "the RESTORE.sh read off the tape does not parse"
 }
+# RESTORE.sh reads its answers from standard input, so it is given /dev/null: a prompt (a
+# cartridge this run cannot give, as for the left-over unit) is answered at once by the end of
+# input, never by whatever terminal launched the run (T6.6 Run 3 waited 3 h at one under tmux).
 heir() { # <name> <expected rc> <RESTORE.sh args...>
     local name="$1" want="$2"; shift 2
-    run "$name" "$want" env TAPE_DEVICE="$TAPE_DEV" TMPDIR="$RUN/tmp" "$HEIR_DIR/RESTORE.sh" "$@"
+    run "$name" "$want" env TAPE_DEVICE="$TAPE_DEV" TMPDIR="$RUN/tmp" "$HEIR_DIR/RESTORE.sh" "$@" </dev/null
 }
 
 # ============================================================
