@@ -176,24 +176,25 @@ cleanup() {
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
     # The work directory is made in --to by default, and taking it out moves
     # that directory's modification time: tar has just given the unit's root
-    # its recorded one (ADR-0012 item 303). A reference file keeps it.
-    local ref=""
-    if [ -n "$WORK_MADE_IN" ] && [ -d "$WORK_MADE_IN" ]; then
-      ref=$(mktemp "${TMPDIR:-/tmp}/.tapectl-mtime.XXXXXX" 2>/dev/null) || ref=""
-      if [ -n "$ref" ] && ! touch -r "$WORK_MADE_IN" "$ref" 2>/dev/null; then
-        rm -f "$ref" 2>/dev/null || true
-        ref=""
-      fi
-    fi
+    # its recorded one (ADR-0012 item 303). A reference file keeps it, made
+    # INSIDE the work directory (nothing is written outside it: #561, item
+    # 271) and held open on fd 8 while the directory is removed; touch then
+    # reads it through /proc/self/fd/8, as the last step, to the nanosecond.
+    local held=0
     chmod -R u+rwx "$WORK" 2>/dev/null || true
+    if [ -n "$WORK_MADE_IN" ] && [ -d "$WORK_MADE_IN" ] && [ -d /proc/self/fd ] &&
+      touch -r "$WORK_MADE_IN" "$WORK/.mtime.ref" 2>/dev/null &&
+      { exec 8<"$WORK/.mtime.ref"; } 2>/dev/null; then
+      held=1
+    fi
     if ! rm -rf "$WORK" 2>/dev/null; then
       # The restored root may have been given a mode that forbids it.
       chmod u+w "$WORK_MADE_IN" 2>/dev/null || true
       rm -rf "$WORK" 2>/dev/null || warn "could not remove the work directory $WORK"
     fi
-    if [ -n "$ref" ]; then
-      touch -r "$ref" "$WORK_MADE_IN" 2>/dev/null || true
-      rm -f "$ref" 2>/dev/null || true
+    if [ "$held" = 1 ]; then
+      touch -r /proc/self/fd/8 "$WORK_MADE_IN" 2>/dev/null || true
+      exec 8<&-
     fi
   fi
   exit "$rc"
@@ -448,6 +449,10 @@ make_work() {
   WORK_MADE_IN=$parent
   WORK="$(mktemp -d "$parent/.tapectl-work.XXXXXX" 2>/dev/null)" ||
     die_io "cannot make a work directory in $(safe_str "$parent")" "" "$parent"
+  # Every temporary file of the run goes into the work directory from here
+  # on: bash's here-documents (made as files when large, or always by an older
+  # bash) and sort's spill files. TMPDIR decides nothing for a restore (#561).
+  export TMPDIR="$WORK"
 }
 
 # Is there room for $2 bytes in $1 (and $4 more in $3)? One message, naming
