@@ -3984,3 +3984,34 @@ restore).
      (`--no-file-check` gives that up, as it gives up the rest). Reading the next slice while
      the current one decrypts is left for later: it meets the rules that no tape device is held
      open at a prompt and that the work directory holds one slice's plain cut.
+
+## Amendment, 2026-11-24 (later): RESTORE.sh reads the next slice while one decrypts
+
+Ruled 2026-11-24. Item 308's change was timed on home2's real drive over 747 files
+(31,241,841,452 bytes, a named-path restore from Run 4's cartridge): 1,398 s before it,
+1,109 s after it, the same bytes restored by both. The drive still stopped at every slice
+while the slice decrypted, so the CTO chose to carry reading the next slice ahead in 2.0.0
+too.
+
+309. **RESTORE.sh's sha256 pin moves again**, from `6e151249…2b0f7f` (item 308) to
+     `0c6c721d…df72c42`, under item 243's on-tape authorization, for this change alone. Once
+     slice k's encrypted copy has passed its length and the front index's hash, the slice to
+     be fed next is read off the tape into the work directory by a job of the script's own
+     while k decrypts. This holds only for the next slice of a whole unit, or the next slice a
+     named path or continued member needs. That slice must be on the cartridge in the drive,
+     not already found bad, and its file must be the one the manifest and the front index
+     agree on. Only one slice is read ahead, never after quit is answered, and only when the
+     work directory has room at that moment, by `df`, for k's plain cut, the next encrypted
+     copy and a block. The read is judged when the slice is asked for, by the same checks and
+     words as a read made then. Every other slice asked for, the end of each feed, every
+     prompt and every way out first wait for the job or stop it (in a process group of its
+     own) and remove its copy. So item 267 and the rule that no tape device is open at a
+     prompt hold as before. The space check still asks for one slice twice, as RECOVERY.md
+     says: without the room, the script reads one slice at a time, prints nothing, and gives
+     no verdict. No other pinned text moves. Item 308's last sentence, which left this for
+     later, is superseded.
+     Two readings the coordinator made, for the CTO to overrule: the space check stays at
+     twice and the read ahead is skipped when the room is short, rather than RECOVERY.md's
+     text moving to three times (a second on-tape text for a speed gain); and the job runs
+     in its own process group (`set -m`), so a KILL sent to the script's group alone does
+     not reach a read already under way. Such a read ends when its slice has been read.
