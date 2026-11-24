@@ -707,7 +707,7 @@ ahead_wait() { # <slice>
   [ -n "$AHEAD_PID" ] || return 1
   wait "$AHEAD_PID" 2>/dev/null || rc=$?
   AHEAD_PID=""
-  read -r got st <"$WORK/ahead.rc" 2>/dev/null || true
+  if [ -f "$WORK/ahead.rc" ]; then read -r got st <"$WORK/ahead.rc" || true; fi
   [ "$rc" = 0 ] && [ "$got" = "$1" ] && is_uint "$st" || return 1
   FH_RC=$st
   FH_MSG=$(cat "$WORK/ahead.msg" 2>/dev/null || true)
@@ -2548,14 +2548,15 @@ restore_one() { # <chosen row> <destination>
     fi
     die "$(safe_str "$dest") is not empty and holds no damaged-file list, so it is not an earlier run of this unit that stopped short. $(units_with_lists)Restore into an empty or new directory, or give --overwrite to replace files that are there."
   fi
-  # Space: the unit's files, and one slice twice (the cut, and its plain form).
+  # Space: the unit's files, and one slice three times (its cut, its plain
+  # form, and the next slice's cut, read while it decrypts).
   local files_bytes biggest=0 k
   files_bytes=$(awk -F'\t' '!/^#/ && $1 == "f" { s += $5 } END { printf "%.0f", s }' "$table")
   for ((k = 1; k <= NSL; k++)); do
     if is_uint "${SL_SIZE[$k]}" && [ "${SL_SIZE[$k]}" -gt "$biggest" ]; then biggest=${SL_SIZE[$k]}; fi
     if is_uint "${SL_ENC[$k]}" && [ "${SL_ENC[$k]}" -gt "$biggest" ]; then biggest=${SL_ENC[$k]}; fi
   done
-  check_space "unit $(safe_str "$name") needs its files, and the work directory one slice twice" "$dest" "$files_bytes" "$WORK" $((2 * biggest + BLOCK))
+  check_space "unit $(safe_str "$name") needs its files, and the work directory one slice three times" "$dest" "$files_bytes" "$WORK" $((3 * biggest + BLOCK))
   say ">>> Unit $(safe_str "$name") version $ver: $NSL slice(s), $sb bytes of stream, into $dest"
   : >"$WORK/bad.slices"
   rm -f "$WORK/fatal.flag"
@@ -2961,7 +2962,7 @@ restore_paths() { # <destination> <how>
     if is_uint "${SL_SIZE[$k]}" && [ "${SL_SIZE[$k]}" -gt "$biggest" ]; then biggest=${SL_SIZE[$k]}; fi
     if is_uint "${SL_ENC[$k]}" && [ "${SL_ENC[$k]}" -gt "$biggest" ]; then biggest=${SL_ENC[$k]}; fi
   done
-  check_space "the named paths of unit $(safe_str "$U_NAME") need their files, and the work directory one slice twice" "$dest" "$files_bytes" "$WORK" $((2 * biggest + BLOCK))
+  check_space "the named paths of unit $(safe_str "$U_NAME") need their files, and the work directory one slice three times" "$dest" "$files_bytes" "$WORK" $((3 * biggest + BLOCK))
   say ">>> Unit $(safe_str "$U_NAME") version $U_VER: $npaths path(s) by the file table, into $dest"
   if [ -s "$WORK/brought.paths" ]; then
     note "$(wc -l <"$WORK/brought.paths" | tr -d ' ') hard link(s) among them are made from the first name of the file, which is restored first and is checked too."
