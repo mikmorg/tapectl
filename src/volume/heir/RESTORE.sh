@@ -141,6 +141,14 @@ TAR_OPEN=0       # 1 while tar's input (fd 4) is open
 FEEDING=0        # the slice being prepared or fed
 INFLIGHT_DEST="" # where, and from which table, a signal's cleanup looks for a partial member
 INFLIGHT_TABLE=""
+# The read ahead (one slice, on the cartridge in the drive): the slice and tape
+# file it reads, the process id of its job while it is not yet waited for, and
+# 1 when the drive could not be brought to the file.
+AHEAD_K=""
+AHEAD_POS=""
+AHEAD_PID=""
+AHEAD_SEEK=0
+NEXT_WANT="" # the slice the caller asks for after this one, when it is good
 umask 077 # decrypted plaintext is not world-readable
 
 # ---- messages and the way out ----
@@ -156,8 +164,10 @@ say() { printf '%s\n' "$*"; }
 cleanup() {
   local rc=$?
   trap - EXIT
-  # Order: tar's input is closed and tar ends, a member it had begun is
-  # removed (the member being fed when a signal came), then the work directory.
+  # Order: a read ahead is stopped, tar's input is closed and tar ends, a
+  # member it had begun is removed (the member being fed when a signal came),
+  # then the work directory.
+  ahead_kill || true
   tar_close 300 || true
   scrub_inflight || true
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
@@ -542,8 +552,8 @@ seek_to() { # <tape file>: the head at its start, or 1
   CUR=$pos
 }
 
-dd_detail() {
-  { grep -v -e 'records in$' -e 'records out$' -e 'bytes.*copied' "$WORK/dd.err" 2>/dev/null | tail -n 2; } || true
+dd_detail() { # [file of dd's words]
+  { grep -v -e 'records in$' -e 'records out$' -e 'bytes.*copied' "${1:-$WORK/dd.err}" 2>/dev/null | tail -n 2; } || true
 }
 
 # Read tape file $1 into file $2, at most $3 bytes of it (all of it when $3 is
@@ -583,31 +593,177 @@ fetch() { # <tape file> <out> [<bytes>]
 FETCH_SHA=""
 FETCH_GOT=""
 fetch_hashed() { # <tape file> <out> <bytes>
-  local pos=$1 out=$2 size=$3 msg="" rc=0 sum=""
+  local pos=$1 out=$2 size=$3
   FETCH_SHA=""
   FETCH_GOT=""
   rm -f "$WORK/stream.sha"
   seek_to "$pos" || return 1
   CUR=""
-  msg=$({ dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | {
-    head -c "$size" | tee "$out" | sha256sum >"$WORK/stream.sha"
+  read_hashed "$size" "$out" "$WORK/dd.err" "$WORK/stream.sha"
+  judge_hashed "$pos" "$out" "$WORK/dd.err" "$WORK/stream.sha"
+}
+
+# The read itself, from the head (at the start of the file): its first $1
+# bytes into $2 and their hash into $4 as they stream, dd's words in $3. What
+# the tools said is left in FH_MSG and the pipeline's status in FH_RC. The
+# read ahead runs this alone, in a job of its own.
+FH_MSG=""
+FH_RC=0
+read_hashed() { # <bytes> <out> <file for dd's words> <file for the hash>
+  FH_MSG=""
+  FH_RC=0
+  FH_MSG=$({ dd if="$DEVICE" bs="$BLOCK" 2>"$3" | {
+    head -c "$1" | tee "$2" | sha256sum >"$4"
     cat >/dev/null
-  }; } 2>&1) || rc=$?
+  }; } 2>&1) || FH_RC=$?
+}
+
+# fetch_hashed's verdict on what read_hashed left (FH_MSG, FH_RC and the
+# files), wherever it ran.
+judge_hashed() { # <tape file> <out> <file of dd's words> <file of the hash>
+  local pos=$1 out=$2 sum=""
   # The copy is written by tee, whose status (and head's) the group's last
   # command (cat) hides: what they said is read from their words.
-  if is_full_text "$msg $(cat "$WORK/dd.err" 2>/dev/null || true)"; then
-    die_io "reading tape file $pos into the work directory failed" "$msg" "$WORK"
+  if is_full_text "$FH_MSG $(cat "$3" 2>/dev/null || true)"; then
+    die_io "reading tape file $pos into the work directory failed" "$FH_MSG" "$WORK"
   fi
-  if [ "$rc" -ne 0 ] || [ -n "$msg" ]; then
-    note "reading tape file $pos failed: ${msg:-$(dd_detail)}"
+  if [ "$FH_RC" -ne 0 ] || [ -n "$FH_MSG" ]; then
+    note "reading tape file $pos failed: ${FH_MSG:-$(dd_detail "$3")}"
     return 1
   fi
   [ -s "$out" ] || return 1
   CUR=$((pos + 1))
-  sum=$(cat "$WORK/stream.sha" 2>/dev/null || true)
+  sum=$(cat "$4" 2>/dev/null || true)
   sum=${sum%% *}
   FETCH_SHA=${sum#\\}
   FETCH_GOT=$({ wc -c <"$out"; } 2>/dev/null | tr -d ' ' || true)
+}
+
+# ---- the read ahead: the next slice comes off the tape while one decrypts ----
+
+# One slice ahead, and only on the cartridge in the drive: once slice k's
+# encrypted copy has passed its hash, the slice the caller asks for next is
+# read into slice.enc.next by a job of its own while k is decrypted and fed
+# (ahead_next). When that slice is asked for, the job is waited for and its
+# read is judged by the same words as a read made then (ahead_take). Any
+# other slice asked for, the end of a feed, and every prompt find the job
+# waited for and its copy removed first (ahead_drop), so no tape device is
+# open and no slice file waits at a prompt; the way out stops it (ahead_kill).
+# The job writes only its own files: what its tools said (ahead.msg), dd's
+# words (ahead.dd), the hash (ahead.sha), and last its slice and status
+# (ahead.rc). The drive is brought to the file here, before the job starts,
+# so CUR and seek_to's notes stay in this shell.
+ahead_job() { # <slice> <bytes>
+  trap - EXIT INT HUP TERM
+  read_hashed "$2" "$WORK/slice.enc.next" "$WORK/ahead.dd" "$WORK/ahead.sha"
+  printf '%s' "$FH_MSG" >"$WORK/ahead.msg"
+  echo "$1 $FH_RC" >"$WORK/ahead.rc"
+}
+
+ahead_clear() {
+  rm -f "$WORK/slice.enc.next" "$WORK/ahead.msg" "$WORK/ahead.dd" "$WORK/ahead.sha" "$WORK/ahead.rc"
+  AHEAD_K=""
+  AHEAD_POS=""
+  AHEAD_SEEK=0
+}
+
+# Begin reading slice $1, NEXT_WANT as the caller set it, when the caller
+# will ask for it next and a read then would reach the tape: it is on the
+# cartridge in the drive, not already found bad, and its file is the one the
+# manifest and the front index agree on (prepare_slice's checks before a
+# read). Never more than one, and never once quit was answered.
+ahead_next() { # <slice>
+  local n=${1:-} p
+  [ -z "$AHEAD_K" ] && [ "$QUIT" = 0 ] && is_uint "$n" && [ "$n" -ge 1 ] && [ "$n" -le "$NSL" ] || return 0
+  p=${SL_HERE[$n]:-}
+  [ -n "$p" ] || return 0
+  if awk -F'|' -v k="$n" '($1 + 0) == (k + 0) { f = 1 } END { exit f ? 0 : 1 }' "$WORK/bad.slices" 2>/dev/null; then
+    return 0
+  fi
+  [ "$(file_type_at "$p" "$FILES_TXT")" = data_slice ] &&
+    [ "$(file_size_at "$p" "$FILES_TXT")" = "${SL_ENC[$n]}" ] &&
+    [ "$(file_hash_at "$p" "$FILES_TXT")" = "${SL_SHAE[$n]}" ] || return 0
+  ahead_clear
+  AHEAD_K=$n
+  AHEAD_POS=$p
+  if ! seek_to "$p"; then
+    # The verdict of a read that cannot begin, kept for when it is asked for.
+    AHEAD_SEEK=1
+    return 0
+  fi
+  CUR=""
+  # A process group of its own (set -m), so that the way out can stop the job
+  # and every tool in it. It holds no descriptor of tar's input (4) or of the
+  # unit list (3), and reads nothing from the heir.
+  set -m
+  (ahead_job "$n" "${SL_ENC[$n]}") </dev/null >/dev/null 2>/dev/null 3<&- 4>&- &
+  AHEAD_PID=$!
+  set +m
+}
+
+# Wait for the job; 0 when it left the outcome of slice $1's read.
+ahead_wait() { # <slice>
+  local rc=0 got="" st=""
+  [ -n "$AHEAD_PID" ] || return 1
+  wait "$AHEAD_PID" 2>/dev/null || rc=$?
+  AHEAD_PID=""
+  read -r got st <"$WORK/ahead.rc" 2>/dev/null || true
+  [ "$rc" = 0 ] && [ "$got" = "$1" ] && is_uint "$st" || return 1
+  FH_RC=$st
+  FH_MSG=$(cat "$WORK/ahead.msg" 2>/dev/null || true)
+}
+
+# The read ahead is not wanted (another slice is asked for, a feed ends, a
+# prompt comes): it is waited for and its copy removed. The head is where the
+# read left it: after the file when it read whole, unknown otherwise.
+ahead_drop() {
+  [ -n "$AHEAD_K" ] || return 0
+  CUR=""
+  if ahead_wait "$AHEAD_K" && [ "$FH_RC" = 0 ] && [ -z "$FH_MSG" ] && [ -s "$WORK/slice.enc.next" ]; then
+    CUR=$((AHEAD_POS + 1))
+  fi
+  ahead_clear
+}
+
+# Slice $1, asked for, from its read ahead: fetch_hashed's verdict, in the
+# same words. A job that left no outcome (it could not write one) is no
+# verdict: the slice is read again here, as it would have been.
+ahead_take() { # <slice> <tape file>
+  local k=$1 pos=$2 rc=0
+  FETCH_SHA=""
+  FETCH_GOT=""
+  CUR=""
+  if [ "$AHEAD_SEEK" = 1 ]; then
+    ahead_clear
+    return 1
+  fi
+  if ! ahead_wait "$k" || { [ -e "$WORK/slice.enc.next" ] && ! mv -f "$WORK/slice.enc.next" "$WORK/slice.enc" 2>/dev/null; }; then
+    ahead_clear
+    rm -f "$WORK/slice.enc"
+    fetch_hashed "$pos" "$WORK/slice.enc" "${SL_ENC[$k]}"
+    return
+  fi
+  judge_hashed "$pos" "$WORK/slice.enc" "$WORK/ahead.dd" "$WORK/ahead.sha" || rc=$?
+  ahead_clear
+  return "$rc"
+}
+
+# The way out: the job and every tool in its process group are stopped, and
+# waited for until none is left, before the work directory is removed. Its
+# process id is one this shell has not yet waited for, so it is still the
+# job's own.
+ahead_kill() {
+  local n=0
+  if [ -n "$AHEAD_PID" ]; then
+    kill -TERM -- "-$AHEAD_PID" 2>/dev/null || kill -TERM "$AHEAD_PID" 2>/dev/null || true
+    wait "$AHEAD_PID" 2>/dev/null || true
+    while kill -0 -- "-$AHEAD_PID" 2>/dev/null && [ "$n" -lt 600 ]; do
+      sleep 0.1 2>/dev/null || sleep 1
+      n=$((n + 1))
+    done
+    AHEAD_PID=""
+  fi
+  AHEAD_K=""
 }
 
 # sha256 of tape file $1, its first $2 bytes (all when empty), hashed as it
@@ -1812,11 +1968,19 @@ absent_follows() { # <slice> <slice it follows>
 # and hash of the cut, after decompression). Each hash is taken as the bytes
 # stream into the work directory, and each copy's length is checked beside
 # it. Nothing the tape or age or a decompressor says about its own exit
-# status is the verdict; the lengths and hashes are.
+# status is the verdict; the lengths and hashes are. Once the encrypted copy
+# has passed, the slice the caller asks for next (NEXT_WANT) is read ahead
+# while this one decrypts.
 prepare_slice() { # <slice number>
-  local k=$1 pos="${SL_HERE[$1]:-}" enc=${SL_ENC[$1]} arc="" got="" text="" why="" want_h rc=0 msg="" sum=""
+  local k=$1 pos="${SL_HERE[$1]:-}" enc=${SL_ENC[$1]} arc="" got="" text="" why="" want_h rc=0 msg="" sum="" next=${NEXT_WANT:-}
+  NEXT_WANT=""
   rm -f "$WORK/slice.enc" "$WORK/slice.plain" "$WORK/age.rc"
   FEEDING=$k
+  # A read ahead of another slice (or of this one where it no longer is) is
+  # not wanted: it ends here, before any prompt.
+  if [ -n "$AHEAD_K" ] && { [ "$AHEAD_K" != "$k" ] || [ "$AHEAD_POS" != "$pos" ] || [ "$QUIT" = 1 ]; }; then
+    ahead_drop
+  fi
   if [ -z "$pos" ] && [ "$QUIT" = 0 ]; then
     # The cartridge in the drive does not hold it: ask for the one that does.
     swap_for "$k" || true
@@ -1835,10 +1999,17 @@ prepare_slice() { # <slice number>
   if [ "$(file_type_at "$pos" "$FILES_TXT")" != data_slice ] ||
     [ "$(file_size_at "$pos" "$FILES_TXT")" != "$enc" ] ||
     [ "$(file_hash_at "$pos" "$FILES_TXT")" != "${SL_SHAE[$k]}" ]; then
+    ahead_drop
     mark_bad "$k" "the manifest and the front index disagree about file $pos"
     return 1
   fi
-  if ! fetch_hashed "$pos" "$WORK/slice.enc" "$enc"; then
+  if [ -n "$AHEAD_K" ]; then
+    # It was read ahead: its verdict is the read's, as if it were made now.
+    if ! ahead_take "$k" "$pos"; then
+      mark_bad "$k" "the tape could not be read at file $pos"
+      return 1
+    fi
+  elif ! fetch_hashed "$pos" "$WORK/slice.enc" "$enc"; then
     mark_bad "$k" "the tape could not be read at file $pos"
     return 1
   fi
@@ -1853,6 +2024,7 @@ prepare_slice() { # <slice number>
   if [ "$FETCH_GOT" != "$enc" ]; then
     die_io "writing slice $k into the work directory failed" "the copy holds ${FETCH_GOT:-no} of the $enc bytes read from tape file $pos" "$WORK"
   fi
+  ahead_next "$next"
   # The plain cut is written by tee and hashed as it streams: slice.plain is
   # not read back to be hashed. tee's and sha256sum's words (a work directory
   # that cannot take the cut) are in msg; age's and the decompressor's in
@@ -1932,10 +2104,11 @@ feed_from() { # <slice number>
     while [ $((b + 1)) -le "$NSL" ] && [ "${SL_CONT[$((b + 1))]}" = true ]; do b=$((b + 1)); done
     k=$a
     while [ "$k" -le "$b" ]; do
+      # Slice k+1 is the one asked for next, whether k ends a run or not.
+      NEXT_WANT=$((k + 1))
       if prepare_slice "$k"; then
         if ! send_slice "$k"; then
-          echo "gone $k" >"$WORK/feed.state"
-          printf '%s\n' "$CUR" >"$WORK/feed.cur"
+          feed_end "gone $k"
           return 0
         fi
       else
@@ -1952,8 +2125,7 @@ feed_from() { # <slice number>
             mark_bad "$j" "part of a long member with a bad piece"
             absent_follows "$j" "$k"
           done
-          echo "resume $((b + 1)) $a" >"$WORK/feed.state"
-          printf '%s\n' "$CUR" >"$WORK/feed.cur"
+          feed_end "resume $((b + 1)) $a"
           return 0
         fi
       fi
@@ -1961,7 +2133,14 @@ feed_from() { # <slice number>
     done
     i=$((b + 1))
   done
-  echo "done" >"$WORK/feed.state"
+  feed_end "done"
+}
+
+# The end of a feed: a read ahead still running is waited for and its copy
+# removed, then the feed's state and the head's place are left for the caller.
+feed_end() { # <state>
+  ahead_drop
+  echo "$1" >"$WORK/feed.state"
   printf '%s\n' "$CUR" >"$WORK/feed.cur"
 }
 
@@ -2565,7 +2744,7 @@ load_members() { # <rows file>
 # The slice a member's part is cut from, prepared and still in slice.plain.
 HAVE_SLICE=""
 HAVE_RC=1
-need_slice() { # <slice number>: 0 when its plain cut is in slice.plain
+need_slice() { # <slice number> <member>: 0 when its plain cut is in slice.plain
   local k=$1
   if [ "$HAVE_SLICE" = "$k" ]; then return "$HAVE_RC"; fi
   rm -f "$WORK/slice.plain"
@@ -2575,8 +2754,25 @@ need_slice() { # <slice number>: 0 when its plain cut is in slice.plain
   if awk -F'|' -v k="$k" '($1 + 0) == (k + 0) { f = 1 } END { exit f ? 0 : 1 }' "$WORK/bad.slices"; then
     return 1
   fi
+  next_wanted "$k" "$2"
   if prepare_slice "$k"; then HAVE_RC=0; fi
   return "$HAVE_RC"
+}
+
+# NEXT_WANT: the slice need_slice is asked for after slice $1, member $2 being
+# fed, when $1 is good: the next slice of that member, or the first slice
+# after $1 of the next member that reaches past it (the members are in stream
+# order; those that end in $1 are cut from it as it is).
+next_wanted() { # <slice> <member>
+  local k=$1 j=$2
+  NEXT_WANT=""
+  while [ "$j" -le "$NM" ]; do
+    if [ "${M_LAST[$j]}" -gt "$k" ]; then
+      if [ "${M_SLICE[$j]}" -gt "$k" ]; then NEXT_WANT=${M_SLICE[$j]}; else NEXT_WANT=$((k + 1)); fi
+      return 0
+    fi
+    j=$((j + 1))
+  done
 }
 
 # Give tar the part of member $1 that lies in slice $2: bytes [from, to) of
@@ -2613,25 +2809,22 @@ feed_members() { # <member number>
     a=${M_SLICE[$j]}
     b=${M_LAST[$j]}
     for ((k = a; k <= b; k++)); do
-      if ! need_slice "$k"; then
+      if ! need_slice "$k" "$j"; then
         mark_left "$j"
         if [ "$k" -gt "$a" ]; then
-          echo "resume $((j + 1)) $j" >"$WORK/feed.state"
-          printf '%s\n' "$CUR" >"$WORK/feed.cur"
+          feed_end "resume $((j + 1)) $j"
           return 0
         fi
         break
       fi
       if ! emit_part "$j" "$k"; then
-        echo "gone $j" >"$WORK/feed.state"
-        printf '%s\n' "$CUR" >"$WORK/feed.cur"
+        feed_end "gone $j"
         return 0
       fi
     done
     j=$((j + 1))
   done
-  echo "done" >"$WORK/feed.state"
-  printf '%s\n' "$CUR" >"$WORK/feed.cur"
+  feed_end "done"
 }
 
 # $1 is the wanted paths (escaped, one a line, sorted) and $2 the unit's table.
