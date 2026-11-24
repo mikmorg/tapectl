@@ -10,7 +10,8 @@
 #      --unit/--all), --restore --path, --restore --paths-from (the one repair, from a second
 #      cartridge), --where, --find; and, for a unit that continues on another cartridge, one
 #      prompt (ENTER: loaded; done or end of input: "I do not have it"; quit). A unit stored with
-#      compression is read with the real gzip, xz or zstd.
+#      compression is read with the real gzip, xz or zstd. heir_restore_tmpdir (#561) restores
+#      with TMPDIR a directory the script cannot write: the work directory is made in --to.
 #   3. Negative leg: cross-tenant decrypt must fail; raw media must not
 #      contain plaintext canaries or a plaintext tar stream
 #   4. Evidence leg: verify must leave a verification_sessions row (ADR-0001)
@@ -43,7 +44,8 @@
 # heir_slice_from_copy to heir_paths_from_copy and heir_restore_symlink_unit to
 # heir_restore_symlinks, and added heir_verify, heir_list, heir_path, heir_find_path,
 # heir_long_member, span_heir_start_later, span_heir_second_run, span_heir_not_have and
-# heir_{gzip,xz,zstd}_{restore,path}: 78 checks. #400 is not exercisable on mhvtl, see its section.
+# heir_{gzip,xz,zstd}_{restore,path}: 78 checks. The open issues before 2.0.0's tag added
+# heir_restore_tmpdir (#561): 79. #400 is not exercisable on mhvtl, see its section.
 #
 # The tools it names: tar (GNU tar 1.35, built with ACL support, is the writer's floor; the
 # config it writes names [tar] binary, never [dar]), age, gzip, xz, zstd (the heir's real
@@ -1229,6 +1231,70 @@ step_heir_restore_symlinks() {
         [ "$(readlink "$dest/$l")" = "$(readlink "$SRC/unitC/$l")" ] || { echo "heir_restore_symlinks: $l points elsewhere"; return 1; }
     done
 }
+#  - tar: the real tar (REAL_TAR), after it appends to WATCH_LOG its arguments ("ARGV ...") and
+#    what WATCH_DEST and WATCH_TMP hold at that moment ("DEST <name>", "TMP <name>", one a line):
+#    where the script's work directory is while it runs (the_work_directory_is_made_inside_to_and_
+#    work_replaces_it in tests/heir_restore.rs reads it the same way).
+heir_write_watcher() { # heir_write_watcher <path of the tar to write>
+    cat >"$1" <<'WATCH'
+#!/bin/bash
+{
+  printf 'ARGV'; printf ' %s' "$@"; printf '\n'
+  [ ! -d "$WATCH_DEST" ] || ls -A -- "$WATCH_DEST" | sed 's/^/DEST /'
+  ls -A -- "$WATCH_TMP" | sed 's/^/TMP /'
+} >>"$WATCH_LOG" 2>&1
+exec "$REAL_TAR" "$@"
+WATCH
+    chmod +x "$1"
+}
+# heir_restore_tmpdir (#561; ADR-0012 items 270-271): heir_restore's case, unitA whole, with TMPDIR
+# set, for the RESTORE.sh process only, to a directory the script cannot write. The work directory
+# is made inside --to (the tar stand-in above sees it there while tar runs, and the envelope's tar
+# is given a -C inside it), TMPDIR decides nothing, and nothing is written under it. The restored
+# root keeps the root member's recorded mtime (ADR-0012 item 303; tests/heir_restore_s6.rs
+# an_empty_to_gets_the_unit_roots_recorded_mode_and_mtime) as heir_restore's tree does: the
+# control for that check is heir_restore's own tree.
+step_heir_restore_tmpdir() {
+    local d="$HEIR/recovered-tmpdir" ro="$HEIR/tmpdir-unwritable" log="$RUN/heir-tmpdir.watch" out rc before after want
+    heir_hook_ready && mkdir -p "$HEIR_HOOK/tar-watch" && heir_write_watcher "$HEIR_HOOK/tar-watch/tar" \
+        || { echo "cannot write the tar stand-in under $HEIR_HOOK"; return 1; }
+    rm -rf "$d" "$ro"
+    mkdir -p "$ro" && chmod 555 "$ro" || return 1
+    # The control: the directory really refuses a write (it would not for root).
+    if touch "$ro/probe" 2>/dev/null; then
+        rm -f "$ro/probe"; echo "control: $ro takes a write, so a TMPDIR there proves nothing"; return 1
+    fi
+    before="$(stat -c '%Y.%Z' "$ro")" || return 1
+    : >"$log"
+    out="$(cd "$HEIR" && env "PATH=$HEIR_HOOK/tar-watch:$PATH" "REAL_TAR=$(command -v tar)" "WATCH_DEST=$d" "WATCH_TMP=$ro" \
+        "WATCH_LOG=$log" "TMPDIR=$ro" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh --restore --unit unitA --key "$HEIR_KEY_A" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 20
+    # tests/heir_restore.rs a_lone_unit_restores_byte_for_byte_into_to_and_the_work_directory_is_gone
+    [ "$rc" -eq 0 ] || { echo "heir_restore_tmpdir: exited $rc with TMPDIR=$ro, want 0"; return 1; }
+    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "heir_restore_tmpdir: no RESTORE COMPLETE"; return 1; }
+    grep -E "File check: all [1-9][0-9]* regular file\\(s\\) match the sha256 in the unit's file table\\." >/dev/null <<<"$out" \
+        || { echo "heir_restore_tmpdir: no file-check match line"; return 1; }
+    diff -r "$SRC/unitA" "$d" || { echo "heir_restore_tmpdir: the tree differs from the source"; return 1; }
+    [ ! -e "$d/.tapectl-damaged-files.txt" ] || { echo "heir_restore_tmpdir: a damaged-file list on a clean restore"; return 1; }
+    if compgen -G "$d/.tapectl-work*" >/dev/null; then echo "heir_restore_tmpdir: the work directory was left in $d"; return 1; fi
+    # The work directory, inside --to while tar ran. The positive control: the stand-in ran.
+    grep -E '^ARGV ' "$log" >/dev/null || { echo "control: the tar stand-in never ran, so it saw nothing"; return 1; }
+    grep -E "^DEST \\.tapectl-work\\." "$log" >/dev/null \
+        || { echo "heir_restore_tmpdir: no .tapectl-work.* in --to while tar ran"; cat "$log"; return 1; }
+    grep -F -- " -C $d/.tapectl-work." "$log" >/dev/null \
+        || { echo "heir_restore_tmpdir: no tar was given a directory inside --to's work directory"; cat "$log"; return 1; }
+    # Nothing under TMPDIR, while tar ran or after.
+    if grep -E '^TMP ' "$log"; then echo "heir_restore_tmpdir: TMPDIR held the entries above while tar ran"; return 1; fi
+    [ -z "$(find "$ro" -mindepth 1 -print -quit)" ] || { echo "heir_restore_tmpdir: $ro is not empty:"; find "$ro" -mindepth 1; return 1; }
+    after="$(stat -c '%Y.%Z' "$ro")" || return 1
+    [ "$before" = "$after" ] || { echo "heir_restore_tmpdir: $ro changed (mtime.ctime $before, now $after)"; return 1; }
+    # The root's recorded mtime. The control: heir_restore's tree, restored with the default TMPDIR.
+    want="$(stat -c %Y "$SRC/unitA")" || return 1
+    [ -d "$HEIR/recovered" ] && [ "$(stat -c %Y "$HEIR/recovered")" = "$want" ] \
+        || { echo "control: heir_restore's tree $HEIR/recovered does not have the source root's mtime $want, so this check proves nothing"; return 1; }
+    [ "$(stat -c %Y "$d")" = "$want" ] \
+        || { echo "heir_restore_tmpdir: the restored root's mtime is $(stat -c %Y "$d"), want the source root's $want (heir_restore's tree has it)"; return 1; }
+}
 echo "gate: leg 2 — heir leg (RESTORE.sh of Layout 3, no tapectl)"
 check heir_extract_script step_heir_extract
 check heir_info           step_heir_info
@@ -1236,6 +1302,7 @@ check heir_find_envelope  step_heir_find
 check heir_verify         step_heir_verify
 check heir_list           step_heir_list
 check heir_restore        step_heir_restore
+check heir_restore_tmpdir step_heir_restore_tmpdir
 check heir_restore_symlinks step_heir_restore_symlinks
 
 # heir_file_check (ADR-0012 item 103; Layout 3: the file table's sha256): the RESTORE.sh on the tape
@@ -4030,7 +4097,7 @@ PY
 check lbp_page_clear_after_every_command step_lbp_page_clear_after_every_command
 
 # ---------- the checks the gate must have run, by name ----------
-# Every `check` line above, in the order they run (T4.16: 78). The verdict compares the run to this
+# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 79). The verdict compares the run to this
 # list by NAME, never by a total: a check named here that did not run is a FAIL (a leg that was
 # edited out, or a run that stopped early, cannot read GREEN), and so is a check that ran and is
 # not named here. TAPECTL_GATE_SPAN_ONLY judges the span_* names alone.
@@ -4039,7 +4106,7 @@ GATE_EXPECTED_CHECKS=(
     volume_write sealed_at_recorded lbp_fallback_recorded volume_verify empty_drive_refused
     evidence_row restore_diff restore_multislice_unit restore_symlink_unit crosskey_rejected
     no_plaintext_leak heir_extract_script heir_info heir_find_envelope heir_verify heir_list
-    heir_restore heir_restore_symlinks heir_file_check heir_path heir_long_member heir_where
+    heir_restore heir_restore_tmpdir heir_restore_symlinks heir_file_check heir_path heir_long_member heir_where
     heir_find heir_find_path heir_paths_from_copy resume_bot resume_midwrite resume_verify
     resume_restore resume_after_crash tier3_floor_unconfirmed health_by_id_device
     health_by_id_restore log_page_sweep_complete log_page_read_once log_page_raw_kept
