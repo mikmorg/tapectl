@@ -6929,3 +6929,143 @@ fn many_hard_links_past_the_end_are_listed_and_the_restore_goes_on() {
         "zulu-unit was reached: {all}"
     );
 }
+
+// ---- #606 (the #551 read, R-3 and R-4): one escape for --find, no raw control byte printed ----
+
+/// The paths `--find` printed for `unit`, as printed.
+fn found_paths(out: &str, unit: &str) -> Vec<String> {
+    out.lines()
+        .filter(|l| l.starts_with(&format!("  {unit}  v")))
+        .filter_map(|l| l.split_once(" bytes  ").map(|(_, p)| p.to_string()))
+        .collect()
+}
+
+/// R-3: `--find` takes TEXT in the form `--list` prints a path (1.5's one
+/// escape) and matches it against each path decoded the same way, under
+/// every awk: `\xe9` is the byte, found in `caf\xe9.txt` and never in the
+/// name that is the text `lit\\xe9.txt`; `\\xe9` is that text; `\t` is a TAB.
+#[test]
+fn find_takes_the_printed_form_of_a_path_under_every_awk() {
+    let all = awks();
+    assert!(!all.is_empty(), "no awk at all on this host");
+    for (name, body) in all {
+        let h = Heir::of(raw());
+        put_awk(&h, &body);
+        let kb = key(&h, Who::TenantB);
+        let o = h.run(&["--find", "caf\\xe9", "--key", &kb]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert_eq!(
+            found_paths(&o.stdout, UNIT_B),
+            vec!["caf\\xe9.txt"],
+            "{name}: {}",
+            o.stdout
+        );
+        let o = h.run(&["--find", "\\xe9", "--key", &kb]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        let got = found_paths(&o.stdout, UNIT_B);
+        assert!(got.contains(&"caf\\xe9.txt".to_string()), "{name}: {got:?}");
+        assert!(
+            !got.contains(&"lit\\\\xe9.txt".to_string()),
+            "{name}: {got:?}"
+        );
+        let o = h.run(&["--find", "\\\\xe9", "--key", &kb]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert_eq!(
+            found_paths(&o.stdout, UNIT_B),
+            vec!["lit\\\\xe9.txt"],
+            "{name}: {}",
+            o.stdout
+        );
+        let o = h.run(&["--find", "lit\\xe9", "--key", &kb]);
+        assert_eq!(o.code, 1, "{name}: the byte is not the text: {}", o.all());
+        let o = h.run(&["--find", "tab\\tand", "--key", &kb]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert_eq!(
+            found_paths(&o.stdout, UNIT_B),
+            vec!["tab\\tand\\nnewline.txt"],
+            "{name}: {}",
+            o.stdout
+        );
+    }
+}
+
+fn control() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.control_names = true;
+        Tape::build(&shape)
+    })
+}
+
+/// R-4: a name holding ESC and BEL never reaches the terminal raw: `--list`
+/// and `--find` print each such byte as `\xHH`, a message names it the same
+/// way, and `--path` takes the listed form back and restores the file by its
+/// bytes, under every awk.
+#[test]
+fn a_control_byte_in_a_name_is_printed_escaped_and_the_listed_form_restores_it() {
+    let printed = "bad\\x1b]0;owned\\x07name.txt";
+    let all = awks();
+    assert!(!all.is_empty(), "no awk at all on this host");
+    for (name, body) in all {
+        let t = control();
+        let h = Heir::of(t);
+        put_awk(&h, &body);
+        let kb = key(&h, Who::TenantB);
+        let list = h.run(&["--list", "--key", &kb, "--unit", UNIT_B]);
+        assert_eq!(list.code, 0, "{name}: {}", list.all());
+        assert!(
+            !list.all().contains(['\u{1b}', '\u{7}']),
+            "{name}: a raw control byte"
+        );
+        assert!(
+            list.stdout
+                .lines()
+                .any(|l| l.ends_with(&format!("  {printed}"))),
+            "{name}: {}",
+            list.stdout
+        );
+        let find = h.run(&["--find", "owned", "--key", &kb]);
+        assert_eq!(find.code, 0, "{name}: {}", find.all());
+        assert!(
+            !find.all().contains(['\u{1b}', '\u{7}']),
+            "{name}: a raw control byte"
+        );
+        assert_eq!(found_paths(&find.stdout, UNIT_B), vec![printed], "{name}");
+        let dest = h.dest("one");
+        let args = [
+            "--restore",
+            "--key",
+            &kb,
+            "--to",
+            dest_str(&dest),
+            "--unit",
+            UNIT_B,
+            "--path",
+            printed,
+        ];
+        let o = h.run(&args);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert_eq!(
+            std::fs::read(dest.join(heir::CONTROL_NAME)).unwrap(),
+            unit_files(t, UNIT_B)
+                .iter()
+                .find(|(p, _)| p == heir::CONTROL_NAME)
+                .unwrap()
+                .1,
+            "{name}"
+        );
+        // Again, without --overwrite: the refusal names it escaped.
+        let o = h.run(&args);
+        assert_eq!(o.code, 1, "{name}: {}", o.all());
+        assert!(
+            o.stderr.contains(&format!("{printed} is already in")),
+            "{name}: {}",
+            o.stderr
+        );
+        assert!(
+            !o.all().contains(['\u{1b}', '\u{7}']),
+            "{name}: a raw control byte"
+        );
+    }
+}

@@ -166,7 +166,13 @@ pub struct Shape {
     /// hard links to it, every name about 220 bytes long (#525: a list of
     /// them longer than a pipe holds).
     pub links: usize,
+    /// Add to each BIG unit a file whose name holds the raw control bytes
+    /// ESC and BEL ([`CONTROL_NAME`]), which no escape of 1.5 covers.
+    pub control_names: bool,
 }
+
+/// A name holding a terminal escape sequence: ESC ] 0 ; ... BEL.
+pub const CONTROL_NAME: &str = "bad\u{1b}]0;owned\u{7}name.txt";
 
 /// Names a uutils `sha256sum -c` prints quoted (`'./a b.txt': OK`), all UTF-8.
 pub const QUOTED_NAMES: [&str; 7] = [
@@ -233,6 +239,7 @@ impl Shape {
             raw_names: false,
             quoted_names: false,
             links: 0,
+            control_names: false,
         }
     }
     /// One big unit of tenant A, compressed.
@@ -250,6 +257,7 @@ impl Shape {
             raw_names: false,
             quoted_names: false,
             links: 0,
+            control_names: false,
         }
     }
 }
@@ -355,6 +363,7 @@ fn make_unit(
     raw: bool,
     quoted: bool,
     links: usize,
+    control: bool,
     seed: u32,
 ) -> UnitTruth {
     let dir = h.sources.join(name);
@@ -375,6 +384,9 @@ fn make_unit(
         // A folder whose name holds a backslash.
         files.push(("dir\\one/leaf.txt".to_string(), text(700, seed + 33)));
         files.push(("notes.txt".to_string(), text(40_000, seed + 31)));
+        if control {
+            files.push((CONTROL_NAME.to_string(), text(800, seed + 70)));
+        }
         if quoted {
             for (i, n) in QUOTED_NAMES.iter().enumerate() {
                 files.push((n.to_string(), text(900 + i * 7, seed + 50 + i as u32)));
@@ -732,6 +744,7 @@ impl Tape {
                 shape.raw_names,
                 shape.quoted_names,
                 shape.links,
+                shape.control_names,
                 1 + 7 * i as u32,
             ));
         }
