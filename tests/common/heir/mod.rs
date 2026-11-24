@@ -162,6 +162,10 @@ pub struct Shape {
     /// Add to each BIG unit files whose names uutils' `sha256sum -c` quotes
     /// under `LC_ALL=C` ([`QUOTED_NAMES`]).
     pub quoted_names: bool,
+    /// Add to each BIG unit a folder `zz-links/` with a file and this many
+    /// hard links to it, every name about 220 bytes long (#525: a list of
+    /// them longer than a pipe holds).
+    pub links: usize,
 }
 
 /// Names a uutils `sha256sum -c` prints quoted (`'./a b.txt': OK`), all UTF-8.
@@ -228,6 +232,7 @@ impl Shape {
             span: None,
             raw_names: false,
             quoted_names: false,
+            links: 0,
         }
     }
     /// One big unit of tenant A, compressed.
@@ -244,6 +249,7 @@ impl Shape {
             span: None,
             raw_names: false,
             quoted_names: false,
+            links: 0,
         }
     }
 }
@@ -348,6 +354,7 @@ fn make_unit(
     big: bool,
     raw: bool,
     quoted: bool,
+    links: usize,
     seed: u32,
 ) -> UnitTruth {
     let dir = h.sources.join(name);
@@ -377,6 +384,18 @@ fn make_unit(
     for (path, bytes) in &files {
         fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
         fs::write(dir.join(path), bytes).unwrap();
+    }
+    if big && links > 0 {
+        let first = format!("zz-links/0-first-{}", "f".repeat(200));
+        let bytes = text(1_000, seed + 60);
+        fs::create_dir_all(dir.join("zz-links")).unwrap();
+        fs::write(dir.join(&first), &bytes).unwrap();
+        for i in 0..links {
+            let name = format!("zz-links/link-{i:04}-{}", "l".repeat(200));
+            fs::hard_link(dir.join(&first), dir.join(&name)).unwrap();
+            files.push((name, bytes.clone()));
+        }
+        files.push((first, bytes));
     }
     let mut raw_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     if big && raw {
@@ -712,6 +731,7 @@ impl Tape {
                 *big,
                 shape.raw_names,
                 shape.quoted_names,
+                shape.links,
                 1 + 7 * i as u32,
             ));
         }

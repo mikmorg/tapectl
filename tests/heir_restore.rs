@@ -6769,3 +6769,157 @@ fn a_work_directory_with_room_for_two_slices_restores_whole_without_a_read_ahead
         events(&h)
     );
 }
+
+// ---- #525: text compared as text, and no silent exit on a full pipe ----
+
+/// Rows for units named `7`, `007`, `1.1` and `1.10` in every `units.tsv` of
+/// the index (names equal as numbers, different as text), and in the
+/// operator's a unit `twin` held under a tenant `7` and then a tenant `007`.
+fn index_numeric_names(idx: &tapectl::volume::index::IndexFiles) {
+    let mut files = vec![idx.operator_units.clone()];
+    files.extend(idx.tenants.values().map(|t| t.units.clone()));
+    for (i, p) in files.iter().enumerate() {
+        heir::edit_tsv(p, |h, rows| {
+            let c = |n: &str| h.iter().position(|x| x == n).unwrap();
+            let tenant = h.iter().position(|x| x == "tenant");
+            let mut row = |unit: &str, n: usize, ten: &str| {
+                let mut r = vec![String::new(); h.len()];
+                r[c("unit")] = unit.into();
+                r[c("unit_uuid")] = format!("cccccccc-0000-4000-8000-{i:04}{n:08}");
+                r[c("version")] = "1".into();
+                r[c("num_slices")] = "1".into();
+                r[c("first_slice")] = "1".into();
+                r[c("last_slice")] = "1".into();
+                r[c("version_bytes")] = "1000".into();
+                r[c("volume")] = format!("OLD{n:02}");
+                r[c("volume_uuid")] = format!("00000000-0000-4000-8000-0000000001{n:02}");
+                r[c("state")] = "sealed".into();
+                r[c("sealed_at")] = "2026-10-01T00:00:00Z".into();
+                if let Some(t) = tenant {
+                    r[t] = ten.into();
+                }
+                rows.push(r);
+            };
+            for (n, unit) in ["7", "007", "1.1", "1.10"].iter().enumerate() {
+                row(unit, n, TENANT_A);
+            }
+            if i == 0 {
+                row("twin", 10, "7");
+                row("twin", 11, "007");
+            }
+        });
+    }
+}
+
+fn numeric_index() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| indexed(index_numeric_names))
+}
+
+/// The `Unit ...` heads `--where` printed: the name, and the tenant when one
+/// is named (`Unit NAME (tenant T):`).
+fn where_heads(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| {
+            l.strip_prefix("Unit ")?
+                .strip_suffix(':')
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// #525: `--where 7` names unit 7 alone, never `007` (and `1.1` never
+/// `1.10`), and one unit held under the tenants `7` and `007` is told under
+/// two heads, under every awk: names are compared as text, never as numbers.
+#[test]
+fn where_compares_unit_and_tenant_names_as_text_under_every_awk() {
+    let all = awks();
+    assert!(!all.is_empty(), "no awk at all on this host");
+    for (name, body) in all {
+        let h = Heir::of(numeric_index());
+        put_awk(&h, &body);
+        let ka = key(&h, Who::TenantA);
+        for unit in ["7", "007", "1.1", "1.10"] {
+            let o = h.run(&["--where", unit, "--key", &ka]);
+            assert_eq!(o.code, 0, "{name} {unit}: {}", o.all());
+            assert_eq!(
+                where_heads(&o.stdout),
+                vec![format!("{unit} (tenant {TENANT_A})")],
+                "{name} {unit}: {}",
+                o.stdout
+            );
+        }
+        let ke = key(&h, Who::Escrow);
+        let o = h.run(&["--where", "twin", "--key", &ke]);
+        assert_eq!(o.code, 0, "{name} twin: {}", o.all());
+        assert_eq!(
+            where_heads(&o.stdout),
+            vec![
+                "twin (tenant 7)".to_string(),
+                "twin (tenant 007)".to_string()
+            ],
+            "{name} twin: {}",
+            o.stdout
+        );
+    }
+}
+
+/// A unit staged first (`zulu-unit`, whole on the tape) and one after it
+/// (`links-unit`) with 240 hard links of long names to one file, all past the
+/// tape's early end: `--all` restores `links-unit` first.
+fn many_links() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.units = vec![
+            ("zulu-unit".into(), TENANT_A, false),
+            ("links-unit".into(), TENANT_A, true),
+        ];
+        shape.warning_in_slice = Some(1);
+        shape.links = 240;
+        Tape::build(&shape)
+    })
+}
+
+/// #525: more hard-linked names whose first name lies in a slice not read
+/// than a pipe holds the lines of. The restore says so (the first 20, and how
+/// many more), prints the unit's id map and RESTORE INCOMPLETE, exits 1, and
+/// `--all` goes on to the next unit: never a silent exit 141.
+#[test]
+fn many_hard_links_past_the_end_are_listed_and_the_restore_goes_on() {
+    let t = many_links();
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    let dest = h.dest("out");
+    let o = h.run(&restore_all(&ka, &dest));
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(o.stdout.contains("RESTORE INCOMPLETE"), "{all}");
+    assert!(
+        o.stdout.contains(
+            "Hard-linked names whose first name is in a slice that was not read (restored by the repair once that tape has been read):"
+        ),
+        "{all}"
+    );
+    let listed = o
+        .stdout
+        .lines()
+        .filter(|l| l.contains(" -> first name zz-links/0-first-"))
+        .count();
+    assert_eq!(listed, 20, "{all}");
+    assert!(
+        o.stdout
+            .lines()
+            .any(|l| l.starts_with("  and ") && l.contains(" more")),
+        "{all}"
+    );
+    assert_eq!(
+        o.stdout
+            .matches("Who the ids were (the stream carries owners by number")
+            .count(),
+        2,
+        "the id map of each unit: {all}"
+    );
+    assert!(o.stdout.contains(">>> Unit zulu-unit "), "{all}");
+    assert_restored(t, "zulu-unit", &dest.join("zulu-unit"));
+}
