@@ -1685,6 +1685,255 @@ fn a_decompressor_that_exits_0_after_short_output_is_caught_by_the_slice_length(
     assert!(o.stdout.contains("RESTORE INCOMPLETE"), "{}", o.stdout);
 }
 
+// ---- each verdict on a slice, by its words ----
+//
+// A slice is judged by the front index's hash of the file as read, then by
+// the manifest's length and hash of its plain cut; a work directory that
+// cannot take it ends the run and is never called damage. Each verdict is
+// held here by its own words, whatever reads and hashes the bytes.
+
+/// An `age` that is the stand-in for every file but a slice (its input is
+/// `slice.enc`), where it runs `body`, with the stand-in as `$REAL`.
+fn age_on_slices(h: &Heir, body: &str) {
+    h.put_tool(
+        "age",
+        &format!(
+            "#!/bin/bash\nREAL={real}\ncase \"$(ls -l /proc/$$/fd/0 2>/dev/null)\" in\n  *slice.enc) ;;\n  *) exec \"$REAL\" \"$@\" ;;\nesac\n{body}\n",
+            real = heir::heir_age_binary().display()
+        ),
+    );
+}
+
+fn restore_unit_b(h: &Heir) -> (heir::Out, std::path::PathBuf) {
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(h, Who::TenantB),
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    (o, dest)
+}
+
+/// A slice the drive cannot read is left out as that, not as damage.
+#[test]
+fn a_slice_the_tape_cannot_give_is_left_out_as_unreadable() {
+    let t = two();
+    let h = Heir::of(t);
+    let bad = t.slice_positions()[1];
+    let dest = h.dest("out");
+    let o = h.run_with(
+        &[
+            "--restore",
+            "--key",
+            &key(&h, Who::TenantB),
+            "--to",
+            dest.to_str().unwrap(),
+        ],
+        &[("FAKE_DD_FAIL", &bad.to_string())],
+    );
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE INCOMPLETE"), "{}", o.stdout);
+    assert!(
+        o.stderr
+            .contains(&format!("the tape could not be read at file {bad}")),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        !o.stderr.contains("differs from the front index"),
+        "{}",
+        o.stderr
+    );
+}
+
+/// A tape file shorter than the front index says is judged by its hash: the
+/// bytes read are not the bytes written.
+#[test]
+fn a_slice_shorter_on_the_tape_than_written_differs_from_the_front_indexs_hash() {
+    let t = two();
+    let h = Heir::of(t);
+    let bad = t.slice_positions()[1];
+    let p = h.file(bad);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_len((t.size_of(bad) - 1000) as u64)
+        .unwrap();
+    let (o, _) = restore_unit_b(&h);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE INCOMPLETE"), "{}", o.stdout);
+    assert!(
+        o.stderr
+            .contains(&format!("file {bad} differs from the front index's hash")),
+        "{}",
+        o.stderr
+    );
+}
+
+/// A plain cut of the right length and the wrong bytes is caught by the
+/// manifest's hash: from age itself, and from a decompressor.
+#[test]
+fn a_plain_cut_of_the_right_length_and_other_bytes_is_caught_by_its_hash() {
+    let t = two();
+    let h = Heir::of(t);
+    age_on_slices(
+        &h,
+        "\"$REAL\" \"$@\" | tr '\\000' '\\001'\nexit ${PIPESTATUS[0]}",
+    );
+    let (o, _) = restore_unit_b(&h);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE INCOMPLETE"), "{}", o.stdout);
+    assert!(
+        o.stderr
+            .contains("its plain cut does not match the manifest's sha256"),
+        "{}",
+        o.stderr
+    );
+    assert!(!o.stderr.contains("decoded length"), "{}", o.stderr);
+
+    let t = compressed("xz");
+    let h = Heir::of(t);
+    let real = heir::host_tool("xz").unwrap();
+    h.put_tool(
+        "xz",
+        &format!(
+            "#!/bin/bash\n{real} \"$@\" | tr '\\000' '\\001'\nexit ${{PIPESTATUS[0]}}\n",
+            real = real.display()
+        ),
+    );
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr
+            .contains("its plain cut does not match the manifest's sha256"),
+        "{}",
+        o.stderr
+    );
+}
+
+/// age's own failure on a slice is named with its words; a key that opens
+/// the envelope and not the slice is told so.
+#[test]
+fn age_failing_on_a_slice_is_named_and_a_key_that_opens_no_slice_is_told_so() {
+    let t = two();
+    let h = Heir::of(t);
+    age_on_slices(
+        &h,
+        "cat >/dev/null\necho 'age: error: failed to decrypt: chunk 2 is not authentic' >&2\nexit 1",
+    );
+    let (o, _) = restore_unit_b(&h);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE INCOMPLETE"), "{}", o.stdout);
+    assert!(
+        o.stderr.contains(
+            "age could not decrypt it: age: error: failed to decrypt: chunk 2 is not authentic"
+        ),
+        "{}",
+        o.stderr
+    );
+
+    let h = Heir::of(t);
+    age_on_slices(
+        &h,
+        "cat >/dev/null\necho \"age: error: no identity matched any of the file's recipients\" >&2\nexit 1",
+    );
+    let (o, _) = restore_unit_b(&h);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr
+            .contains("no key given opens it (a slice can be sealed to an older key"),
+        "{}",
+        o.stderr
+    );
+}
+
+/// A work directory that fills while a slice is decrypted (or decompressed)
+/// ends the run, saying so; the slice is not called damaged.
+#[test]
+fn a_full_work_directory_while_a_slice_is_decoded_ends_the_run_and_is_not_damage() {
+    let t = two();
+    let h = Heir::of(t);
+    age_on_slices(
+        &h,
+        "cat >/dev/null\necho 'age: error: failed to write output: No space left on device' >&2\nexit 1",
+    );
+    let (o, _) = restore_unit_b(&h);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("FATAL: writing slice")
+            && o.stderr.contains("is full or not writable")
+            && o.stderr.contains("--work DIR"),
+        "{}",
+        o.stderr
+    );
+    assert!(!o.stderr.contains("could not decrypt"), "{}", o.stderr);
+    assert!(!o.stdout.contains("RESTORE COMPLETE"), "{}", o.stdout);
+
+    let t = compressed("xz");
+    let h = Heir::of(t);
+    h.put_tool(
+        "xz",
+        "#!/bin/sh\ncat >/dev/null\necho 'xz: (stdout): Write error: No space left on device' >&2\nexit 1\n",
+    );
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("FATAL: writing slice") && o.stderr.contains("is full or not writable"),
+        "{}",
+        o.stderr
+    );
+    assert!(!o.stderr.contains("decoded length"), "{}", o.stderr);
+}
+
+/// A work directory that fills while a slice comes off the tape ends the
+/// run, saying so; the slice is neither unreadable nor damaged.
+#[test]
+fn a_full_work_directory_while_a_slice_is_read_ends_the_run_and_is_not_damage() {
+    let t = two();
+    let h = Heir::of(t);
+    let bad = t.slice_positions()[1];
+    let real_head = heir::host_tool("head").unwrap();
+    h.put_tool(
+        "head",
+        &format!(
+            "#!/bin/bash\ncase \"$*\" in\n  \"-c {size}\")\n    cat >/dev/null\n    echo \"head: error writing 'standard output': No space left on device\" >&2\n    exit 1 ;;\nesac\nexec {real} \"$@\"\n",
+            size = t.size_of(bad),
+            real = real_head.display()
+        ),
+    );
+    let (o, _) = restore_unit_b(&h);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains(&format!(
+            "reading tape file {bad} into the work directory failed"
+        )) && o
+            .stderr
+            .contains("cannot take it: it is full, or not writable"),
+        "{}",
+        o.stderr
+    );
+    for bad_words in ["could not be read at file", "differs from the front index"] {
+        assert!(!o.stderr.contains(bad_words), "{bad_words}: {}", o.stderr);
+    }
+}
+
 // ---- the low findings of #525 and the rest of the traps ----
 
 /// A2: the script keeps no process id to kill at the end.
