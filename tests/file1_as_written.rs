@@ -1042,6 +1042,117 @@ fn recovery_md_every_fenced_block_is_owned() {
     }
 }
 
+// ---- a holder of only a tenant key (#605) ----
+
+/// Whitespace folded, so a sentence wrapped across lines still matches.
+fn flat(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// #605: what File 1 tells a holder of only a tenant key is what RESTORE.sh
+/// does with one. The key's kind is the envelope type `--find-envelope`
+/// prints, in the words File 1 quotes (and a damaged operator envelope hides
+/// it, as File 1 warns); `--all` with a tenant key restores that tenant's
+/// units and no other; a tape with none of a tenant's units opens nothing for
+/// that key, with the message File 1 quotes, and reports no damage.
+#[test]
+fn file_1_tells_a_tenant_key_holder_what_restore_sh_does_with_one() {
+    let t = two();
+    let g = flat(&guide(t));
+    let opens = "The key opens the envelope at file N (tenant_envelope).";
+    for needle in [
+        &format!("\"{opens}\"") as &str,
+        "a key that opens a `tenant_envelope` and no `operator_envelope` is a tenant's",
+        "when RESTORE.sh reports an envelope damaged",
+    ] {
+        assert!(g.contains(needle), "{needle:?}: {g}");
+    }
+    let (head, tail) = opens.split_once('N').unwrap();
+    let h = Heir::of(t);
+    let o = h.run(&["--find-envelope", "--key", &key_of(&h, Who::TenantA)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout
+            .lines()
+            .any(|l| l.starts_with(head) && l.ends_with(tail)),
+        "File 1's line, as RESTORE.sh prints it: {}",
+        o.stdout
+    );
+    assert!(!o.stdout.contains("(operator_envelope)"), "{}", o.stdout);
+    for who in [Who::Operator, Who::Escrow] {
+        let o = h.run(&["--find-envelope", "--key", &key_of(&h, who)]);
+        assert_eq!(o.code, 0, "{}", o.all());
+        assert!(
+            o.stdout.contains("(operator_envelope).") && o.stdout.contains("(tenant_envelope)."),
+            "{}",
+            o.stdout
+        );
+    }
+    // The exception File 1 names: the operator envelope and its backup
+    // damaged, the escrow key opens tenant envelopes only, and says so.
+    let damaged = Heir::of(t);
+    for p in t
+        .positions_of("operator_envelope")
+        .into_iter()
+        .chain(t.positions_of("operator_envelope_backup"))
+    {
+        damaged.flip(p, 200);
+    }
+    let o = damaged.run(&["--find-envelope", "--key", &key_of(&damaged, Who::Escrow)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(!o.stdout.contains("(operator_envelope)"), "{}", o.stdout);
+    assert!(o.stdout.contains("(tenant_envelope)."), "{}", o.stdout);
+    assert!(o.all().contains("damaged"), "{}", o.all());
+
+    // `--all` with a tenant's key: that tenant's units and no other's.
+    assert!(
+        g.contains("with a tenant's key that tenant's units and no one else's"),
+        "{g}"
+    );
+    let dest = h.dest("tenant-all");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key_of(&h, Who::TenantA),
+        "--all",
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains("RESTORE COMPLETE: 1 unit(s)"),
+        "{}",
+        o.stdout
+    );
+    assert_restored(t, UNIT_A, &dest);
+    assert!(!o.all().contains(UNIT_B), "{}", o.all());
+
+    // A tape that holds none of tenant B's units: B's key opens nothing,
+    // with File 1's words, and no envelope is called damaged.
+    assert!(
+        g.contains("With a tenant's key, a tape that holds none of that tenant's units has no envelope for that key: it opens nothing")
+            && g.contains("and that is normal, not a fault"),
+        "{g}"
+    );
+    let one = compressed("gzip");
+    assert!(one.units.iter().all(|u| u.name != UNIT_B));
+    let h = Heir::of(one);
+    let o = h.run(&["--find-envelope", "--key", &key_of(&h, Who::TenantB)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("no envelope on this tape")
+            && o.stderr.contains("opens with the key given"),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        g.contains("\"no envelope on this tape ... opens with the key given\""),
+        "File 1 quotes it: {g}"
+    );
+    assert!(!o.all().contains("DAMAGED"), "{}", o.all());
+    assert!(!o.all().contains("damaged"), "{}", o.all());
+}
+
 // ---- the inventory and the absences ----
 
 /// Every code block of File 1 is in a section a test owns above (or the two

@@ -5914,6 +5914,115 @@ verify any entry by hashing the file it describes.
         assert!(words.contains("**File table**"), "{words}");
     }
 
+    /// #605: File 1 for a holder of only a tenant key. Every pointer to
+    /// "tapectl itself" outside that section carries the key condition, and
+    /// the section opens with it; the reader learns how to tell a tenant's key,
+    /// that `--all` is theirs too, that a tape with none of their units opens
+    /// nothing and that this is normal, and that the Heir Kit's check is the
+    /// escrow key's alone.
+    #[test]
+    fn file_1_tells_a_holder_of_only_a_tenant_key_its_route_and_when_it_is_done() {
+        let g = generate_system_guide_v2_for_media("TENANT605", 20, "LTO-6");
+
+        // The key condition on "tapectl itself": every sentence that points
+        // at the section names the key it is for.
+        let itself_at = g.find("\n## tapectl itself\n").expect("the section");
+        let itself_end = itself_at + 1 + g[itself_at + 1..].find("\n## ").unwrap();
+        let outside = format!("{}{}", &g[..itself_at], &g[itself_end..]);
+        let flat = flat_text(&outside);
+        let mut pointers = 0;
+        for (at, _) in flat.match_indices("\"tapectl itself\"") {
+            pointers += 1;
+            let from = flat[..at].rfind(". ").map_or(0, |i| i + 2);
+            let to = at + flat[at..].find(". ").unwrap_or(flat.len() - at);
+            let sentence = &flat[from..to];
+            assert!(
+                sentence.contains("for the operator or escrow key")
+                    || sentence.contains("The escrow key and the operator key")
+                    || sentence.contains("A tenant's key opens that tenant's envelope and slices only"),
+                "a pointer to \"tapectl itself\" without the key condition: {sentence}"
+            );
+        }
+        assert_eq!(pointers, 6, "every pointer is checked");
+        let itself = guide_section(&g, "tapectl itself");
+        assert!(
+            itself.trim_start().starts_with("**Which key it needs.**"),
+            "the section opens with the key it needs: {itself}"
+        );
+        let start = flat_text(guide_section(&g, "Start here"));
+        assert!(
+            start.contains(
+                "A slice damaged in the middle, which RESTORE.sh cannot read around: \"tapectl itself\", for the operator or escrow key"
+            ),
+            "{start}"
+        );
+
+        // How to tell the key's kind.
+        let key = flat_text(guide_section(&g, "Which file is your key"));
+        for needle in [
+            "**Which kind of key you hold.**",
+            "\"The key opens the envelope at file N (tenant_envelope).\"",
+            "The operator envelope is encrypted to the operator and escrow keys alone",
+            "a key that opens a `tenant_envelope` and no `operator_envelope` is a tenant's",
+            "which must equal the one in the record you have for THAT key (the cover sheet's `age1...` is the escrow key's alone)",
+        ] {
+            assert!(key.contains(needle), "{needle:?}: {key}");
+        }
+        assert!(
+            start.contains("\"Which kind of key you hold\""),
+            "Start here points at it: {start}"
+        );
+
+        // `--all` is a tenant's too, and restores only that tenant's units.
+        assert!(
+            start.contains(
+                "From one tape, `--all` restores every unit your key opens that is on it, whatever the key: with a tenant's key that tenant's units and no one else's"
+            ),
+            "{start}"
+        );
+
+        // The tenant's done rule.
+        let box_ = flat_text(guide_section(&g, "The rest of the box: other tapes, copies and the index"));
+        for needle in [
+            "With a tenant's key, a tape that holds none of that tenant's units has no envelope for that key: it opens nothing",
+            "and that is normal, not a fault",
+            "a tenant's index lists that tenant's units only",
+        ] {
+            assert!(box_.contains(needle), "{needle:?}: {box_}");
+        }
+        assert!(
+            start.contains("With a tenant's key, a tape that holds none of your units opens nothing, and that is normal"),
+            "{start}"
+        );
+
+        // The Heir Kit's check is the escrow key's alone.
+        assert!(
+            start.contains("with the escrow key (no other key opens that catalogue)"),
+            "{start}"
+        );
+        assert!(
+            box_.contains("With a Heir Kit and the escrow key:")
+                && box_.contains("The operator's or a tenant's key does not open that catalogue"),
+            "{box_}"
+        );
+    }
+
+    /// #564's File 1 sentence (D13): the id map always holds the numbers, and
+    /// a name only where the writing host's local files held one (the static
+    /// build has no NSS modules; measured 2026-11-24).
+    #[test]
+    fn file_1_says_what_names_the_id_map_holds() {
+        let g = generate_system_guide_v2_for_media("IDS564", 20, "LTO-6");
+        let sec = flat_text(guide_section(&g, "What a restore on another computer does"));
+        for needle in [
+            "The map always holds the numbers",
+            "It holds a name only where the writing computer's `/etc/passwd` or `/etc/group` had one",
+            "a name from LDAP, sssd or systemd's dynamic users is recorded empty",
+        ] {
+            assert!(sec.contains(needle), "{needle:?}: {sec}");
+        }
+    }
+
     /// A unit's slice list for RECOVERY.md tests: `(number, tape position,
     /// continues)`.
     fn unit_with(
