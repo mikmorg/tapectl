@@ -90,6 +90,8 @@ Show each collection's pending, staged, under-copied and missing units
 
 Pending is a unit never archived or dirty (changed since its last version); staged is a version waiting in staging for a copy it is still owed, which `volume write` writes.
 
+Each unit whose newest snapshot left something out (an exclusion pattern's match, or a socket) is shown with the files and bytes left out; `--json` lists them, as `snapshot create --json` does. That changes no exit status.
+
 Exit status: 0 = clean; 1 = warnings (a unit refused, an entry outside every unit, a unit missing); 2 = errors (a root that is not absolute or does not exist, a tenant or archive set that does not exist). Every collection is shown whatever another's problems; the status is the worst seen.
 
 ```text

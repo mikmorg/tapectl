@@ -103,6 +103,38 @@ pub fn status_for_collection(
     Ok(status)
 }
 
+/// What the patterns (and the socket rule) left out of one unit's newest
+/// snapshot (#542's third criterion), by the unit's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedLeftOut {
+    pub unit: String,
+    pub left: crate::db::snapshot_left_out::UnitLeftOut,
+}
+
+/// For each unit under `lib`'s root, in name order, what its newest
+/// snapshot left out; a unit whose newest left nothing out, or with no
+/// snapshot, is not listed. Read beside [`status_for_collection`] by
+/// `cli::collection`, as the staged count is: two statements a collection
+/// (the unit list and one read of every unit's rows), whatever its units.
+pub fn left_out_for_collection(
+    conn: &Connection,
+    lib: &CollectionConfig,
+) -> Result<Vec<NamedLeftOut>> {
+    let root = super::canonical_root(lib)?;
+    let mut units = super::units_under_root(conn, &root)?;
+    units.sort_by(|a, b| a.name.cmp(&b.name));
+    let ids: Vec<i64> = units.iter().map(|u| u.id).collect();
+    let names: std::collections::HashMap<i64, String> =
+        units.into_iter().map(|u| (u.id, u.name)).collect();
+    Ok(crate::db::snapshot_left_out::newest_for_units(conn, &ids)?
+        .into_iter()
+        .map(|left| NamedLeftOut {
+            unit: names[&left.unit_id].clone(),
+            left,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

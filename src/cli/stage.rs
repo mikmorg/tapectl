@@ -16,7 +16,8 @@ pub enum StageCommands {
     /// memory: no plaintext reaches staging. Several units
     /// may be named; `--jobs` stages that many at once. Every name is checked
     /// before any unit is staged. Under --json, an array of one object per
-    /// unit, printed only when every unit was staged.
+    /// unit, printed only when every unit was staged; its `left_out` is what
+    /// the version's snapshot left out, as `snapshot create --json` has it.
     ///
     /// Exit status: 0 = every unit staged; 2 = a unit failed or was refused
     /// (the error names each unit staged, failed and not started).
@@ -764,29 +765,18 @@ pub fn run(
             let done = staging::jobs::first_failure(outcomes)?;
             let mut rows = Vec::with_capacity(done.len());
             for (unit_name, stage_set_id) in &done {
-                let (num_slices, stream, total_enc): (Option<i64>, Option<i64>, Option<i64>) = conn
-                    .query_row(
-                        "SELECT num_slices, stream_bytes, total_encrypted_size
-                         FROM stage_sets WHERE id = ?1",
-                        params![stage_set_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )?;
-                rows.push(serde_json::json!({
-                    "stage_set_id": stage_set_id,
-                    "unit": unit_name,
-                    "num_slices": num_slices,
-                    "stream_bytes": stream,
-                    "total_encrypted_size": total_enc,
-                }));
+                let row = staged_row(conn, unit_name, *stage_set_id)?;
                 if !json_output {
+                    let n = |key: &str| row[key].as_i64().unwrap_or(0);
                     println!(
                         "staged: {} ({}, {} stream, {} encrypted)",
                         unit_name,
-                        crate::render::plural(num_slices.unwrap_or(0), "slice", "slices"),
-                        crate::util::format_bytes_binary(stream.unwrap_or(0)),
-                        crate::util::format_bytes_binary(total_enc.unwrap_or(0)),
+                        crate::render::plural(n("num_slices"), "slice", "slices"),
+                        crate::util::format_bytes_binary(n("stream_bytes")),
+                        crate::util::format_bytes_binary(n("total_encrypted_size")),
                     );
                 }
+                rows.push(row);
             }
             if json_output {
                 // ADR-0012 item 212, one shape: an array, one object per unit,
@@ -797,6 +787,29 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+/// `stage create --json`'s object for one staged unit (ADR-0012 item 212:
+/// the command prints an array of these). `left_out` is what the staged
+/// version's snapshot left out, in `snapshot create --json`'s shape (#542),
+/// the list `stage create` names on stderr.
+fn staged_row(conn: &Connection, unit_name: &str, stage_set_id: i64) -> Result<serde_json::Value> {
+    let (num_slices, stream, total_enc, snapshot_id): (Option<i64>, Option<i64>, Option<i64>, i64) =
+        conn.query_row(
+            "SELECT num_slices, stream_bytes, total_encrypted_size, snapshot_id
+         FROM stage_sets WHERE id = ?1",
+            params![stage_set_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let left_out = crate::db::snapshot_left_out::load(conn, snapshot_id)?;
+    Ok(serde_json::json!({
+        "stage_set_id": stage_set_id,
+        "unit": unit_name,
+        "num_slices": num_slices,
+        "stream_bytes": stream,
+        "total_encrypted_size": total_enc,
+        "left_out": left_out.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+    }))
 }
 
 /// The status of the live `writes` row behind a
@@ -1275,6 +1288,68 @@ mod tests {
         .unwrap();
 
         (conn, paths, config, tmp)
+    }
+
+    /// #542's criterion 2c: `stage create --json` carries what the staged
+    /// version's snapshot left out, under `left_out`, in `snapshot create
+    /// --json`'s shape (`LeftOut::to_json`); a version that left nothing
+    /// out carries the key, empty, as `snapshot create` does.
+    #[test]
+    fn create_json_carries_what_the_snapshot_left_out() {
+        let (conn, paths, mut config, tmp) = setup();
+        let src = tmp.path().join("src");
+        fs::write(src.join("scratch.tmp"), b"not kept").unwrap();
+        fs::create_dir_all(src.join("cache")).unwrap();
+        fs::write(src.join("cache/x"), b"123").unwrap();
+        config.defaults.global_excludes = vec!["*.tmp".to_string(), "cache/".to_string()];
+
+        let staged = |config: &Config| -> serde_json::Value {
+            crate::staging::snapshot_create(&conn, "unit1", config).unwrap();
+            run(
+                &conn,
+                &paths,
+                config,
+                &StageCommands::Create {
+                    name: vec!["unit1".to_string()],
+                    jobs: None,
+                    version: None,
+                },
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+            let id: i64 = conn
+                .query_row("SELECT MAX(id) FROM stage_sets", [], |r| r.get(0))
+                .unwrap();
+            staged_row(&conn, "unit1", id).unwrap()
+        };
+
+        let row = staged(&config);
+        let left = row["left_out"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no left_out key in {row}"));
+        assert_eq!(
+            left,
+            &vec![
+                serde_json::json!({
+                    "reason": "pattern", "pattern": "cache/", "path": "cache",
+                    "kind": "folder", "files": 1, "bytes": 3,
+                }),
+                serde_json::json!({
+                    "reason": "pattern", "pattern": "*.tmp", "path": "scratch.tmp",
+                    "kind": "file", "files": 1, "bytes": 8,
+                }),
+            ],
+            "{row}"
+        );
+        assert_eq!(row["unit"], "unit1", "{row}");
+
+        // A new version that leaves nothing out: the key, empty.
+        fs::write(src.join("f.txt"), b"changed, so a new version").unwrap();
+        config.defaults.global_excludes = Vec::new();
+        let row = staged(&config);
+        assert_eq!(row["left_out"], serde_json::json!([]), "{row}");
     }
 
     #[test]

@@ -57,6 +57,94 @@ impl LeftOut {
             "file"
         }
     }
+
+    /// The one shape `--json` gives a left-out row (#542): `snapshot
+    /// create`'s, and `stage create`'s and `collection status`'s with it.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "reason": self.reason.as_str(),
+            "pattern": self.pattern,
+            "path": self.path,
+            "kind": self.kind(),
+            "files": self.files,
+            "bytes": self.bytes,
+        })
+    }
+}
+
+/// What the newest snapshot of one unit left out (#542's third criterion:
+/// `collection status` shows it for a unit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitLeftOut {
+    pub unit_id: i64,
+    /// The newest snapshot's version.
+    pub version: i64,
+    /// Its rows, in `seq` order; never empty.
+    pub rows: Vec<LeftOut>,
+}
+
+impl UnitLeftOut {
+    /// Files left out: a file row counts 1, a folder row what was under it.
+    pub fn files(&self) -> i64 {
+        self.rows.iter().map(|r| r.files).sum()
+    }
+
+    /// Bytes of content left out.
+    pub fn bytes(&self) -> i64 {
+        self.rows.iter().map(|r| r.bytes).sum()
+    }
+}
+
+/// For each of `unit_ids`, what its newest snapshot (the highest version,
+/// as the pending scan reads it: `content_match::latest_snapshot`) left
+/// out, in `unit_ids`' order. A unit with no snapshot, or whose newest left
+/// nothing out, has no entry. One statement for every unit, whatever their
+/// number: each unit's newest version by `UNIQUE(unit_id, version)`, its
+/// rows by the primary key.
+pub fn newest_for_units(conn: &Connection, unit_ids: &[i64]) -> Result<Vec<UnitLeftOut>> {
+    if unit_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = serde_json::to_string(unit_ids).expect("ids serialize");
+    let mut stmt = conn.prepare(
+        "SELECT s.unit_id, s.version, s.id,
+                l.reason, l.pattern, l.path, l.kind, l.files, l.bytes
+         FROM json_each(?1) j
+         JOIN snapshots s ON s.unit_id = j.value
+              AND s.version = (SELECT MAX(version) FROM snapshots WHERE unit_id = j.value)
+         JOIN snapshot_left_out l ON l.snapshot_id = s.id
+         ORDER BY j.key, l.seq",
+    )?;
+    let raw: Vec<(i64, i64, i64, Raw)> = stmt
+        .query_map(params![ids], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                (
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ),
+            ))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut out: Vec<UnitLeftOut> = Vec::new();
+    for (unit_id, version, snapshot_id, row) in raw {
+        let row = from_raw(snapshot_id, row)?;
+        match out.last_mut() {
+            Some(last) if last.unit_id == unit_id => last.rows.push(row),
+            _ => out.push(UnitLeftOut {
+                unit_id,
+                version,
+                rows: vec![row],
+            }),
+        }
+    }
+    Ok(out)
 }
 
 /// Record `rows` as `snapshot_id`'s left-out list, in order, with one
@@ -89,7 +177,7 @@ pub fn load(conn: &Connection, snapshot_id: i64) -> Result<Vec<LeftOut>> {
         "SELECT reason, pattern, path, kind, files, bytes FROM snapshot_left_out
          WHERE snapshot_id = ?1 ORDER BY seq",
     )?;
-    let raw: Vec<(String, Option<String>, String, String, i64, i64)> = stmt
+    let raw: Vec<Raw> = stmt
         .query_map(params![snapshot_id], |r| {
             Ok((
                 r.get(0)?,
@@ -102,27 +190,34 @@ pub fn load(conn: &Connection, snapshot_id: i64) -> Result<Vec<LeftOut>> {
         })?
         .collect::<std::result::Result<_, _>>()?;
     raw.into_iter()
-        .map(|(reason, pattern, path, kind, files, bytes)| {
-            crate::volume::index::unescape(&path).map_err(|e| {
-                crate::error::TapectlError::Other(format!(
-                    "snapshot {snapshot_id}'s left-out path {path:?} is not escaped as the \
-                     index escapes a field: {e}"
-                ))
-            })?;
-            Ok(LeftOut {
-                reason: if reason == "socket" {
-                    Reason::Socket
-                } else {
-                    Reason::Pattern
-                },
-                pattern,
-                path,
-                folder: kind == "folder",
-                files,
-                bytes,
-            })
-        })
+        .map(|row| from_raw(snapshot_id, row))
         .collect()
+}
+
+/// One stored row: reason, pattern, path, kind, files, bytes.
+type Raw = (String, Option<String>, String, String, i64, i64);
+
+/// A stored row as a [`LeftOut`], its path checked to be escaped as the
+/// index escapes a field.
+fn from_raw(snapshot_id: i64, (reason, pattern, path, kind, files, bytes): Raw) -> Result<LeftOut> {
+    crate::volume::index::unescape(&path).map_err(|e| {
+        crate::error::TapectlError::Other(format!(
+            "snapshot {snapshot_id}'s left-out path {path:?} is not escaped as the \
+             index escapes a field: {e}"
+        ))
+    })?;
+    Ok(LeftOut {
+        reason: if reason == "socket" {
+            Reason::Socket
+        } else {
+            Reason::Pattern
+        },
+        pattern,
+        path,
+        folder: kind == "folder",
+        files,
+        bytes,
+    })
 }
 
 #[cfg(test)]
@@ -184,5 +279,104 @@ mod tests {
                 []
             )
             .is_err());
+    }
+
+    fn row(path: &str, files: i64, bytes: i64) -> LeftOut {
+        LeftOut {
+            reason: Reason::Pattern,
+            pattern: Some("*.tmp".into()),
+            path: path.into(),
+            folder: files > 1,
+            files,
+            bytes,
+        }
+    }
+
+    /// #542: the one `--json` shape of a left-out row, every key and value,
+    /// so `stage create` and `collection status` carry `snapshot create`'s.
+    #[test]
+    fn a_rows_json_is_snapshot_creates_shape() {
+        assert_eq!(
+            row("a.tmp", 1, 5).to_json(),
+            serde_json::json!({
+                "reason": "pattern", "pattern": "*.tmp", "path": "a.tmp",
+                "kind": "file", "files": 1, "bytes": 5,
+            })
+        );
+        let socket = LeftOut {
+            reason: Reason::Socket,
+            pattern: None,
+            path: "s.sock".into(),
+            folder: false,
+            files: 1,
+            bytes: 0,
+        };
+        assert_eq!(
+            socket.to_json(),
+            serde_json::json!({
+                "reason": "socket", "pattern": null, "path": "s.sock",
+                "kind": "file", "files": 1, "bytes": 0,
+            })
+        );
+    }
+
+    /// #542's third criterion: each unit's NEWEST snapshot's rows, in the
+    /// order the units are given; a unit whose newest left nothing out, or
+    /// with no snapshot, has no entry.
+    #[test]
+    fn newest_for_units_reads_each_units_newest_version_only() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        for u in ["a", "b", "c", "d"] {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+                 VALUES (?1, ?1, 1, '/x', 'mtime_size', 1, 'active')",
+                params![u],
+            )
+            .unwrap();
+        }
+        // a: v1 left out old.tmp, v2 new.tmp and a folder. b: v1 left out
+        // b.tmp, v2 nothing. c: v1 left out c.tmp. d: no snapshot.
+        let snap = |unit: i64, version: i64| -> i64 {
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, source_path, total_size, file_count)
+                 VALUES (?1, ?2, '/x', 0, 0)",
+                params![unit, version],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let a1 = snap(1, 1);
+        let a2 = snap(1, 2);
+        let b1 = snap(2, 1);
+        snap(2, 2);
+        let c1 = snap(3, 1);
+        insert(&conn, a1, &[row("old.tmp", 1, 1)]).unwrap();
+        insert(&conn, a2, &[row("new.tmp", 1, 7), row("cache", 3, 30)]).unwrap();
+        insert(&conn, b1, &[row("b.tmp", 1, 2)]).unwrap();
+        insert(&conn, c1, &[row("c.tmp", 1, 4)]).unwrap();
+
+        let got = newest_for_units(&conn, &[3, 4, 2, 1]).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                UnitLeftOut {
+                    unit_id: 3,
+                    version: 1,
+                    rows: vec![row("c.tmp", 1, 4)],
+                },
+                UnitLeftOut {
+                    unit_id: 1,
+                    version: 2,
+                    rows: vec![row("new.tmp", 1, 7), row("cache", 3, 30)],
+                },
+            ]
+        );
+        assert_eq!((got[1].files(), got[1].bytes()), (4, 37));
+        assert!(newest_for_units(&conn, &[]).unwrap().is_empty());
     }
 }

@@ -22,7 +22,7 @@ tapectl stage [OPTIONS] <COMMAND>
 
 Archive and encrypt each unit's newest snapshot into staging
 
-GNU tar archives each unit's files from its snapshot's exact list; its stream is checked and hashed as it passes, cut into slices of whole files, packed alone when compressed and age-encrypted in memory: no plaintext reaches staging. Several units may be named; `--jobs` stages that many at once. Every name is checked before any unit is staged. Under --json, an array of one object per unit, printed only when every unit was staged.
+GNU tar archives each unit's files from its snapshot's exact list; its stream is checked and hashed as it passes, cut into slices of whole files, packed alone when compressed and age-encrypted in memory: no plaintext reaches staging. Several units may be named; `--jobs` stages that many at once. Every name is checked before any unit is staged. Under --json, an array of one object per unit, printed only when every unit was staged; its `left_out` is what the version's snapshot left out, as `snapshot create --json` has it.
 
 Exit status: 0 = every unit staged; 2 = a unit failed or was refused (the error names each unit staged, failed and not started).
 

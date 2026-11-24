@@ -964,7 +964,9 @@ A plain pattern such as `*.iso` matches a file's name, anywhere in the unit. A
 pattern ending in `/`, such as `.cache/` or `node_modules/`, drops everything
 inside every directory of that name, at any depth below the unit, from the
 snapshot and from the archive, so none of it reaches tape (the directory
-itself is kept, empty). A collection's own `exclude` list, which decides which
+itself is kept, empty). What a pattern left out is never silent: `snapshot create` and
+`stage create` name what each pattern left out (`left_out` in their `--json`), and
+`collection status` counts it for each unit. A collection's own `exclude` list, which decides which
 folders become units, ignores case too: a plain pattern there matches a
 candidate folder's name, and a `name/` pattern skips every candidate below a
 folder of that name. Every key is in [configuration.md](configuration.md).

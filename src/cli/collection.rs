@@ -121,6 +121,11 @@ pub enum CollectionCommands {
     /// version); staged is a version waiting in staging for a copy it is
     /// still owed, which `volume write` writes.
     ///
+    /// Each unit whose newest snapshot left something out (an exclusion
+    /// pattern's match, or a socket) is shown with the files and bytes left
+    /// out; `--json` lists them, as `snapshot create --json` does. That
+    /// changes no exit status.
+    ///
     /// Exit status: 0 = clean; 1 = warnings (a unit refused, an entry
     /// outside every unit, a unit missing); 2 = errors (a root that is not
     /// absolute or does not exist, a tenant or archive set that does not
@@ -929,7 +934,44 @@ struct StatusRow<'a> {
     name: &'a str,
     status: Option<collection::status::CollectionStatus>,
     staged: usize,
+    /// What each unit's newest snapshot left out (#542).
+    left_out: Vec<collection::status::NamedLeftOut>,
     errors: Vec<String>,
+}
+
+/// `collection status --json`'s `left_out` (#542): for each unit whose
+/// newest snapshot left something out, its version, the files and bytes
+/// left out, and the rows in `snapshot create --json`'s shape.
+fn left_out_status_json(left: &[collection::status::NamedLeftOut]) -> Vec<serde_json::Value> {
+    left.iter()
+        .map(|u| {
+            serde_json::json!({
+                "unit": u.unit,
+                "version": u.left.version,
+                "files": u.left.files(),
+                "bytes": u.left.bytes(),
+                "left_out": u.left.rows.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+/// `collection status`'s lines for what each unit's newest snapshot left
+/// out (#542): a count and bytes, one line a unit; none for a unit that
+/// left nothing out.
+fn left_out_status_lines(left: &[collection::status::NamedLeftOut]) -> Vec<String> {
+    left.iter()
+        .map(|u| {
+            format!(
+                "  LEFT OUT (not archived): unit \"{}\" v{}: {}, {} \
+                 (`collection status --json` names them)",
+                u.unit,
+                u.left.version,
+                crate::render::plural(u.left.files(), "file", "files"),
+                crate::util::format_bytes_binary(u.left.bytes()),
+            )
+        })
+        .collect()
 }
 
 fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i32> {
@@ -952,6 +994,7 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i
                 name: &lib.name,
                 status: None,
                 staged: 0,
+                left_out: Vec::new(),
                 errors,
             });
             continue;
@@ -961,10 +1004,14 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i
             seen.push(Severity::Warning);
         }
         let staged = staged_under(conn, &collection::canonical_root(lib)?, &owing)?.len();
+        // #542: what each unit's newest snapshot left out. A report, not a
+        // fault: it leaves the exit status as it is.
+        let left_out = collection::status::left_out_for_collection(conn, lib)?;
         rows.push(StatusRow {
             name: &lib.name,
             status: Some(status),
             staged,
+            left_out,
             errors: Vec::new(),
         });
     }
@@ -986,6 +1033,7 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i
                     "under_copied": s.map(|s| s.under_copied),
                     "refused": s.map(|s| refused_json(&s.refused)).unwrap_or_default(),
                     "outside": s.map(|s| outside_json(&s.outside)).unwrap_or_default(),
+                    "left_out": left_out_status_json(&row.left_out),
                     "errors": row.errors,
                 })
             })
@@ -999,6 +1047,9 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i
                     println!("{}", status_line(row.name, s, row.staged));
                     print_refused_plain(&s.refused);
                     print_outside_plain(row.name, &s.outside);
+                    for line in left_out_status_lines(&row.left_out) {
+                        println!("{line}");
+                    }
                 }
             }
         }
@@ -2428,6 +2479,68 @@ pattern = ["*.tmp"]
             let code = run(&conn, &paths, &config, &command, false, false, false).unwrap();
             assert_ne!(code, 0, "{command:?} must exit non-zero");
         }
+    }
+
+    /// #542's criterion 3: `collection status` shows, for each unit, what
+    /// the patterns left out of its newest snapshot: a count and bytes in
+    /// the text, the same with the rows in `snapshot create --json`'s shape
+    /// in `--json`, and nothing for a unit that left nothing out (beta,
+    /// snapshotted; gamma, never). It is a report: the exit status is the
+    /// one the collection had without it.
+    #[test]
+    fn status_shows_what_each_units_newest_snapshot_left_out() {
+        let conn = db::open_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let lib = seed_three_unit_collection(&conn, root.path(), false);
+        let alpha = std::path::Path::new(&lib.root).join("alpha");
+        std::fs::write(alpha.join("a.tmp"), b"12345").unwrap();
+        std::fs::create_dir_all(alpha.join("cache/sub")).unwrap();
+        std::fs::write(alpha.join("cache/x"), b"123").unwrap();
+        std::fs::write(alpha.join("cache/sub/y"), b"1234567").unwrap();
+        let mut config = Config::default();
+        config.defaults.global_excludes = vec!["*.tmp".into(), "cache/".into()];
+        config.collections.push(lib.clone());
+        crate::staging::snapshot_create(&conn, "testlib/alpha", &config).unwrap();
+        crate::staging::snapshot_create(&conn, "testlib/beta", &config).unwrap();
+
+        let left = collection::status::left_out_for_collection(&conn, &lib).unwrap();
+        assert_eq!(
+            left_out_status_json(&left),
+            vec![serde_json::json!({
+                "unit": "testlib/alpha",
+                "version": 1,
+                "files": 3,
+                "bytes": 15,
+                "left_out": [
+                    {"reason": "pattern", "pattern": "*.tmp", "path": "a.tmp",
+                     "kind": "file", "files": 1, "bytes": 5},
+                    {"reason": "pattern", "pattern": "cache/", "path": "cache",
+                     "kind": "folder", "files": 2, "bytes": 10},
+                ],
+            })]
+        );
+        assert_eq!(
+            left_out_status_lines(&left),
+            vec![
+                "  LEFT OUT (not archived): unit \"testlib/alpha\" v1: 3 files, 15 B \
+                 (`collection status --json` names them)"
+                    .to_string()
+            ]
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        let code = run(
+            &conn,
+            &paths,
+            &config,
+            &CollectionCommands::Status,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(code, 0, "what was left out does not change the exit status");
     }
 }
 
