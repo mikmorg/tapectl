@@ -2435,13 +2435,87 @@ EOF
 DAMAGED_TOTAL=0
 UNITS_DONE=0
 
+# A file-table path is written under the destination only when it stays there
+# and is written as volume-format-v3.md 1.5 writes one: the four checks of
+# tapectl's filetable::check_member_path, in its order, on each path and on
+# each hard link's target. The first row that fails one is printed as its
+# words, a TAB, and the path as the table writes it; nothing is printed for a
+# table whose every path passes. tesc() is 1.5's escape: a backslash, a TAB, a
+# newline and a carriage return written out, and each byte that is not part
+# of a well-formed UTF-8 sequence \xHH.
+AWK_TABLE_PATHS='
+BEGIN { for (i = 1; i < 256; i++) ord_of[sprintf("%c", i)] = i }
+function tesc(s,    out, i, n, c, b, k, need, lo, hi, j, ok) {
+  out = ""
+  n = length(s)
+  i = 1
+  while (i <= n) {
+    c = substr(s, i, 1)
+    b = ord_of[c]
+    if (c == "\\") { out = out "\\\\"; i++; continue }
+    if (c == "\t") { out = out "\\t"; i++; continue }
+    if (c == "\n") { out = out "\\n"; i++; continue }
+    if (c == "\r") { out = out "\\r"; i++; continue }
+    if (b < 128) { out = out c; i++; continue }
+    need = 0; lo = 128; hi = 191
+    if (b >= 194 && b <= 223) need = 1
+    else if (b == 224) { need = 2; lo = 160 }
+    else if ((b >= 225 && b <= 236) || b == 238 || b == 239) need = 2
+    else if (b == 237) { need = 2; hi = 159 }
+    else if (b == 240) { need = 3; lo = 144 }
+    else if (b >= 241 && b <= 243) need = 3
+    else if (b == 244) { need = 3; hi = 143 }
+    ok = (need > 0 && i + need <= n)
+    for (j = 1; ok && j <= need; j++) {
+      k = ord_of[substr(s, i + j, 1)]
+      if (j == 1) { if (k < lo || k > hi) ok = 0 }
+      else if (k < 128 || k > 191) ok = 0
+    }
+    if (ok) { out = out substr(s, i, need + 1); i += need + 1 }
+    else { out = out sprintf("\\x%02x", b); i++ }
+  }
+  return out
+}
+function refused(p,    d, t, nd, np) {
+  d = bytes(p)
+  if (substr(d, 1, 1) == "/") return "it begins with /"
+  if (("/" d "/") ~ /\/\.\.\//) return "it has a .. component"
+  t = d; nd = gsub(/\//, "", t)
+  t = p; np = gsub(/\//, "", t)
+  if (nd > np) return "a / in it is written \\x2f"
+  if ((index(p, "\\") > 0 || p !~ /^[ -~]*$/) && tesc(d) != p) return "it is not written as a path is written (volume-format-v3.md 1.5)"
+  return ""
+}
+/^#/ { next }
+{
+  w = refused($7)
+  if (w != "") { print w "\t" $7; exit }
+  if ($1 == "h") {
+    w = refused($8)
+    if (w != "") { print "its hard link\047s target: " w "\t" $8; exit }
+  }
+}
+'
+
 # The unit chosen, from its row of units.txt: its file table and its slices
 # are read, and the decompressor its staging needs is found.
 U_POS="" U_IDX="" U_NAME="" U_VER="" U_UUID="" U_COMP="" U_SB="" U_FT="" U_IDM="" U_NS="" U_TABLE=""
+U_REFUSED=""     # the words that refuse the unit open's file table, or nothing
+TABLE_REFUSED="" # the units a whole restore refused by their tables
 unit_open() { # <chosen row>
   IFS='|' read -r U_POS U_IDX U_NAME U_VER _ U_UUID U_COMP U_SB U_FT U_IDM U_NS <<<"$1"
   U_TABLE=$(unit_table_path "$U_POS" "$U_FT")
   [ -f "$U_TABLE" ] || die "the envelope has no file table for unit $(safe_str "$U_NAME") at $(safe_str "$U_FT")"
+  # A table with a path that would leave the destination (or is not written
+  # as 1.5 writes one) is refused before anything is removed, made or linked
+  # (#606 C-2): the caller says so and writes nothing of the unit.
+  local bad
+  U_REFUSED=""
+  bad=$(awk -F'\t' "$AWK_INDEX_COMMON $AWK_TABLE_PATHS" "$U_TABLE") || bad=""
+  if [ -n "$bad" ]; then
+    U_REFUSED="the file table of unit $(safe_str "$U_NAME") holds a path this script will not write: $(visible_text "${bad#*$'\t'}") (${bad%%$'\t'*}). The envelope is damaged; try another copy of this tape. Nothing of this unit was written."
+    return 0
+  fi
   COMP=$U_COMP
   DECOMP=""
   if [ -n "$COMP" ]; then
@@ -2618,6 +2692,11 @@ units_with_lists() {
 restore_one() { # <chosen row> <destination>
   local dest=$2 table pos name ver uuid idm ns sb
   unit_open "$1"
+  if [ -n "$U_REFUSED" ]; then
+    warn "$U_REFUSED"
+    TABLE_REFUSED="${TABLE_REFUSED:+$TABLE_REFUSED, }$(safe_str "$U_NAME")"
+    return 0
+  fi
   table=$U_TABLE pos=$U_POS name=$U_NAME ver=$U_VER uuid=$U_UUID idm=$U_IDM ns=$U_NS sb=$U_SB
   mkdir -p -- "$dest" || die "cannot create $(safe_str "$dest")"
   local earlier="$dest/.tapectl-damaged-files.txt"
@@ -3196,6 +3275,7 @@ do_paths() {
     printf '%s\n' "$p" >>"$WORK/want.paths"
   done
   unit_open "$(head -n 1 "$WORK/chosen.txt")"
+  [ -z "$U_REFUSED" ] || die "$U_REFUSED"
   restore_paths "$TO" path
 }
 
@@ -3254,6 +3334,7 @@ do_repair() {
   fi
   choose_repair_unit
   unit_open "$(head -n 1 "$WORK/chosen.txt")"
+  [ -z "$U_REFUSED" ] || die "$U_REFUSED"
   if [ ! -s "$WORK/want.paths" ]; then
     say "The damaged-file list names no path: nothing to restore."
     return 0
@@ -3311,6 +3392,9 @@ do_restore() {
     say "RESTORE STOPPED at your request: the files restored and checked so far stay, a file tar had begun was removed, and what was left out is on the damaged-file list."
     return 1
   fi
+  if [ -n "$TABLE_REFUSED" ]; then
+    say "RESTORE INCOMPLETE: the file table of unit(s) $TABLE_REFUSED holds a path that would leave the destination or is not written as a path is written, so nothing of it was restored: restore it from another copy of this tape."
+  fi
   if [ "$DAMAGED_TOTAL" -gt 0 ]; then
     say "RESTORE INCOMPLETE: $DAMAGED_TOTAL path(s) are damaged or left out; restore them from another copy (the list is the one repair: give it to --paths-from on a tape that holds the same version)."
     return 1
@@ -3319,6 +3403,7 @@ do_restore() {
     say "RESTORE INCOMPLETE: tar ended with a status other than 0, and --no-file-check runs no check to say what it restored. Run again without --no-file-check to learn which files are whole."
     return 1
   fi
+  [ -z "$TABLE_REFUSED" ] || return 1
   if [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; then
     say "RESTORE COMPLETE: the named path(s) of unit $(safe_str "$U_NAME") are restored into $TO."
   else
