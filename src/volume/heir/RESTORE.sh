@@ -29,7 +29,8 @@
 #                                              escaped, so a backslash in a name
 #                                              is typed \\, a TAB \t, a newline
 #                                              \n, a carriage return \r, and a
-#                                              byte that is not UTF-8 \xHH (two
+#                                              byte that is not UTF-8, or a
+#                                              control byte, \xHH (two
 #                                              lowercase hex digits)
 #   RESTORE.sh --restore --key K --to DIR --paths-from LIST
 #                                              the one repair: LIST is the
@@ -41,7 +42,8 @@
 #   RESTORE.sh --where UNIT --key K            every version of a unit and the
 #   RESTORE.sh --where --all --key K           tapes that hold it; every unit
 #   RESTORE.sh --find TEXT --key K             paths containing TEXT, with their
-#                                              unit, version and tapes
+#                                              unit, version and tapes (TEXT is
+#                                              written as P is)
 #                                              (all three read the index this
 #                                              tape carries, as of its writing)
 #   Also: [--key K2 ...] repeats a key; --work DIR puts the work directory
@@ -1543,9 +1545,13 @@ do_list() {
     r=$(range_of "$uuid" "$ver")
     [ -z "$r" ] || say "  PART: $(range_words "$r"). A file in a slice this tape does not hold is not on it."
     say "  Paths are written escaped: a backslash in a name is \\\\, a TAB \\t, a newline \\n, a carriage"
-    say "  return \\r, and a byte that is not UTF-8 \\xHH. Give --path and --paths-from a path as it is printed here."
+    say "  return \\r, and a byte that is not UTF-8, or a control byte, \\xHH. Give --path and --paths-from a path as it is"
+    say "  printed here."
     say "  kind  slice  bytes  path"
-    awk -F'\t' '/^#/ { next } { printf "  %s  %5s  %s  %s%s\n", $1, $2, $5, $7, ($1 == "h" ? "  -> " $8 : "") }' "$table"
+    awk -F'\t' "$AWK_INDEX_COMMON"'
+      /^#/ { next }
+      { printf "  %s  %5s  %s  %s%s\n", $1, $2, $5, vis($7), ($1 == "h" ? "  -> " vis($8) : "") }
+    ' "$table"
   done <"$WORK/chosen.txt"
 }
 
@@ -2212,7 +2218,8 @@ feed_end() { # <state>
 # writes the bytes, each by its code: not printf %b, which reads other escapes
 # (\c stops the output). Run under LC_ALL=C by every awk the script supports,
 # it writes a byte as a byte. A backslash that is not one of these escapes is
-# kept as it stands. A NUL byte is never written (a name has none).
+# kept as it stands. A NUL byte is never written (a name has none). The index
+# programs' bytes() is this decoder as an awk function.
 AWK_UNESC='
 BEGIN { hex = "0123456789abcdef" }
 {
@@ -2465,7 +2472,7 @@ write_damaged_list() { # <destination> <name> <uuid> <version> <file of paths>
 
 print_damaged() { # <file of paths> <count> <list path>
   say "DAMAGED: $2 path(s) were left out or failed the check. They are listed in $3:"
-  head -n 41 "$1" | sed 's/^/  /'
+  awk "$AWK_INDEX_COMMON"' NR <= 41 { print "  " vis($0) }' "$1"
   if [ "$2" -gt 40 ]; then say "  ... and $(($2 - 40)) more, in the list."; fi
 }
 
@@ -2991,7 +2998,14 @@ make_links() { # <destination>
 restore_paths() { # <destination> <how>
   local dest=$1 how=$2 npaths nm k p files_bytes biggest=0 ndam
   mkdir -p -- "$dest" || die "cannot create $(safe_str "$dest")"
-  sort -u "$WORK/want.paths" >"$WORK/want.sorted"
+  # A path holding a raw control byte is printed with it written \xHH
+  # (--list, --find): that printed form names the table's own text. Every other
+  # path is matched as it is given.
+  awk -F'\t' "$AWK_INDEX_COMMON"'
+    FILENAME == ARGV[1] { if (!/^#/ && $7 ~ /[[:cntrl:]]/) canon[vis($7)] = $7; next }
+    { print ((($0 "") in canon) ? canon[$0 ""] : $0) }
+  ' "$U_TABLE" "$WORK/want.paths" >"$WORK/want.canon"
+  sort -u "$WORK/want.canon" >"$WORK/want.sorted"
   npaths=$(wc -l <"$WORK/want.sorted" | tr -d ' ')
   : >"$WORK/wanted.rows"
   : >"$WORK/brought.paths"
@@ -3134,7 +3148,7 @@ restore_paths() { # <destination> <how>
       print_damaged "$WORK/damaged.paths" "$ndam" "$dest/.tapectl-damaged-files.txt"
     else
       say "DAMAGED: $ndam path(s) were left out or failed the check:"
-      head -n 41 "$WORK/damaged.paths" | sed 's/^/  /'
+      awk "$AWK_INDEX_COMMON"' NR <= 41 { print "  " vis($0) }' "$WORK/damaged.paths"
     fi
     ABSENT_HOW=$how ABSENT_DEST=$dest
     report_absent "$WORK/damaged.paths"
@@ -3362,13 +3376,53 @@ function show(s,    out, i, n, c) {
   }
   return out
 }
-# A path as the index writes it, which is as --list writes it and as --path
-# takes it: already escaped (a backslash is \\, a TAB \t, a newline \n, a
-# carriage return \r, a byte that is not UTF-8 \xHH), so it is printed as it
-# stands. Only a control byte that is still raw is not shown.
+# The bytes of an escaped path (1.5): the decoder of AWK_UNESC, as a
+# function. A backslash that is not one of the escapes is kept as it stands.
+# A NUL byte is never made.
+function bytes(s,    out, p, d, v) {
+  if (index(s, "\\") == 0) return s
+  out = ""
+  while ((p = index(s, "\\")) > 0) {
+    out = out substr(s, 1, p - 1)
+    d = substr(s, p + 1, 1)
+    if (d == "t") { out = out "\t"; s = substr(s, p + 2) }
+    else if (d == "n") { out = out "\n"; s = substr(s, p + 2) }
+    else if (d == "r") { out = out "\r"; s = substr(s, p + 2) }
+    else if (d == "\\") { out = out "\\"; s = substr(s, p + 2) }
+    else if (d == "x" && substr(s, p + 2, 2) ~ /^[0-9a-f][0-9a-f]$/) {
+      v = (index("0123456789abcdef", substr(s, p + 2, 1)) - 1) * 16 + (index("0123456789abcdef", substr(s, p + 3, 1)) - 1)
+      if (v > 0) out = out sprintf("%c", v)
+      s = substr(s, p + 4)
+    }
+    else { out = out "\\"; s = substr(s, p + 1) }
+  }
+  return out s
+}
+# An escaped path as it is printed: a control byte that is still raw (1.5
+# escapes only a TAB, a newline and a carriage return of them) is written
+# \xHH, so none reaches the terminal, and --path takes the printed form back.
+function vis(s,    out, i, n, c) {
+  if (s !~ /[[:cntrl:]]/) return s
+  if (!vis_ready) {
+    for (i = 1; i < 32; i++) vis_code[sprintf("%c", i)] = i
+    vis_code[sprintf("%c", 127)] = 127
+    vis_ready = 1
+  }
+  out = ""
+  n = length(s)
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (c ~ /[[:cntrl:]]/) out = out sprintf("\\x%02x", vis_code[c])
+    else out = out c
+  }
+  return out
+}
+# A path as the index writes it, which is as the file table writes it:
+# already escaped (a backslash is \\, a TAB \t, a newline \n, a carriage
+# return \r, a byte that is not UTF-8 \xHH), so it is printed as it stands,
+# but for a raw control byte, written \xHH (vis), as --list writes it.
 function showpath(s) {
-  gsub(/[[:cntrl:]]/, "?", s)
-  return s
+  return vis(s)
 }
 function human(b) {
   if (b !~ /^[0-9]+$/) return "size not known"
@@ -3631,7 +3685,9 @@ END {
 
 # --find TEXT over one tenant envelope: FIND_UNITS is its index/units.tsv (or
 # /dev/null), the program input its index/paths.tsv. Prints the rows whose
-# DECODED path contains the literal text in FIND_TEXT (index(), not a pattern),
+# path, decoded to its bytes (bytes(): 1.5's one escape), contains the text in
+# FIND_TEXT decoded the same way, so TEXT is written as --list prints a path
+# (index(), not a pattern),
 # at most FIND_LIMIT of them, each as unit, version, kind, size and path, then
 # the tapes holding each printed version. FIND_WHO names the envelope. The
 # numbers printed and matched are written to the file FIND_COUNTS, so the
@@ -3640,7 +3696,9 @@ END {
 AWK_INDEX_FIND='
 BEGIN {
   FS = "\t"
-  needle = ENVIRON["FIND_TEXT"]
+  needle = bytes(ENVIRON["FIND_TEXT"])
+  # A text that decodes to nothing (\x00 alone) is in no path.
+  none = (needle == "" && ENVIRON["FIND_TEXT"] != "")
   limit = ENVIRON["FIND_LIMIT"] + 0
   uf = ENVIRON["FIND_UNITS"]
   cf = ENVIRON["FIND_COUNTS"]
@@ -3663,7 +3721,7 @@ NR == 1 {
 }
 {
   p = $(ph["path"])
-  if (index(unesc(p), needle) == 0) next
+  if (none || index(bytes(p), needle) == 0) next
   total++
   if (shown >= limit) next
   shown++
@@ -3860,13 +3918,28 @@ do_where() {
 }
 
 # The text given, with a TAB, newline or carriage return written out, so a
-# message about it stays on its own line.
+# message about it stays on its own line, and any other control byte written
+# \xHH, as --list writes it, so none reaches the terminal raw.
 visible_text() { # <text>
-  local t=$1
+  local t=$1 out="" c i
   t=${t//$'\t'/\\t}
   t=${t//$'\n'/\\n}
   t=${t//$'\r'/\\r}
-  printf '%s' "$t"
+  case $t in
+  *[[:cntrl:]]*) ;;
+  *)
+    printf '%s' "$t"
+    return 0
+    ;;
+  esac
+  for ((i = 0; i < ${#t}; i++)); do
+    c=${t:i:1}
+    case $c in
+    [[:cntrl:]]) printf -v c '\\x%02x' "'$c" ;;
+    esac
+    out+=$c
+  done
+  printf '%s' "$out"
 }
 
 # --find: the matches of each tenant envelope's paths.tsv, kept in a file so
@@ -3923,7 +3996,8 @@ do_find() {
   say ""
   say "Paths containing '$(visible_text "$FIND_TEXT")' (unit, version, kind, size, path; kind is d directory,"
   say "f file, l symlink, s special). A path is written as --list writes it, which is the form --path"
-  say "takes: a backslash is \\\\, a TAB \\t, a newline \\n, a carriage return \\r, and a byte that is not UTF-8 \\xHH."
+  say "takes: a backslash is \\\\, a TAB \\t, a newline \\n, a carriage return \\r, and a byte that is not UTF-8, or a control"
+  say "byte, \\xHH. TEXT is matched in that form too."
   say ""
   cat "$WORK/find.out"
   say ""
