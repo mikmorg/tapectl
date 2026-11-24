@@ -233,7 +233,7 @@ fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created>
         // the created path, `false` when an existing version was reported
         // instead — never two different JSON shapes for the same command.
         "minted": outcome.minted,
-        "left_out": left_out.iter().map(left_out_json).collect::<Vec<_>>(),
+        "left_out": left_out.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
     });
     let mut line = if outcome.minted {
         format!(
@@ -251,18 +251,6 @@ fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created>
     };
     line.push_str(&left_out_lines(&left_out));
     Ok(Created { line, json })
-}
-
-/// One thing a version left out, as `--json` carries it (#542).
-fn left_out_json(row: &crate::db::snapshot_left_out::LeftOut) -> serde_json::Value {
-    serde_json::json!({
-        "reason": row.reason.as_str(),
-        "pattern": row.pattern,
-        "path": row.path,
-        "kind": row.kind(),
-        "files": row.files,
-        "bytes": row.bytes,
-    })
 }
 
 /// How many left-out things `snapshot create` names in its text before it
