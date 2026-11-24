@@ -45,7 +45,7 @@
 # heir_restore_symlinks, and added heir_verify, heir_list, heir_path, heir_find_path,
 # heir_long_member, span_heir_start_later, span_heir_second_run, span_heir_not_have and
 # heir_{gzip,xz,zstd}_{restore,path}: 78 checks. The open issues before 2.0.0's tag added
-# heir_restore_tmpdir (#561): 79. #400 is not exercisable on mhvtl, see its section.
+# heir_restore_tmpdir (#561) and span_heir_wrong_cartridge (#521): 80. #400 is not exercisable on mhvtl, see its section.
 #
 # The tools it names: tar (GNU tar 1.35, built with ACL support, is the writer's floor; the
 # config it writes names [tar] binary, never [dar]), age, gzip, xz, zstd (the heir's real
@@ -2971,6 +2971,9 @@ check heir_zstd_path       step_heir_zstd_path
 #                          pa-whole first, then pb-big until the warning on tape 1; pc-small, queued
 #                          after it, is not on tapes 1 and 2 and follows pb-big's owed tail on tape 3.
 #                          It restores across both swaps.
+#   span_heir_wrong_cartridge  #521: proof 2's restore, its prompt answered first with a blank
+#                          cartridge, then with SPF-0001 (no slice of sb-span): each refused with its
+#                          NOTE and the prompt asked again, nothing restored removed; then tape 3.
 SP="$RUN/span"
 SP_WAIT="${TAPECTL_GATE_SWAP_WAIT:-300}"
 SP_DRIVER="$(cd "$(dirname "$0")" && pwd)/mhvtl-prompt-driver.py"
@@ -3069,7 +3072,7 @@ sp_prepare() {
         SP_FREE+=("$slot")
         SP_TAG[$slot]="$(sed -n 's/.*VolumeTag *= *\([A-Z0-9]*\).*/\1/p' <<<"$line")"
     done < <(grep -E "Storage Element [0-9]+:Full" <<<"$status" | grep "VolumeTag=[EF][0-9]*$GEN")
-    [ "${#SP_FREE[@]}" -ge 7 ] || { SP_PREP="the library has ${#SP_FREE[@]} free $GEN data cartridges; the leg needs 7"; return 1; }
+    [ "${#SP_FREE[@]}" -ge 8 ] || { SP_PREP="the library has ${#SP_FREE[@]} free $GEN data cartridges; the leg needs 8"; return 1; }
 }
 sp_ready() {
     [ -z "$SP_PREP" ] || { echo "the span leg could not be prepared: $SP_PREP"; return 1; }
@@ -3920,6 +3923,106 @@ PY
 }
 check span_three_tapes step_span_three_tapes
 
+# span_heir_wrong_cartridge (#521; R8): span_heir_tapes_1_3's restore (sb-span, started on tape 1),
+# whose one prompt is first answered with cartridges the script cannot use: a blank one (this leg's
+# own, erased in the drive), then a tapectl tape of another home that holds none of sb-span's slices
+# (SPF-0001, span_floor_target_1's). Each is refused with its NOTE, nothing is taken from it, and
+# the prompt is asked again, for the same slice; then tape 3 is loaded and taken. Nothing restored
+# before the first prompt is removed (the same files, by inode, at every prompt and at the end), the
+# work directory is there at every prompt, the one tar run waits across the three swaps, and the run
+# ends RESTORE COMPLETE with the unit byte for byte (tests/heir_restore.rs
+# a_cartridge_is_taken_only_by_the_next_slices_hash_at_a_position_its_seal_covers, tests/
+# heir_restore_s6.rs a_refused_cartridge_does_not_cost_the_run_its_home_tape).
+# What a restore's destination holds, outside its work directory: "<type> <inode> <path>", one a
+# line. Exported with sp_swap: the prompt driver runs it.
+sp_dest_note() { # sp_dest_note <dest> <out>
+    find "$1" -mindepth 1 -name '.tapectl-work*' -prune -o -printf '%y %i %P\n' 2>/dev/null | sort -k3 >"$2"
+    echo "sp_dest_note: $(wc -l <"$2") entr(ies) in $1"
+}
+export -f sp_dest_note
+step_span_heir_wrong_cartridge() {
+    local h="$SP/a/heir5" dest="$SP/a/heir5/wrong" key="$SP/a/home/keys/alice-primary.age.key" rc s1 s2 s3 got needle
+    sp_ready && sp_a_figures || return 1
+    [ -n "${SP_SLOT[SPF-0001]:-}" ] || { echo "no SPF-0001: span_floor_target_1 did not give the leg its tapectl tape that lacks sb-span's slices"; return 1; }
+    # The blank cartridge, erased in the drive. The control: its first file gives no byte.
+    sp_assign SPX-BLANK && sp_load SPX-BLANK && mt -f "$TAPE_DEV" erase && mt -f "$TAPE_DEV" rewind \
+        || { echo "cannot load and erase the blank cartridge"; return 1; }
+    got="$(dd if="$TAPE_DEV" bs=512k count=1 2>/dev/null | wc -c)"
+    [ "$got" = 0 ] || { echo "control: the erased cartridge gives $got bytes at its first file"; return 1; }
+    sp_load SPA-0001 && sp_restore_sh "$h" || return 1
+    s1="$(printf 'sp_work_note %q %q && sp_dest_note %q %q && sp_swap %q' "$dest" "$h/work-1.txt" "$dest" "$h/dest-1.txt" "${SP_SLOT[SPX-BLANK]}")"
+    s2="$(printf 'sp_work_note %q %q && sp_dest_note %q %q && sp_swap %q' "$dest" "$h/work-2.txt" "$dest" "$h/dest-2.txt" "${SP_SLOT[SPF-0001]}")"
+    s3="$(printf 'sp_work_note %q %q && sp_dest_note %q %q && sp_swap %q' "$dest" "$h/work-3.txt" "$dest" "$h/dest-3.txt" "${SP_SLOT[SPA-0003]}")"
+    (cd "$h" && sp_drive "$h/wrong.out" "$h/wrong.events" "$SP_PROMPT_HEIR" quit --swap "$s1" --swap "$s2" --swap "$s3" -- \
+        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$dest")
+    rc=$?
+    cat "$h/wrong.out"
+    [ "$rc" -eq 0 ] || { echo "RESTORE.sh, offered a blank cartridge and SPF-0001 before tape 3, exited $rc, want 0"; return 1; }
+    sp_has "$h/wrong.out" "RESTORE COMPLETE" "This cartridge identifies as: SPA-0003" || return 1
+    diff -r "$SP/a/src/sb-span" "$dest" || { echo "the restore after two refused cartridges differs from the source"; return 1; }
+    [ ! -e "$dest/.tapectl-damaged-files.txt" ] || { echo "a damaged-file list after a complete run"; return 1; }
+    if compgen -G "$dest/.tapectl-work*" >/dev/null; then echo "the work directory was left in $dest"; return 1; fi
+    # A refused cartridge ends nothing, and nothing said of it reads as a verdict on this restore.
+    for needle in "FATAL" "Use the RESTORE.sh stored on THIS tape"; do
+        grep -F -- "$needle" "$h/wrong.out" >/dev/null
+        case $? in
+            0) echo "the run printed '$needle' about a cartridge it was offered"; return 1 ;;
+            1) ;;
+            *) echo "grep failed on $h/wrong.out"; return 1 ;;
+        esac
+    done
+    sp_dest_note "$dest" "$h/dest-end.txt" >/dev/null || return 1
+    python3 - "$h" "$SP_A_K1" "$SP_PROMPT_HEIR" <<'PY' || return 1
+import json, sys
+h, k1, prompt = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+k = k1 + 1
+ev = [json.loads(l) for l in open(f"{h}/wrong.events")]
+prompts = [e for e in ev if "prompt" in e]
+assert len(prompts) == 3, f"{len(prompts)} prompts, want three (blank, SPF-0001, tape 3): {prompts}"
+for p in prompts:
+    assert p["swap_rc"] == 0 and p["reply"] == "", f"a swap failed: {p}"
+    assert f"holds slice {k} into" in p["line"], f"prompt {p['prompt']} is {p['line']!r}, want slice {k} again"
+# The one tar run, the same process at every prompt and every reply: nothing was started again.
+tars = {tuple(p["tar_at_prompt"]) for p in prompts} | {tuple(p["tar_at_reply"]) for p in prompts}
+assert len(tars) == 1 and len(next(iter(tars))) == 1, f"tar processes at the prompts and replies: {tars}"
+# What each offer drew, in the text between its prompt and the next.
+out = open(f"{h}/wrong.out").read()
+seg = out.split(prompt)
+assert len(seg) == 4, f"the prompt text appears {len(seg) - 1} times, want 3"
+want = [
+    ["NOTE: this cartridge is blank: nothing can be read at its first file. Nothing is taken from it."],
+    ["NOTE: This cartridge (label SPF-0001) lists no data slice with the sha256 of slice %d " % k, "Nothing is taken from it."],
+    ["This cartridge identifies as: SPA-0003"],
+]
+for i, needles in enumerate(want, 1):
+    for n in needles:
+        assert n in seg[i], f"after prompt {i}: no {n!r} in:\n{seg[i]}"
+    if i < 3:
+        assert "This cartridge identifies as" not in seg[i], f"the cartridge offered at prompt {i} was taken:\n{seg[i]}"
+# The work directory at every prompt (a refusal keeps it), and what was restored before the first
+# prompt is still there, the same file by inode, at each later prompt and at the end.
+def note(path):
+    rows = {}
+    for line in open(path):
+        typ, ino, rel = line.rstrip("\n").split(" ", 2)
+        rows[rel] = (typ, ino)
+    return rows
+for i in (1, 2, 3):
+    w = open(f"{h}/work-{i}.txt").read().splitlines()
+    assert w and w[0] == "WORKDIR 1", f"the work directory at prompt {i}: {w}"
+first = note(f"{h}/dest-1.txt")
+files = [r for r, (t, _) in first.items() if t == "f"]
+assert files, f"positive control: nothing restored before the first prompt, so 'nothing removed' proves nothing: {first}"
+for later in ("dest-2.txt", "dest-3.txt", "dest-end.txt"):
+    now = note(f"{h}/{later}")
+    gone = [r for r in first if now.get(r) != first[r]]
+    assert not gone, f"{later}: restored before the first prompt and since removed or replaced: {gone}"
+print(f"three prompts for slice {k}, one tar run; the blank and SPF-0001 refused, tape 3 taken; "
+      f"{len(first)} entr(ies) restored before the first prompt kept, {len(files)} of them files: {sorted(files)}")
+PY
+}
+check span_heir_wrong_cartridge step_span_heir_wrong_cartridge
+
 # The gate's own cartridge back in the drive. When every span check passed, the leg's bulk
 # (sources, staging, restored trees) is removed and the logs, JSON reports and catalogs stay;
 # after a failure all of it is kept, so the failure can be read from what it left.
@@ -3930,13 +4033,13 @@ if [ -z "$SP_PREP" ]; then
     sp_all_passed=1
     for sp_name in span_rows span_heir_tapes_1_3 span_heir_tape_2 span_heir_stream_swap span_heir_start_later \
         span_heir_second_run span_heir_not_have span_restore_unit \
-        span_retire_floors span_floor_target_1 span_rebuild_tape_3 span_three_tapes; do
+        span_retire_floors span_floor_target_1 span_rebuild_tape_3 span_three_tapes span_heir_wrong_cartridge; do
         [ "${RESULT[$sp_name]:-}" = PASS ] || sp_all_passed=0
     done
     if [ "$sp_all_passed" = 1 ]; then
         rm -rf "$SP"/{a,c,f}/src "$SP"/{a,c,f}/home/staging "$SP"/a/heir/from-1-3 "$SP"/a/heir/stream \
             "$SP"/a/heir2/from-2 "$SP"/a/heir3/from-3 "$SP"/a/heir4/{done,eof,quit} "$SP"/a/restore/attended \
-            "$SP"/a/restore/unattended "$SP"/c/heir/restored
+            "$SP"/a/restore/unattended "$SP"/c/heir/restored "$SP"/a/heir5/wrong
     else
         echo "gate: span leg: a span check failed; its sources, staging and restored trees are kept in $SP"
     fi
@@ -4097,7 +4200,7 @@ PY
 check lbp_page_clear_after_every_command step_lbp_page_clear_after_every_command
 
 # ---------- the checks the gate must have run, by name ----------
-# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 79). The verdict compares the run to this
+# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 80). The verdict compares the run to this
 # list by NAME, never by a total: a check named here that did not run is a FAIL (a leg that was
 # edited out, or a run that stopped early, cannot read GREEN), and so is a check that ran and is
 # not named here. TAPECTL_GATE_SPAN_ONLY judges the span_* names alone.
@@ -4116,7 +4219,7 @@ GATE_EXPECTED_CHECKS=(
     heir_xz_path heir_zstd_restore heir_zstd_path span_rows span_heir_tapes_1_3 span_heir_tape_2
     span_heir_stream_swap span_heir_start_later span_heir_second_run span_heir_not_have
     span_restore_unit span_retire_floors span_floor_target_1 span_rebuild_tape_3
-    span_three_tapes rust_e2e rust_motions rust_lbp perf_write_2g
+    span_three_tapes span_heir_wrong_cartridge rust_e2e rust_motions rust_lbp perf_write_2g
     lbp_page_clear_after_every_command
 )
 
