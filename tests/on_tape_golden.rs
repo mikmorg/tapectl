@@ -1358,6 +1358,8 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    tenant's. With `age` installed (step 2), check it against the record you
    hold of its public half (`age-keygen -y`); with only a key file, the
    check is that it opens an envelope (`--find-envelope`, step 5).
+   `--find-envelope` also tells which kind of key you hold: "Which kind of
+   key you hold", in that section.
 2. Get a drive that reads this tape and a computer it connects to: "The
    tape drive" and "Loading the tape, and a drive that does not show up".
    The programs it needs, with their package names: "Tools Required".
@@ -1385,9 +1387,11 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    not have, start from the newest your drive reads, and know that the
    newest index is out of reach: get that drive, or say what may be missing
    ("The rest of the box").
-6. Restore. From one tape with the escrow or operator key, `--all` restores
-   every unit your key opens that is on it ("Automated Recovery
-   (recommended)"); check that it did ("Did the restore get everything?").
+6. Restore. From one tape, `--all` restores every unit your key opens that
+   is on it, whatever the key: with a tenant's key that tenant's units and
+   no one else's, with the escrow or operator key every unit ("Automated
+   Recovery (recommended)"); check that it did ("Did the restore get
+   everything?").
    From several tapes, restore each unit's NEWEST version once, from a tape
    that holds it, into a directory of its own (`/destination/UNIT`), and
    never an older version first ("The rest of the box" says how). A renamed
@@ -1402,16 +1406,20 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    that is damaged: "If a slice or a file is damaged".
 8. Know when you are done: every tape you hold opened with your key and
    the newest version of every unit any of them lists restored; every
-   unit `--where --all` names on the newest readable index, and every unit
-   the Heir Kit's catalogue lists on a sealed tape, restored or named as
-   held only on tapes you do not have; and any tape your key cannot open
-   named, never counted as looked at. No tape names one written after it
-   ("The Heir Kit's catalogue"). "The rest of the box" has the whole rule,
-   a damaged unit's place in it, and what a box cannot show.
+   unit `--where --all` names on the newest readable index, and, with the
+   escrow key (no other key opens that catalogue), every unit the Heir
+   Kit's catalogue lists on a sealed tape, restored or named as held only
+   on tapes you do not have; and any tape your key cannot open named, never
+   counted as looked at. With a tenant's key, a tape that holds none of
+   your units opens nothing, and that is normal ("The rest of the box",
+   step 6). No tape names one written after it ("The Heir Kit's
+   catalogue"). "The rest of the box" has the whole rule, a damaged unit's
+   place in it, and what a box cannot show.
 
 No RESTORE.sh or tools: "Manual Recovery Steps" does the same job by hand.
 The tape's map is lost: "If All Else Fails". A slice damaged in the middle,
-which RESTORE.sh cannot read around: "tapectl itself".
+which RESTORE.sh cannot read around: "tapectl itself", for the operator or
+escrow key (a tenant's key has no route around it).
 
 ## Words this guide uses
 
@@ -1471,7 +1479,8 @@ which RESTORE.sh cannot read around: "tapectl itself".
   which drives read them, and `catalog.db.age`, the Heir Kit's catalogue
   (the whole database), encrypted to the escrow key ("The Heir Kit's
   catalogue" opens it). The kit also holds a copy of the tapectl program
-  that made it, a file named `tapectl-` and its version ("tapectl itself").
+  that made it, a file named `tapectl-` and its version ("tapectl itself",
+  for the operator or escrow key).
   It records the archive as of the day it was made, which may be before the
   newest tape was written. You may have none.
 - **`YOUR_KEY.age.key`**: the one name this guide uses for your key file,
@@ -1541,9 +1550,9 @@ not a key. After `AGE-SECRET-KEY-1` the letters B, I, O and the digit 1
 never occur, so a doubtful character on paper is one of the others. If
 you copied a secret by hand, check the copy: type the line
 alone into a file and run `age-keygen -y YOUR_KEY.age.key`; it prints the
-public `age1...` that goes with that one key, which must equal the one on
-the cover sheet or record you have for THAT key. A character miscopied is
-refused with "invalid checksum".
+public `age1...` that goes with that one key, which must equal the one in
+the record you have for THAT key (the cover sheet's `age1...` is the escrow
+key's alone). A character miscopied is refused with "invalid checksum".
 
 If the key file was itself encrypted with a passphrase (it starts with
 `age-encryption.org/v1`, or `-----BEGIN AGE ENCRYPTED FILE-----`), age
@@ -1573,6 +1582,20 @@ can be asked which key it wants: try your key on each tape, which
 `--find-envelope` does. A key that opens one tape of a box may not open
 another, because tapes written at different times were sealed to the keys
 of their time, and tapes from another installation to its keys.
+
+**Which kind of key you hold.** `./RESTORE.sh --find-envelope --key
+YOUR_KEY.age.key` prints a line for each envelope the key opens, with the
+type the front index gives it: "The key opens the envelope at file N
+(tenant_envelope)." or the same line ending "(operator_envelope)." The
+operator envelope is encrypted to the operator and escrow keys alone. So a
+key that opens an `operator_envelope` is the operator key or the escrow key
+(the cover sheet tells which: below), and a key that opens a
+`tenant_envelope` and no `operator_envelope` is a tenant's: it opens that
+tenant's units only. One exception: an operator or escrow key opens only
+the `tenant_envelope`s of a tape whose `operator_envelope` and its backup
+are both damaged, so when RESTORE.sh reports an envelope damaged (a WARNING
+or NOTE line), ask the question of another tape. A key that opens nothing on
+a tape says nothing there about its kind.
 
 **A bad key file, or a tape of another installation?** tapectl refuses to
 write without an escrow recipient, so the ESCROW key opens every tape its
@@ -1843,11 +1866,12 @@ firm that tenant's data and no one else's.
 On Debian 11 or later and Ubuntu 22.04 or later every one of these is a
 package of the same name or one named above (`apt` installs them): mt-st,
 coreutils, tar, age, gzip, xz-utils, zstd, sqlite3, lsscsi, pciutils, kmod
-and, for tapectl itself, sg3-utils ("tapectl itself"). Debian 10 has every
-one of those packages but `age`: install the others the same way and take
-age from a release (github.com/FiloSottile/age/releases has a Linux build
-that needs no installation). Package names are Debian's and Ubuntu's; other
-systems name the same programs their own way.
+and, for tapectl itself, sg3-utils ("tapectl itself", for the operator or
+escrow key). Debian 10 has every one of those packages but `age`: install
+the others the same way and take age from a release
+(github.com/FiloSottile/age/releases has a Linux build that needs no
+installation). Package names are Debian's and Ubuntu's; other systems name
+the same programs their own way.
 
 RESTORE.sh checks for the tools each mode runs, before it reads the tape,
 and names any that is missing: `--info` and `--verify` need only `mt`, `dd`, `sha256sum` and `head`.
@@ -2191,7 +2215,11 @@ where the tape is restored:
   owner, the ACL nor any extended attribute, and does not say so.
 - The ID MAP says who the numbers were: for each unit, the names the
   computer that wrote the tape gave each user and group number its files
-  carry (or none). RESTORE.sh prints it after each unit it restores,
+  carry (or none). The map always holds the numbers. It holds a name only
+  where the writing computer's `/etc/passwd` or `/etc/group` had one:
+  tapectl's released program finds names in those two files and in no
+  directory service, so a name from LDAP, sssd or systemd's dynamic users
+  is recorded empty. RESTORE.sh prints it after each unit it restores,
   headed "Who the ids were", and it is the file `tables/NAME.ids.tsv` in
   your envelope. It is information: a restore shows it and never acts on it.
 - A tar restores a file's contents, its times and its permission bits as
@@ -2241,9 +2269,11 @@ expect an older tape to know less. The index is plain text in the envelope
 **Is the box complete?** Nothing on a tape can name tapes written after
 it, so the newest tape you hold may not be the newest ever written, and no
 tape can tell you that. What you can do is compare. The newest index lists
-every unit the installation's catalogue knew when its tape was written,
-including units held only on OTHER tapes (`units.tsv` has a row for each
-tape that holds each version, and `--where UNIT` prints those rows).
+every unit the installation's catalogue knew when its tape was written, of
+the tenants your key reads (a tenant's index lists that tenant's units only;
+the operator's lists every tenant's), including units held only on OTHER
+tapes (`units.tsv` has a row for each tape that holds each version, and
+`--where UNIT` prints those rows).
 `./RESTORE.sh --where --all --key YOUR_KEY.age.key` prints all of them, with
 no limit: for each unit its newest version, whether the tape in the drive
 holds it, and every version with each tape that holds it (label, uuid,
@@ -2312,13 +2342,15 @@ The whole box, in short:
    - Every unit the newest readable index names (`--where --all`) is
    restored at its newest version, or you have written down that it is
    held only on tapes you do not have.
-   - With a Heir Kit: every unit the Heir Kit's catalogue lists on a tape
-   whose status is `sealed` ("Which tapes hold which units", in "The
-   Heir Kit's catalogue") is restored at the newest version the kit
-   names, or you have written down that it is held only on tapes you do
-   not have. A kit made after your newest tape is the one thing you hold
-   that can name a tape written after it, so the two checks above do not
-   cover this one.
+   - With a Heir Kit and the escrow key: every unit the Heir Kit's
+   catalogue lists on a tape whose status is `sealed` ("Which tapes hold
+   which units", in "The Heir Kit's catalogue") is restored at the newest
+   version the kit names, or you have written down that it is held only on
+   tapes you do not have. A kit made after your newest tape is the one
+   thing you hold that can name a tape written after it, so the two checks
+   above do not cover this one. The operator's or a tenant's key does not
+   open that catalogue: with either, this check is not yours; write down
+   that the kit's catalogue was not read.
    - A unit whose every copy in the box is damaged counts once it is
    restored as far as its copies allow ("If a slice or a file is
    damaged": RESTORE.sh's one repair, then tapectl's own restore if your
@@ -2326,13 +2358,23 @@ The whole box, in short:
    and you have written down that the files on that list are lost. An
    older version, restored into a directory of its own, may hold older
    copies of them.
-   - A tape your key cannot open is NOT done. `./RESTORE.sh` ends with "no
-   envelope on this tape ... opens with the key given", and `--info`,
-   which needs no key, shows only the tape's label, dates and map, never
-   what it holds. Do not count that tape as looked at: name it (a tape of
-   another installation, or a key you do not have) and try every other
-   key you hold on it. If none opens it, the box is not done, and you say
-   so, by that tape's name.
+   - A tape your key cannot open is NOT done (with a tenant's key, see the
+   next point). `./RESTORE.sh` ends with "no envelope on this tape ...
+   opens with the key given", and `--info`, which needs no key, shows only
+   the tape's label, dates and map, never what it holds. Do not count
+   that tape as looked at: name it (a tape of another installation, or a
+   key you do not have) and try every other key you hold on it. If none
+   opens it, the box is not done, and you say so, by that tape's name.
+   - With a tenant's key, a tape that holds none of that tenant's units has
+   no envelope for that key: it opens nothing, with the same message, and
+   that is normal, not a fault. Try every key you hold on it, then set it
+   against the newest index your key reads (`--where --all` names every
+   tape that holds a unit of yours). A tape that index does not name, sealed
+   before the tape that index is on, holds none of your units: write down
+   its label and that your keys open nothing on it, and it is done. A tape
+   that index names as a holder needs a key you do not hold, and the box is
+   not done. A tape sealed after it may hold units of yours written since:
+   write that down, by its name.
    - An unsealed tape (no seal marker) is ordered by File 0's
    `created_at`. If the newest tape in the box will not read, the older
    tapes' indexes cannot see what was written after them: say that some
@@ -2675,6 +2717,15 @@ escrow key.
 
 ## tapectl itself
 
+**Which key it needs.** tapectl's own restore starts from `tapectl catalog
+rebuild --from-volume`, which reads the tape's operator envelope: it needs
+the OPERATOR key or the ESCROW secret. With a tenant's key it is refused ("cannot
+open the operator envelope"), and tapectl's own restore cannot run without the
+rebuilt catalogue. A holder of only a tenant's key has RESTORE.sh, the
+manual steps and the one repair from another copy of the tape, and
+nothing else; they do not read around a damaged piece of a slice, and
+nothing here pretends they do.
+
 Look in the Heir Kit first. The kit holds a copy of the program that made
 it, in the folder with `catalog.db.age`: a file named `tapectl-` and its
 version, `tapectl-X.Y.Z` below (X.Y.Z such as 2.0.0). The cover sheet
@@ -2698,15 +2749,6 @@ the repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs,
 installs it), a network connection to download its libraries, and `mt-st`
 and `sg3-utils` installed ("Tools Required"); the repository's own
 documentation (`docs/keys-and-recovery.md`, runbook C) gives the commands.
-
-**Which key it needs.** tapectl's own restore starts from `tapectl catalog
-rebuild --from-volume`, which reads the tape's operator envelope: it needs
-the OPERATOR key or the ESCROW secret. With a tenant's key it is refused ("cannot
-open the operator envelope"), and tapectl's own restore cannot run without the
-rebuilt catalogue. A holder of only a tenant's key has RESTORE.sh, the
-manual steps and the one repair from another copy of the tape, and
-nothing else; they do not read around a damaged piece of a slice, and
-nothing here pretends they do.
 
 The route with the operator or escrow key, in order. ESCROW_PUBLIC is the
 `age1...` line of the cover sheet, the ESCROW key's public half
@@ -3228,6 +3270,8 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    tenant's. With `age` installed (step 2), check it against the record you
    hold of its public half (`age-keygen -y`); with only a key file, the
    check is that it opens an envelope (`--find-envelope`, step 5).
+   `--find-envelope` also tells which kind of key you hold: "Which kind of
+   key you hold", in that section.
 2. Get a drive that reads this tape and a computer it connects to: "The
    tape drive" and "Loading the tape, and a drive that does not show up".
    The programs it needs, with their package names: "Tools Required".
@@ -3255,9 +3299,11 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    not have, start from the newest your drive reads, and know that the
    newest index is out of reach: get that drive, or say what may be missing
    ("The rest of the box").
-6. Restore. From one tape with the escrow or operator key, `--all` restores
-   every unit your key opens that is on it ("Automated Recovery
-   (recommended)"); check that it did ("Did the restore get everything?").
+6. Restore. From one tape, `--all` restores every unit your key opens that
+   is on it, whatever the key: with a tenant's key that tenant's units and
+   no one else's, with the escrow or operator key every unit ("Automated
+   Recovery (recommended)"); check that it did ("Did the restore get
+   everything?").
    From several tapes, restore each unit's NEWEST version once, from a tape
    that holds it, into a directory of its own (`/destination/UNIT`), and
    never an older version first ("The rest of the box" says how). A renamed
@@ -3272,16 +3318,20 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    that is damaged: "If a slice or a file is damaged".
 8. Know when you are done: every tape you hold opened with your key and
    the newest version of every unit any of them lists restored; every
-   unit `--where --all` names on the newest readable index, and every unit
-   the Heir Kit's catalogue lists on a sealed tape, restored or named as
-   held only on tapes you do not have; and any tape your key cannot open
-   named, never counted as looked at. No tape names one written after it
-   ("The Heir Kit's catalogue"). "The rest of the box" has the whole rule,
-   a damaged unit's place in it, and what a box cannot show.
+   unit `--where --all` names on the newest readable index, and, with the
+   escrow key (no other key opens that catalogue), every unit the Heir
+   Kit's catalogue lists on a sealed tape, restored or named as held only
+   on tapes you do not have; and any tape your key cannot open named, never
+   counted as looked at. With a tenant's key, a tape that holds none of
+   your units opens nothing, and that is normal ("The rest of the box",
+   step 6). No tape names one written after it ("The Heir Kit's
+   catalogue"). "The rest of the box" has the whole rule, a damaged unit's
+   place in it, and what a box cannot show.
 
 No RESTORE.sh or tools: "Manual Recovery Steps" does the same job by hand.
 The tape's map is lost: "If All Else Fails". A slice damaged in the middle,
-which RESTORE.sh cannot read around: "tapectl itself".
+which RESTORE.sh cannot read around: "tapectl itself", for the operator or
+escrow key (a tenant's key has no route around it).
 
 ## Words this guide uses
 
@@ -3341,7 +3391,8 @@ which RESTORE.sh cannot read around: "tapectl itself".
   which drives read them, and `catalog.db.age`, the Heir Kit's catalogue
   (the whole database), encrypted to the escrow key ("The Heir Kit's
   catalogue" opens it). The kit also holds a copy of the tapectl program
-  that made it, a file named `tapectl-` and its version ("tapectl itself").
+  that made it, a file named `tapectl-` and its version ("tapectl itself",
+  for the operator or escrow key).
   It records the archive as of the day it was made, which may be before the
   newest tape was written. You may have none.
 - **`YOUR_KEY.age.key`**: the one name this guide uses for your key file,
@@ -3411,9 +3462,9 @@ not a key. After `AGE-SECRET-KEY-1` the letters B, I, O and the digit 1
 never occur, so a doubtful character on paper is one of the others. If
 you copied a secret by hand, check the copy: type the line
 alone into a file and run `age-keygen -y YOUR_KEY.age.key`; it prints the
-public `age1...` that goes with that one key, which must equal the one on
-the cover sheet or record you have for THAT key. A character miscopied is
-refused with "invalid checksum".
+public `age1...` that goes with that one key, which must equal the one in
+the record you have for THAT key (the cover sheet's `age1...` is the escrow
+key's alone). A character miscopied is refused with "invalid checksum".
 
 If the key file was itself encrypted with a passphrase (it starts with
 `age-encryption.org/v1`, or `-----BEGIN AGE ENCRYPTED FILE-----`), age
@@ -3443,6 +3494,20 @@ can be asked which key it wants: try your key on each tape, which
 `--find-envelope` does. A key that opens one tape of a box may not open
 another, because tapes written at different times were sealed to the keys
 of their time, and tapes from another installation to its keys.
+
+**Which kind of key you hold.** `./RESTORE.sh --find-envelope --key
+YOUR_KEY.age.key` prints a line for each envelope the key opens, with the
+type the front index gives it: "The key opens the envelope at file N
+(tenant_envelope)." or the same line ending "(operator_envelope)." The
+operator envelope is encrypted to the operator and escrow keys alone. So a
+key that opens an `operator_envelope` is the operator key or the escrow key
+(the cover sheet tells which: below), and a key that opens a
+`tenant_envelope` and no `operator_envelope` is a tenant's: it opens that
+tenant's units only. One exception: an operator or escrow key opens only
+the `tenant_envelope`s of a tape whose `operator_envelope` and its backup
+are both damaged, so when RESTORE.sh reports an envelope damaged (a WARNING
+or NOTE line), ask the question of another tape. A key that opens nothing on
+a tape says nothing there about its kind.
 
 **A bad key file, or a tape of another installation?** tapectl refuses to
 write without an escrow recipient, so the ESCROW key opens every tape its
@@ -3713,11 +3778,12 @@ firm that tenant's data and no one else's.
 On Debian 11 or later and Ubuntu 22.04 or later every one of these is a
 package of the same name or one named above (`apt` installs them): mt-st,
 coreutils, tar, age, gzip, xz-utils, zstd, sqlite3, lsscsi, pciutils, kmod
-and, for tapectl itself, sg3-utils ("tapectl itself"). Debian 10 has every
-one of those packages but `age`: install the others the same way and take
-age from a release (github.com/FiloSottile/age/releases has a Linux build
-that needs no installation). Package names are Debian's and Ubuntu's; other
-systems name the same programs their own way.
+and, for tapectl itself, sg3-utils ("tapectl itself", for the operator or
+escrow key). Debian 10 has every one of those packages but `age`: install
+the others the same way and take age from a release
+(github.com/FiloSottile/age/releases has a Linux build that needs no
+installation). Package names are Debian's and Ubuntu's; other systems name
+the same programs their own way.
 
 RESTORE.sh checks for the tools each mode runs, before it reads the tape,
 and names any that is missing: `--info` and `--verify` need only `mt`, `dd`, `sha256sum` and `head`.
@@ -4061,7 +4127,11 @@ where the tape is restored:
   owner, the ACL nor any extended attribute, and does not say so.
 - The ID MAP says who the numbers were: for each unit, the names the
   computer that wrote the tape gave each user and group number its files
-  carry (or none). RESTORE.sh prints it after each unit it restores,
+  carry (or none). The map always holds the numbers. It holds a name only
+  where the writing computer's `/etc/passwd` or `/etc/group` had one:
+  tapectl's released program finds names in those two files and in no
+  directory service, so a name from LDAP, sssd or systemd's dynamic users
+  is recorded empty. RESTORE.sh prints it after each unit it restores,
   headed "Who the ids were", and it is the file `tables/NAME.ids.tsv` in
   your envelope. It is information: a restore shows it and never acts on it.
 - A tar restores a file's contents, its times and its permission bits as
@@ -4111,9 +4181,11 @@ expect an older tape to know less. The index is plain text in the envelope
 **Is the box complete?** Nothing on a tape can name tapes written after
 it, so the newest tape you hold may not be the newest ever written, and no
 tape can tell you that. What you can do is compare. The newest index lists
-every unit the installation's catalogue knew when its tape was written,
-including units held only on OTHER tapes (`units.tsv` has a row for each
-tape that holds each version, and `--where UNIT` prints those rows).
+every unit the installation's catalogue knew when its tape was written, of
+the tenants your key reads (a tenant's index lists that tenant's units only;
+the operator's lists every tenant's), including units held only on OTHER
+tapes (`units.tsv` has a row for each tape that holds each version, and
+`--where UNIT` prints those rows).
 `./RESTORE.sh --where --all --key YOUR_KEY.age.key` prints all of them, with
 no limit: for each unit its newest version, whether the tape in the drive
 holds it, and every version with each tape that holds it (label, uuid,
@@ -4182,13 +4254,15 @@ The whole box, in short:
    - Every unit the newest readable index names (`--where --all`) is
    restored at its newest version, or you have written down that it is
    held only on tapes you do not have.
-   - With a Heir Kit: every unit the Heir Kit's catalogue lists on a tape
-   whose status is `sealed` ("Which tapes hold which units", in "The
-   Heir Kit's catalogue") is restored at the newest version the kit
-   names, or you have written down that it is held only on tapes you do
-   not have. A kit made after your newest tape is the one thing you hold
-   that can name a tape written after it, so the two checks above do not
-   cover this one.
+   - With a Heir Kit and the escrow key: every unit the Heir Kit's
+   catalogue lists on a tape whose status is `sealed` ("Which tapes hold
+   which units", in "The Heir Kit's catalogue") is restored at the newest
+   version the kit names, or you have written down that it is held only on
+   tapes you do not have. A kit made after your newest tape is the one
+   thing you hold that can name a tape written after it, so the two checks
+   above do not cover this one. The operator's or a tenant's key does not
+   open that catalogue: with either, this check is not yours; write down
+   that the kit's catalogue was not read.
    - A unit whose every copy in the box is damaged counts once it is
    restored as far as its copies allow ("If a slice or a file is
    damaged": RESTORE.sh's one repair, then tapectl's own restore if your
@@ -4196,13 +4270,23 @@ The whole box, in short:
    and you have written down that the files on that list are lost. An
    older version, restored into a directory of its own, may hold older
    copies of them.
-   - A tape your key cannot open is NOT done. `./RESTORE.sh` ends with "no
-   envelope on this tape ... opens with the key given", and `--info`,
-   which needs no key, shows only the tape's label, dates and map, never
-   what it holds. Do not count that tape as looked at: name it (a tape of
-   another installation, or a key you do not have) and try every other
-   key you hold on it. If none opens it, the box is not done, and you say
-   so, by that tape's name.
+   - A tape your key cannot open is NOT done (with a tenant's key, see the
+   next point). `./RESTORE.sh` ends with "no envelope on this tape ...
+   opens with the key given", and `--info`, which needs no key, shows only
+   the tape's label, dates and map, never what it holds. Do not count
+   that tape as looked at: name it (a tape of another installation, or a
+   key you do not have) and try every other key you hold on it. If none
+   opens it, the box is not done, and you say so, by that tape's name.
+   - With a tenant's key, a tape that holds none of that tenant's units has
+   no envelope for that key: it opens nothing, with the same message, and
+   that is normal, not a fault. Try every key you hold on it, then set it
+   against the newest index your key reads (`--where --all` names every
+   tape that holds a unit of yours). A tape that index does not name, sealed
+   before the tape that index is on, holds none of your units: write down
+   its label and that your keys open nothing on it, and it is done. A tape
+   that index names as a holder needs a key you do not hold, and the box is
+   not done. A tape sealed after it may hold units of yours written since:
+   write that down, by its name.
    - An unsealed tape (no seal marker) is ordered by File 0's
    `created_at`. If the newest tape in the box will not read, the older
    tapes' indexes cannot see what was written after them: say that some
@@ -4545,6 +4629,15 @@ escrow key.
 
 ## tapectl itself
 
+**Which key it needs.** tapectl's own restore starts from `tapectl catalog
+rebuild --from-volume`, which reads the tape's operator envelope: it needs
+the OPERATOR key or the ESCROW secret. With a tenant's key it is refused ("cannot
+open the operator envelope"), and tapectl's own restore cannot run without the
+rebuilt catalogue. A holder of only a tenant's key has RESTORE.sh, the
+manual steps and the one repair from another copy of the tape, and
+nothing else; they do not read around a damaged piece of a slice, and
+nothing here pretends they do.
+
 Look in the Heir Kit first. The kit holds a copy of the program that made
 it, in the folder with `catalog.db.age`: a file named `tapectl-` and its
 version, `tapectl-X.Y.Z` below (X.Y.Z such as 2.0.0). The cover sheet
@@ -4568,15 +4661,6 @@ the repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs,
 installs it), a network connection to download its libraries, and `mt-st`
 and `sg3-utils` installed ("Tools Required"); the repository's own
 documentation (`docs/keys-and-recovery.md`, runbook C) gives the commands.
-
-**Which key it needs.** tapectl's own restore starts from `tapectl catalog
-rebuild --from-volume`, which reads the tape's operator envelope: it needs
-the OPERATOR key or the ESCROW secret. With a tenant's key it is refused ("cannot
-open the operator envelope"), and tapectl's own restore cannot run without the
-rebuilt catalogue. A holder of only a tenant's key has RESTORE.sh, the
-manual steps and the one repair from another copy of the tape, and
-nothing else; they do not read around a damaged piece of a slice, and
-nothing here pretends they do.
 
 The route with the operator or escrow key, in order. ESCROW_PUBLIC is the
 `age1...` line of the cover sheet, the ESCROW key's public half
