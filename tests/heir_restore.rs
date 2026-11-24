@@ -6127,3 +6127,116 @@ exit $rc
     );
     assert_eq!(escaped_bytes(b"dir\xe9/in\xff.bin"), "dir\\xe9/in\\xff.bin");
 }
+
+// ---- the next slice is read while one is decrypted (CTO 2026-11-24) ----
+
+/// What `log_reads_and_decrypts` saw, in the order it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Event {
+    /// A `dd` began on this tape file, in the process with this id.
+    Dd(usize, u32),
+    AgeStart,
+    AgeEnd,
+}
+
+/// A `dd` and an `age` that append to `state/events`, each line whole and in
+/// the order it happens: `dd <tape file> <time> <pid>` as each read begins (the
+/// stand-in `dd` then runs in that same process), and `age-start <time>` /
+/// `age-end <time>` around each slice's decryption (never an envelope's).
+/// `age` sleeps `nap` seconds on a slice, so a read begun while it decrypts
+/// lands between its two lines.
+fn log_reads_and_decrypts(h: &Heir, nap: &str) {
+    let bin = h.bin();
+    std::fs::rename(bin.join("dd"), bin.join("dd.fake")).unwrap();
+    h.put_tool(
+        "dd",
+        "#!/bin/sh\necho \"dd $(cat \"$FAKE_TAPE/pos\") $(date +%s.%N) $$\" >>\"$FAKE_TAPE/events\"\nexec \"$(dirname \"$0\")/dd.fake\" \"$@\"\n",
+    );
+    h.put_tool(
+        "age",
+        &format!(
+            "#!/bin/bash\ncase \"$(ls -l /proc/$$/fd/0 2>/dev/null)\" in\n  *slice.enc) ;;\n  *) exec {real} \"$@\" ;;\nesac\necho \"age-start $(date +%s.%N)\" >>\"$FAKE_TAPE/events\"\nsleep {nap}\nrc=0\n{real} \"$@\" || rc=$?\necho \"age-end $(date +%s.%N)\" >>\"$FAKE_TAPE/events\"\nexit $rc\n",
+            real = heir::heir_age_binary().display()
+        ),
+    );
+}
+
+fn events(h: &Heir) -> Vec<Event> {
+    std::fs::read_to_string(h.root.path().join("state/events"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            match w.first().copied() {
+                Some("dd") => Some(Event::Dd(w[1].parse().ok()?, w[3].parse().ok()?)),
+                Some("age-start") => Some(Event::AgeStart),
+                Some("age-end") => Some(Event::AgeEnd),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// For each slice decryption in turn (the i-th `age-end`, from 1), how many
+/// reads of the slice positions `slices` had begun by its end. Without a read
+/// ahead it is i: slice i+1 is read after slice i is decrypted. With it, i+1
+/// where slice i+1's read began while slice i decrypted.
+fn reads_begun_at_each_decrypt_end(evs: &[Event], slices: &[usize]) -> Vec<usize> {
+    let mut begun = 0;
+    let mut out = Vec::new();
+    for e in evs {
+        match e {
+            Event::Dd(p, _) if slices.contains(p) => begun += 1,
+            Event::AgeEnd => out.push(begun),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Read-ahead, depth one: while slice k is decrypted, the read of slice k+1
+/// (on the cartridge in the drive) has already begun, at least once in a unit
+/// of several slices, and never more than one slice ahead. Each slice is read
+/// once, and the unit comes back byte for byte.
+#[test]
+fn the_next_slice_is_read_from_the_tape_while_one_is_decrypted() {
+    let t = two();
+    let h = Heir::of(t);
+    log_reads_and_decrypts(&h, "0.3");
+    let (o, dest) = restore_unit_b(&h);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.stdout);
+    assert_restored(t, UNIT_B, &dest);
+    let all = t.slice_positions();
+    let reads: Vec<usize> = h
+        .dd_reads()
+        .into_iter()
+        .filter(|p| all.contains(p))
+        .collect();
+    assert!(
+        reads.len() > 2,
+        "unit B is read in several slices: {reads:?}"
+    );
+    let mut once = reads.clone();
+    once.sort_unstable();
+    once.dedup();
+    assert_eq!(
+        once.len(),
+        reads.len(),
+        "each slice is read once: {reads:?}"
+    );
+    let evs = events(&h);
+    let at_end = reads_begun_at_each_decrypt_end(&evs, &reads);
+    assert_eq!(at_end.len(), reads.len(), "one decryption a slice: {evs:?}");
+    for (i, n) in at_end.iter().enumerate() {
+        assert!(
+            *n <= i + 2,
+            "never more than one slice ahead: decryption {} ended with {n} reads begun: {evs:?}",
+            i + 1
+        );
+    }
+    assert!(
+        at_end.iter().enumerate().any(|(i, n)| *n == i + 2),
+        "slice k+1's read begins before slice k's decryption ends, at least once: {at_end:?} {evs:?}"
+    );
+}
