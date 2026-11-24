@@ -86,6 +86,75 @@ fn an_empty_to_gets_the_unit_roots_recorded_mode_and_mtime() {
     assert!(!dest.join(".tapectl-damaged-files.txt").exists());
 }
 
+/// D1 (#561, ADR-0012 item 271): the restore keeps the unit root's recorded
+/// mtime (item 303) without writing outside `--to`: with TMPDIR a directory it
+/// cannot write, the root still gets its recorded mtime to the nanosecond, and
+/// with a writable TMPDIR nothing at all is created there during the restore
+/// (inotify sees every file made there, however briefly).
+#[test]
+fn the_roots_mtime_is_kept_and_nothing_is_written_to_tmpdir() {
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let t = two();
+    let mode = |p: &std::path::Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    // A TMPDIR the script cannot write.
+    let h = Heir::of(t);
+    let tmp = h.root.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    mode(&tmp, 0o555);
+    assert!(
+        std::fs::File::create(tmp.join("probe")).is_err(),
+        "positive control: TMPDIR is not writable (not root)"
+    );
+    let dest = h.dest("ro-tmp");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dstr(&dest),
+    ]);
+    mode(&tmp, 0o755);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let m = std::fs::metadata(&dest).unwrap();
+    assert_eq!(
+        (m.mtime(), m.mtime_nsec()),
+        (heir::ROOT_MTIME_SECS, 0),
+        "{}",
+        o.all()
+    );
+    // A writable TMPDIR: nothing is made in it.
+    let h = Heir::of(t);
+    let tmp = h.root.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let ino = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+    ino.add_watch(&tmp, AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO)
+        .unwrap();
+    let dest = h.dest("rw-tmp");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dstr(&dest),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let m = std::fs::metadata(&dest).unwrap();
+    assert_eq!((m.mtime(), m.mtime_nsec()), (heir::ROOT_MTIME_SECS, 0));
+    let made: Vec<String> = match ino.read_events() {
+        Ok(evs) => evs.iter().map(|e| format!("{:?}", e.name)).collect(),
+        Err(nix::errno::Errno::EAGAIN) => Vec::new(),
+        Err(e) => panic!("inotify: {e}"),
+    };
+    assert_eq!(
+        made,
+        Vec::<String>::new(),
+        "made in TMPDIR during a restore"
+    );
+}
+
 // ---- helpers ----
 
 fn unit_files<'a>(t: &'a Tape, name: &str) -> &'a [(String, Vec<u8>)] {
