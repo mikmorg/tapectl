@@ -1611,7 +1611,9 @@ identical
 ```
 
 The `owners are restored by number` lines are the unit's id map, printed after the
-restore (the names are the ones the writing host gave the ids; shown here as `alice`).
+restore (the names are the ones the writing host gave the ids, from its `/etc/passwd`
+and `/etc/group` only, or an `nscd` where one runs, and empty otherwise; shown here as
+`alice`).
 When not running as root (which includes the service user) the files come back owned
 by the restoring user rather than their archived owners. `--version N` restores an older snapshot; by default the newest version
 of the unit on that volume is used. `catalog locate` (below) tells you which
@@ -1663,7 +1665,8 @@ tapes that hold it. A later run into the same `--to` from another tape adds that
 tape's files and leaves alone those that already pass.
 
 **Owners.** `restore` prints the unit's id map (every user and group id the stream
-carries, with the name the writing host gave it) and `--json` carries it. Files
+carries, with the name the writing host's `/etc/passwd` or `/etc/group`, or an `nscd`
+where one runs, gave it, or none) and `--json` carries it. Files
 come back by number; no owner is changed by name, and as a non-root user `tar`
 makes the files yours.
 

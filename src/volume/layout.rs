@@ -1411,11 +1411,11 @@ where the tape is restored:
   owner, the ACL nor any extended attribute, and does not say so.
 - The ID MAP says who the numbers were: for each unit, the names the
   computer that wrote the tape gave each user and group number its files
-  carry (or none). The map always holds the numbers. It holds a name only
-  where the writing computer's `/etc/passwd` or `/etc/group` had one:
-  tapectl's released program finds names in those two files and in no
-  directory service, so a name from LDAP, sssd or systemd's dynamic users
-  is recorded empty. RESTORE.sh prints it after each unit it restores,
+  carry (or none). The map always holds the numbers. tapectl's released
+  program reads names from `/etc/passwd` and `/etc/group` only (and from an
+  `nscd`, where one runs), so a name that only a directory service (LDAP,
+  sssd) or systemd's dynamic users would give is recorded empty unless an
+  `nscd` answers for it. RESTORE.sh prints it after each unit it restores,
   headed "Who the ids were", and it is the file `tables/NAME.ids.tsv` in
   your envelope. It is information: a restore shows it and never acts on it.
 - A tar restores a file's contents, its times and its permission bits as
@@ -6053,17 +6053,18 @@ verify any entry by hashing the file it describes.
         );
     }
 
-    /// #564's File 1 sentence (D13): the id map always holds the numbers, and
-    /// a name only where the writing host's local files held one (the static
-    /// build has no NSS modules; measured 2026-11-24).
+    /// #564's File 1 sentence (D13): the id map always holds the numbers; the
+    /// static build reads names from the local files only, and from an `nscd`
+    /// where one runs (the local files measured 2026-11-24; the rest follows
+    /// from its C library).
     #[test]
     fn file_1_says_what_names_the_id_map_holds() {
         let g = generate_system_guide_v2_for_media("IDS564", 20, "LTO-6");
         let sec = flat_text(guide_section(&g, "What a restore on another computer does"));
         for needle in [
             "The map always holds the numbers",
-            "It holds a name only where the writing computer's `/etc/passwd` or `/etc/group` had one",
-            "a name from LDAP, sssd or systemd's dynamic users is recorded empty",
+            "tapectl's released program reads names from `/etc/passwd` and `/etc/group` only (and from an `nscd`, where one runs)",
+            "a name that only a directory service (LDAP, sssd) or systemd's dynamic users would give is recorded empty unless an `nscd` answers for it",
         ] {
             assert!(sec.contains(needle), "{needle:?}: {sec}");
         }
