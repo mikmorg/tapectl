@@ -2842,17 +2842,19 @@ before stays; run the restore again.
 ### RESTORE.sh: not enough disk space, or OUT OF DISK SPACE
 
 ```text
-FATAL: unit <unit> needs its files, and the work directory one slice three times: /restore has 8589934592 bytes
+FATAL: unit <unit> needs its files, and the work directory one slice twice: /restore has 8589934592 bytes
 free and this needs about 53687091200. Nothing has been read from a slice yet. Free space there, or choose a
 larger disk with --to or --work DIR; --no-space-check skips this check.
 ```
 
-RESTORE.sh (`--restore`) decrypts one slice at a time (and decompresses it, for a
-compressed unit) into a work directory and gives it to `tar`, while it reads the next
-slice off the tape into the same directory. `--to` needs about the units' size
-("bytes of stream" in `--list` and `--find-envelope`) and the work directory about
-three times the largest slice. The work directory is made inside `--to`
-(`.tapectl-work.` and some letters) for a restore, and under `$TMPDIR` (default `/tmp`)
+RESTORE.sh (`--restore`) reads one slice at a time, decrypts it (and decompresses it,
+for a compressed unit) into a work directory and gives it to `tar`. `--to` needs
+about the units' size ("bytes of stream" in `--list` and `--find-envelope`) and the
+work directory about twice the largest slice. Where the disk has room for a third
+slice, the script reads the next slice off the tape while it decrypts one, which is
+faster; without that room it reads one slice at a time and says nothing about it.
+The work directory is made inside `--to` (`.tapectl-work.` and some letters) for a
+restore, and under `$TMPDIR` (default `/tmp`)
 for the modes that only read; `--work DIR` puts it on another disk. The script measures
 this after it has picked the version and before it reads any slice. Free space, or
 choose a larger disk with `--to` or `--work`. `--no-space-check` skips the check, for a

@@ -6640,45 +6640,64 @@ fn named_paths_read_the_next_slice_they_need_while_one_is_decrypted() {
     }
 }
 
-/// A `df` that reports a disk of `cap_kb` KiB for every path, whose use is
-/// what the restore has put there: the files under `dest` outside the work
-/// directory, and the slice files (`slice.*`) in it; nothing else counts.
-/// `work` set, a path under it is a disk of its own of `cap_kb` (with room to
-/// spare until the envelopes are unpacked: their room is not what this
-/// tests), and every other path has room to spare.
-fn slice_room_df(h: &Heir, dest: &Path, work: Option<&Path>, cap_kb: u64) {
-    let sum = "awk '{ s += $1 } END { printf \"%d\", s }'";
-    let body = match work {
-        Some(w) => format!(
-            "#!/bin/bash\nfor a; do last=$a; done\ncase \"$last\" in\n  {w}*)\n    dev=/dev/work\n    used=$(find \"{w}\" -path '*/.tapectl-work*/slice.*' -type f -printf '%s\\n' 2>/dev/null | {sum})\n    avail=$(( {cap_kb} - (used + 1023) / 1024 ))\n    ls -d \"$last\"/env.* >/dev/null 2>&1 || avail=999999999 ;;\n  *) dev=/dev/dest; avail=999999999 ;;\nesac\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho \"$dev 999999999 0 $avail 0% /\"\n",
-            w = w.display()
-        ),
-        None => format!(
-            "#!/bin/bash\nu1=$(find \"{d}\" -path '*/.tapectl-work*' -prune -o -type f -printf '%s\\n' 2>/dev/null | {sum})\nu2=$(find \"{d}\" -path '*/.tapectl-work*/slice.*' -type f -printf '%s\\n' 2>/dev/null | {sum})\navail=$(( {cap_kb} - (u1 + u2 + 1023) / 1024 ))\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho \"/dev/one 999999999 0 $avail 0% /\"\n",
+/// A disk of `phys` bytes, as `df` and `tee` see it. Its use is what the
+/// restore has put there: the slice files (`slice.*`) in the work directory
+/// and, with `work` unset (the work directory inside `--to`), the files
+/// restored under `dest`; nothing else counts, and until the envelopes are
+/// unpacked it has room to spare (their room is not what this tests). `df`
+/// reports `phys` and one tape block more, the block the script keeps free as
+/// its own margin, so a read ahead it starts on that report fits in `phys`.
+/// `tee` holds the disk to `phys`: a slice file that leaves more than that in
+/// use fails as a full disk does. With `work` set, the work directory under it
+/// is that disk, and every other path has room to spare.
+fn slice_disk(h: &Heir, dest: &Path, work: Option<&Path>, phys: u64) {
+    let root = work.unwrap_or(dest).display().to_string();
+    let files = if work.is_some() {
+        String::new()
+    } else {
+        format!(
+            "  f=$(find \"{d}\" -path '*/.tapectl-work*' -prune -o -type f -printf '%s\\n' 2>/dev/null | awk '{{ s += $1 }} END {{ printf \"%d\", s }}')\n  s=$((s + f))\n",
             d = dest.display()
-        ),
+        )
     };
-    h.put_tool("df", &body);
+    let used = format!(
+        "used() {{\n  s=$(find \"{root}\" -path '*/.tapectl-work*/slice.*' -type f -printf '%s\\n' 2>/dev/null | awk '{{ s += $1 }} END {{ printf \"%d\", s }}')\n{files}  echo \"$s\"\n}}\n"
+    );
+    h.put_tool(
+        "df",
+        &format!(
+            "#!/bin/bash\n{used}for a; do last=$a; done\navail=999999999\ndev=/dev/other\ncase \"$last\" in\n  {root}*)\n    dev=/dev/slices\n    if [ -n \"$(find \"{root}\" -path '*/.tapectl-work*/env.*' -print -quit 2>/dev/null)\" ]; then\n      avail=$(( ({phys} + 524288 - $(used)) / 1024 ))\n    fi ;;\nesac\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho \"$dev 999999999 0 $avail 0% /\"\n"
+        ),
+    );
+    let real = heir::host_tool("tee").unwrap();
+    h.put_tool(
+        "tee",
+        &format!(
+            "#!/bin/bash\n{used}case \"$1\" in\n  *slice.*) ;;\n  *) exec {real} \"$@\" ;;\nesac\nrc=0\n{real} \"$@\" || rc=$?\n[ \"$rc\" = 0 ] || exit \"$rc\"\nu=$(used)\nif [ \"$u\" -gt {phys} ]; then\n  echo \"$1 $u\" >>\"$FAKE_TAPE/overfull\"\n  echo \"tee: $1: No space left on device\" >&2\n  exit 1\nfi\n",
+            real = real.display()
+        ),
+    );
 }
 
 /// The read ahead is taken only where there is room for it: a work directory
-/// with room for two slices (the space check's need) but not three restores
-/// the unit whole, reading one slice at a time, on a disk of its own and on
-/// the disk of `--to`, where the files the restore has yet to write keep
-/// their room.
+/// with room for two of the unit's largest slices (the space check's need)
+/// and not three restores the unit whole, each slice read once, and never
+/// holds more than it has room for. On a disk of its own, the slices that
+/// would not fit are not read ahead (a few small ones still may be); on the
+/// disk of `--to`, where tar's pipe may still hold up to a megabyte that is
+/// not yet on the disk, none is.
 #[test]
 fn a_work_directory_with_room_for_two_slices_restores_whole_without_a_read_ahead() {
-    const BLOCK: u64 = 524_288;
     let t = two();
     let reads = unit_b_reads(t);
     let big = reads.iter().map(|p| t.size_of(*p) as u64).max().unwrap();
     // The work directory on a disk of its own.
     let h = Heir::of(t);
-    log_reads_and_decrypts(&h, "0.1");
+    let kb = key(&h, Who::TenantB);
+    log_reads_and_decrypts(&h, "0.3");
     let work = h.dest("workdir");
     let dest = h.dest("out");
-    slice_room_df(&h, &dest, Some(&work), (2 * big + BLOCK).div_ceil(1024));
-    let kb = key(&h, Who::TenantB);
+    slice_disk(&h, &dest, Some(&work), 2 * big + 1024);
     let o = h.run(&[
         "--restore",
         "--key",
@@ -6688,30 +6707,44 @@ fn a_work_directory_with_room_for_two_slices_restores_whole_without_a_read_ahead
         "--work",
         dest_str(&work),
     ]);
+    assert!(
+        !h.root.path().join("state/overfull").exists(),
+        "the work directory held more than it has room for: {}",
+        o.all()
+    );
     assert_eq!(o.code, 0, "{}", o.all());
     assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.stdout);
     assert_restored(t, UNIT_B, &dest);
     assert_eq!(data_reads(t, &h), reads, "each slice once");
     let at_end = reads_begun_at_each_decrypt_end(&events(&h), &reads);
-    assert_eq!(
-        at_end,
-        (1..=reads.len()).collect::<Vec<_>>(),
-        "no slice read ahead: {:?}",
+    assert!(
+        at_end[..at_end.len() - 1]
+            .iter()
+            .enumerate()
+            .any(|(i, n)| *n == i + 1),
+        "a slice that would not fit is not read ahead: {at_end:?} {:?}",
         events(&h)
     );
-    // The work directory inside --to: the unit's files and two slices.
+    // The work directory inside --to: room for the unit's files and two slices.
     let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
     let files: u64 = list_rows(&h, &kb, UNIT_B)
         .iter()
         .filter(|r| r.0 == "f")
         .map(|r| r.2)
         .sum();
-    log_reads_and_decrypts(&h, "0.1");
+    log_reads_and_decrypts(&h, "0.3");
     let dest = h.dest("out");
-    slice_room_df(&h, &dest, None, (files + 2 * big + BLOCK).div_ceil(1024));
+    slice_disk(&h, &dest, None, files + 2 * big + 1024);
     let o = h.run(&["--restore", "--key", &kb, "--to", dest_str(&dest)]);
+    assert!(
+        !h.root.path().join("state/overfull").exists(),
+        "the disk held more than it has room for: {}",
+        o.all()
+    );
     assert_eq!(o.code, 0, "{}", o.all());
     assert_restored(t, UNIT_B, &dest);
+    assert_eq!(data_reads(t, &h), reads, "each slice once");
     let at_end = reads_begun_at_each_decrypt_end(&events(&h), &reads);
     assert_eq!(
         at_end,

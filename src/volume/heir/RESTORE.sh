@@ -148,6 +148,7 @@ AHEAD_K=""
 AHEAD_POS=""
 AHEAD_PID=""
 AHEAD_SEEK=0
+AHEAD_SHARED=1 # 0 when the work directory is known to be on another file system than the unit's files
 NEXT_WANT="" # the slice the caller asks for after this one, when it is good
 umask 077 # decrypted plaintext is not world-readable
 
@@ -167,7 +168,7 @@ cleanup() {
   # Order: a read ahead is stopped, tar's input is closed and tar ends, a
   # member it had begun is removed (the member being fed when a signal came),
   # then the work directory.
-  ahead_kill || true
+  [ -z "$AHEAD_PID" ] || ahead_kill || true
   tar_close 300 || true
   scrub_inflight || true
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
@@ -641,10 +642,12 @@ judge_hashed() { # <tape file> <out> <file of dd's words> <file of the hash>
 
 # ---- the read ahead: the next slice comes off the tape while one decrypts ----
 
-# One slice ahead, and only on the cartridge in the drive: once slice k's
-# encrypted copy has passed its hash, the slice the caller asks for next is
-# read into slice.enc.next by a job of its own while k is decrypted and fed
-# (ahead_next). When that slice is asked for, the job is waited for and its
+# One slice ahead, only on the cartridge in the drive, and only where the
+# work directory has room for it (ahead_room): once slice k's encrypted copy
+# has passed its hash, the slice the caller asks for next is read into
+# slice.enc.next by a job of its own while k is decrypted and fed
+# (ahead_next). Without the room, nothing is read ahead and nothing is said:
+# the space check asks for one slice twice, and that is enough. When that slice is asked for, the job is waited for and its
 # read is judged by the same words as a read made then (ahead_take). Any
 # other slice asked for, the end of a feed, and every prompt find the job
 # waited for and its copy removed first (ahead_drop), so no tape device is
@@ -667,13 +670,43 @@ ahead_clear() {
   AHEAD_SEEK=0
 }
 
-# Begin reading slice $1, NEXT_WANT as the caller set it, when the caller
-# will ask for it next and a read then would reach the tape: it is on the
-# cartridge in the drive, not already found bad, and its file is the one the
-# manifest and the front index agree on (prepare_slice's checks before a
-# read). Never more than one, and never once quit was answered.
-ahead_next() { # <slice>
-  local n=${1:-} p
+# Is the work directory on the file system of the unit's files ($1)? Then
+# what tar has not yet written counts against a read ahead's room (ahead_room).
+# Unknown is taken as the same.
+ahead_disk() { # <destination>
+  local f1 f2
+  f1=$(fs_id "$WORK")
+  f2=$(fs_id "$1")
+  AHEAD_SHARED=1
+  if [ -n "$f1" ] && [ -n "$f2" ] && [ "$f1" != "$f2" ]; then AHEAD_SHARED=0; fi
+}
+
+# Has the work directory room, now, for slice $1's plain cut about to be
+# written, slice $2's encrypted copy and a block? The free space is measured
+# as check_space measures it, by df, just before the read would begin: it
+# already counts slice $1's encrypted copy and the files tar has written. On
+# the file system of the unit's files, two blocks more are kept free for what
+# tar's pipe may still hold of the slice before (up to 1 MiB under uutils).
+# When df cannot say, there is no room. Without the room nothing is read
+# ahead; the restore reads one slice at a time, as the space check allows.
+ahead_room() { # <slice being decrypted> <slice to read ahead>
+  local k=$1 n=$2 free need
+  is_uint "${SL_SIZE[$k]:-}" && is_uint "${SL_ENC[$n]:-}" || return 1
+  free=$(free_kb "$WORK")
+  is_uint "$free" || return 1
+  need=$((SL_SIZE[k] + SL_ENC[n] + BLOCK))
+  if [ "$AHEAD_SHARED" = 1 ]; then need=$((need + 2 * BLOCK)); fi
+  [ $((free * 1024)) -ge "$need" ]
+}
+
+# Begin reading slice $2, NEXT_WANT as the caller set it, while slice $1 is
+# decrypted, when the caller will ask for it next and a read then would
+# reach the tape: it is on the cartridge in the drive, not already found
+# bad, and its file is the one the manifest and the front index agree on
+# (prepare_slice's checks before a read); and when the work directory has
+# room for it. Never more than one, and never once quit was answered.
+ahead_next() { # <slice being decrypted> <slice>
+  local k=$1 n=${2:-} p
   [ -z "$AHEAD_K" ] && [ "$QUIT" = 0 ] && is_uint "$n" && [ "$n" -ge 1 ] && [ "$n" -le "$NSL" ] || return 0
   p=${SL_HERE[$n]:-}
   [ -n "$p" ] || return 0
@@ -683,6 +716,7 @@ ahead_next() { # <slice>
   [ "$(file_type_at "$p" "$FILES_TXT")" = data_slice ] &&
     [ "$(file_size_at "$p" "$FILES_TXT")" = "${SL_ENC[$n]}" ] &&
     [ "$(file_hash_at "$p" "$FILES_TXT")" = "${SL_SHAE[$n]}" ] || return 0
+  ahead_room "$k" "$n" || return 0
   ahead_clear
   AHEAD_K=$n
   AHEAD_POS=$p
@@ -2024,7 +2058,7 @@ prepare_slice() { # <slice number>
   if [ "$FETCH_GOT" != "$enc" ]; then
     die_io "writing slice $k into the work directory failed" "the copy holds ${FETCH_GOT:-no} of the $enc bytes read from tape file $pos" "$WORK"
   fi
-  ahead_next "$next"
+  ahead_next "$k" "$next"
   # The plain cut is written by tee and hashed as it streams: slice.plain is
   # not read back to be hashed. tee's and sha256sum's words (a work directory
   # that cannot take the cut) are in msg; age's and the decompressor's in
@@ -2548,15 +2582,15 @@ restore_one() { # <chosen row> <destination>
     fi
     die "$(safe_str "$dest") is not empty and holds no damaged-file list, so it is not an earlier run of this unit that stopped short. $(units_with_lists)Restore into an empty or new directory, or give --overwrite to replace files that are there."
   fi
-  # Space: the unit's files, and one slice three times (its cut, its plain
-  # form, and the next slice's cut, read while it decrypts).
+  # Space: the unit's files, and one slice twice (the cut, and its plain form).
   local files_bytes biggest=0 k
   files_bytes=$(awk -F'\t' '!/^#/ && $1 == "f" { s += $5 } END { printf "%.0f", s }' "$table")
   for ((k = 1; k <= NSL; k++)); do
     if is_uint "${SL_SIZE[$k]}" && [ "${SL_SIZE[$k]}" -gt "$biggest" ]; then biggest=${SL_SIZE[$k]}; fi
     if is_uint "${SL_ENC[$k]}" && [ "${SL_ENC[$k]}" -gt "$biggest" ]; then biggest=${SL_ENC[$k]}; fi
   done
-  check_space "unit $(safe_str "$name") needs its files, and the work directory one slice three times" "$dest" "$files_bytes" "$WORK" $((3 * biggest + BLOCK))
+  check_space "unit $(safe_str "$name") needs its files, and the work directory one slice twice" "$dest" "$files_bytes" "$WORK" $((2 * biggest + BLOCK))
+  ahead_disk "$dest"
   say ">>> Unit $(safe_str "$name") version $ver: $NSL slice(s), $sb bytes of stream, into $dest"
   : >"$WORK/bad.slices"
   rm -f "$WORK/fatal.flag"
@@ -2962,7 +2996,8 @@ restore_paths() { # <destination> <how>
     if is_uint "${SL_SIZE[$k]}" && [ "${SL_SIZE[$k]}" -gt "$biggest" ]; then biggest=${SL_SIZE[$k]}; fi
     if is_uint "${SL_ENC[$k]}" && [ "${SL_ENC[$k]}" -gt "$biggest" ]; then biggest=${SL_ENC[$k]}; fi
   done
-  check_space "the named paths of unit $(safe_str "$U_NAME") need their files, and the work directory one slice three times" "$dest" "$files_bytes" "$WORK" $((3 * biggest + BLOCK))
+  check_space "the named paths of unit $(safe_str "$U_NAME") need their files, and the work directory one slice twice" "$dest" "$files_bytes" "$WORK" $((2 * biggest + BLOCK))
+  ahead_disk "$dest"
   say ">>> Unit $(safe_str "$U_NAME") version $U_VER: $npaths path(s) by the file table, into $dest"
   if [ -s "$WORK/brought.paths" ]; then
     note "$(wc -l <"$WORK/brought.paths" | tr -d ' ') hard link(s) among them are made from the first name of the file, which is restored first and is checked too."
