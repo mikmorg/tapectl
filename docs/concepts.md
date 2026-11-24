@@ -381,8 +381,13 @@ ACL support, and refuses a stream that carries a name where a number belongs or 
 lost a file's ACL (`config check` prints which tar it would use). The unit's file
 table, one row for each member with its slice, offsets and sha256, is kept in the catalog
 and travels in each tenant's envelope, with an **id map**: every user and group id the
-stream carries, with the name the writing host gave it. A restore shows the map and
-never acts on it: files come back by number.
+stream carries, with the name the writing host gave it. The map always holds the numbers;
+it holds a name only where the writing host's `/etc/passwd` or `/etc/group` held one. The
+released binary is static and has no NSS modules, so a name from LDAP, sssd or systemd's
+dynamic users is recorded empty. (#564: the local files were measured with that binary on
+2026-11-24; the directory services are reasoned from its C library, not measured. That
+library would ask an `nscd` if one ran, and no host measured runs one.) A restore shows
+the map and never acts on it: files come back by number.
 
 For each slice, tapectl records the sha256 of the plain cut and of the encrypted
 file. The encrypted hash is later printed in plaintext on the tape (it reveals nothing
