@@ -2164,10 +2164,14 @@ pub fn cartridge_mark_erased(
 ///   operator's hands), its own status unchanged: erasing a medium declared
 ///   unfit does not make it fit (ADR-0011);
 /// - every open mount on it closed;
-/// - each of `erased_volume_ids` to `erased`;
+/// - each of `erased_volume_ids` to `erased`, with an `erased` event on the
+///   volume naming its label and the status it had (#606 R-2), as `cartridge
+///   retire` and `cartridge erase`'s unknown-cartridge branch record theirs;
+///   a volume already `erased` is not logged again;
 /// - one `erased` event on the cartridge, `details` carrying what the
 ///   caller knows about the act (`cartridge erase`: the mode, the contact,
-///   what File 0 said).
+///   what File 0 said). Each volume's row carries the same `details`, or,
+///   with none (`cartridge mark-erased`), a line naming the cartridge.
 pub(crate) fn record_cartridge_erased(
     tx: &Connection,
     cartridge_id: i64,
@@ -2186,11 +2190,37 @@ pub(crate) fn record_cartridge_erased(
          WHERE cartridge_id = ?1 AND unmounted_at IS NULL",
         params![cartridge_id],
     )?;
+    let volume_details = details.map(str::to_string).unwrap_or_else(|| {
+        format!(
+            "cartridge \"{barcode}\" was marked erased (`cartridge mark-erased`); this \
+             volume's bytes are no longer on it"
+        )
+    });
     for vol_id in erased_volume_ids {
+        // Read BEFORE the change, so the row records the real transition.
+        let (label, prior): (String, String) = tx.query_row(
+            "SELECT label, status FROM volumes WHERE id = ?1",
+            params![vol_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         tx.execute(
             "UPDATE volumes SET status = 'erased' WHERE id = ?1",
             params![vol_id],
         )?;
+        if prior != "erased" {
+            events::log_event(
+                tx,
+                "volume",
+                *vol_id,
+                Some(&label),
+                "erased",
+                Some("status"),
+                Some(&prior),
+                Some("erased"),
+                Some(&volume_details),
+                None,
+            )?;
+        }
     }
     events::log_event(
         tx,
@@ -10251,6 +10281,58 @@ mod tests {
                 "erased",
                 "the volume that was mounted on this cartridge must move to erased"
             );
+        }
+
+        /// #606 R-2: marking a cartridge erased moves each mounted volume to
+        /// `erased`, and an audit row names the volume and the status it
+        /// had, as `cartridge retire` and `cartridge erase`'s unknown
+        /// cartridge already record theirs. Before, only the cartridge's own
+        /// row was written (details NULL), and the volume's old status was
+        /// recorded nowhere.
+        #[test]
+        fn mark_erased_logs_each_volume_with_its_old_status() {
+            let (conn, cart_id, vol_id) = setup_cartridge("in_use", true);
+            let vol_id = vol_id.unwrap();
+            cartridge_mark_erased(&conn, "BC001", true, false, false, false)
+                .expect("--force passes the lifecycle gate; the volume holds nothing live");
+            assert_eq!(volume_status(&conn, vol_id), "erased");
+            let rows: Vec<(String, Option<String>, String, String, String, String)> = conn
+                .prepare(
+                    "SELECT action, entity_label, field, old_value, new_value, details
+                     FROM events WHERE entity_type = 'volume' AND entity_id = ?1",
+                )
+                .unwrap()
+                .query_map(params![vol_id], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            let (action, label, field, old, new, details) = &rows[0];
+            assert_eq!(action, "erased");
+            assert_eq!(label.as_deref(), Some("L6-MOUNTED"));
+            assert_eq!(field, "status");
+            assert_eq!(old, "sealed");
+            assert_eq!(new, "erased");
+            assert!(details.contains("BC001"), "{details}");
+            // The cartridge's own row is unchanged.
+            let cartridge_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE entity_type = 'cartridge'
+                       AND entity_id = ?1 AND action = 'erased'",
+                    params![cart_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(cartridge_rows, 1);
         }
 
         #[test]

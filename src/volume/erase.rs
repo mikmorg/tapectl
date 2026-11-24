@@ -1840,6 +1840,57 @@ mod tests {
         assert_eq!(contact(&conn).2, Some(c));
     }
 
+    /// #606 R-2: erasing a KNOWN cartridge records, for each volume it held,
+    /// an audit row naming the volume and the status it had, as the unknown
+    /// cartridge's branch and `cartridge retire` already do. Before, only the
+    /// cartridge's row was written, and the volume's old status was recorded
+    /// nowhere.
+    #[test]
+    fn erasing_a_known_cartridge_logs_each_volume_with_its_old_status() {
+        let conn = crate::db::open_memory().unwrap();
+        let c = add_cartridge(&conn, "L6-0001", SERIAL, "pending_erase");
+        let v = add_volume(&conn, "L6-0001", UUID, "retired");
+        mount(&conn, c, v);
+        let fake = sealed_tape("L6-0001");
+        run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, Some("L6-0001"), false),
+            &[Some(SERIAL)],
+        )
+        .expect("a retired volume may be erased");
+        let rows: Vec<(String, String, String, String, String, String)> = conn
+            .prepare(
+                "SELECT action, entity_label, field, old_value, new_value, details
+                 FROM events WHERE entity_type = 'volume' AND entity_id = ?1",
+            )
+            .unwrap()
+            .query_map(params![v], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (action, label, field, old, new, details) = &rows[0];
+        assert_eq!(
+            (action.as_str(), label.as_str(), field.as_str()),
+            ("erased", "L6-0001", "status")
+        );
+        assert_eq!((old.as_str(), new.as_str()), ("retired", "erased"));
+        assert!(
+            details.contains("\"mode\""),
+            "the erase's own record: {details}"
+        );
+    }
+
     /// A `retired_permanent` cartridge may be erased — before it leaves the
     /// operator's hands — and stays retired: erasing a medium declared unfit
     /// does not make it fit (ADR-0011).
