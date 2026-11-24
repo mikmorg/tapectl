@@ -3955,3 +3955,32 @@ restore ended RESTORE INCOMPLETE with the files correct. The CTO ratified the re
      `sha256sum -c --strict`'s lines with its rows by position and reads no name back; a row
      not positively passed is hashed alone. Nothing else in the script changes. The recorded
      tape of T6.4 is recorded after it.
+
+## Amendment, 2026-11-24: RESTORE.sh's pin moves to hash each slice as it streams
+
+Ruled 2026-11-24. T6.6's span run on home2's real drive (Run 4) restored a 505 GB unit with
+RESTORE.sh at about 24 MB/s. Measured on that host per 1 GiB slice, all in sequence: the tape
+read about 7 s, then `sha256sum` reading the copy back about 8 s, `age -d` about 10 s,
+`sha256sum` reading the plain cut back about 9 s, and tar about 2 s. Two of the five passes
+only re-read what had just been written. The CTO said "fix it now" and chose to carry the fix
+in 2.0.0 (the tag moves to the commit that holds it, after the chain and a timed real-drive
+restore).
+
+308. **RESTORE.sh's sha256 pin moves** from `1aa02316…5288e` to `6e151249…2b0f7f`, under item
+     243's on-tape authorization, for this change alone: a slice's encrypted bytes are hashed
+     as they stream off the tape into the work directory (`head -c | tee | sha256sum`), and its
+     plain cut as `age` (and the decompressor) writes it (`| tee | sha256sum`), instead of by
+     reading each copy back. Every verdict, its order and its words are kept: the front
+     index's hash is judged before any decrypt, the decoded length and the manifest's hash
+     before tar is fed, and the final per-file check is unchanged. Two checks are added
+     because a stream's hash can pass while its copy is short (GNU `tee` keeps writing to its
+     standard output after its file fails): the encrypted copy's byte count, whose shortfall
+     ends the run as the work directory's fault; the plain cut's was already checked.
+     Nothing else in the script changes, and no other pinned text moves.
+     Two readings the coordinator made, for the CTO to overrule: `tee` is used unchecked, as
+     `cat` and `wc` are (it comes with `head` and `sha256sum`; checking it would move File 1's
+     tool list too); and the plain cut's hash now covers the bytes as they streamed, not as
+     tar reads them back from the work directory, which the final per-file check covers
+     (`--no-file-check` gives that up, as it gives up the rest). Reading the next slice while
+     the current one decrypts is left for later: it meets the rules that no tape device is held
+     open at a prompt and that the work directory holds one slice's plain cut.
