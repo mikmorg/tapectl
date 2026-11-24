@@ -997,6 +997,7 @@ const HOST_TOOLS: &[&str] = &[
     "head",
     "tail",
     "cat",
+    "tee",
     "wc",
     "ls",
     "df",

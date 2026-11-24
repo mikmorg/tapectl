@@ -1934,6 +1934,84 @@ fn a_full_work_directory_while_a_slice_is_read_ends_the_run_and_is_not_damage() 
     }
 }
 
+/// A `tee` that is the host's for every file but one whose name ends in
+/// `name`: that copy it cuts to its first 1000 bytes while it passes every
+/// byte on, as a disk that fills mid-file leaves GNU tee doing. `loud`, it
+/// says so as a full disk does and exits 1; silent, it exits 0. It leaves
+/// `tee.cut` in TMPDIR when it cut a copy.
+fn short_tee(h: &Heir, name: &str, loud: bool) {
+    let real = heir::host_tool("tee").unwrap();
+    let end = if loud {
+        "echo \"tee: $1: No space left on device\" >&2\nexit 1"
+    } else {
+        "exit 0"
+    };
+    h.put_tool(
+        "tee",
+        &format!(
+            "#!/bin/bash\ncase \"$1\" in\n  *{name}) ;;\n  *) exec {real} \"$@\" ;;\nesac\n: >\"$TMPDIR/tee.cut\"\ncat >\"$TMPDIR/tee.all\"\nhead -c 1000 \"$TMPDIR/tee.all\" >\"$1\"\ncat \"$TMPDIR/tee.all\"\nrm -f \"$TMPDIR/tee.all\"\n{end}\n",
+            real = real.display()
+        ),
+    );
+}
+
+/// The encrypted slice is hashed as it streams off the tape into the work
+/// directory, so a copy cut short while every byte streamed whole would pass
+/// the hash: it is caught by its length, or by tee's words, and said to be
+/// the work directory's, never the tape's.
+#[test]
+fn a_copy_of_a_slice_cut_short_while_its_bytes_stream_whole_is_the_work_directorys() {
+    let t = two();
+    let bad = t.slice_positions()[1];
+    for loud in [true, false] {
+        let h = Heir::of(t);
+        short_tee(&h, "slice.enc", loud);
+        let (o, _) = restore_unit_b(&h);
+        assert!(
+            h.root.path().join("tmp/tee.cut").exists(),
+            "loud={loud}: the copy went through tee: {}",
+            o.all()
+        );
+        assert_eq!(o.code, 1, "loud={loud}: {}", o.all());
+        assert!(
+            o.stderr
+                .contains("cannot take it: it is full, or not writable"),
+            "loud={loud}: {}",
+            o.stderr
+        );
+        if loud {
+            assert!(
+                o.stderr.contains(&format!(
+                    "reading tape file {bad} into the work directory failed"
+                )),
+                "{}",
+                o.stderr
+            );
+        } else {
+            assert!(
+                o.stderr
+                    .contains("into the work directory failed: the copy holds 1000 of the")
+                    && o.stderr
+                        .contains(&format!("bytes read from tape file {bad}")),
+                "{}",
+                o.stderr
+            );
+        }
+        for bad_words in [
+            "could not be read at file",
+            "differs from the front index",
+            "could not decrypt",
+            "RESTORE COMPLETE",
+        ] {
+            assert!(
+                !o.all().contains(bad_words),
+                "loud={loud} {bad_words}: {}",
+                o.all()
+            );
+        }
+    }
+}
+
 // ---- the low findings of #525 and the rest of the traps ----
 
 /// A2: the script keeps no process id to kill at the end.

@@ -84,8 +84,8 @@ BLOCK=524288 # 512 KiB, the fixed block size of the tape
 # ---- the tool table: the one list the tool checks are drawn from ----
 # Each mode checks only the tools it runs, before the first read of the tape.
 # mt is checked on its own (mt-st sets the block size; GNU cpio's mt cannot).
-# The everyday text tools (awk, sed, grep, tr, cat, wc, ls, df, mktemp, sort)
-# are not checked for.
+# The everyday text tools (awk, sed, grep, tr, cat, tee, wc, ls, df, mktemp,
+# sort) are not checked for.
 TOOLS_READ=(dd head sha256sum)
 TOOLS_ENVELOPE=(dd head sha256sum age tar)
 TOOLS_LIST=(dd head sha256sum age tar)
@@ -572,6 +572,42 @@ fetch() { # <tape file> <out> [<bytes>]
   fi
   [ -s "$out" ] || return 1
   CUR=$((pos + 1))
+}
+
+# Read tape file $1 into file $2, its first $3 bytes, as fetch does, and hash
+# the same bytes as they are written: a slice is read once, never read back
+# to be hashed. The hash of the bytes as they streamed is left in FETCH_SHA
+# and the length of the copy in FETCH_GOT; the caller trusts the hash only
+# for a copy that holds every byte. Returns 1 when the tape cannot give it.
+# A work directory that cannot take it ends the run, saying that.
+FETCH_SHA=""
+FETCH_GOT=""
+fetch_hashed() { # <tape file> <out> <bytes>
+  local pos=$1 out=$2 size=$3 msg="" rc=0 sum=""
+  FETCH_SHA=""
+  FETCH_GOT=""
+  rm -f "$WORK/stream.sha"
+  seek_to "$pos" || return 1
+  CUR=""
+  msg=$({ dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | {
+    head -c "$size" | tee "$out" | sha256sum >"$WORK/stream.sha"
+    cat >/dev/null
+  }; } 2>&1) || rc=$?
+  # The copy is written by tee, whose status (and head's) the group's last
+  # command (cat) hides: what they said is read from their words.
+  if is_full_text "$msg $(cat "$WORK/dd.err" 2>/dev/null || true)"; then
+    die_io "reading tape file $pos into the work directory failed" "$msg" "$WORK"
+  fi
+  if [ "$rc" -ne 0 ] || [ -n "$msg" ]; then
+    note "reading tape file $pos failed: ${msg:-$(dd_detail)}"
+    return 1
+  fi
+  [ -s "$out" ] || return 1
+  CUR=$((pos + 1))
+  sum=$(cat "$WORK/stream.sha" 2>/dev/null || true)
+  sum=${sum%% *}
+  FETCH_SHA=${sum#\\}
+  FETCH_GOT=$({ wc -c <"$out"; } 2>/dev/null | tr -d ' ' || true)
 }
 
 # sha256 of tape file $1, its first $2 bytes (all when empty), hashed as it
@@ -1801,15 +1837,20 @@ prepare_slice() { # <slice number>
     mark_bad "$k" "the manifest and the front index disagree about file $pos"
     return 1
   fi
-  if ! fetch "$pos" "$WORK/slice.enc" "$enc"; then
+  if ! fetch_hashed "$pos" "$WORK/slice.enc" "$enc"; then
     mark_bad "$k" "the tape could not be read at file $pos"
     return 1
   fi
   want_h=${SL_SHAE[$k]}
-  if [ "$(sha_of_file "$WORK/slice.enc")" != "$want_h" ]; then
+  if [ "$FETCH_SHA" != "$want_h" ]; then
     mark_bad "$k" "file $pos differs from the front index's hash"
     rm -f "$WORK/slice.enc"
     return 1
+  fi
+  # The tape gave the right bytes; a copy that does not hold them all was cut
+  # short by the work directory, never by the tape.
+  if [ "$FETCH_GOT" != "$enc" ]; then
+    die_io "writing slice $k into the work directory failed" "the copy holds ${FETCH_GOT:-no} of the $enc bytes read from tape file $pos" "$WORK"
   fi
   if [ -z "$COMP" ]; then
     {
