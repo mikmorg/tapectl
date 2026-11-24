@@ -13,7 +13,9 @@
 #      compression is read with the real gzip, xz or zstd. heir_restore_tmpdir (#561) restores
 #      with TMPDIR a directory the script cannot write: the work directory is made in --to.
 #      heir_restage_dotfile (#528) restores, from its own tape, a unit staged again after `unit tag`
-#      rewrote its dotfile (a home of its own, on two of the span leg's cartridges).
+#      rewrote its dotfile (a home of its own, on two of the span leg's cartridges). In the same
+#      home, heir_inner_tar (#556) loses the first slice of a tar file's run: none of the inner
+#      archive's members is extracted.
 #   3. Negative leg: cross-tenant decrypt must fail; raw media must not
 #      contain plaintext canaries or a plaintext tar stream
 #   4. Evidence leg: verify must leave a verification_sessions row (ADR-0001)
@@ -47,7 +49,8 @@
 # heir_restore_symlinks, and added heir_verify, heir_list, heir_path, heir_find_path,
 # heir_long_member, span_heir_start_later, span_heir_second_run, span_heir_not_have and
 # heir_{gzip,xz,zstd}_{restore,path}: 78 checks. The open issues before 2.0.0's tag added
-# heir_restore_tmpdir (#561), span_heir_wrong_cartridge (#521) and heir_restage_dotfile (#528): 81.
+# heir_restore_tmpdir (#561), span_heir_wrong_cartridge (#521), heir_restage_dotfile (#528) and
+# heir_inner_tar (#556): 82.
 # #400 is not exercisable on mhvtl, see its section.
 #
 # The tools it names: tar (GNU tar 1.35, built with ACL support, is the writer's floor; the
@@ -4154,6 +4157,86 @@ PY
 }
 check heir_restage_dotfile step_heir_restage_dotfile
 
+# heir_inner_tar (#556 a; ADR-0012 item 264; volume-format-v3.md 7: no reader zero-fills a lost slice
+# or passes --ignore-zeros): hx-inner's b-old-backup.tar is a real tar archive as a plain file,
+# larger than a slice, so a run; its first piece is made bad as it is read (the dd stand-in flips a
+# byte of that one tape file). Members of the inner archive lie in the run's later, intact piece,
+# where a reader that resynchronised on a header would find them. RESTORE.sh feeds tar whole members
+# by the file table and leaves the bad slice's members out: none of the inner archive's members
+# appears under --to, b-old-backup.tar is listed damaged and is not on disk, the files before and
+# after it are whole, and the run ends RESTORE INCOMPLETE: 1 path(s), exit 1 (tests/heir_restore.rs
+# a_bad_slice_is_left_out_its_files_are_listed_and_the_rest_restores). The slice made bad is the one
+# --list says b-old-backup.tar begins in, at the tape file the catalog gives it. The control: the
+# same restore with no fault gives b-old-backup.tar whole, and tar -t of it lists the inner members.
+step_heir_inner_tar() {
+    local db="$HX/home/tapectl.db" d out rc k s b t sa sc first bad cont m list
+    hx_prepare || return 1
+    sp_load HX-0001 || return 1
+    read -r k s b t < <(hx_list_row "$HX/heir1" hx-inner b-old-backup.tar)
+    [ "$k" = f ] && [ "${b:-0}" -gt 1048576 ] || { echo "heir_inner_tar: b-old-backup.tar is '$k $s $b' in hx-inner's --list, want a file larger than a 1M slice"; return 1; }
+    first="$s"
+    read -r k sa b t < <(hx_list_row "$HX/heir1" hx-inner a-first.bin)
+    read -r k sc b t < <(hx_list_row "$HX/heir1" hx-inner c-last.bin)
+    [ -n "$sa" ] && [ -n "$sc" ] && [ "$sa" -lt "$first" ] && [ "$sc" -gt $((first + 1)) ] \
+        || { echo "heir_inner_tar: a-first.bin in slice '$sa', b-old-backup.tar from $first, c-last.bin in '$sc': want them apart"; return 1; }
+    cont="$(gate_q "$db" "SELECT sl.continues FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+        WHERE u.name = 'hx-inner' AND sl.slice_number = ?" $((first + 1)))"
+    [ "$cont" = 1 ] || { echo "heir_inner_tar: slice $((first + 1)) does not continue b-old-backup.tar (continues='$cont')"; return 1; }
+    # The inner archive's members begin in the run's pieces after the first: where the bad slice
+    # leaves them intact. From the member's offsets in the catalog's file table and the inner
+    # archive's own headers.
+    python3 - "$db" "$HX/src/hx-inner/b-old-backup.tar" <<'PY' || return 1
+import sqlite3, sys, tarfile
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+rows = c.execute("""SELECT sf.start, sf."end", sf.size FROM stage_files sf JOIN paths p ON p.id = sf.path_id
+    JOIN stage_sets ss ON ss.id = sf.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
+    JOIN units u ON u.id = s.unit_id WHERE u.name = 'hx-inner' AND p.path = 'b-old-backup.tar'""").fetchall()
+assert len(rows) == 1, rows
+start, end, size = rows[0]
+data = end - (size + 511) // 512 * 512
+with tarfile.open(sys.argv[2]) as tf:
+    piece = {m.name: (data + m.offset - start) // 1048576 for m in tf.getmembers()}
+later = sorted(n for n, p in piece.items() if p >= 1)
+assert later, f"every inner header is in the run's first piece: {piece}"
+print(f"inner headers by piece of the run: {piece}; in the intact later piece(s): {later}")
+PY
+    bad="$(gate_slice_pos "$db" HX-0001 hx-inner "$first")"
+    [ -n "$bad" ] || { echo "heir_inner_tar: no tape file for slice $first of hx-inner on HX-0001"; return 1; }
+    # The control: no fault. The inner archive comes back as the one file it is.
+    d="$HX/heir1/inner-clean"
+    out="$(hx_sh "$HX/heir1" --restore --unit hx-inner --key "$HX_KEY" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 8
+    [ "$rc" -eq 0 ] && grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "control: hx-inner with no fault exited $rc or is not complete"; return 1; }
+    diff -r "$HX/src/hx-inner" "$d" || { echo "control: hx-inner with no fault differs from the source"; return 1; }
+    list="$(tar -tf "$d/b-old-backup.tar")" || { echo "control: tar -t of the restored b-old-backup.tar failed"; return 1; }
+    for m in payload/inner1.bin payload/inner3.bin payload/INNER-NOTE.txt; do
+        grep -Fx -- "$m" >/dev/null <<<"$list" || { echo "control: the inner archive does not list $m: $list"; return 1; }
+    done
+    # The run's first piece bad.
+    d="$HX/heir1/inner-bad"
+    out="$(hx_sh_hooked "$HX/heir1" "$bad" "$HX/inner.fault" "$HX/inner.trace" --restore --unit hx-inner --key "$HX_KEY" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 20
+    grep -Fx "flipped one byte of tape file $bad" "$HX/inner.fault" >/dev/null \
+        || { echo "control: the stand-in did not flip a byte of tape file $bad, so the run proves nothing"; return 1; }
+    [ "$rc" -eq 1 ] || { echo "heir_inner_tar: exited $rc with slice $first bad, want 1"; return 1; }
+    grep -F "RESTORE INCOMPLETE: 1 path(s)" >/dev/null <<<"$out" || { echo "heir_inner_tar: no 'RESTORE INCOMPLETE: 1 path(s)'"; return 1; }
+    grep -F "differs from the front index's hash" >/dev/null <<<"$out" || { echo "heir_inner_tar: the bad slice is not said to differ from the front index's hash"; return 1; }
+    [ -f "$d/.tapectl-damaged-files.txt" ] && [ "$(tail -n +2 "$d/.tapectl-damaged-files.txt")" = b-old-backup.tar ] \
+        || { echo "heir_inner_tar: the damaged-file list names '$(tail -n +2 "$d/.tapectl-damaged-files.txt" 2>/dev/null | tr '\n' ' ')', want exactly b-old-backup.tar"; return 1; }
+    [ ! -e "$d/b-old-backup.tar" ] || { echo "heir_inner_tar: b-old-backup.tar is on disk although its first slice was bad"; return 1; }
+    if [ -n "$(find "$d" \( -name payload -o -name inner1.bin -o -name inner3.bin -o -name INNER-NOTE.txt \) -print -quit)" ]; then
+        echo "heir_inner_tar: a member of the inner archive was extracted into --to:"
+        find "$d" \( -name payload -o -name inner1.bin -o -name inner3.bin -o -name INNER-NOTE.txt \)
+        return 1
+    fi
+    # Every file there is the source's, every other file of the source is there whole.
+    sp_partition "$HX/src/hx-inner" "$d" b-old-backup.tar || return 1
+    cmp "$HX/src/hx-inner/a-first.bin" "$d/a-first.bin" && cmp "$HX/src/hx-inner/c-last.bin" "$d/c-last.bin" \
+        || { echo "heir_inner_tar: a file before or after the bad run is not whole"; return 1; }
+}
+check heir_inner_tar step_heir_inner_tar
+
 # The gate's own cartridge back in the drive. When every span check passed, the leg's bulk
 # (sources, staging, restored trees) is removed and the logs, JSON reports and catalogs stay;
 # after a failure all of it is kept, so the failure can be read from what it left.
@@ -4331,7 +4414,7 @@ PY
 check lbp_page_clear_after_every_command step_lbp_page_clear_after_every_command
 
 # ---------- the checks the gate must have run, by name ----------
-# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 81). The verdict compares the run to this
+# Every `check` line above, in the order they run (T4.16: 78; with the open issues' legs: 82). The verdict compares the run to this
 # list by NAME, never by a total: a check named here that did not run is a FAIL (a leg that was
 # edited out, or a run that stopped early, cannot read GREEN), and so is a check that ran and is
 # not named here. TAPECTL_GATE_SPAN_ONLY judges the span_* names alone.
@@ -4350,7 +4433,7 @@ GATE_EXPECTED_CHECKS=(
     heir_xz_path heir_zstd_restore heir_zstd_path span_rows span_heir_tapes_1_3 span_heir_tape_2
     span_heir_stream_swap span_heir_start_later span_heir_second_run span_heir_not_have
     span_restore_unit span_retire_floors span_floor_target_1 span_rebuild_tape_3
-    span_three_tapes span_heir_wrong_cartridge heir_restage_dotfile rust_e2e rust_motions rust_lbp perf_write_2g
+    span_three_tapes span_heir_wrong_cartridge heir_restage_dotfile heir_inner_tar rust_e2e rust_motions rust_lbp perf_write_2g
     lbp_page_clear_after_every_command
 )
 
