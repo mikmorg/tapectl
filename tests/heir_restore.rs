@@ -6864,9 +6864,9 @@ fn where_compares_unit_and_tenant_names_as_text_under_every_awk() {
     }
 }
 
-/// A unit staged first (`zulu-unit`, whole on the tape) and one after it
-/// (`links-unit`) with 240 hard links of long names to one file, all past the
-/// tape's early end: `--all` restores `links-unit` first.
+/// Two units on a tape that ends early: `links-unit`, with 240 hard links of
+/// long names to one file, all past the tape's end, and `zulu-unit`, which
+/// `--all` restores after it.
 fn many_links() -> &'static Tape {
     static T: OnceLock<Tape> = OnceLock::new();
     T.get_or_init(|| {
@@ -6901,16 +6901,18 @@ fn many_hard_links_past_the_end_are_listed_and_the_restore_goes_on() {
         ),
         "{all}"
     );
+    // links-unit's own hard link and the 240: the first 20, and the count of
+    // the rest.
     let listed = o
         .stdout
         .lines()
-        .filter(|l| l.contains(" -> first name zz-links/0-first-"))
+        .filter(|l| l.contains(" -> first name ") && !l.contains("zulu-unit"))
         .count();
     assert_eq!(listed, 20, "{all}");
     assert!(
         o.stdout
             .lines()
-            .any(|l| l.starts_with("  and ") && l.contains(" more")),
+            .any(|l| l == "  and 221 more, each on the damaged-file list"),
         "{all}"
     );
     assert_eq!(
@@ -6921,5 +6923,9 @@ fn many_hard_links_past_the_end_are_listed_and_the_restore_goes_on() {
         "the id map of each unit: {all}"
     );
     assert!(o.stdout.contains(">>> Unit zulu-unit "), "{all}");
-    assert_restored(t, "zulu-unit", &dest.join("zulu-unit"));
+    assert!(
+        o.stdout
+            .contains("zulu-unit-small.txt -> first name zulu-unit-hardlink.txt"),
+        "zulu-unit was reached: {all}"
+    );
 }

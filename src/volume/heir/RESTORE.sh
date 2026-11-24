@@ -219,7 +219,7 @@ removed_option() {
 is_uint() { case ${1:-} in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
 
 # Text that came off a tape, made safe to show.
-safe_str() { printf '%s' "$1" | tr -c 'A-Za-z0-9 ._/:=,+-' '?' | head -c 120; }
+safe_str() { printf '%s' "${1:0:120}" | tr -c 'A-Za-z0-9 ._/:=,+-' '?'; }
 
 # ---- arguments ----
 
@@ -1433,7 +1433,7 @@ collect_ranges() {
 # part of it: "first last slices" (first and last empty when none), or nothing.
 range_of() { # <unit uuid> <version>
   RANGE_UUID="$1" RANGE_VER="$2" awk -F'\t' '
-    $1 == ENVIRON["RANGE_UUID"] && ($2 + 0) == (ENVIRON["RANGE_VER"] + 0) { print $3 "|" $4 "|" $5; exit }
+    ($1 "") == (ENVIRON["RANGE_UUID"] "") && ($2 + 0) == (ENVIRON["RANGE_VER"] + 0) { print $3 "|" $4 "|" $5; exit }
   ' "$WORK/range.versions"
 }
 
@@ -1569,7 +1569,7 @@ start_holds() { # <slice>
   U_ID="$U_UUID" U_V="$U_VER" U_K="$1" awk -F'\t' '
     NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; ok = ("unit_uuid" in col) && ("version" in col) && ("state" in col) && ("first_slice" in col) && ("last_slice" in col); next }
     !ok { next }
-    $(col["unit_uuid"]) == ENVIRON["U_ID"] && ($(col["version"]) + 0) == (ENVIRON["U_V"] + 0) && $(col["state"]) == "this-tape" && $(col["first_slice"]) ~ /^[0-9]+$/ && $(col["last_slice"]) ~ /^[0-9]+$/ && (ENVIRON["U_K"] + 0) >= ($(col["first_slice"]) + 0) && (ENVIRON["U_K"] + 0) <= ($(col["last_slice"]) + 0) { f = 1 }
+    ($(col["unit_uuid"]) "") == (ENVIRON["U_ID"] "") && ($(col["version"]) + 0) == (ENVIRON["U_V"] + 0) && $(col["state"]) == "this-tape" && $(col["first_slice"]) ~ /^[0-9]+$/ && $(col["last_slice"]) ~ /^[0-9]+$/ && (ENVIRON["U_K"] + 0) >= ($(col["first_slice"]) + 0) && (ENVIRON["U_K"] + 0) <= ($(col["last_slice"]) + 0) { f = 1 }
     END { exit f ? 0 : 1 }
   ' "$f"
 }
@@ -1586,7 +1586,7 @@ holders_of() { # [slice]
     }
     !ok { next }
     {
-      if ($(col["unit_uuid"]) != ENVIRON["U_ID"]) next
+      if (($(col["unit_uuid"]) "") != (ENVIRON["U_ID"] "")) next
       if (($(col["version"]) + 0) != (ENVIRON["U_V"] + 0)) next
       st = $(col["state"])
       if (st == "this-tape" && ENVIRON["U_START_IN"] == "1") next
@@ -1710,7 +1710,7 @@ probe_cartridge() { # <dir> <slice>
     echo "NOTE: Its seal marker cannot be read (or the tape is not sealed), so nothing is taken from it: a cartridge gives a slice only at a position its seal marker says the tape holds (R8)." >&2
     exit 2
   fi
-  h16=$(printf '%s' "$NEED_HASH" | head -c 16)
+  h16=${NEED_HASH:0:16}
   pos=$(awk -F'|' -v h="$NEED_HASH" -v s="$NEED_SIZE" '$2 == "data_slice" && ($4 "") == (h "") && ($3 "") == (s "") { print $1; exit }' "$FILES_TXT")
   if [ -z "$pos" ]; then
     echo "NOTE: This cartridge (label $(safe_str "$label")) lists no data slice with the sha256 of slice $k ($h16...) in its front index, so it does not hold that slice. Nothing is taken from it." >&2
@@ -2118,7 +2118,8 @@ prepare_slice() { # <slice number>
     if not_a_recipient "$text"; then
       why="no key given opens it (a slice can be sealed to an older key than the envelope: give each key with --key)"
     else
-      why="age could not decrypt it: $(printf '%s' "$text" | head -n 1 | head -c 100)"
+      why=${text%%$'\n'*}
+      why="age could not decrypt it: ${why:0:100}"
     fi
     mark_bad "$k" "$why"
     rm -f "$WORK/slice.plain"
@@ -2551,19 +2552,30 @@ report_absent() { # <damaged paths file>
       say "This tape's envelope carries no index, so no tape is named: $0 --where $(safe_str "$U_NAME") --key KEY on the newest tape you hold may name them."
     fi
   fi
-  # Hard-linked names whose first name lies in a slice not read.
-  nh=$(awk -F'\t' '
+  # Hard-linked names whose first name lies in a slice not read: the first 20
+  # go to a file and awk counts them all, so no pipe is cut short under
+  # pipefail however many there are.
+  local hp ht sl
+  nh=$(awk -F'\t' -v out="$WORK/hardlinks.absent" '
     FILENAME == ARGV[1] { gone[$1 + 0] = 1; next }
     FILENAME == ARGV[2] { want[$0] = 1; next }
     /^#/ { next }
     { at[$7] = $2 + 0; if ($1 == "h") { hp[++n] = $7; ht[n] = $8 } }
-    END { for (i = 1; i <= n; i++) if ((hp[i] in want) && (ht[i] in at) && (at[ht[i]] in gone)) print hp[i] "\t" ht[i] "\t" at[ht[i]] }
-  ' "$WORK/absent.slices" "$1" "$U_TABLE" | head -n 20)
-  if [ -n "$nh" ]; then
+    END {
+      printf "" > out
+      for (i = 1; i <= n; i++) if ((hp[i] in want) && (ht[i] in at) && (at[ht[i]] in gone)) { if (++c <= 20) print hp[i] "\t" ht[i] "\t" at[ht[i]] > out }
+      close(out)
+      print c + 0
+    }
+  ' "$WORK/absent.slices" "$1" "$U_TABLE")
+  if is_uint "$nh" && [ "$nh" -gt 0 ]; then
     say "Hard-linked names whose first name is in a slice that was not read (restored by the repair once that tape has been read):"
-    printf '%s\n' "$nh" | while IFS=$'\t' read -r hp ht sl; do
+    while IFS=$'\t' read -r hp ht sl; do
       say "  $(visible_text "$hp") -> first name $(visible_text "$ht"), slice $sl"
-    done
+    done <"$WORK/hardlinks.absent"
+    if [ "$nh" -gt 20 ]; then
+      say "  and $((nh - 20)) more, each on the damaged-file list"
+    fi
   fi
   say_run_limits
 }
@@ -2583,7 +2595,7 @@ units_with_lists() {
     done
   )
   [ -n "$names" ] || return 0
-  first=$(printf '%s\n' "$names" | head -n 1)
+  first=${names%%$'\n'*}
   if [ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" -eq 1 ]; then
     printf 'The unit whose directory holds a list is %s: continue it with --unit %s --to %s/%s. ' "$(safe_str "$first")" "$(safe_str "$first")" "$(safe_str "$TO")" "$(safe_str "$first")"
   else
@@ -2987,7 +2999,7 @@ restore_paths() { # <destination> <how>
   resolve_paths "$WORK/want.sorted" "$U_TABLE"
   if [ -s "$WORK/missing.paths" ]; then
     echo "FATAL: $(wc -l <"$WORK/missing.paths" | tr -d ' ') path(s) are not in the file table of unit $(safe_str "$U_NAME") version $U_VER on this tape (a path is written as '$0 --list' shows it, relative to the unit's root):" >&2
-    sort "$WORK/missing.paths" | head -n 10 | while IFS= read -r p; do printf '         %s\n' "$(safe_str "$p")" >&2; done
+    sort "$WORK/missing.paths" | awk 'NR <= 10' | while IFS= read -r p; do printf '         %s\n' "$(safe_str "$p")" >&2; done
     echo "       Nothing has been read from a slice and nothing was changed." >&2
     exit 1
   fi
@@ -3491,16 +3503,18 @@ NR == 1 {
   split($0, f, "\t")
   u = unesc(val(f, h, "unit"))
   if (!(u in seen)) { seen[u] = 1; print show(val(f, h, "unit")) >> known }
-  if (u != want) next
+  # Text compared as text: a field that looks like a number would otherwise
+  # be compared as one (7 and 007, 1.1 and 1.10 equal under gawk and mawk).
+  if ((u "") != (want "")) next
   found = 1
   t = ("tenant" in h) ? val(f, h, "tenant") : tenant
-  if (!started || t != lastt) {
+  if (!started || (t "") != (lastt "")) {
     if (started) print ""
     print "Unit " show(val(f, h, "unit")) (t == "" ? "" : " (tenant " show(t) ")") ":"
     started = 1; lastt = t; lastv = ""; vseen = 0
   }
   v = val(f, h, "version")
-  if (!vseen || v != lastv) {
+  if (!vseen || (v "") != (lastv "")) {
     print ""
     print "  Version " show(v) ": " show(val(f, h, "num_slices")) " slice(s), " human(val(f, h, "version_bytes")) " (" show(val(f, h, "version_bytes")) " bytes); unit uuid " nk(show(val(f, h, "unit_uuid")))
     lastv = v; vseen = 1
