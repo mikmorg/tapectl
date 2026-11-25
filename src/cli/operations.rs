@@ -12597,6 +12597,180 @@ mod tests {
             );
         }
     }
+
+    /// #606 C-3: `cartridge retire` and `cartridge mark-erased` judge the
+    /// last-copy floor per mounted volume. Two open mounts on one cartridge,
+    /// whose volumes were each other's only other copy, would each pass. That
+    /// cannot arise: one cartridge never has two open mounts. These tests
+    /// are the proof, in two halves.
+    mod one_open_mount_per_cartridge {
+        use super::*;
+
+        /// Every production `.rs` file under `src/`, cut at its first
+        /// `#[cfg(test)]` module (the convention the other source scans hold
+        /// to: production code all lies before it).
+        fn production_sources() -> Vec<(String, String)> {
+            fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                for e in std::fs::read_dir(dir).unwrap().flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else if p.extension().is_some_and(|x| x == "rs") {
+                        out.push(p);
+                    }
+                }
+            }
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+            let mut files = Vec::new();
+            walk(&root, &mut files);
+            files
+                .into_iter()
+                .filter(|p| {
+                    let name = p.file_name().unwrap().to_string_lossy();
+                    // Whole files that are test modules.
+                    !name.ends_with("_tests.rs")
+                        && !["fixture.rs", "cost_budget.rs"].contains(&name.as_ref())
+                })
+                .map(|p| {
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    // Cut at the first `#[cfg(test)]` on a module (`mod`,
+                    // `pub(crate) mod`), and comment lines dropped: only
+                    // statements count.
+                    let cut = text
+                        .match_indices("\n#[cfg(test)]\n")
+                        .find(|(at, m)| {
+                            let next = text[at + m.len()..].lines().next().unwrap_or("");
+                            ["mod ", "pub(crate) mod ", "pub mod "]
+                                .iter()
+                                .any(|p| next.starts_with(p))
+                        })
+                        .map_or(text.len(), |(at, _)| at);
+                    let production = text[..cut]
+                        .lines()
+                        .filter(|l| !l.trim_start().starts_with("//"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (
+                        p.strip_prefix(&root).unwrap().display().to_string(),
+                        production,
+                    )
+                })
+                .collect()
+        }
+
+        /// Each statement that writes `cartridge_volumes` in production
+        /// code, by file, with its text from the keyword on.
+        fn writers(verb: &str) -> Vec<(String, String)> {
+            let mut found = Vec::new();
+            for (file, text) in production_sources() {
+                let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                for (at, _) in flat.match_indices(verb) {
+                    let tail = &flat[at..(at + 160).min(flat.len())];
+                    if tail.contains("cartridge_volumes")
+                        && tail.find("cartridge_volumes").unwrap() < 40
+                    {
+                        found.push((file.clone(), tail.to_string()));
+                    }
+                }
+            }
+            found
+        }
+
+        /// The only production INSERT is `mount_and_record`'s, which closes
+        /// every other open mount on the cartridge first (the UPDATE just
+        /// above it); every other production write to the table only closes
+        /// a mount (sets `unmounted_at` to now); nothing replaces a row or
+        /// reopens one.
+        #[test]
+        fn the_only_production_insert_is_mount_and_records() {
+            let inserts = writers("INSERT INTO");
+            assert_eq!(
+                inserts.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
+                vec!["volume/binding.rs"],
+                "{inserts:#?}"
+            );
+            for verb in ["INSERT OR", "REPLACE INTO", "DELETE FROM"] {
+                assert!(writers(verb).is_empty(), "{verb}: {:#?}", writers(verb));
+            }
+            let updates = writers("UPDATE");
+            assert!(
+                updates.len() >= 2,
+                "positive control: the scan sees the closing UPDATEs: {updates:#?}"
+            );
+            for (file, text) in &updates {
+                assert!(
+                    text.starts_with("UPDATE cartridge_volumes SET unmounted_at = datetime('now')"),
+                    "{file}: a production UPDATE that does more than close a mount: {text}"
+                );
+            }
+            // And in binding.rs, the close of the cartridge's other mounts
+            // comes before the insert.
+            let binding = production_sources()
+                .into_iter()
+                .find(|(f, _)| f == "volume/binding.rs")
+                .unwrap()
+                .1;
+            let close = binding
+                .find("WHERE cartridge_id = ?1 AND unmounted_at IS NULL AND volume_id != ?2")
+                .expect("mount_and_record closes the cartridge's other open mounts");
+            let insert = binding.find("INSERT INTO cartridge_volumes").unwrap();
+            assert!(close < insert);
+        }
+
+        /// The behaviour: three volumes bound in turn onto one cartridge
+        /// through `mount_and_record` (what `volume init`, the late binding
+        /// and `catalog rebuild` call) leave one open mount after each.
+        #[test]
+        fn binding_volumes_in_turn_leaves_one_open_mount() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                 VALUES ('BC-ONE', 'LTO-6', 2500000000000, 'available')",
+                [],
+            )
+            .unwrap();
+            let cart = conn.last_insert_rowid();
+            let open = |conn: &Connection| -> i64 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM cartridge_volumes
+                     WHERE cartridge_id = ?1 AND unmounted_at IS NULL",
+                    params![cart],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            for label in ["L6-A", "L6-B", "L6-C"] {
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                    params![label],
+                )
+                .unwrap();
+                let vol = conn.last_insert_rowid();
+                let status: String = conn
+                    .query_row(
+                        "SELECT status FROM cartridges WHERE id = ?1",
+                        params![cart],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                crate::volume::binding::mount_and_record(
+                    &conn,
+                    vol,
+                    cart,
+                    "BC-ONE",
+                    &status,
+                    None,
+                    &crate::tape::mam::MamInfo::default(),
+                    "volume init",
+                    true,
+                )
+                .unwrap();
+                assert_eq!(open(&conn), 1, "after binding {label}");
+            }
+        }
+    }
 }
 
 /// Test support for remedy strings (#468): a message that tells the operator
