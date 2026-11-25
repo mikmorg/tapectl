@@ -1938,7 +1938,8 @@ fn a_full_work_directory_while_a_slice_is_read_ends_the_run_and_is_not_damage() 
 /// `name`: that copy it cuts to its first 1000 bytes while it passes every
 /// byte on, as a disk that fills mid-file leaves GNU tee doing. `loud`, it
 /// says so as a full disk does and exits 1; silent, it exits 0. It leaves
-/// `tee.cut` in TMPDIR when it cut a copy.
+/// `tee.cut` in the state directory (`$FAKE_TAPE`) when it cut a copy: the
+/// script's TMPDIR is its work directory.
 fn short_tee(h: &Heir, name: &str, loud: bool) {
     let real = heir::host_tool("tee").unwrap();
     let end = if loud {
@@ -1949,7 +1950,7 @@ fn short_tee(h: &Heir, name: &str, loud: bool) {
     h.put_tool(
         "tee",
         &format!(
-            "#!/bin/bash\ncase \"$1\" in\n  *{name}) ;;\n  *) exec {real} \"$@\" ;;\nesac\n: >\"$TMPDIR/tee.cut\"\ncat >\"$TMPDIR/tee.all\"\nhead -c 1000 \"$TMPDIR/tee.all\" >\"$1\"\ncat \"$TMPDIR/tee.all\"\nrm -f \"$TMPDIR/tee.all\"\n{end}\n",
+            "#!/bin/bash\ncase \"$1\" in\n  *{name}) ;;\n  *) exec {real} \"$@\" ;;\nesac\n: >\"$FAKE_TAPE/tee.cut\"\ncat >\"$FAKE_TAPE/tee.all\"\nhead -c 1000 \"$FAKE_TAPE/tee.all\" >\"$1\"\ncat \"$FAKE_TAPE/tee.all\"\nrm -f \"$FAKE_TAPE/tee.all\"\n{end}\n",
             real = real.display()
         ),
     );
@@ -1968,7 +1969,7 @@ fn a_copy_of_a_slice_cut_short_while_its_bytes_stream_whole_is_the_work_director
         short_tee(&h, "slice.enc", loud);
         let (o, _) = restore_unit_b(&h);
         assert!(
-            h.root.path().join("tmp/tee.cut").exists(),
+            h.root.path().join("state/tee.cut").exists(),
             "loud={loud}: the copy went through tee: {}",
             o.all()
         );
@@ -2037,7 +2038,7 @@ fn a_plain_cut_cut_short_while_its_bytes_stream_whole_is_caught() {
             ]);
             let all = o.all();
             assert!(
-                h.root.path().join("tmp/tee.cut").exists(),
+                h.root.path().join("state/tee.cut").exists(),
                 "{alg:?} loud={loud}: the cut went through tee: {all}"
             );
             assert_eq!(o.code, 1, "{alg:?} loud={loud}: {all}");
@@ -6387,7 +6388,7 @@ fn a_slice_read_ahead_that_fails_has_the_verdict_of_a_read_made_then() {
         short_tee(&h, "slice.enc.next", loud);
         let (o, _) = restore_unit_b(&h);
         assert!(
-            h.root.path().join("tmp/tee.cut").exists(),
+            h.root.path().join("state/tee.cut").exists(),
             "loud={loud}: {}",
             o.all()
         );
