@@ -345,7 +345,19 @@ impl<'j, 'a> Reading<'j, 'a> {
         if let Some(t) = self.tar.take() {
             self.runs.push(t.close(false));
         }
+        // Never anything outside the destination (#606 C-2): a path the writer
+        // never makes is left alone (the catalog read refuses one before a
+        // restore begins), and so is a path under a symbolic link in the
+        // destination, which tar may have made.
+        if crate::volume::filetable::check_member_path(&m.path).is_err() {
+            warn!(path = %m.path, "a partial file's path is not one the writer makes; left");
+            return;
+        }
         let at = self.job.dest.join(crate::volume::index::on_disk(&m.path));
+        if under_a_link(self.job.dest, &at) {
+            warn!(path = %at.display(), "a partial file under a symbolic link; left");
+            return;
+        }
         if let Ok(meta) = std::fs::symlink_metadata(&at) {
             if meta.is_file() {
                 if let Err(e) = std::fs::remove_file(&at) {
@@ -561,6 +573,19 @@ impl<'j, 'a> Reading<'j, 'a> {
     }
 }
 
+/// Whether a folder between `root` and `at` (both excluded) is a symbolic
+/// link: removing `at` would then follow it, perhaps out of `root`.
+fn under_a_link(root: &Path, at: &Path) -> bool {
+    let Some(parent) = at.parent().and_then(|p| p.strip_prefix(root).ok()) else {
+        return true;
+    };
+    let mut here = root.to_path_buf();
+    parent.components().any(|c| {
+        here.push(c);
+        std::fs::symlink_metadata(&here).is_ok_and(|m| m.file_type().is_symlink())
+    })
+}
+
 /// Read the job's slices and feed tar the members: the whole of
 /// [`Reading`]'s work, and the check on disk after it.
 pub(super) fn run(
@@ -568,6 +593,19 @@ pub(super) fn run(
     supply: &mut Supply<'_, '_, '_>,
     trace: &mut RestoreTrace,
 ) -> Result<Outcome> {
+    // Every member's path is one the writer makes, or nothing is touched
+    // (#606 C-2). The catalog read refuses such a row first; this holds the
+    // reader to it whatever gave it the members.
+    for m in job.members {
+        for path in std::iter::once(m.path.as_str()).chain(m.link.as_deref()) {
+            crate::volume::filetable::check_member_path(path).map_err(|e| {
+                TapectlError::Other(format!(
+                    "unit \"{}\": the file table's member {e}; nothing was read or written",
+                    job.unit_name
+                ))
+            })?;
+        }
+    }
     std::fs::create_dir_all(job.dest).map_err(|e| {
         TapectlError::Other(format!(
             "cannot make the destination {}: {e}",

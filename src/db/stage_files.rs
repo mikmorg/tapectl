@@ -186,6 +186,16 @@ impl<'c> Query<'c> {
                 .ok_or_else(|| bad_row(set, seq, format!("kind {letter:?} is not a file kind")))?;
             let sha256 = sha_of(r.get(5)?)
                 .ok_or_else(|| bad_row(set, seq, "sha256 is not 32 bytes".into()))?;
+            // A path a reader joins to its destination: one the writer makes,
+            // or refused here, before a restore or a rebuild uses it (#606 C-2).
+            let path: String = r.get(6)?;
+            let link: Option<String> = r.get(7)?;
+            crate::volume::filetable::check_member_path(&path)
+                .map_err(|e| bad_row(set, seq, format!("path {e}")))?;
+            if let Some(link) = &link {
+                crate::volume::filetable::check_member_path(link)
+                    .map_err(|e| bad_row(set, seq, format!("link target {e}")))?;
+            }
             Ok(Row {
                 kind,
                 slice: unsigned(r.get(1)?, "slice", set, seq)?,
@@ -193,8 +203,8 @@ impl<'c> Query<'c> {
                 end: unsigned(r.get(3)?, "end", set, seq)?,
                 size: unsigned(r.get(4)?, "size", set, seq)?,
                 sha256,
-                path: r.get(6)?,
-                link: r.get(7)?,
+                path,
+                link,
             })
         })?;
         Ok(rows.map(|r| r.map_err(TapectlError::from)))
@@ -239,6 +249,51 @@ mod tests {
             err.contains("stage_set_id 7, seq 0") && err.contains("size"),
             "{err}"
         );
+    }
+
+    /// #606 C-2: the table a restore loads and `catalog rebuild` imports
+    /// from a tape's `catalog.db` (both through [`Query::rows`]) refuses, by
+    /// row and by name, a path or hard-link target the writer never makes:
+    /// absolute, a `..` component, a `/` from `\x2f`, or not the writer's
+    /// escape of its bytes. Before, each was taken as stored, and a reader
+    /// joined it to the destination.
+    #[test]
+    fn a_path_that_could_leave_the_destination_is_refused_naming_the_row() {
+        for (path, link, says) in [
+            ("/etc/passwd", None, "is absolute"),
+            ("../../x", None, "a `..` component"),
+            ("a\\x2fb", None, "a `/` written as `\\x2f`"),
+            ("\\x41bc", None, "is not the writer's escape"),
+            ("b", Some("../a"), "a `..` component"),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE paths (id INTEGER PRIMARY KEY, unit_id INTEGER, path TEXT);
+                 CREATE TABLE stage_files (stage_set_id INTEGER, seq INTEGER, kind TEXT,
+                   slice INTEGER, path_id INTEGER, size INTEGER, sha256 BLOB, start INTEGER,
+                   \"end\" INTEGER, link_path_id INTEGER);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO paths VALUES (1, 1, ?1)", params![path])
+                .unwrap();
+            conn.execute("INSERT INTO paths VALUES (2, 1, ?1)", params![link])
+                .unwrap();
+            let (kind, link_id) = match link {
+                Some(_) => ("h", Some(2)),
+                None => ("f", None),
+            };
+            conn.execute(
+                "INSERT INTO stage_files VALUES (7, 0, ?1, 1, 1, 5, zeroblob(32), 0, 1024, ?2)",
+                params![kind, link_id],
+            )
+            .unwrap();
+            let err = load(&conn, 7).unwrap_err().to_string();
+            let named = format!("{:?}", link.unwrap_or(path));
+            assert!(
+                err.contains("stage_set_id 7, seq 0") && err.contains(says) && err.contains(&named),
+                "{path:?}: {err}"
+            );
+        }
     }
 
     /// A catalog with one unit, one version of it and one stage set, the

@@ -927,3 +927,74 @@ fn the_second_name_of_a_symbolic_link_is_listed_when_the_first_is_lost() {
         "no claim on a name that was not made"
     );
 }
+
+/// #606 C-2: a restore takes its members from the catalog's file table and
+/// joins each path to `--to`. A path the writer never makes (absolute, a
+/// `..` component, a `/` from `\x2f`, or not the writer's escape) is refused
+/// by name before anything is read or written: nothing lands in `--to`, and
+/// nothing beside it. Each case is one crafted row: the unit's one file's
+/// member pointed at a crafted path in the catalog.
+#[test]
+fn a_member_path_that_could_leave_the_destination_is_refused_before_the_disk() {
+    let h = home_with(
+        "esc",
+        &[Item::file("f.txt", b"one file\n".to_vec())],
+        "64K",
+        None,
+    );
+    // The path's row as the catalog interns it: a new `paths` row for the
+    // crafted name, and the member pointed at it (rows are never changed in
+    // place).
+    let mut was: i64 = h
+        .conn
+        .query_row("SELECT id FROM paths WHERE path = 'f.txt'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    for (path, says) in [
+        ("/tmp/tapectl-c2-absolute.txt", "is absolute"),
+        ("../tapectl-c2-outside.txt", "a `..` component"),
+        ("sub\\x2f..\\x2fescape.txt", "a `/` written as `\\x2f`"),
+        ("\\x66.txt", "is not the writer's escape"),
+    ] {
+        h.conn
+            .execute(
+                "INSERT INTO paths (unit_id, path) SELECT unit_id, ?1 FROM paths WHERE id = ?2",
+                rusqlite::params![path, was],
+            )
+            .unwrap();
+        let crafted = h.conn.last_insert_rowid();
+        h.conn
+            .execute(
+                "UPDATE stage_files SET path_id = ?1 WHERE path_id = ?2",
+                rusqlite::params![crafted, was],
+            )
+            .unwrap();
+        was = crafted;
+        let mut bay = h.bay("RDR-A", &[]);
+        let (r, dest) = h.restore(
+            "esc",
+            What::Unit,
+            "RDR-A",
+            &RestoreOptions::default(),
+            &mut bay,
+        );
+        let err = r.expect_err("refused").to_string();
+        assert!(
+            err.contains(says) && err.contains(&format!("{path:?}")),
+            "{path:?}: {err}"
+        );
+        assert!(
+            listing(dest.path()).is_empty(),
+            "{path:?}: nothing was written: {:?}",
+            listing(dest.path())
+        );
+        assert!(!dest
+            .path()
+            .parent()
+            .unwrap()
+            .join("tapectl-c2-outside.txt")
+            .exists());
+        assert!(!Path::new("/tmp/tapectl-c2-absolute.txt").exists());
+    }
+}

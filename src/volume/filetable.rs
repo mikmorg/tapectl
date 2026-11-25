@@ -94,6 +94,34 @@ impl Kind {
     }
 }
 
+/// Whether `escaped`, a member's path (or a hard link's target) as the file
+/// table and the catalog hold it, is one the writer makes (§1.5; #606 C-2):
+/// relative, with no `..` component, no `/` written as `\x2f`, and in the
+/// writer's own escape of its bytes (unescaped and escaped again, the same
+/// text). A path that is not could lead a reader out of the destination it
+/// joins the path to, or to a name the writer did not mean, so every reader
+/// refuses it, naming it, before it touches the disk. The root `.` passes.
+pub fn check_member_path(escaped: &str) -> std::result::Result<(), String> {
+    let bytes = unescape(escaped).map_err(|e| format!("{escaped:?}: {e}"))?;
+    let slashes = |b: &[u8]| b.iter().filter(|&&c| c == b'/').count();
+    if slashes(&bytes) != slashes(escaped.as_bytes()) {
+        return Err(format!("{escaped:?} holds a `/` written as `\\x2f`"));
+    }
+    if bytes.first() == Some(&b'/') {
+        return Err(format!("{escaped:?} is absolute"));
+    }
+    if bytes.split(|&c| c == b'/').any(|part| part == b"..") {
+        return Err(format!("{escaped:?} holds a `..` component"));
+    }
+    let again = crate::volume::index::escape_bytes(&bytes);
+    if again != escaped {
+        return Err(format!(
+            "{escaped:?} is not the writer's escape of its bytes, which is {again:?} (§1.5)"
+        ));
+    }
+    Ok(())
+}
+
 /// One member of a staging's stream, as the text and the catalog hold it.
 /// `path` and `link` are in the escaped form (§1.5; ADR-0012 item 297), the
 /// one the text and the catalog both hold: relative to the unit's root with
@@ -361,6 +389,11 @@ impl<R: BufRead> Reader<R> {
         // catalog holds.
         unescape(fields[6]).map_err(|e| format!("`path`: {e}"))?;
         unescape(fields[7]).map_err(|e| format!("`link target`: {e}"))?;
+        // And is one the writer makes (#606 C-2).
+        check_member_path(fields[6]).map_err(|e| format!("`path`: {e}"))?;
+        if !fields[7].is_empty() {
+            check_member_path(fields[7]).map_err(|e| format!("`link target`: {e}"))?;
+        }
         let path = fields[6].to_string();
         let link = fields[7].to_string();
         let row = Row {
@@ -779,6 +812,44 @@ mod tests {
             let e = refused(&text);
             assert!(e.contains(says), "{text:?}: {e}");
         }
+    }
+
+    /// #606 C-2: a member path the writer never makes, and that could lead
+    /// a reader out of the destination or to a name the writer did not
+    /// mean, is refused by name: absolute, a `..` component, a `/` written
+    /// as `\x2f`, or a text that is not the writer's own escape of its
+    /// bytes. A hard link's target is held to the same. The writer's
+    /// forms pass (the round trip above is the positive control).
+    #[test]
+    fn a_path_the_writer_never_makes_is_refused_by_name() {
+        for (path, says) in [
+            ("/etc/passwd", "is absolute"),
+            ("a/../../x", "a `..` component"),
+            ("..", "a `..` component"),
+            ("a\\x2fb", "a `/` written as `\\x2f`"),
+            ("\\x2e\\x2e/x", "a `..` component"),
+            ("\\x41bc", "is not the writer's escape"),
+            ("caf\\xc3\\xa9", "is not the writer's escape"),
+        ] {
+            let text = format!("{H}f\t1\t0\t1024\t5\t{HASH}\t{path}\t\n");
+            let e = refused(&text);
+            assert!(
+                e.contains(says) && e.contains(&format!("{path:?}")),
+                "{path:?}: {e}"
+            );
+        }
+        let text =
+            format!("{H}f\t1\t0\t1024\t5\t{HASH}\ta\t\nh\t1\t1024\t1536\t0\t{HASH}\tb\t../a\n");
+        let e = refused(&text);
+        assert!(
+            e.contains("`link target`") && e.contains("a `..` component"),
+            "{e}"
+        );
+        // A name the writer escapes, and a `..` inside a component, pass.
+        let ok = format!(
+            "{H}f\t1\t0\t1024\t5\t{HASH}\tcaf\\xe9/a..b\t\nf\t1\t1024\t2048\t5\t{HASH}\t\\\\x2f\t\n"
+        );
+        assert_eq!(read_all(ok.as_bytes()).unwrap().1.len(), 2);
     }
 
     /// A row holds its path escaped: a raw TAB, LF or CR, or a text that is

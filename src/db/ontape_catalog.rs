@@ -365,9 +365,10 @@ impl FileSpans {
     /// empty iterator.
     ///
     /// A value that would not come back as what the writer recorded is
-    /// refused, naming the row: a reader does not guess. A `kind` outside 0–3
-    /// or a `sha256` that is not 32 bytes is refused; everything else is the
-    /// catalog's own value.
+    /// refused, naming the row: a reader does not guess. A `kind` outside 0–3,
+    /// a `sha256` that is not 32 bytes, or a path the writer never makes
+    /// (absolute, a `..` component, a `/` from `\x2f`, or not its escape;
+    /// #606 C-2) is refused; everything else is the catalog's own value.
     pub fn stream<R>(
         &self,
         conn: &Connection,
@@ -422,6 +423,9 @@ impl FileVersionRow {
             _ => None,
         }
         .ok_or_else(|| bad(format!("kind {:?} is not 0, 1, 2 or 3", self.kind)))?;
+        // The path, not a symbolic link's target: a target may be absolute or
+        // climb out by `..`, as the link on disk did.
+        crate::volume::filetable::check_member_path(&self.path).map_err(bad)?;
         let sha256 = match &self.sha256 {
             Value::Null => None,
             Value::Blob(b) if b.len() == 32 => {
@@ -1510,6 +1514,44 @@ mod tests {
                     && err.contains("\"a.txt\"")
                     && err.contains(needle),
                 "{name}: {err}"
+            );
+        }
+    }
+
+    /// #606 C-2: `catalog rebuild` takes each version's file list from the
+    /// tape's `catalog.db`; a path the writer never makes is refused, naming
+    /// the row, before anything is imported: absolute, a `..` component, a
+    /// `/` from `\x2f`, or not the writer's escape of its bytes. Before, the
+    /// path was "the catalog's own value", taken as stored.
+    #[test]
+    fn a_path_the_writer_never_makes_is_refused_naming_the_row() {
+        let conn = crate::db::open_memory().unwrap();
+        let (_unit, ss_id) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
+        let dir = tempfile::tempdir().unwrap();
+        for (i, (path, says)) in [
+            ("/etc/passwd", "is absolute"),
+            ("a/../../x", "a `..` component"),
+            ("a\\x2fb", "a `/` written as `\\x2f`"),
+            ("\\x41bc", "is not the writer's escape"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let p = dir.path().join(format!("path-{i}.db"));
+            write(&conn, &[ss_id], &p).unwrap();
+            let out = Connection::open(&p).unwrap();
+            out.execute(
+                "UPDATE paths SET path = ?1 WHERE path = 'a.txt'",
+                rusqlite::params![path],
+            )
+            .unwrap();
+            drop(out);
+            let err = read(&p).unwrap_err().to_string();
+            assert!(
+                err.contains("catalog.db file_versions row")
+                    && err.contains(says)
+                    && err.contains(&format!("{path:?}")),
+                "{path:?}: {err}"
             );
         }
     }
