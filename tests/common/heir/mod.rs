@@ -365,12 +365,15 @@ fn make_unit(
     name: &str,
     tenant: &'static str,
     big: bool,
-    raw: bool,
-    quoted: bool,
-    links: usize,
-    control: bool,
+    shape: &Shape,
     seed: u32,
 ) -> UnitTruth {
+    let (raw, quoted, links, control) = (
+        shape.raw_names,
+        shape.quoted_names,
+        shape.links,
+        shape.control_names,
+    );
     let dir = h.sources.join(name);
     fs::create_dir_all(dir.join("inner")).unwrap();
     let mut files: Vec<(String, Vec<u8>)> = vec![
@@ -746,17 +749,7 @@ impl Tape {
         };
         let mut units = Vec::new();
         for (i, (name, tenant, big)) in shape.units.iter().enumerate() {
-            units.push(make_unit(
-                &h,
-                name,
-                tenant,
-                *big,
-                shape.raw_names,
-                shape.quoted_names,
-                shape.links,
-                shape.control_names,
-                1 + 7 * i as u32,
-            ));
+            units.push(make_unit(&h, name, tenant, *big, shape, 1 + 7 * i as u32));
         }
         let mut keys = BTreeMap::new();
         keys.insert(key_name(Who::TenantA), secret_of(&h, TENANT_A));

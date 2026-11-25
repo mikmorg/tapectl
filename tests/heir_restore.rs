@@ -7096,6 +7096,9 @@ fn craft_row(table: &Path, kind: &str, bad: &str) {
     std::fs::write(table, out).unwrap();
 }
 
+/// An edit of a staging's file table (`Shape::table_edit`).
+type TableEdit = fn(&Path);
+
 fn t_abs(p: &Path) {
     craft_row(p, "f", "/abs-sentinel.txt")
 }
@@ -7123,7 +7126,7 @@ fn t_link(p: &Path) {
 /// made or removed, and `--all` goes on to the next unit.
 #[test]
 fn a_table_path_that_leaves_to_is_refused_and_nothing_outside_to_is_touched() {
-    let cases: [(fn(&Path), &str); 6] = [
+    let cases: [(TableEdit, &str); 6] = [
         (t_abs, "it begins with /"),
         (t_dotdot, "it has a .. component"),
         (t_dotdot_x, "it has a .. component"),
