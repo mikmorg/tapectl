@@ -252,10 +252,10 @@ which of three tiers applies:
 |---|---|---|---|
 | 1: staleness | nothing new; the evidence is old ("last verified 15y ago") | displays it | nothing to override |
 | 2: degraded but non-zero | a unit left short of its `min_copies`, `min_locations` or `required_locations`, a dirty unit, an older version released while its superseder is short of policy, a staging directory that may be too small, a host that is not quiet | shows the facts and asks | yes: `--yes` (on some commands `--force` too) |
-| 3: zero coverage or incoherence | writing over a sealed cartridge, marking a never-archived unit tape-only, retiring a unit's last copy, a drive that physically cannot write the medium, a staging directory proven too small for the unit | refuses | **no**, and no prompt appears either |
+| 3: zero coverage or incoherence | writing over a sealed cartridge, marking a unit that no tape holds tape-only (never archived, or snapshotted or staged and never written), retiring a unit's last copy, a drive that physically cannot write the medium, a staging directory proven too small for the unit | refuses | **no**, and no prompt appears either |
 
 A Tier-3 refusal reports a fact, not a risk. It tells you what has to change
-(load another cartridge, erase the tape, take a snapshot, free some space),
+(load another cartridge, erase the tape, write the unit to tape, free some space),
 and none of `--yes`, `--force` or answering `y` gets past it.
 
 ### The prompt, and the non-interactive refusal
@@ -288,16 +288,33 @@ Read the fact lines. If you accept them, re-run with `--yes`. The one command
 this does not carry through is `volume compact`, which needs a terminal
 whatever its flags say ([below](#volume-compact-needs-a-terminal)).
 
-For example, `unit mark-tape-only` on a unit that has been staged but never
-written:
+For example, `unit mark-tape-only` on a unit with one copy on tape, where the
+tape-only floor asks for four:
 
 ```text
 error: mark unit "<unit>" tape-only refused: non-interactive session with no confirmation given — refusing
 rather than assuming consent (re-run with --yes to proceed)
-insufficient copies: 0 < 4 required by unit "<unit>"'s policy (tape-only 2x)
-insufficient locations: 0 < 2 required ([defaults] location floor)
+insufficient copies: 1 < 4 required by unit "<unit>"'s policy (tape-only 2x)
+insufficient locations: 1 < 2 required ([defaults] location floor)
+coverage for unit "<unit>" rests on <label>, last verified <d> days ago
 (`--force` or `--yes` confirms this in advance)
 ```
+
+A unit that no tape holds is not asked about: it is refused at Tier 3, whatever
+the flags (ADR-0008; the ruling of 2026-11-24). That is a unit never archived,
+one snapshotted or staged but never written, and one whose every copy is on a
+volume that is retired, erased or quarantined. The refusal names the write to
+make first:
+
+```text
+error: unit "<unit>" has no copy on any tape: v<n> is staged and not yet written. Marking it tape-only would
+greenlight deleting the only copy of its data, and this cannot be overridden (ADR-0008 Tier 3): not by --force, not
+by --yes. Write it to tape first: `tapectl volume write <LABEL>`, which writes the staged version.
+```
+
+For a version never staged it names `tapectl stage create <unit>` then the write; for a staging released unwritten,
+or a version whose copies are all gone, `tapectl stage create <unit> --version <n>` then the write; for a unit with no
+snapshot at all, `tapectl snapshot create <unit> && tapectl stage create <unit> && tapectl volume write <LABEL>`.
 
 `unit mark-tape-only` reads `min_copies` from the unit's resolved policy
 (dotfile > archive set > `[defaults]`) and the location floor from
@@ -311,6 +328,10 @@ no extra margin. Other fact lines it can show:
 - `insufficient locations: no copy at required location(s) <names> (policy
   requires <list>)`
 - `unit is dirty: on-disk contents changed since the last snapshot — <changes>`
+- `the unit's newest version v<n> <state>: the content on disk now is not on tape`,
+  where `<state>` says why it is on no tape (`is staged and not yet written, …`,
+  `was never staged, …`, `is reclaimable: …`, `is purged: …`, or `has no copy on a
+  volume in service …`), when an older version is on tape but the newest is not
 - under the copies line, when the unit has more than one current version,
   `  version <n> of <m> current versions has the fewest copies: <c>`
 - when the unit has copies, a line on the weakest of them, just before the

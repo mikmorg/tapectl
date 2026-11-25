@@ -2042,7 +2042,9 @@ unit's copy floors, the copy floor and each location's target, are multiplied
 by `[compaction] tape_only_safety_multiplier` (2 by default; ADR-0012,
 2026-10-12). The number of distinct locations is not. So at the defaults it
 needs 4 copies in 2 locations, and 2 copies at each named location. It also checks that nothing changed on
-disk since its last snapshot. A unit that meets all of it is marked with no
+disk since its last snapshot, and that its newest version is on tape (a newest
+version staged and not yet written, for one, is on no tape even when an older
+version meets the floor). A unit that meets all of it is marked with no
 question asked.
 
 A shortfall is a risk you may knowingly accept (ADR-0008 Tier 2), so it is
@@ -2060,9 +2062,19 @@ coverage for unit "family/letters" rests on L8-0001, last verified 0 days ago
 (`--force` or `--yes` confirms this in advance)
 ```
 
-Two things no flag passes: a unit that was never archived (no snapshot, so no
-tape holds it; ADR-0008 Tier 3), and a unit whose policy cannot be resolved,
-such as one with a malformed dotfile. The gate will not guess at a policy.
+Two things no flag passes (ADR-0008 Tier 3): a unit that no tape holds, and a
+unit whose policy cannot be resolved, such as one with a malformed dotfile. The
+gate will not guess at a policy. "No tape holds it" means no copy of any of its
+versions on a volume that is not retired, erased or quarantined: a unit never
+archived, one snapshotted or staged but never written, and one whose every copy
+is on such a volume. `--force` and `--yes` do not pass it, and neither does a
+snapshot: the refusal names the write to make first, and once one tape holds the
+unit, a shortfall below the floor is a question again.
+
+```text
+$ tapectl unit mark-tape-only family/recipes --yes
+error: unit "family/recipes" has no copy on any tape: v1 is staged and not yet written. Marking it tape-only would greenlight deleting the only copy of its data, and this cannot be overridden (ADR-0008 Tier 3): not by --force, not by --yes. Write it to tape first: `tapectl volume write <LABEL>`, which writes the staged version.
+```
 
 ### Retire a Volume
 

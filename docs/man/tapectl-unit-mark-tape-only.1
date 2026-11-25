@@ -14,7 +14,7 @@ Refused while the unit is short of its copies or locations, or dirty, unless con
 \fB\-\-force\fR
 Mark it though it is short of copies or locations, or dirty
 
-Confirms in advance, as the global \-\-yes does: mark the unit even though it is short of its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets), the copy target at each location of its copies_at map (an archive set\*(Aqs required_locations counts as one copy at each name), both times [compaction] tape_only_safety_multiplier, the tape\-only floor, or the [defaults] min_locations count of places (never multiplied), or is dirty (changed since its last snapshot). Without either flag a terminal asks, and a non\-interactive run refuses, naming each shortfall. It never overrides the refusal of a unit that was never archived.
+Confirms in advance, as the global \-\-yes does: mark the unit even though it is short of its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets), the copy target at each location of its copies_at map (an archive set\*(Aqs required_locations counts as one copy at each name), both times [compaction] tape_only_safety_multiplier, the tape\-only floor, or the [defaults] min_locations count of places (never multiplied), or is dirty (changed since its last snapshot). Without either flag a terminal asks, and a non\-interactive run refuses, naming each shortfall. It never overrides the refusal of a unit that no tape holds.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

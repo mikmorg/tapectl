@@ -3350,11 +3350,12 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
         )
         .unwrap();
     let unit2_id = conn2.last_insert_rowid();
-    // A snapshot but deliberately no writes: archived, on no tape -- below
-    // the copy threshold. (Issue #462: this unit used to have no snapshot at
-    // all and reached Tier 2 only because it had no `current_path`, which
-    // let the never-archived refusal be skipped; a unit with no snapshot is
-    // Tier 3 whatever its directory, and is checked below.)
+    // A snapshot but deliberately no writes: snapshotted, with no copy on any
+    // tape. The CTO's ruling of 2026-11-24 (#606 C-1) refuses that at ADR-0008
+    // Tier 3, as it does a unit with no snapshot (unit3, below): it used to be
+    // Tier 2, "insufficient copies". (Issue #462: this unit used to have no
+    // snapshot at all and reached Tier 2 only because it had no
+    // `current_path`, which let the never-archived refusal be skipped.)
     conn2
         .execute(
             "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
@@ -3389,12 +3390,14 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
         .expect("failed to run the tapectl binary");
     assert!(
         !guard_output.status.success(),
-        "a below-threshold unit must still refuse without --force (guard unchanged)"
+        "a unit with no copy on any tape must refuse"
     );
     let guard_stderr = String::from_utf8_lossy(&guard_output.stderr);
     assert!(
-        guard_stderr.contains("insufficient copies"),
-        "guard wording must be unchanged: {guard_stderr}"
+        guard_stderr.contains("has no copy on any tape")
+            && guard_stderr.contains("cannot be overridden")
+            && guard_stderr.contains("ADR-0008 Tier 3"),
+        "a snapshot on no tape is refused at Tier 3: {guard_stderr}"
     );
 
     // Issue #462, through the binary: a unit that was never snapshotted is

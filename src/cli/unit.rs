@@ -148,8 +148,8 @@ pub enum UnitCommands {
         /// the [defaults] min_locations count of places (never multiplied),
         /// or is dirty (changed since its last snapshot). Without either flag
         /// a terminal asks, and a non-interactive run refuses, naming each
-        /// shortfall. It never overrides the refusal of a unit that was never
-        /// archived.
+        /// shortfall. It never overrides the refusal of a unit that no tape
+        /// holds.
         #[arg(long)]
         force: bool,
     },

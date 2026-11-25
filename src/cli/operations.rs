@@ -2790,6 +2790,56 @@ fn thinnest_current_version(
         }))
 }
 
+/// `unit mark-tape-only`'s Tier-3 refusal of a unit that has a snapshot but
+/// no copy on any tape (the CTO's ruling of 2026-11-24, #606 C-1): what
+/// there is instead, and the write to make first, from the state the newest
+/// version is in. Never `snapshot create` alone, which makes no copy.
+fn no_tape_copy_refusal(
+    conn: &Connection,
+    unit_name: &str,
+    snapshot_id: i64,
+    version: i64,
+    status: &str,
+) -> Result<String> {
+    let staging_held = || -> Result<bool> {
+        let statuses: Vec<String> = conn
+            .prepare("SELECT status FROM stage_sets WHERE snapshot_id = ?1")?
+            .query_map(params![snapshot_id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(statuses
+            .iter()
+            .any(|s| crate::staging::stage_set_has_live_slices(s)))
+    };
+    let write = "`tapectl volume write <LABEL>`";
+    let restage = format!("`tapectl stage create {unit_name} --version {version}`, then {write}");
+    let (state, remedy) = match status {
+        "staged" if staging_held()? => (
+            format!("v{version} is staged and not yet written"),
+            format!("{write}, which writes the staged version"),
+        ),
+        "staged" => (
+            format!("v{version} was staged, and its staging released unwritten"),
+            restage,
+        ),
+        "created" => (
+            format!("v{version} was snapshotted and never staged"),
+            format!("`tapectl stage create {unit_name}`, then {write}"),
+        ),
+        other => (
+            format!(
+                "every copy it had is on a volume that is retired, erased or quarantined (its \
+                 newest version, v{version}, is {other})"
+            ),
+            restage,
+        ),
+    };
+    Ok(format!(
+        "unit \"{unit_name}\" has no copy on any tape: {state}. Marking it tape-only would \
+         greenlight deleting the only copy of its data, and this cannot be overridden \
+         (ADR-0008 Tier 3): not by --force, not by --yes. Write it to tape first: {remedy}."
+    ))
+}
+
 /// `unit mark-tape-only`'s fact for a newest version that no tape in
 /// service holds as a copy (#606 R-1): one that is not `current`, or is
 /// `current` with no copy left. `None` for a current version with a copy.
@@ -2915,14 +2965,17 @@ pub fn unit_mark_tape_only(
     // TIER 3 (ADR-0008): zero coverage is ABSOLUTE. Checked BEFORE the
     // consent gate, and deliberately outside it.
     //
-    // A never-archived unit has no snapshot, so no tape holds it and there
-    // is no claim to be stale. Marking it tape-only is not a riskier
-    // version of a thin safety margin — it is incoherent, and it greenlights
-    // deleting the only copy of data that exists nowhere else. ADR-0008
-    // draws exactly this line: `--force` means "I accept a degraded but
-    // non-zero margin", never "I accept total loss". The escape hatch is
-    // `snapshot create`, which resolves the incoherence rather than waiving
-    // it.
+    // A unit no tape holds has no claim to be stale. Marking it tape-only is
+    // not a riskier version of a thin safety margin — it is incoherent, and
+    // it greenlights deleting the only copy of data that exists nowhere
+    // else. ADR-0008 draws exactly this line: `--force` means "I accept a
+    // degraded but non-zero margin", never "I accept total loss". The CTO's
+    // ruling of 2026-11-24 (#606 C-1) draws it at the tape, not at the
+    // snapshot row: a unit with a snapshot but no copy on any tape (staged
+    // and never written, snapshotted and never staged, or every copy on a
+    // volume retired, erased or quarantined) is refused here too, and the
+    // remedy named is always a write, never `snapshot create` alone, which
+    // used to lift the refusal with no tape copy made.
     //
     // The copy-count check below cannot stand in for this. It catches a
     // never-archived unit only INCIDENTALLY (zero completed writes fails
@@ -2939,13 +2992,43 @@ pub fn unit_mark_tape_only(
     let Some((newest_id, newest_version, newest_status)) =
         crate::unit::content_match::latest_snapshot(conn, unit.id)?
     else {
-        return Err(TapectlError::Other(
-            "unit has never been archived: no snapshot exists, so there is no tape copy — \
-             marking it tape-only would greenlight deleting the only copy. This cannot be \
-             overridden (ADR-0008 Tier 3); run `tapectl snapshot create` first."
-                .to_string(),
-        ));
+        return Err(TapectlError::Other(format!(
+            "unit \"{unit_name}\" has never been archived: no snapshot exists, so no tape \
+             holds it. Marking it tape-only would greenlight deleting the only copy of its \
+             data, and this cannot be overridden (ADR-0008 Tier 3): not by --force, not by \
+             --yes. Write it to tape first: `tapectl snapshot create {unit_name} && tapectl \
+             stage create {unit_name} && tapectl volume write <LABEL>`."
+        )));
     };
+    // A copy anywhere, of any version (the ruling's "zero copies on any
+    // tape"): `policy::coverage`'s count over every version of the unit,
+    // which counts only volumes that are a copy (sealed, not retired,
+    // erased or quarantined). Whether the NEWEST version is on tape is a
+    // Tier-2 fact below (#606 R-1), as a dirty source is: an older version
+    // on tape is degraded coverage of what is on disk, not none.
+    let copies_anywhere: i64 = conn.query_row(
+        &format!(
+            "SELECT {}",
+            crate::policy::coverage::copy_count_expr(&crate::policy::coverage::CoverageQuery {
+                scope: crate::policy::coverage::CoverageScope::Unit {
+                    id_expr: "?1",
+                    current_only: false,
+                },
+                exclude_volume: None,
+            })
+        ),
+        params![unit.id],
+        |row| row.get(0),
+    )?;
+    if copies_anywhere == 0 {
+        return Err(TapectlError::Other(no_tape_copy_refusal(
+            conn,
+            unit_name,
+            newest_id,
+            newest_version,
+            &newest_status,
+        )?));
+    }
 
     // Reuses `fingerprint::classify` — the same scan backing `unit info
     // --dirty` and `report dirty` — so these can never disagree about
@@ -2973,20 +3056,15 @@ pub fn unit_mark_tape_only(
     // the facts). A compliant unit has no facts and never reaches the gate,
     // so a scripted run of a policy-meeting unit is not blocked.
     //
-    // Issue #89 / ADR-0004 interaction, decided by the coordinator and
-    // recorded here so it is not re-litigated: `copy_count` above already
-    // excludes ineligible (quarantined/retired/erased/missing) volumes,
-    // so a unit whose every copy has become ineligible reads `copy_count
-    // == 0` right here — the SAME zero the Tier-3 guard above would use
-    // if it applied. It does not apply. Tier 3 is reserved for
-    // INCOHERENCE: a never-archived unit, where no tape ever held the
-    // data at all (caught above from the catalog — no snapshot row —
-    // independent of this count). A unit whose only copy sits on a quarantined volume is
-    // DEGRADED, not incoherent — the cartridge still physically exists,
-    // and quarantine means "claims unreliable until reconciled at
-    // contact," not "gone." So this stays Tier 2 and remains
-    // confirmable, same as any other below-threshold copy count. Do not
-    // move this case into the Tier-3 guard above.
+    // Issue #89 / ADR-0004 interaction, as the CTO's ruling of 2026-11-24
+    // (#606 C-1) now has it: `copy_count` above excludes ineligible
+    // (quarantined/retired/erased/missing) volumes, and so does the
+    // any-version count the Tier-3 guard above refuses on. A unit whose
+    // every copy has become ineligible has no copy on any tape and is
+    // refused there, with no override; the coordinator's earlier decision
+    // that a quarantined-only unit stays Tier 2 is superseded by the ruling's
+    // definition of a copy. What reaches here has at least one copy, so a
+    // shortfall below is degraded coverage, Tier 2 and confirmable.
     let mut facts: Vec<String> = Vec::new();
     if copy_count < min_copies {
         facts.push(format!(
@@ -6119,17 +6197,21 @@ mod tests {
         .unwrap()
     }
 
+    /// The unit is written first (#606 C-1, the CTO's ruling of 2026-11-24:
+    /// a unit with no copy on any tape is refused at Tier 3, so a dirty
+    /// unit's Tier-2 fact is asked about only once a tape holds it).
     #[test]
     fn mark_tape_only_refuses_a_dirty_unit_without_force() {
-        let tmp = TempDir::new().unwrap();
-        let file_path = tmp.path().join("f.txt");
-        std::fs::write(&file_path, b"hello").unwrap();
-        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
-        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
+        let h = written_unit("unit1");
+        let conn = &h.conn;
+        std::fs::write(
+            h.source("unit1").join("f.txt"),
+            b"hello, world! now a different size",
+        )
+        .unwrap();
 
-        let config = config_with_zero_tape_only_thresholds();
-        let err = unit_mark_tape_only(&conn, &config, "unit1", false, false)
+        let config = config_one_copy_meets(&h);
+        let err = unit_mark_tape_only(conn, &config, "unit1", false, false)
             .expect_err("a dirty unit must refuse mark-tape-only without --force");
         let msg = err.to_string();
         assert!(msg.contains("dirty"), "error must mention dirty: {msg}");
@@ -6142,51 +6224,54 @@ mod tests {
             "error must mention the override: {msg}"
         );
         assert_eq!(
-            unit_status(&conn),
+            unit_status(conn),
             "active",
             "a refused mark-tape-only must not have changed unit status"
         );
     }
 
+    /// Written first, as above (#606 C-1).
     #[test]
     fn mark_tape_only_succeeds_on_a_dirty_unit_with_force() {
-        let tmp = TempDir::new().unwrap();
-        let file_path = tmp.path().join("f.txt");
-        std::fs::write(&file_path, b"hello").unwrap();
-        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
-        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
+        let h = written_unit("unit1");
+        std::fs::write(
+            h.source("unit1").join("f.txt"),
+            b"hello, world! now a different size",
+        )
+        .unwrap();
 
-        let config = config_with_zero_tape_only_thresholds();
-        unit_mark_tape_only(&conn, &config, "unit1", true, false)
+        let config = config_one_copy_meets(&h);
+        unit_mark_tape_only(&h.conn, &config, "unit1", true, false)
             .expect("--force must override the dirty guard, same as the copy/location checks");
-        assert_eq!(unit_status(&conn), "tape_only");
+        assert_eq!(unit_status(&h.conn), "tape_only");
     }
 
     /// #529: the source equals its newest snapshot, which was never staged
     /// (`stage create` failed or never ran), while v1 is on tape: the Tier-2
     /// "dirty" fact was omitted, so a unit meeting its floor went tape-only
     /// without a word. Now the fact is shown and the gate asks.
+    ///
+    /// v1 is written by the real write (#606 C-1: a unit with no copy on any
+    /// tape is refused at Tier 3, before any Tier-2 fact).
     #[test]
     fn mark_tape_only_shows_a_fact_for_a_newest_snapshot_never_staged() {
-        let tmp = TempDir::new().unwrap();
-        let file_path = tmp.path().join("f.txt");
-        std::fs::write(&file_path, b"hello").unwrap();
-        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
-        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        conn.execute("UPDATE snapshots SET status = 'current'", [])
-            .unwrap();
-        std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
-        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let h = written_unit("unit1");
+        let conn = &h.conn;
+        std::fs::write(
+            h.source("unit1").join("f.txt"),
+            b"hello, world! now a different size",
+        )
+        .unwrap();
+        crate::staging::snapshot_create(conn, "unit1", &h.config).unwrap();
 
-        let config = config_with_zero_tape_only_thresholds();
-        let err = unit_mark_tape_only(&conn, &config, "unit1", false, false)
+        let config = config_one_copy_meets(&h);
+        let err = unit_mark_tape_only(conn, &config, "unit1", false, false)
             .expect_err("an unstaged newest snapshot must ask before tape-only");
         let msg = err.to_string();
         assert!(msg.contains("unit is unstaged"), "{msg}");
-        assert_eq!(unit_status(&conn), "active");
-        unit_mark_tape_only(&conn, &config, "unit1", true, false).expect("--force confirms it");
-        assert_eq!(unit_status(&conn), "tape_only");
+        assert_eq!(unit_status(conn), "active");
+        unit_mark_tape_only(conn, &config, "unit1", true, false).expect("--force confirms it");
+        assert_eq!(unit_status(conn), "tape_only");
     }
 
     #[test]
@@ -6368,7 +6453,11 @@ mod tests {
             assert!(msg.contains("never been archived"), "{msg}");
             assert!(msg.contains("cannot be overridden"), "{msg}");
             assert!(msg.contains("ADR-0008 Tier 3"), "{msg}");
-            assert!(msg.contains("snapshot create"), "{msg}");
+            // The remedy is a write (#606 C-1): the chain ends in one.
+            assert!(
+                msg.contains("snapshot create") && msg.contains("volume write"),
+                "{msg}"
+            );
             assert_eq!(
                 unit_status(conn),
                 "active",
@@ -6395,32 +6484,30 @@ mod tests {
             assert_refused_at_tier3(&conn, true);
         }
 
-        /// The recorded decision stays: a unit that HAS been archived, whose
-        /// copies all became ineligible, is degraded and not incoherent —
-        /// Tier 2, confirmable, even with its directory gone. The positive
-        /// control for the guard above: it must not fire on a snapshot.
+        /// A unit that a tape holds, short of its floor, is degraded and not
+        /// incoherent — Tier 2, confirmable, even with its directory gone.
+        /// The positive control for the guard above: it must not fire on a
+        /// unit with a copy. (Before the CTO's ruling of 2026-11-24, #606
+        /// C-1, a snapshot with no copy on any tape was enough to stay Tier
+        /// 2; it is now refused, so the unit here is written first.)
         #[test]
         fn an_archived_unit_whose_directory_is_gone_stays_tier_two() {
-            let tmp = TempDir::new().unwrap();
-            let dir = tmp.path().join("src");
-            std::fs::create_dir(&dir).unwrap();
-            std::fs::write(dir.join("f.txt"), b"archived").unwrap();
-            let conn = setup_unit_for_tape_only(dir.to_str().unwrap());
-            crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-            std::fs::remove_dir_all(&dir).unwrap();
+            let h = written_unit("unit1");
+            std::fs::remove_dir_all(h.source("unit1")).unwrap();
 
-            // Default policy wants 2 copies and the snapshot is on no tape:
-            // a Tier-2 fact, which `--yes` confirms.
-            let err = unit_mark_tape_only(&conn, &Config::default(), "unit1", false, false)
-                .expect_err("zero copies against min_copies = 2 is a Tier-2 fact");
+            // Default policy wants 2 copies, times the tape-only 2x, and the
+            // unit has one: a Tier-2 fact, which `--yes` confirms.
+            let err = unit_mark_tape_only(&h.conn, &Config::default(), "unit1", false, false)
+                .expect_err("one copy against a floor of 4 is a Tier-2 fact");
             assert!(
-                !err.to_string().contains("never been archived"),
-                "an archived unit is not Tier 3: {err}"
+                err.to_string().contains("insufficient copies: 1 < 4")
+                    && !err.to_string().contains("ADR-0008 Tier 3"),
+                "a unit with a copy is not Tier 3: {err}"
             );
-            assert_eq!(unit_status(&conn), "active");
-            unit_mark_tape_only(&conn, &Config::default(), "unit1", true, false)
+            assert_eq!(unit_status(&h.conn), "active");
+            unit_mark_tape_only(&h.conn, &Config::default(), "unit1", true, false)
                 .expect("Tier 2 is what --yes confirms");
-            assert_eq!(unit_status(&conn), "tape_only");
+            assert_eq!(unit_status(&h.conn), "tape_only");
         }
     }
 
@@ -8588,18 +8675,15 @@ mod tests {
         }
 
         #[test]
-        fn mark_tape_only_with_zero_eligible_copies_is_tier2_not_tier3() {
-            // ADR-0008 interaction (issue #89), the coordinator's decision
-            // recorded in the code comment above the Tier-2 check in
-            // `unit_mark_tape_only`: a unit whose every copy has become
-            // ineligible reads `copy_count == 0`, the same number Tier 3
-            // would use -- but this unit WAS archived (it has a snapshot
-            // and completed writes), so `PendingReason::New` never fires
-            // and the Tier-3 guard never applies. It must refuse with the
-            // ordinary Tier-2 message and must be overridable by --force,
-            // never the "never been archived... cannot be overridden"
-            // Tier-3 message that `mark_tape_only_refuses_a_never_archived_
-            // unit_even_with_force` (above) proves is absolute.
+        fn mark_tape_only_with_zero_eligible_copies_is_tier3() {
+            // The CTO's ruling of 2026-11-24 (#606 C-1) changes the ADR-0008
+            // interaction this test pinned (issue #89): a unit whose every
+            // copy has become ineligible has no copy on any tape, by the
+            // ruling's own definition of a copy (a version's slices on a
+            // volume that is not erased, retired or quarantined), and is
+            // refused at Tier 3, `--force` included. It used to be Tier 2,
+            // confirmable, on the coordinator's earlier decision that a
+            // quarantined-only unit is degraded, not incoherent.
             let name = "mto-zero-eligible";
             let (conn, _unit_id) = setup_unit_with_two_volumes(name, "quarantined");
             // Issue #242: quarantine is a condition now, not a status move.
@@ -8612,20 +8696,17 @@ mod tests {
             .unwrap();
 
             let config = config_isolating_copy_count();
-            let err = unit_mark_tape_only(&conn, &config, name, false, false)
-                .expect_err("zero eligible copies must still refuse without --force");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("insufficient copies: 0 < 2"),
-                "must be the ordinary Tier-2 message: {msg}"
-            );
-            assert!(
-                !msg.contains("never been archived") && !msg.contains("cannot be overridden"),
-                "must NOT be classified as the Tier-3 never-archived case: {msg}"
-            );
-
-            unit_mark_tape_only(&conn, &config, name, true, false)
-                .expect("Tier 2 must be --force-overridable, unlike Tier 3");
+            for force in [false, true] {
+                let msg = unit_mark_tape_only(&conn, &config, name, force, false)
+                    .expect_err("zero eligible copies is no copy on any tape")
+                    .to_string();
+                assert!(
+                    msg.contains("has no copy on any tape")
+                        && msg.contains("retired, erased or quarantined")
+                        && msg.contains("cannot be overridden"),
+                    "force {force}: {msg}"
+                );
+            }
         }
 
         /// tenant + unit + TWO snapshots: v1 ('current', the one to be
@@ -12432,6 +12513,88 @@ mod tests {
             unit_mark_tape_only(&h.conn, &config, "mto-r1", true, false)
                 .expect("Tier 2: --force confirms it");
             assert_eq!(status_of_unit(&h.conn, "mto-r1"), "tape_only");
+        }
+    }
+    // ── #606 C-1 ──
+    /// The CTO's ruling of 2026-11-24 on #606 C-1: a unit with no copy on
+    /// any tape is refused, and neither `--force` nor `--yes` passes it
+    /// (ADR-0008 Tier 3). "A snapshot row exists" no longer clears the
+    /// floor: a unit snapshotted and staged but never written was Tier 2,
+    /// and `--force` marked it tape-only with no tape holding it. A copy is
+    /// a version's slices on a volume that is not erased, retired or
+    /// quarantined, counted by `policy::coverage` over every version.
+    mod c1_no_copy_on_any_tape {
+        use super::*;
+        use crate::volume::restore::fixture::{Home, Item, TENANT};
+
+        fn refused_at_tier3(msg: &str) {
+            assert!(msg.contains("has no copy on any tape"), "{msg}");
+            assert!(msg.contains("cannot be overridden"), "{msg}");
+            assert!(msg.contains("ADR-0008 Tier 3"), "{msg}");
+            assert!(!msg.contains("confirms this in advance"), "{msg}");
+            assert!(!msg.contains("snapshot create"), "{msg}");
+        }
+
+        #[test]
+        fn a_unit_staged_and_never_written_is_refused_whatever_the_flags() {
+            let mut h = Home::new("64K", None, 1);
+            h.unit(TENANT, "mto-c1", &[Item::file("f.txt", b"hello".to_vec())]);
+            h.stage("mto-c1");
+            // A floor of 0 copies: the refusal is not a floor's.
+            let mut config = config_one_copy_meets(&h);
+            config.defaults.min_copies = 0;
+            for force in [false, true] {
+                let msg = unit_mark_tape_only(&h.conn, &config, "mto-c1", force, false)
+                    .expect_err("no tape holds it")
+                    .to_string();
+                refused_at_tier3(&msg);
+                assert!(msg.contains("v1 is staged and not yet written"), "{msg}");
+                crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+                    &msg,
+                    &[("<LABEL>", "L6-0001")],
+                    &["tapectl volume write L6-0001"],
+                );
+            }
+            // The global --yes, as `unit mark-tape-only` takes it.
+            let cmd = crate::cli::unit::UnitCommands::MarkTapeOnly {
+                name: "mto-c1".into(),
+                force: false,
+            };
+            let msg = crate::cli::unit::run(&h.conn, &h.paths, &config, &cmd, false, false, true)
+                .expect_err("--yes does not pass it")
+                .to_string();
+            refused_at_tier3(&msg);
+            assert_eq!(status_of_unit(&h.conn, "mto-c1"), "active");
+
+            // The same unit after a write: allowed as before.
+            h.volume("MTO-0001");
+            h.write("MTO-0001");
+            unit_mark_tape_only(&h.conn, &config, "mto-c1", false, false)
+                .expect("one copy on tape meets this policy");
+            assert_eq!(status_of_unit(&h.conn, "mto-c1"), "tape_only");
+        }
+
+        /// Snapshotted, never staged: the remedy is the staging, then the
+        /// write.
+        #[test]
+        fn a_unit_snapshotted_and_never_staged_is_refused_naming_stage_then_write() {
+            let mut h = Home::new("64K", None, 1);
+            h.unit(TENANT, "mto-c1s", &[Item::file("f.txt", b"hello".to_vec())]);
+            crate::staging::snapshot_create(&h.conn, "mto-c1s", &h.config).unwrap();
+            let config = config_one_copy_meets(&h);
+            let msg = unit_mark_tape_only(&h.conn, &config, "mto-c1s", true, false)
+                .expect_err("no tape holds it")
+                .to_string();
+            refused_at_tier3(&msg);
+            assert!(msg.contains("v1 was snapshotted and never staged"), "{msg}");
+            crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+                &msg,
+                &[("<LABEL>", "L6-0001")],
+                &[
+                    "tapectl stage create mto-c1s",
+                    "tapectl volume write L6-0001",
+                ],
+            );
         }
     }
 }
