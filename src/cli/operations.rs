@@ -3037,12 +3037,17 @@ pub fn unit_mark_tape_only(
         )?;
     }
 
-    conn.execute(
+    // The status and its audit row are one transaction (#606 R-6), as the
+    // other state changes in this file are: an event that cannot be written
+    // (a busy database, which invites a retry) leaves the status as it was,
+    // never `tape_only` with no row saying from what.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE units SET status = 'tape_only' WHERE id = ?1",
         params![unit.id],
     )?;
     events::log_field_change(
-        conn,
+        &tx,
         "unit",
         unit.id,
         unit_name,
@@ -3052,6 +3057,7 @@ pub fn unit_mark_tape_only(
         "tape_only",
         Some(unit.tenant_id),
     )?;
+    tx.commit()?;
 
     if json_output {
         let evidence_json: Vec<serde_json::Value> = evidence.iter().map(evidence_json).collect();
@@ -6147,6 +6153,68 @@ mod tests {
         unit_mark_tape_only(&conn, &config, "unit1", false, false)
             .expect("a clean unit must not be blocked by the new dirty guard");
         assert_eq!(unit_status(&conn), "tape_only");
+    }
+
+    /// The unit `name` of one file, staged by the real `stage create` and
+    /// written by the real `volume write` to `MTO-0001` (invariant 8): v1
+    /// `current`, one copy, no location.
+    fn written_unit(name: &str) -> crate::volume::restore::fixture::Home {
+        use crate::volume::restore::fixture::{Home, Item, TENANT};
+        let mut h = Home::new("64K", None, 1);
+        h.unit(TENANT, name, &[Item::file("f.txt", b"hello".to_vec())]);
+        h.stage(name);
+        h.volume("MTO-0001");
+        h.write("MTO-0001");
+        h
+    }
+
+    /// A policy that one copy anywhere meets as a tape-only unit: one copy,
+    /// no multiplier, no location floor. What is left to refuse is what a
+    /// test is about.
+    fn config_one_copy_meets(h: &crate::volume::restore::fixture::Home) -> Config {
+        let mut config = h.config.clone();
+        config.defaults.min_copies = 1;
+        config.defaults.min_locations = 0;
+        config.compaction.tape_only_safety_multiplier = 1;
+        config
+    }
+
+    fn status_of_unit(conn: &Connection, name: &str) -> String {
+        conn.query_row(
+            "SELECT status FROM units WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// #606 R-6: the status change and its audit row are one transaction,
+    /// as the file's other state changes are. Before, the `UPDATE` was its
+    /// own autocommit statement: an event insert that failed (a busy
+    /// database, exit 75, which invites a retry) left the unit `tape_only`
+    /// with no row, and the retry logged `tape_only` -> `tape_only`.
+    #[test]
+    fn mark_tape_only_leaves_the_status_when_its_event_cannot_be_written() {
+        let h = written_unit("mto-atomic");
+        let config = config_one_copy_meets(&h);
+        h.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_the_event BEFORE INSERT ON main.events
+                 WHEN NEW.action = 'mark_tape_only'
+                 BEGIN SELECT RAISE(ABORT, 'the event cannot be written'); END;",
+            )
+            .unwrap();
+        let err = unit_mark_tape_only(&h.conn, &config, "mto-atomic", false, false)
+            .expect_err("the event's insert fails");
+        assert!(err.to_string().contains("cannot be written"), "{err}");
+        assert_eq!(status_of_unit(&h.conn, "mto-atomic"), "active");
+        // The positive control: without the trigger the same call marks it.
+        h.conn
+            .execute_batch("DROP TRIGGER temp.refuse_the_event")
+            .unwrap();
+        unit_mark_tape_only(&h.conn, &config, "mto-atomic", false, false)
+            .expect("one copy meets this policy");
+        assert_eq!(status_of_unit(&h.conn, "mto-atomic"), "tape_only");
     }
 
     #[test]
