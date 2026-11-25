@@ -380,7 +380,10 @@ both forms, never one of them), queued, backlog
 **Never Archived**:
 The form of Pending with no snapshot at all: nothing about this unit has ever
 been recorded, so no tape holds it and no claim exists to be stale. Marking
-such a unit tape-only is incoherent — there is no copy to fall back on.
+such a unit tape-only is incoherent — there is no copy to fall back on — and so
+is marking any unit that no tape holds, one snapshotted or staged but never
+written included (ADR-0008 Tier 3; ADR-0012 item 310, the CTO's ruling of
+2026-11-24).
 _Avoid_: new (collides with a newly *discovered* unit, which may have been
 archived already under a previous path and is resolved by dotfile uuid)
 
