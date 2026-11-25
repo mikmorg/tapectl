@@ -4015,3 +4015,71 @@ too.
      text moving to three times (a second on-tape text for a speed gain); and the job runs
      in its own process group (`set -m`), so a KILL sent to the script's group alone does
      not reach a read already under way. Such a read ends when its slice has been read.
+
+## Amendment, 2026-11-24 (night): the issue review before the tag
+
+Ruled 2026-11-24. The CTO asked for the open issues to be reviewed and worked before the tag
+("40 gh issues? Review & work"). Two read-only reviews checked each open issue against master
+and closed those it met. An adversarial read of the code no read had covered (#551, item 262)
+found the defects of #606. These items record what the CTO ruled, and the on-tape texts that
+move with it.
+
+310. **`unit mark-tape-only` refuses a unit that no tape holds, and no flag defeats it**
+     (#606 C-1). ADR-0008's Tier 3 refuses to mark a **Never Archived** unit tape-only:
+     "Marking a unit tape-only when it is on no tape is ... a contradiction in terms, and it
+     greenlights deleting the only copy of data that exists nowhere else." As built, Tier 3 held
+     only for a unit with no snapshot, and its escape hatch, `snapshot create`, lifted the
+     refusal without making a copy. Now Tier 3 holds whenever no version of the unit has a copy
+     on a tape that counts: not erased, retired or quarantined, as `policy::coverage` counts it.
+     `--force` and `--yes` do not defeat it, and the refusal names the write to make first,
+     ending in `volume write`. Tier 2 keeps everything else:
+     - fewer copies than the floor while at least one version is on tape;
+     - a dirty unit;
+     - a newest version that is created, staged or released but on no tape (#529; #606 R-1).
+
+     This amends ADR-0008's "the escape hatch for Tier 3 is ... `snapshot create`". The escape
+     hatch is now a tape write. ADR-0008's reason for Tier 3 is unchanged; what changes is what
+     "on no tape" means: no snapshot before, no tape copy now.
+
+311. **File 1's pins move** (`FILE_1_LTO8` `a896debc…` → `2fe5299b…`, `FILE_1_LTO6`
+     `621df543…` → `b3d57cef…`), under item 243's on-tape authorization, for these changes alone.
+     The CTO chose to make them before the tag.
+     - **For a holder of only a tenant key** (#605, from #523's fresh read). Every pointer to
+       "tapectl itself" names the operator or escrow key. A paragraph says how
+       `--find-envelope` tells a tenant's key from the operator's or escrow's. `--all` restores
+       the tenant's own units. A tape that holds none of a tenant's units opens nothing, which is
+       normal, and how such a box is finished is said. The Heir Kit's catalogue check is the
+       escrow key's alone.
+     - **What the id map names** (#564, D13). The map always holds the numbers; the released
+       static program reads names from `/etc/passwd` and `/etc/group` only, or from an `nscd`
+       where one runs. The local files were measured on 2026-11-24. The directory-service half
+       follows from the C library and is not measured.
+
+     No other pinned text moves. The recorded tape keeps the File 1 it was written with.
+     Coordinator's reading, for the CTO to overrule: #556's sentence on why not `tar -i` is moot
+     under item 283 (no hole is ever given to tar), so File 1 carries none.
+
+312. **RESTORE.sh's pin moves** from `0c6c721d…df72c42` (item 309) through `1e755be2…621704` to
+     `ddce81da…2ea826`, under item 243's on-tape authorization, for these changes alone:
+     - **The read ahead's way out waits for no zombie.** It waits until no tool of the read is
+       running, read from `/proc`; where nothing reaps orphans, as under docker's PID 1, a dead
+       tool stays a zombie. Before, the way out waited 60 s on zombies (u26; `tests/heir_orphans.rs`).
+     - **Text compared as text.** `--where 7` no longer names a unit `007`. Every awk
+       comparison of a name, path or label forces a string compare (#525).
+     - **A long list ends no run.** A list of hard-linked names past twenty is cut inside awk.
+       Before, a `| head` under `pipefail` ended the run silently with exit 141 (#525).
+     - **`--find` decodes `\xHH`,** so a name that is not UTF-8 is found by its printed form
+       (#606 R-3).
+     - **`--list` masks control bytes,** as the index programs do, and `--path` takes the
+       masked form back (#606 R-4).
+     - **The unit root keeps its mtime without TMPDIR.** Item 303's keeping of the root's
+       mtime across the work directory's removal made its reference file in TMPDIR, so an
+       unwritable TMPDIR lost the mtime and a writable one was written to (#561, item 271;
+       found by the new gate leg `heir_restore_tmpdir_root_mtime`).
+     - **A table path that could leave `--to` is refused** (#606 C-2): a leading `/`, a `..`
+       component, a `/` from `\x2f`, or an escape the writer never makes. The unit is refused
+       by name before any `rm`, `mkdir` or `ln`. Only a crafted tenant envelope could hold such
+       a row; tapectl's own readers refuse the same four (item 310's companion fix).
+
+     Every verdict, its order and its words are kept, as are item 267 and the rule that no tape
+     device is open at a prompt.
