@@ -134,9 +134,9 @@ tapectl restore file [OPTIONS] --to <TO> <UNIT|--unit <UNIT>> <PATH|--file <PATH
 **Arguments**
 
 - `[UNIT]` — Unit name. After --unit, the file's PATH instead
-- `[PATH]` — File path within the unit, relative to its root, as `catalog list` prints it.
+- `[PATH]` — File path within the unit, relative to its root: the name's own bytes.
   
-    Typed as the shell has it: the name's own bytes, so a name that is not UTF-8 and one with a backslash are typed as they are. `catalog list` prints them escaped (`\\` for a backslash, `\xHH` for a byte outside UTF-8).
+    Typed as the shell has it, so a name that is not UTF-8 and one with a backslash are typed as their bytes, for example `$'caf\xe9.txt'` in bash. `catalog list` and `catalog search` show such a name escaped (`\\` for a backslash, `\xHH` for a byte outside UTF-8): type the bytes that form stands for, not the form.
   
     Checked against the catalog's file list for the version before the tape is touched; a directory is refused
 

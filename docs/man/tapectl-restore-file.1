@@ -67,9 +67,9 @@ Print help (see a summary with \*(Aq\-h\*(Aq)
 Unit name. After \-\-unit, the file\*(Aqs PATH instead
 .TP
 [\fIPATH\fR]
-File path within the unit, relative to its root, as `catalog list` prints it.
+File path within the unit, relative to its root: the name\*(Aqs own bytes.
 
-Typed as the shell has it: the name\*(Aqs own bytes, so a name that is not UTF\-8 and one with a backslash are typed as they are. `catalog list` prints them escaped (`\\\\` for a backslash, `\\xHH` for a byte outside UTF\-8).
+Typed as the shell has it, so a name that is not UTF\-8 and one with a backslash are typed as their bytes, for example `$\*(Aqcaf\\xe9.txt\*(Aq` in bash. `catalog list` and `catalog search` show such a name escaped (`\\\\` for a backslash, `\\xHH` for a byte outside UTF\-8): type the bytes that form stands for, not the form.
 
 Checked against the catalog\*(Aqs file list for the version before the tape is touched; a directory is refused
 .SH "GLOBAL OPTIONS"

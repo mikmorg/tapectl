@@ -1584,3 +1584,52 @@ mod tests {
         assert_eq!(mode_of(dest.path()), mode);
     }
 }
+
+/// #606 R-5: the operator types a name's bytes (item 297), and `catalog list`
+/// shows it escaped. A name typed in its printed form (`caf\xe9.txt` as text)
+/// is escaped again and is not in the table; the refusal says to type the
+/// bytes, as `$'...'` in bash, and that the listing shows the escaped form.
+/// Before, it sent the operator back to `catalog list`, whose form is the
+/// one just refused.
+#[test]
+fn a_name_typed_in_its_printed_form_is_refused_saying_to_type_its_bytes() {
+    use crate::volume::filetable::{Kind, Row};
+    let row = |kind, path: &str| Row {
+        kind,
+        slice: 1,
+        start: 0,
+        end: 1024,
+        size: 0,
+        sha256: None,
+        path: path.into(),
+        link: None,
+    };
+    let rows = [row(Kind::Folder, "."), row(Kind::File, "caf\\xe9.txt")];
+    // What `resolve()` makes of the text `caf\xe9.txt`: its backslash escaped.
+    let typed = crate::volume::index::escape("caf\\xe9.txt");
+    let target = RestoreTarget::File {
+        file_path: &typed,
+        dest_dir: "/nonexistent",
+    };
+    let err = super::members_of_target(&rows, "photos", 1, target)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("has no file \"caf\\\\xe9.txt\""), "{err}");
+    assert!(err.contains("by the name's own bytes"), "{err}");
+    assert!(err.contains("$'caf\\xe9.txt'"), "{err}");
+    assert!(
+        err.contains("`catalog list` and `catalog search` show a name escaped"),
+        "{err}"
+    );
+    // The bytes themselves are found.
+    let target = RestoreTarget::File {
+        file_path: "caf\\xe9.txt",
+        dest_dir: "/nonexistent",
+    };
+    assert_eq!(
+        super::members_of_target(&rows, "photos", 1, target)
+            .unwrap()
+            .len(),
+        1
+    );
+}

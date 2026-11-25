@@ -1691,7 +1691,11 @@ pub(crate) fn members_of_target<'r>(
                 None => Err(TapectlError::Other(format!(
                     "unit \"{unit_name}\" version {version} has no file \"{file_path}\" in its \
                      file table, so the tape was not touched. A path is relative to the unit's \
-                     root and matched exactly; `tapectl catalog search \"<words of the name>\" \
+                     root and matched exactly, by the name's own bytes: `catalog list` and \
+                     `catalog search` show a name escaped (`\\\\` for a backslash, `\\xHH` for a \
+                     byte that is not UTF-8), and a name so shown is typed as the bytes it \
+                     stands for, for example `$'caf\\xe9.txt'` in bash. \
+                     `tapectl catalog search \"<words of the name>\" \
                      --all-versions` finds one and names the versions that hold it (without \
                      `--all-versions` it searches each unit's newest version only), and \
                      `tapectl catalog list {unit_name}` lists the newest version's files."

@@ -2629,15 +2629,21 @@ remaining one with `restore unit`.
 ### `restore file`: the file is not in the catalog
 
 ```text
-error: unit "<unit>" version <n> has no file "<file>" in the catalog's record of what it archived, so the tape was
-not touched. A path is relative to the unit's root and matched exactly; `tapectl catalog search "<words of the name>"
---all-versions` finds one and names the versions that hold it (without `--all-versions` it searches each unit's newest
-version only), and `tapectl catalog list <unit>` lists the newest version's files.
+error: unit "<unit>" version <n> has no file "<file>" in its file table, so the tape was not touched. A path is
+relative to the unit's root and matched exactly, by the name's own bytes: `catalog list` and `catalog search` show a
+name escaped (`\\` for a backslash, `\xHH` for a byte that is not UTF-8), and a name so shown is typed as the bytes it
+stands for, for example `$'caf\xe9.txt'` in bash. `tapectl catalog search "<words of the name>" --all-versions` finds
+one and names the versions that hold it (without `--all-versions` it searches each unit's newest version only), and
+`tapectl catalog list <unit>` lists the newest version's files.
 ```
 
-`--file` is checked against the version's file list before the drive is
+The file is checked against the version's file table before the drive is
 opened. Give the path relative to the unit's root, with no leading `/` or
-`./`, exactly as `catalog list` prints it:
+`./`, as `catalog list` prints it. A name that `catalog list` shows with a
+backslash escape is typed as its bytes, not as the escape: `caf\xe9.txt` is
+typed `$'caf\xe9.txt'` in bash, and `back\\slash.txt` is typed `'back\slash.txt'`
+(the `<file>` in the refusal is what you typed, escaped the same way). To find
+the name:
 
 ```bash
 tapectl catalog search "letter mum"

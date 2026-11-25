@@ -1698,10 +1698,11 @@ tape, and refuses with nothing read
   cannot do. A file that is not an identity is refused by name before the drive is
   opened.
 - **The file.** `restore file --file` must be a path the catalog recorded for
-  that version, relative to the unit's root, as `catalog list` and
-  `catalog search` print it, escaped as a name is shown: a backslash typed `\\`,
-  a tab `\t`, a newline `\n`, and a byte that is not UTF-8 `\xHH`. A directory is
-  refused: restore the unit. Only the slices that hold that one file are read off
+  that version, relative to the unit's root, typed as the name's own bytes.
+  `catalog list` and `catalog search` show a name escaped (a backslash as `\\`,
+  a tab `\t`, a newline `\n`, a byte that is not UTF-8 `\xHH`); type the bytes
+  that form stands for, for example `$'caf\xe9.txt'` in bash, not the form. A
+  directory is refused: restore the unit. Only the slices that hold that one file are read off
   the tape, using the unit's file table.
 - **A restore that fails partway** — a slice that fails its checksum, a read
   error — has already let `tar` extract what came before it into `--to`. The
