@@ -2790,6 +2790,28 @@ fn thinnest_current_version(
         }))
 }
 
+/// `unit mark-tape-only`'s fact for a newest version that no tape in
+/// service holds as a copy (#606 R-1): one that is not `current`, or is
+/// `current` with no copy left. `None` for a current version with a copy.
+fn newest_version_fact(version: i64, status: &str, copies: i64) -> Option<String> {
+    let says = match status {
+        "current" if copies > 0 => return None,
+        "current" => "has no copy on a volume in service (each one is retired, erased or \
+                      quarantined)"
+            .to_string(),
+        "created" => "was never staged, so it is on no tape".to_string(),
+        "staged" => "is staged and not yet written, so it is on no tape (its slices in \
+                     staging are not a copy)"
+            .to_string(),
+        "reclaimable" => "is reclaimable: its copies are released, and are not counted".to_string(),
+        "purged" => "is purged: no tape holds it".to_string(),
+        other => format!("is {other}, not current"),
+    };
+    Some(format!(
+        "the unit's newest version v{version} {says}: the content on disk now is not on tape"
+    ))
+}
+
 /// Mark a unit as tape-only with enforcement.
 ///
 /// `force` is ADR-0008's Tier-2 confirmation for this command: it answers
@@ -2914,14 +2936,16 @@ pub fn unit_mark_tape_only(
     // unmounted filesystem), so reading `PendingReason::New` off it skipped
     // this refusal for exactly the unit that would then read as tape-only
     // with no tape copy once the disk came back.
-    if crate::unit::content_match::latest_snapshot(conn, unit.id)?.is_none() {
+    let Some((newest_id, newest_version, newest_status)) =
+        crate::unit::content_match::latest_snapshot(conn, unit.id)?
+    else {
         return Err(TapectlError::Other(
             "unit has never been archived: no snapshot exists, so there is no tape copy — \
              marking it tape-only would greenlight deleting the only copy. This cannot be \
              overridden (ADR-0008 Tier 3); run `tapectl snapshot create` first."
                 .to_string(),
         ));
-    }
+    };
 
     // Reuses `fingerprint::classify` — the same scan backing `unit info
     // --dirty` and `report dirty` — so these can never disagree about
@@ -3021,6 +3045,36 @@ pub fn unit_mark_tape_only(
                     .to_string(),
             ),
             PendingReason::New => {}
+        }
+    }
+    // #606 R-1: the newest version on no tape. The copy count above is over
+    // `current` versions only, and the scan above reads a source that equals
+    // its newest snapshot as clean whatever that snapshot's status, so a
+    // newest version staged and not yet written (or released, or with every
+    // copy gone) left an older version's copies to meet the floor while the
+    // content on disk now was on no tape. Judged from the catalog, not the
+    // walk (#462): the newest version's own copies, and its status.
+    let newest_copies: i64 = conn.query_row(
+        &format!(
+            "SELECT {}",
+            crate::policy::coverage::copy_count_expr(&crate::policy::coverage::CoverageQuery {
+                scope: crate::policy::coverage::CoverageScope::Snapshot { id_expr: "?1" },
+                exclude_volume: None,
+            })
+        ),
+        params![newest_id],
+        |row| row.get(0),
+    )?;
+    let unstaged_said = pending.as_ref().is_some_and(|p| {
+        matches!(
+            p.reason,
+            crate::collection::fingerprint::PendingReason::Unstaged
+        )
+    });
+    if let Some(fact) = newest_version_fact(newest_version, &newest_status, newest_copies) {
+        // `created` with the source equal to it is the Unstaged line already.
+        if !(newest_status == "created" && unstaged_said) {
+            facts.push(fact);
         }
     }
     if !facts.is_empty() {
@@ -6138,21 +6192,16 @@ mod tests {
     #[test]
     fn mark_tape_only_does_not_block_a_clean_unit() {
         // Regression guard for the guard itself: proves it doesn't
-        // false-positive on a unit nothing has changed for.
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
-        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
-        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        // A snapshot nothing wrote is not clean (#529: it is `unstaged`); the
-        // unit is clean when its newest snapshot is the one on tape.
-        conn.execute("UPDATE snapshots SET status = 'current'", [])
-            .unwrap();
-        // No mutation after the snapshot — stays clean.
-
-        let config = config_with_zero_tape_only_thresholds();
-        unit_mark_tape_only(&conn, &config, "unit1", false, false)
+        // false-positive on a unit nothing has changed for. A snapshot nothing
+        // wrote is not clean (#529: it is `unstaged`), and a newest version
+        // with no copy is a fact (#606 R-1): the unit is clean when its
+        // newest version is on tape, written by the real write.
+        let h = written_unit("unit1");
+        // No mutation after the write — stays clean.
+        let config = config_one_copy_meets(&h);
+        unit_mark_tape_only(&h.conn, &config, "unit1", false, false)
             .expect("a clean unit must not be blocked by the new dirty guard");
-        assert_eq!(unit_status(&conn), "tape_only");
+        assert_eq!(status_of_unit(&h.conn, "unit1"), "tape_only");
     }
 
     /// The unit `name` of one file, staged by the real `stage create` and
@@ -12339,6 +12388,50 @@ mod tests {
                 detail.contains(&format!("writes rowid {id}")),
                 "the event names each deleted row: {detail}"
             );
+        }
+    }
+
+    // ── #606 R-1 ──
+    /// #606 R-1: v1 written and at the floor; the source edited, and v2
+    /// snapshotted and staged but not written. The source equals v2, so the
+    /// scan saw nothing dirty, and the copy count looks only at `current`
+    /// versions, which v2 is not: the unit was marked tape-only with no
+    /// fact and no question while the content on disk was on no tape. Now
+    /// the newest version on no tape is a fact, asked about (Tier 2, as
+    /// #529's `created` case is).
+    mod r1_newest_version_on_no_tape {
+        use super::*;
+
+        #[test]
+        fn a_staged_newest_version_is_a_fact_asked_about() {
+            let h = written_unit("mto-r1");
+            let config = config_one_copy_meets(&h);
+            std::fs::write(
+                h.source("mto-r1").join("f.txt"),
+                b"edited since v1, and a different size",
+            )
+            .unwrap();
+            h.stage("mto-r1");
+            let status: String = h
+                .conn
+                .query_row("SELECT status FROM snapshots WHERE version = 2", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(status, "staged");
+
+            let msg = unit_mark_tape_only(&h.conn, &config, "mto-r1", false, false)
+                .expect_err("v2 is on no tape")
+                .to_string();
+            assert!(
+                msg.contains("newest version v2 is staged and not yet written"),
+                "{msg}"
+            );
+            assert!(msg.contains("(`--force` or `--yes`"), "Tier 2: {msg}");
+            assert_eq!(status_of_unit(&h.conn, "mto-r1"), "active");
+            unit_mark_tape_only(&h.conn, &config, "mto-r1", true, false)
+                .expect("Tier 2: --force confirms it");
+            assert_eq!(status_of_unit(&h.conn, "mto-r1"), "tape_only");
         }
     }
 }
