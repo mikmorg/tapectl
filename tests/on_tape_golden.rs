@@ -5953,7 +5953,7 @@ fn layout3_recovery_md_operator_catalog_db_section() {
 /// by its hash, not its text (it is long, and the file in the tree is the text): a change to
 /// it is a change to every tape's heir path, a CTO decision, and proved in the `tapectl-u26`
 /// container as uid 1000 and by the gate's heir legs before this moves.
-const RESTORE_SH_SHA256: &str = "1e755be252b33f875d7cc80564173c887dc23e9d6def59f1dc1b8ee914621704";
+const RESTORE_SH_SHA256: &str = "ddce81da85350835dd8b446f80833bd12a41d804496cda08baa6e9ddec2ea826";
 
 #[test]
 fn layout3_restore_sh_sha256() {
