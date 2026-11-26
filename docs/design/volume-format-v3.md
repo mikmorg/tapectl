@@ -1361,17 +1361,26 @@ where it is and rewinds only for a file behind it. Besides those five tools the 
    its `front_index_sha256` must match File 3's hash. Absent or mismatched: the tape is
    unsealed or damaged; proceed knowing trailing slices may be missing. If File 3 is
    unreadable, the seal's embedded copy is the same map (validate its hashes against the
-   files before trusting it).
+   files before trusting it). If File 3 reads and the two disagree, neither vouches for
+   the other, and a file is not called damaged on File 3's word alone: steps 4 and 5 say
+   what decides (item 313).
 4. For each envelope position: `dd` it out, check its hash against the front index, `age
-   -d -i KEY`. The one that decrypts is yours: `MANIFEST.toml`, `RECOVERY.md`, `tables/`
-   (each staging's file table and id map, §1.6) and `index/`. age's "no identity matched"
+   -d -i KEY`. Where the two ends disagree (step 3) and the seal's embedded copy is sound
+   by itself, an envelope that matches that copy's hash is given to `age` too, and a backup
+   is paired through either map: `age` authenticates what it decrypts, so a wrong line in
+   a plain-text map can cost a try and never a wrong answer. The one that decrypts is
+   yours: `MANIFEST.toml`, `RECOVERY.md`, `tables/` (each staging's file table and id map,
+   §1.6) and `index/`. age's "no identity matched"
    means the key is not a recipient; any other failure after a key matched means the
    envelope is damaged, and its backup (§1.3, the `*_backup` entry with the same
    `sha256_encrypted`) is read instead.
 5. For a unit, from its block in `MANIFEST.toml`: the slices with a `tape_position` at or
    before `ended_after` are on this tape (§5.3). For each such slice, in order: `dd bs=512k`
    it out; `head -c size_bytes` (the front index's) to trim padding; `sha256sum` against the
-   front index's `sha256_encrypted`; `age -d -i KEY`; for a compressed staging, the
+   front index's `sha256_encrypted`; `age -d -i KEY`. On a sound tape the manifest states
+   the same size and hash for the slice. Where the front index's line and the manifest's
+   differ, the manifest's decide: it came out of the envelope `age` authenticated, and the
+   front index is plain text. Then, for a compressed staging, the
    algorithm's tool (`gzip -dc`, `xz -dc`, `zstd -dc`). The result is the slice's cut: its
    length is the manifest's `size_bytes`, and its sha256 the manifest's `sha256_plain`.
 6. Give the good slices, in order, to **one** `tar -x` run into an empty directory (a

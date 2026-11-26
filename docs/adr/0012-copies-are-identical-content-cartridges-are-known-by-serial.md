@@ -4096,6 +4096,20 @@ stated options. Each item below gives the option chosen in the CTO's words.
      - the mediums: DI-3, DI-4, D-1 and S-1;
      - the lows: DI-9, S-5, D-3, D-4, D-5, D-6 and D-7.
 
+     Three readings the fixes rest on, the coordinator's, for the CTO to overrule:
+     - **DI-4 amends `volume-format-v3.md` §7.2, steps 3 to 5.** Where the tape's two ends
+       disagree, a file is no longer called damaged on File 3's word alone: an envelope that
+       matches the seal's own copy of the map is given to `age`, which authenticates it, and
+       for a slice the manifest's size and hash decide over the front index's.
+     - **DI-9 keeps the refusal.** A File 0 whose `magic` or `requires` names something this
+       script does not know is still refused (§1.2 rule 1; the 2026-10-06 item 15). What
+       changes is its words: they say what the seal marker states, where it differs, and they
+       no longer send the heir to the script already in hand. DI-1 keeps the fence too: with
+       File 0 unreadable, the seal's `requires` decides (§1.2 rule 2).
+     - **D-1 is fixed in the script only.** tapectl's own check accepts a NUL in a path too,
+       but hands the name whole to the system, which refuses it. Its refusal by name is 2.0.1's
+       (item 314).
+
      With them, by the CTO's choice ("Include it"), the final per-file check is split across
      the machine's cores (C-4). The pin moves in a commit of its own, and the hash it moves to
      is added to this item when it is known.
