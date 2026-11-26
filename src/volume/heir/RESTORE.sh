@@ -221,6 +221,15 @@ removed_option() {
 
 is_uint() { case ${1:-} in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
 
+# A number off a plain-text file of the tape (File 0, the front index), before
+# it is bash's arithmetic or head's argument: decimal digits, at most 18 (no
+# overflow), left in REPLY read as base 10, so that a leading zero is never
+# octal. Returns 1 for anything else: a damaged line.
+tape_uint() { # <text>
+  is_uint "${1:-}" && [ "${#1}" -le 18 ] || return 1
+  REPLY=$((10#$1))
+}
+
 # Text that came off a tape, made safe to show.
 safe_str() { printf '%s' "${1:0:120}" | tr -c 'A-Za-z0-9 ._/:=,+-' '?'; }
 
@@ -890,11 +899,12 @@ END { if (p != "") print p "|" t "|" s "|" h }
 
 # A front index (or the seal's copy of it) is a total, ordered map: positions
 # 0, 1, 2 ... with no gap, one front_index entry at 3, one seal_marker entry
-# and it last, and (when given) exactly `total` entries.
+# and it last, and (when given) exactly `total` entries. A position is written
+# as a plain decimal number, with no leading zero: bash would read one as octal.
 AWK_CONSISTENT='
 BEGIN { FS = "|" }
 {
-  if ($1 !~ /^[0-9][0-9]*$/) bad = "a position is not a non-negative integer"
+  if ($1 !~ /^(0|[1-9][0-9]*)$/) bad = "a position is not a non-negative integer, written plainly"
   else if (($1 + 0) != NR - 1) bad = "positions are not contiguous from 0"
   if (($2 "") == "front_index") { fi++; if (($1 + 0) != 3) bad = "the front_index entry is not at position 3" }
   if (($2 "") == "seal_marker") { sm++; smrow = NR }
@@ -988,8 +998,8 @@ file0_fields() {
   FRONT_INDEX=$(toml_val "$WORK/file0.txt" front_index)
   SEAL_MARKER=$(toml_val "$WORK/file0.txt" seal_marker)
   TOTAL_FILES=$(toml_val "$WORK/file0.txt" total_files)
-  is_uint "$FRONT_INDEX" || FRONT_INDEX=3
-  is_uint "$SEAL_MARKER" || SEAL_MARKER=""
+  if tape_uint "$FRONT_INDEX"; then FRONT_INDEX=$REPLY; else FRONT_INDEX=3; fi
+  if tape_uint "$SEAL_MARKER"; then SEAL_MARKER=$REPLY; else SEAL_MARKER=""; fi
   is_uint "$TOTAL_FILES" || TOTAL_FILES=""
 }
 
@@ -1251,11 +1261,12 @@ do_verify() {
       fi
       continue
     fi
-    if [ -z "$size" ] || [ -z "$hash" ]; then
-      printf 'FAIL  %4d  %-18s the front index gives it no size or hash\n' "$pos" "$type"
+    if ! tape_uint "$size" || [ -z "$hash" ]; then
+      printf 'FAIL  %4d  %-18s its line of the map gives no size that is a number, or no hash (a damaged line?)\n' "$pos" "$type"
       fails=$((fails + 1))
       continue
     fi
+    size=$REPLY
     if hash_tape_file "$pos" "$size" && [ "$TAPE_SHA" = "$hash" ]; then
       printf 'PASS  %4d  %-18s %s bytes\n' "$pos" "$type" "$size"
       passed=$((passed + 1))
@@ -1352,6 +1363,11 @@ try_envelope_at() { # <position of this copy> <primary position> <true bytes> <h
     note "the copy of envelope $primary at file $pos is after the end of this tape; not read."
     return 3
   fi
+  if ! tape_uint "$size"; then
+    note "the line ${5:-the front index} has for envelope file $pos gives no size that is a number: a damaged line of the map."
+    return 3
+  fi
+  size=$REPLY
   if ! fetch "$pos" "$WORK/envelope.enc" "$size"; then
     note "envelope file $pos cannot be read from the tape."
     return 3
@@ -1446,7 +1462,8 @@ envelope_space_check() {
   local total=0 biggest=0 pos size
   while IFS='|' read -r pos _; do
     size=$(file_size_at "$pos" "$FILES_TXT")
-    is_uint "$size" || continue
+    tape_uint "$size" || continue
+    size=$REPLY
     total=$((total + size))
     [ "$size" -le "$biggest" ] || biggest=$size
   done <<EOF

@@ -1716,3 +1716,151 @@ fn a_damaged_envelope_whose_line_is_changed_too_is_replaced_by_its_backup_throug
         o.stderr
     );
 }
+
+/// What bash and its builtins say of a number they cannot read: never the
+/// script's words.
+const BASH_NUMBER_ERRORS: [&str; 4] = [
+    "value too great for base",
+    "invalid octal number",
+    "invalid number",
+    "syntax error",
+];
+
+fn assert_no_bash_error(all: &str, name: &str) {
+    for words in BASH_NUMBER_ERRORS {
+        assert!(!all.contains(words), "{name}: {words}: {all}");
+    }
+}
+
+/// A number with its first digit made a zero.
+fn leading_zero(v: &str) -> String {
+    format!("0{}", &v[1..])
+}
+
+/// A number with its second character made a letter.
+fn a_letter(v: &str) -> String {
+    format!("{}x{}", &v[..1], &v[2..])
+}
+
+/// DI-4 (c): a size in File 3 with a leading zero or a letter is a damaged
+/// line of the map. It never reaches bash's arithmetic unread as base 10 and
+/// never reaches `head -c` as it stands, so the run goes on. Here the damaged
+/// line is the OTHER tenant's envelope: tenant A's restore is whole.
+#[test]
+fn a_size_with_a_leading_zero_or_a_letter_in_another_tenants_line_does_not_end_the_run() {
+    let t = two();
+    let (_, _, b) = tenant_envelopes(t);
+    let cases: [(&str, fn(&str) -> String); 2] =
+        [("a leading zero", leading_zero), ("a letter", a_letter)];
+    for (name, edit) in cases {
+        let h = Heir::of(t);
+        h.replace(3, &front_index_with(t, b, "size_bytes", edit));
+        let dest = h.dest("out");
+        let o = restore_a(&h, &dest);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{name}: {all}");
+        assert_no_bash_error(&all, name);
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{name}: {all}");
+        assert_unit_restored(t, heir::UNIT_A, &dest, &all);
+        if name == "a letter" {
+            assert!(
+                o.stderr.contains(&format!(
+                    "the line the front index has for envelope file {b} gives no size that is a number"
+                )),
+                "{all}"
+            );
+        }
+    }
+}
+
+/// DI-4 (c): `--verify` names a slice whose size line holds a letter as a
+/// damaged line of the map, a FAIL of that line alone: the files after it are
+/// still judged, where the tape used to be called unreadable from there on.
+#[test]
+fn verify_fails_the_one_line_whose_size_is_not_a_number_and_judges_the_rest() {
+    let t = two();
+    let slices = t.slice_positions();
+    let p = slices[1];
+    let last = *slices.last().unwrap();
+    assert!(last > p);
+    let h = Heir::of(t);
+    h.replace(3, &front_index_with(t, p, "size_bytes", a_letter));
+    let o = h.run(&["--verify"]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert_no_bash_error(&all, "--verify");
+    let row = o
+        .stdout
+        .lines()
+        .find(|l| l.starts_with(&format!("FAIL  {p:4}  data_slice")))
+        .unwrap_or_else(|| panic!("no FAIL row for file {p}: {all}"));
+    assert!(row.contains("gives no size that is a number"), "{all}");
+    assert!(
+        o.stdout.contains(&format!("PASS  {last:4}  data_slice"))
+            && !o.stdout.contains("nothing after file"),
+        "the later files are judged: {all}"
+    );
+}
+
+/// DI-4 (c): a position is a plain decimal number. One with a leading zero
+/// (which bash's arithmetic and printf read as octal, or refuse) makes File 3
+/// inconsistent, and the map is the seal marker's copy. File 0's two
+/// pointers are read as base 10 too.
+#[test]
+fn a_position_or_a_pointer_with_a_leading_zero_is_never_read_as_octal() {
+    let t = two();
+    let h = Heir::of(t);
+    h.replace(3, &front_index_with(t, 8, "position", |v| format!("0{v}")));
+    let o = h.run(&["--info"]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert_no_bash_error(&all, "position = 08");
+    assert!(
+        o.stderr.contains("the front index is not consistent")
+            && o.stderr
+                .contains("falling back to the seal marker's own copy of it"),
+        "{all}"
+    );
+
+    // File 0's front_index = 08: file 8 is no front index, and the map is the
+    // seal marker's copy.
+    let h = Heir::of(t);
+    let file0 = text_of(t, 0);
+    assert!(file0.contains("\nfront_index = 3\n"), "{file0}");
+    h.replace(
+        0,
+        file0
+            .replace("\nfront_index = 3\n", "\nfront_index = 08\n")
+            .as_bytes(),
+    );
+    let o = h.run(&["--info"]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert_no_bash_error(&all, "front_index = 08");
+    assert!(
+        o.stderr.contains("the front index (file 8) is unreadable"),
+        "{all}"
+    );
+
+    // File 0's seal_marker with a leading zero, where mt cannot space to end
+    // of data and the pointer is used: the seal is found at that file.
+    let h = Heir::of(t);
+    let last = t.files.len() - 1;
+    let pointer = format!("\nseal_marker = {last}\n");
+    assert!(file0.contains(&pointer), "{file0}");
+    h.replace(
+        0,
+        file0
+            .replace(&pointer, &format!("\nseal_marker = 0{last}\n"))
+            .as_bytes(),
+    );
+    let o = h.run_with(&["--info"], &[("FAKE_MT_NO_EOD", "1")]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert_no_bash_error(&all, "seal_marker with a leading zero");
+    assert!(
+        o.stdout
+            .contains(&format!("Seal marker: present (file {last})")),
+        "{all}"
+    );
+}
