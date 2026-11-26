@@ -936,10 +936,26 @@ ALT_TXT=""
 ENDED_AFTER="" SEAL_STATE="" SEAL_BINDS="" SEAL_FILE_COUNT="" SEAL_SEALED_AT=""
 FRONT_INDEX_HASH=""
 
+# The way on from a refusal on File 0's word. The refusal stays (volume-
+# format-v3.md 1.2 rule 1); its words are $1 unless the seal marker reads and
+# states Layout 3 and no feature. Then File 0 may be the damaged one, and the
+# RESTORE.sh in this tape's File 2 is this same script: the words say what the
+# seal states and point to File 1's steps by hand (ADR-0012 item 313).
+file0_way_on() { # <the way on otherwise>
+  local lv=""
+  if read_seal; then lv=$(toml_val "$WORK/seal.toml" layout_version || true); fi
+  if [ "$lv" = 3 ] && [ -z "$(requires_of "$WORK/seal.toml" || true)" ]; then
+    printf '%s' "But the seal marker at the end of this tape states layout_version = 3 and requires no feature, which is what this script reads: File 0 may be damaged. This script refuses on File 0's word all the same, and so does the RESTORE.sh in this tape's File 2 if it is this script.
+       Restore by hand, by the steps of File 1: mt -f $DEVICE rewind; mt -f $DEVICE fsf 1; dd if=$DEVICE bs=512k | tr -d '\\0' | less"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 die_other_layout() { # <magic> <layout_version>
   die "this is a tapectl volume of Layout $(safe_str "${2:-unknown}") (magic $(safe_str "${1:-none}")), label $(safe_str "$LABEL"). This RESTORE.sh reads Layout 3 only.
-       Read it with the tapectl that wrote it, or with the RESTORE.sh in its own File 2:
-         mt -f $DEVICE rewind; mt -f $DEVICE fsf 2; dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE-OLD.sh"
+       $(file0_way_on "Read it with the tapectl that wrote it, or with the RESTORE.sh in its own File 2:
+         mt -f $DEVICE rewind; mt -f $DEVICE fsf 2; dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE-OLD.sh")"
 }
 
 # $1 is a TOML text with a `requires` list; the feature names it holds.
@@ -952,11 +968,12 @@ requires_of() {
 # A feature this script does not know is refused by name; this script knows
 # none (Layout 3's `requires` is empty on every tape).
 check_requires() { # <what> <file>
-  local feats
+  local feats way="Use a newer tapectl, the tapectl that wrote this tape, or the RESTORE.sh in this tape's own File 2."
   feats=$(requires_of "$2")
-  [ -z "$feats" ] ||
-    die "$1 requires feature(s) this RESTORE.sh does not know: $(safe_str "$feats").
-       Use a newer tapectl, the tapectl that wrote this tape, or the RESTORE.sh in this tape's own File 2."
+  [ -n "$feats" ] || return 0
+  [ "$1" != "File 0" ] || way=$(file0_way_on "$way")
+  die "$1 requires feature(s) this RESTORE.sh does not know: $(safe_str "$feats").
+       $way"
 }
 
 # 1 when File 0 gave nothing (a read error, or no bytes). Nothing it states is

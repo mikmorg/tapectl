@@ -1864,3 +1864,106 @@ fn a_position_or_a_pointer_with_a_leading_zero_is_never_read_as_octal() {
         "{all}"
     );
 }
+
+const SEAL_VOUCHES: &str =
+    "the seal marker at the end of this tape states layout_version = 3 and requires no feature";
+
+/// DI-9 (ADR-0012 item 313: the refusal stays, its words change). A File 0
+/// whose `requires` names a feature this script does not know is refused, by
+/// `volume-format-v3.md` 1.2 rule 1. When the seal marker reads and states
+/// Layout 3 and no feature, the refusal says so (File 0 may be the damaged
+/// one), points to File 1's steps by hand, and no longer names the RESTORE.sh
+/// in this tape's File 2, the script already running, as the way on. When the
+/// seal marker states the feature too, or does not read, the old way on is
+/// kept: the tape may well be a later one.
+#[test]
+fn a_refusal_on_file_0s_requires_says_what_the_seal_marker_states() {
+    let t = two();
+    let last = t.files.len() - 1;
+    let file0 = text_of(t, 0).replace("requires = []", "requires = [\"future-thing\"]");
+    let old_way = "the RESTORE.sh in this tape's own File 2";
+
+    let h = Heir::of(t);
+    h.replace(0, file0.as_bytes());
+    let o = h.run(&["--info"]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr
+            .contains("File 0 requires feature(s) this RESTORE.sh does not know: future-thing.")
+            && o.stderr.contains(SEAL_VOUCHES)
+            && o.stderr.contains("File 0 may be damaged")
+            && o.stderr.contains("by the steps of File 1")
+            && o.stderr.contains("fsf 1")
+            && !o.stderr.contains(old_way),
+        "{}",
+        o.stderr
+    );
+    assert!(o.stdout.is_empty(), "the refusal stays: {}", o.stdout);
+    // File 0, then the seal marker, and nothing else of the tape.
+    assert_eq!(h.dd_reads(), vec![0, last]);
+
+    let both = Heir::of(t);
+    both.replace(0, file0.as_bytes());
+    both.replace(
+        last,
+        text_of(t, last)
+            .replace("requires = []", "requires = [\"future-thing\"]")
+            .as_bytes(),
+    );
+    let unread = Heir::of(t);
+    unread.replace(0, file0.as_bytes());
+    fail_read(&unread, last);
+    for (name, h) in [
+        ("the seal requires it too", &both),
+        ("no seal reads", &unread),
+    ] {
+        let o = h.run(&["--info"]);
+        assert_eq!(o.code, 1, "{name}: {}", o.all());
+        assert!(
+            o.stderr.contains("File 0 requires feature(s)")
+                && o.stderr.contains(old_way)
+                && !o.stderr.contains(SEAL_VOUCHES)
+                && !o.stderr.contains("File 0 may be damaged"),
+            "{name}: {}",
+            o.stderr
+        );
+    }
+}
+
+/// DI-9: the same for a File 0 that states another magic or layout. With a
+/// seal marker of another layout, or none, the tape is taken for the other
+/// layout it says it is, and the way on is the one a reader of that layout
+/// gives.
+#[test]
+fn a_refusal_on_file_0s_layout_keeps_its_old_way_on_when_the_seal_marker_does_not_vouch() {
+    let t = two();
+    let last = t.files.len() - 1;
+    let file0 = text_of(t, 0)
+        .replace("tapectl-volume-v3", "tapectl-volume-v2")
+        .replace("layout_version = 3", "layout_version = 2");
+    let other = Heir::of(t);
+    other.replace(0, file0.as_bytes());
+    other.replace(
+        last,
+        text_of(t, last)
+            .replace("layout_version = 3", "layout_version = 2")
+            .as_bytes(),
+    );
+    let unread = Heir::of(t);
+    unread.replace(0, file0.as_bytes());
+    fail_read(&unread, last);
+    for (name, h) in [("a seal of Layout 2", &other), ("no seal reads", &unread)] {
+        let o = h.run(&["--info"]);
+        assert_eq!(o.code, 1, "{name}: {}", o.all());
+        assert!(
+            o.stderr.contains("a tapectl volume of Layout 2")
+                && o.stderr.contains("Layout 3 only")
+                && o.stderr.contains("RESTORE.sh in its own File 2")
+                && o.stderr.contains("RESTORE-OLD.sh")
+                && !o.stderr.contains(SEAL_VOUCHES)
+                && !o.stderr.contains("File 0 may be damaged"),
+            "{name}: {}",
+            o.stderr
+        );
+    }
+}

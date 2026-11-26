@@ -452,13 +452,27 @@ fn another_layout_is_refused_by_name_with_its_label() {
         o.stderr.contains("a tapectl volume of Layout 2")
             && o.stderr.contains("magic tapectl-volume-v2")
             && o.stderr.contains(LABEL)
-            && o.stderr.contains("Layout 3 only")
-            && o.stderr.contains("RESTORE.sh in its own File 2"),
+            && o.stderr.contains("Layout 3 only"),
         "{}",
         o.stderr
     );
-    // Nothing but File 0 was read.
-    assert_eq!(h.dd_reads(), vec![0]);
+    // This is a Layout 3 tape whose File 0 alone was changed, so its seal
+    // marker still states Layout 3 and no feature. The refusal stays, and
+    // says so: File 0 may be the damaged one, and the RESTORE.sh in this
+    // tape's File 2, the script that is running, is not the way on (ADR-0012
+    // item 313, DI-9). A tape whose seal marker does not vouch keeps the old
+    // way on: `tests/heir_restore_s6.rs`.
+    assert!(
+        o.stderr.contains(
+            "the seal marker at the end of this tape states layout_version = 3 and requires no feature"
+        ) && o.stderr.contains("File 0 may be damaged")
+            && o.stderr.contains("by the steps of File 1")
+            && !o.stderr.contains("RESTORE.sh in its own File 2"),
+        "{}",
+        o.stderr
+    );
+    // Nothing but File 0 and the seal marker was read.
+    assert_eq!(h.dd_reads(), vec![0, t.files.len() - 1]);
 }
 
 #[test]
