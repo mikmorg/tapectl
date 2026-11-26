@@ -1509,3 +1509,47 @@ fn a_drive_that_gives_nothing_is_asked_about_and_the_run_stops() {
         );
     }
 }
+
+/// DI-3 and File 1's sentence on `--verify` ("a file that is missing or will
+/// not read is a FAIL, and it ends `VERIFY PASSED` only for a sealed tape
+/// every file of which passed"): File 3 is a file of the tape as any other.
+/// One that gives a read error, or reads as bytes that are no front index,
+/// is a FAIL. The other files are still judged, against the seal marker's
+/// copy of the map, and the last line names that map.
+#[test]
+fn verify_fails_a_front_index_that_did_not_read_and_names_the_map_it_judged_by() {
+    let t = two();
+    let unreadable = Heir::of(t);
+    fail_read(&unreadable, 3);
+    let garbage = Heir::of(t);
+    garbage.replace(3, &heir::noise(4096, 11));
+    for (name, h) in [("a read error", &unreadable), ("garbage", &garbage)] {
+        let o = h.run(&["--verify"]);
+        let all = o.all();
+        assert_eq!(o.code, 1, "{name}: {all}");
+        assert!(!o.stdout.contains("VERIFY PASSED"), "{name}: {all}");
+        let fail: Vec<&str> = o.stdout.lines().filter(|l| l.starts_with("FAIL")).collect();
+        assert_eq!(fail.len(), 1, "{name}: {all}");
+        assert!(
+            fail[0].starts_with("FAIL     3  front_index ")
+                && fail[0].contains("the seal marker's copy of it"),
+            "{name}: {all}"
+        );
+        assert_eq!(
+            o.stdout.matches("PASS ").count(),
+            t.files.len() - 1,
+            "{name}: every other file is still judged: {all}"
+        );
+        assert!(
+            o.stdout.lines().last().unwrap().starts_with(
+                "VERIFY FAILED: 1 file(s) differ from the seal marker's copy of the front index or cannot be read; "
+            ),
+            "{name}: {all}"
+        );
+        assert!(
+            o.stderr
+                .contains("falling back to the seal marker's own copy of it"),
+            "{name}: {all}"
+        );
+    }
+}

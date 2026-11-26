@@ -1214,7 +1214,10 @@ do_info() {
 
 do_verify() {
   establish
-  local pos type size hash fails=0 passed=0 bound="" fi_hash last stop
+  local pos type size hash fails=0 passed=0 bound="" fi_hash last stop map="the front index"
+  # The map the files are judged against, for the last line: File 3 itself, or
+  # the seal marker's copy of it when File 3 did not read (establish).
+  [ -n "$FRONT_INDEX_HASH" ] || map=$FILES_SOURCE
   last=$(last_planned)
   stop=$last
   [ -z "$ENDED_AFTER" ] || stop=$ENDED_AFTER
@@ -1226,7 +1229,10 @@ do_verify() {
       local want
       want=$(toml_val "$WORK/seal.toml" front_index_sha256 2>/dev/null || true)
       if [ -z "$fi_hash" ]; then
-        printf 'NOTE  %4d  front_index          not read: the map above is the seal marker'"'"'s copy of it\n' "$pos"
+        # File 3 is a file of the tape as any other: one that did not read, or
+        # did not read as a front index, is a FAIL (File 1 says so of --verify).
+        printf 'FAIL  %4d  front_index          not read, or not a consistent front index: the map here is the seal marker'"'"'s copy of it\n' "$pos"
+        fails=$((fails + 1))
       elif [ "$SEAL_BINDS" = no ]; then
         printf 'FAIL  %4d  front_index          the seal marker binds another hash\n' "$pos"
         fails=$((fails + 1))
@@ -1274,7 +1280,7 @@ do_verify() {
     say "VERIFY INCOMPLETE: $passed file(s) match, and the tape is unsealed."
     return 1
   fi
-  say "VERIFY FAILED: $fails file(s) differ from the front index or cannot be read; $passed match."
+  say "VERIFY FAILED: $fails file(s) differ from $map or cannot be read; $passed match."
   return 1
 }
 
