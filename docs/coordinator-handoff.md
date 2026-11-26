@@ -10,17 +10,24 @@ This page is the entry. Everything it names holds the detail, and is not repeate
 
 ## Where things stand
 
-- **The design is ruled, whole**: ADR-0012 items 235 to 291
-  (`docs/adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md`, the
-  amendments from 2026-11-13 on). Nothing of it is built: no file under `src/`, `tests/` or
-  `scripts/` has changed for it.
-- **The plan** is `docs/design/v3-implementation-plan.md`: every task, its owner, its
-  fence, its traps and what proves it done. Sections 1 to 6 are its rules.
-- **The code on `master` writes Layout 2** and is release 1.9.2. The production host runs
-  it, untouched; its two cartridges and its catalog are test articles (items 235 to 238).
-- **The queue** is the GitHub label `review-2026-11-12`; the epic is #554.
-- `master` is pushed, its CI is green and the tree is clean. The five `pm-19*` worktrees
-  under `.claude/worktrees/` belong to finished work; leave them.
+*This section was brought up to date on 2026-11-26. The rest of the page is as written on
+2026-11-17, and its "On the go" order is how the build ran.*
+
+- **The build is done through Stage 6.** `master` writes Layout 3 and is the 2.0.0 candidate.
+  Stages 2 to 6 of `docs/design/v3-implementation-plan.md` are on it, with the golden pins,
+  the recorded tape and every fix from the Stage 6 reads.
+- **The proof of the candidate** is in `docs/runs/`:
+  - the whole chain (`2026-11-22-2.0.0-t65-chain.md`, and
+    `2026-11-25-2.0.0-chain-07144179.md` for the code as it stands);
+  - the real drive (`2026-11-24-2.0.0-real-drive.md`);
+  - the heir's script's speed (`2026-11-25-restore-sh-speed.md`).
+- **The design is ruled**: ADR-0012 items 235 to 312, gathered for the format in ADR-0014.
+- **What is left is Stage 7**, the CTO's and the operator's: the tag `v2.0.0`, the fresh
+  start on the production host, and the drill (#548, #554, #559).
+- **A review of the candidate** is `docs/audits/2026-11-26-pragmatic-design-and-defect-review.md`.
+  Its decision list is for the CTO, before the tag.
+- The production host still runs 1.9.2; its two cartridges and its catalog are test articles
+  (items 235 to 238).
 
 ## The gate: the go
 
