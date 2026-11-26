@@ -16,7 +16,8 @@
 //! with its recorded kind, size and sha256 and the root's mode; `volume verify` passes;
 //! and the tape's OWN RESTORE.sh (File 2 of the fixture, never the tree's) restores every
 //! unit under the heir harness, `mt` and `dd` standing in for the drive and serving the
-//! fixture's tape files.
+//! fixture's tape files. The TREE's RESTORE.sh restores every unit of it too (ADR-0012 item
+//! 317): one copy of the script serves every tape, so a later script reads this older tape.
 //!
 //! THE RULE. This fixture is never re-recorded to make a test pass. A later build that
 //! cannot read it has broken the format, and that is the CTO's decision, as a change to a
@@ -599,31 +600,23 @@ fn volume_verify_passes_on_the_recorded_tape() {
 
 // ---- the heir reads it ----
 
-/// The tape's OWN RESTORE.sh (File 2 of the fixture, not the tree's), run under the heir
-/// harness with the fixture's tape files served as `FAKE_FILES`, restores every unit; the
-/// result is checked against EXPECTED as tapectl's restore is.
-#[test]
-fn the_recorded_tapes_own_restore_sh_restores_every_unit() {
-    let want = expected();
-    let files = tape_files();
-    let script_file = fixture_dir().join("file-002");
-    // The script as the heir reads it: the padding after its last byte is zeros.
-    let mut script = files[2].clone();
-    while script.last() == Some(&0) {
-        script.pop();
-    }
-    assert!(
-        script.starts_with(b"#!"),
-        "{}: File 2 of the recorded tape is not the script",
-        script_file.display()
-    );
-    let keys: Vec<(&'static str, PathBuf)> = ["tenant-alpha", "tenant-bravo", "operator", "escrow"]
+/// The fixture's four keys, by the names the harness files them under.
+fn recorded_keys() -> Vec<(&'static str, PathBuf)> {
+    ["tenant-alpha", "tenant-bravo", "operator", "escrow"]
         .iter()
         .map(|n| (*n, key_path(n)))
-        .collect();
+        .collect()
+}
+
+/// `script`, run under the heir harness with the fixture's tape files served as `FAKE_FILES`,
+/// restores every unit; each result is checked against EXPECTED as tapectl's restore is.
+/// `what` names the script in a failure.
+fn script_restores_every_recorded_unit(files: &[Vec<u8>], script: &[u8], what: &str) {
+    let want = expected();
+    let keys = recorded_keys();
     let key_refs: Vec<(&'static str, &Path)> =
         keys.iter().map(|(n, p)| (*n, p.as_path())).collect();
-    let h = Heir::recorded(&files, &script, &want.tape.label, &key_refs);
+    let h = Heir::recorded(files, script, &want.tape.label, &key_refs);
     for u in &want.unit {
         let dest = h.dest(&format!("out-{}", u.name));
         let key = h.keys[key_name_of(&u.tenant)]
@@ -641,11 +634,55 @@ fn the_recorded_tapes_own_restore_sh_restores_every_unit() {
         assert_eq!(
             out.code,
             0,
-            "{}: the tape's RESTORE.sh failed for {}: {}",
-            script_file.display(),
+            "{}: {what} failed for {}: {}",
+            fixture_dir().display(),
             u.name,
             out.all()
         );
-        assert_unit_restored(u, &dest, "the tape's own RESTORE.sh");
+        assert_unit_restored(u, &dest, what);
     }
+}
+
+/// The tape's OWN RESTORE.sh (File 2 of the fixture, not the tree's), run under the heir
+/// harness with the fixture's tape files served as `FAKE_FILES`, restores every unit; the
+/// result is checked against EXPECTED as tapectl's restore is.
+#[test]
+fn the_recorded_tapes_own_restore_sh_restores_every_unit() {
+    let files = tape_files();
+    let script_file = fixture_dir().join("file-002");
+    // The script as the heir reads it: the padding after its last byte is zeros.
+    let mut script = files[2].clone();
+    while script.last() == Some(&0) {
+        script.pop();
+    }
+    assert!(
+        script.starts_with(b"#!"),
+        "{}: File 2 of the recorded tape is not the script",
+        script_file.display()
+    );
+    script_restores_every_recorded_unit(&files, &script, "the tape's own RESTORE.sh");
+}
+
+/// The TREE's RESTORE.sh (`src/volume/heir/RESTORE.sh`, the bytes this build writes as File 2
+/// of a new tape), run on the recorded tape's files, restores every unit, checked against
+/// EXPECTED exactly as the tape's own script's result is (ADR-0012 item 317).
+///
+/// WHAT IT HOLDS. File 1 tells the heir that one copy of RESTORE.sh serves every tape. So
+/// every later RESTORE.sh must read every older Layout 3 tape, and this tape's own script
+/// is an older one: a change to the tree's script that cannot restore this tape has broken
+/// that promise, whatever the script's own tests say.
+#[test]
+fn the_trees_restore_sh_restores_every_unit_of_the_recorded_tape() {
+    let files = tape_files();
+    let script = tapectl::volume::heir::RESTORE_SH.as_bytes();
+    let mut on_tape = files[2].clone();
+    while on_tape.last() == Some(&0) {
+        on_tape.pop();
+    }
+    if on_tape == script {
+        eprintln!("the tree's RESTORE.sh is still the recorded tape's own");
+    } else {
+        eprintln!("the tree's RESTORE.sh is a later one than the recorded tape's own");
+    }
+    script_restores_every_recorded_unit(&files, script, "the tree's RESTORE.sh");
 }
