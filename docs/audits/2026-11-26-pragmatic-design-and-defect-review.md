@@ -37,7 +37,8 @@ The coordinator read the cited lines of the high and of every medium, and re-ran
   the real `age` 1.1.1 and GNU tar 1.35.
 
 "CONFIRMED" below means a probe showed it. "TRACED" means read and not run. No finding was
-confirmed by building tapectl. Lows rest on their finder's trace unless marked.
+confirmed by building tapectl. The one cargo run of the review is the ignored test of P-1
+(§7), which passed. Lows rest on their finder's trace unless marked.
 
 **A correction to the coordinator's own figure.** RESTORE.sh is 4,118 lines at `fd583f03`. The
 figure 3,633 given to the CTO on 2026-11-26 was counted on a stale checkout; it is the length
@@ -59,7 +60,7 @@ of the recorded tape's older script.
   is about 2,800 lines and the tape does not need tapectl. Three things grew with no rule to
   stop them: the heir's script, the destructive commands in the CLI layer, and the decision
   record.
-- **Every RESTORE.sh fix moves a pin**, so each is the CTO's decision (§9, D14). A tape's
+- **Every RESTORE.sh fix moves a pin**, so each is the CTO's decision (§9, RD-1). A tape's
   script can never be patched afterwards. The review recommends one more move of that pin
   before the tag, and a test and a kit change that make later defects repairable.
 
@@ -363,8 +364,8 @@ ever; one only tapectl carries can change in a patch release.
 | Freeze (no growth without a named decision it would change) | `copies_at` and auto-staging; `volume rewrite`; compaction; drive and cartridge observation; the fifteen reports; `tapectl setup` |
 | Remove or rule | the `research` feature: its own header says the shaping "is NOT ruled", and it costs a third clippy target on every chain run |
 
-`volume rewrite` is the one command that erases a last copy by design, and it has drawn a
-medium finding in each of the last four reads (#579, #580, #590, A-1).
+`volume rewrite` is the one command that erases a last copy by design. It has drawn four
+medium findings in the two latest reads: #579, #580 and #590 on 2026-11-20, and A-1 here.
 
 ### The method
 
@@ -378,7 +379,7 @@ the rate is high (434 commits from the go to the candidate).
   kind of mind each time. Nothing resists growth: an agent does not feel a 4,118-line script
   as pain, and the harness makes each addition safe to land. A list answered with "ratify all"
   makes the design the recommender's, with a veto; the veto was used well three times in one
-  week, which shows what is lost when it is not. And the definition of done moves: 62 commits
+  week, which shows what is lost when it is not. And the definition of done moves: 61 commits
   followed the commit the chain record called final.
 - **Its failure mode is surplus, not negligence.**
 
@@ -394,7 +395,10 @@ exit codes and by-name judgement held on every leg it checked. What it did find:
   record. GNU tar writes the header's own size field as zero for it. The test is an ignored
   lib test; the documented perf command builds another test binary, and neither the gate nor
   the chain names it. Swapping the precedence at `:765` would pass every other test.
-  P1_RUN_RESULT
+  The coordinator ran it once by hand on this source on 2026-11-26 (a debug build, with
+  `TAPECTL_PERF_TESTS=1` and `--ignored`): 1 passed in 98.9 s, with no skip line. So the path
+  works on the candidate. The finding stands as a gap in the chain: a gate leg that names the
+  test is still owed.
 - **P-2 (low). The tests named for tenant isolation do not test tapectl's choice of
   recipients.** In `cargo test`, nothing puts one tenant's key against another tenant's
   production-staged slice; sealing slices to every tenant would pass CI. The gate's
@@ -494,44 +498,69 @@ Ranked within each group. "Pin" marks a change to bytes on tape, which is the CT
 
 ## 9. For the CTO
 
-These continue the earlier reviews' numbering. Nothing here is built or filed as a ruling.
+Nine decisions, RD-1 to RD-9. (The plan's own decisions are D1 to D22, ratified by item 290;
+these are numbered apart so the two lists cannot be confused.) Nothing here is built, and
+nothing is a ruling until the CTO gives it.
 
-- **D14. One more move of RESTORE.sh's pin before the tag, for §2 and §3.** *Recommended:
+- **RD-1. One more move of RESTORE.sh's pin before the tag, for §2 and §3.** *Recommended:
   yes.* The reasons: DI-1 is the likely form of damage and the format document forbids the
   hard stop; D-1 and S-1 are holes in a guard item 312 added on purpose; D-3, D-6 and D-7 are
   regressions from the coordinator's fix of 2026-11-25; and after the tag every cartridge
   carries the script for good. The cost: one branch of fixes with a failing test first for
   each, the u26 container run, the gate's heir legs, a PR's CI, the whole chain again on the
-  new commit, and a record for it. No real-drive run is needed for these (none changes a tape
-  command), though the script that ran on the real drive would then be one version back.
-  Under D14 the coordinator would also take C-4 (the split final check) in the same move,
-  if the CTO wants it: it is the largest remaining cost of an heir's restore.
-- **D15. The tapectl mediums before the tag, or in 2.0.1?** A-1, A-2, A-3, S-2, DI-2, DI-5 and
+  new commit, a record for it, and an independent read of the fix's own diff before it lands
+  (D-1 sat in the lines added to close the read before it). The cross-script test of RD-5 goes in first,
+  so the new script is held against the recorded tape from its first commit. None of the fixes
+  changes a command sent to the drive: after a failed read the script already rewinds and
+  spaces forward to the next file it wants (`seek_to`, `:535-562`). So no real-drive run is
+  asked for, though the script that ran on the real drive would then be one version back. One
+  thing no run on record shows, on mhvtl or the HP: the drive spacing past a block it cannot
+  read. A read error cannot be made to order.
+  Under RD-1 the coordinator would also take C-4 (the split final check) in the same move,
+  and recommends it: it is the largest remaining cost of an heir's restore, and the same pin
+  move carries it.
+- **RD-2. The tapectl mediums before the tag, or in 2.0.1?** A-1, A-2, A-3, S-2, DI-2, DI-5 and
   DI-8 change no byte on tape. *Recommended: A-1, A-3 and S-2 before the tag* (each is a few
   lines: a sync, a lock probe, a directory), *the rest in 2.0.1 with R3*, since A-2's right
   fix is R3's shape and DI-2, DI-5 and DI-8 want one decision about a damaged File 0 and
-  File 3 across all of tapectl's readers. If D14 is yes, the chain runs again anyway.
-- **D16. Item 310's count (DP-1).** Should `mark-tape-only`'s Tier 3 leave out `reclaimable`
+  File 3 across all of tapectl's readers. If RD-1 is yes, the chain runs again anyway.
+- **RD-3. Item 310's count (DP-1).** Should `mark-tape-only`'s Tier 3 leave out `reclaimable`
   and `purged` versions, as every other floor does? *Recommended: yes.*
-- **D17. The erase of a retired volume (DP-2) and of an unknown sealed tape (DP-3).** Should
+- **RD-4. The erase of a retired volume (DP-2) and of an unknown sealed tape (DP-3).** Should
   the erase show which versions on the tape have no copy now, should a `volume retire` have a
   way back, and should "the catalog does not hold this volume" name `catalog rebuild
   --from-volume`? *Recommended: yes to the facts and the wording; the way back is a small
   command and can wait for 2.0.1.*
-- **D18. R1: the current RESTORE.sh in the Heir Kit, and the cross-script test.** *Recommended:
+- **RD-5. R1: the current RESTORE.sh in the Heir Kit, and the cross-script test.** *Recommended:
   yes, the test now (no pin) and the kit change in 2.0.1.* It is the one change that makes
   every later defect in a tape's script repairable.
-- **D19. R2: a ceiling and an admission rule on File 2.** *Recommended: yes to the rule, after
+- **RD-6. R2: a ceiling and an admission rule on File 2.** *Recommended: yes to the rule, after
   the tag.* The read-ahead's removal is a separate question for the next on-tape
   authorization; the coordinator built it and does not rank it.
-- **D20. A feature freeze after the tag, with R3 and R4 as the first work.** The 2026-11-12
+- **RD-7. A feature freeze after the tag, with R3 and R4 as the first work.** The 2026-11-12
   intent review asked for a freeze (its D2) and was not answered. *Recommended: yes.* The
   method's failure mode is surplus.
-- **D21. Item 289** (fill to the warning). Is a unit across two cartridges at the end of every
-  full tape the wanted default, given what it asks of the heir? *The CTO's call; the review
-  only names the cost.*
-- **D22. `tapectl setup --yes` and the escrow secret (S-3).** Should it refuse without an
+- **RD-8. Item 289** (fill to the warning). Is a unit across two cartridges at the end of every
+  full tape the wanted default, given what it asks of the heir? *Recommended: leave item 289 as
+  ruled for 2.0.0.* The review names the cost and did not re-read the measurements behind the
+  ruling; reopening it is a question for after the drill.
+- **RD-9. `tapectl setup --yes` and the escrow secret (S-3).** Should it refuse without an
   explicit flag, as `first-run.sh --auto` does? *Recommended: yes.*
+
+**What "ratify all" would be read to cover.** Each recommendation above, as written, and
+the go to build what it names:
+
+- RD-1: a branch with the fixes of §2 and §3 and C-4, RESTORE.sh's pin moved in a commit of
+  its own under item 243's authorization, the chain and its record on the new commit;
+- RD-2: A-1, A-3 and S-2 on the same branch; the other four mediums filed for 2.0.1;
+- RD-3, RD-4 (the facts and the wording) and RD-9: amendments to items 310, 216 and 188, with
+  their code, on the same branch;
+- RD-5: the test now; the kit change filed for 2.0.1;
+- RD-6 and RD-7: a rule and a freeze recorded as ADR-0012 items, taking effect at the tag;
+- RD-8: nothing changes.
+
+It would not be read as the tag: that stays Stage 7's first step, the CTO's and the
+operator's, on the commit the new chain passes on.
 
 ## 10. Not reached
 
@@ -550,7 +579,7 @@ These continue the earlier reviews' numbering. Nothing here is built or filed as
 - **design:** most extras were judged from module headers, size and reach, not a full read.
 - **cost:** `session.rs`'s execute, `rebuild.rs`, `verify_contacted` itself, compaction, the
   lifecycle suite's breakdown. C-1's gain is not measured.
-- Nothing was confirmed by building tapectl, and nothing was run on a tape device.
+- No finding was confirmed by building tapectl, and nothing was run on a tape device.
 
 ## 11. Finder rules (as given)
 
