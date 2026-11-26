@@ -498,6 +498,9 @@ Ranked within each group. "Pin" marks a change to bytes on tape, which is the CT
 
 ## 9. For the CTO
 
+Filed with this record: #610 (the review, with this list), #611 (the heir's script: §2 and
+§3) and #612 (A-1, A-3 and S-2). Everything else stays in this record until the CTO has ruled.
+
 Nine decisions, RD-1 to RD-9. (The plan's own decisions are D1 to D22, ratified by item 290;
 these are numbered apart so the two lists cannot be confused.) Nothing here is built, and
 nothing is a ruling until the CTO gives it.
@@ -591,4 +594,4 @@ probe run on synthetic input under the finder's own directory) or a CONCERN with
 that would settle it. Never argue from the present collection's size or the production host's
 tools (items 281 and 273). An improvement needs a measured or cited cost. Each report has
 findings, improvements, "considered and dropped", "read" and "not reached". The finders'
-reports, whole, are comments on the review's tracking issue.
+reports, whole, are comments on #610, the review's tracking issue.
