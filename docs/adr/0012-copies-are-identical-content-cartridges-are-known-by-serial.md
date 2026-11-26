@@ -4136,12 +4136,14 @@ stated options. Each item below gives the option chosen in the CTO's words.
 
 318. **A rule on what may enter File 2** (RD-6: "Rule now, keep read-ahead"). From the commit
      item 313's pin moves to:
-     - RESTORE.sh gains no new mode and no new option;
-     - a new capability for the heir goes into File 1's text, the envelope, or the kit's tapectl;
-     - a fix may add lines. A fix that adds a mechanism (a background job, a new work file, a
-       new external tool) is asked of the CTO as its own item.
+     - RESTORE.sh gains no new mode;
+     - a new capability for the heir goes into File 1's text, the envelope, or the kit's tapectl.
 
      The read-ahead of item 309 stays.
+
+     Coordinator's reading, for the CTO to overrule: "no new mode" covers a new option too; a
+     fix may add lines; and a fix that adds a mechanism (a background job, a new external
+     tool) is asked of the CTO as its own item, as item 313's split check was.
 
 319. **A feature freeze from the tag** (RD-7: "Freeze at the tag"). After `v2.0.0`, no new
      capability is built without a ruling that names the unit, the collection or the decision
