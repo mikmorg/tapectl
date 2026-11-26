@@ -1124,7 +1124,7 @@ learn_end() {
   # is not trusted (volume-format-v3.md 7.2 step 3, R2): the tape reads as
   # unsealed, its ended_after is not used, and the two ends are said to disagree.
   if [ "$SEAL_BINDS" = no ]; then
-    warn "the two ends of the tape disagree: the seal marker binds front_index_sha256 $want, and File 3's hash is $FRONT_INDEX_HASH. The tape is read as unsealed; the seal's ended_after is not used. Every file is still checked against File 3's hashes as it is read; an envelope that differs from File 3's is tried by the seal marker's copy of the map too."
+    warn "the two ends of the tape disagree: the seal marker binds front_index_sha256 $(safe_str "$want"), and File 3's hash is $FRONT_INDEX_HASH. The tape is read as unsealed; the seal's ended_after is not used. Every file is still checked against File 3's hashes as it is read; an envelope that differs from File 3's is tried by the seal marker's copy of the map too."
     SEAL_STATE=disagrees
     ALT_TXT="$WORK/files_from_seal.txt"
     ENDED_AFTER=""
@@ -1234,7 +1234,7 @@ do_info() {
       printf '  %4d  %-24s %s\n' "$pos" "seal_marker" "$(info_own_size seal_marker)"
       break
     fi
-    if [ -n "$size" ]; then size="$size bytes"; else size=$(info_own_size "$type"); fi
+    if [ -n "$size" ]; then size="$(safe_str "$size") bytes"; else size=$(info_own_size "$type"); fi
     printf '  %4d  %-24s %s\n' "$pos" "$(safe_str "$type")" "$size"
   done <"$FILES_TXT"
   if [ -n "$ENDED_AFTER" ] && [ "$SEAL_STATE" = short ]; then
@@ -1278,6 +1278,8 @@ do_verify() {
       fi
       continue
     fi
+    # A kind and a hash are the map's own text, shown as text off a tape is.
+    type=$(safe_str "$type")
     if ! tape_uint "$size" || [ -z "$hash" ]; then
       printf 'FAIL  %4d  %-18s its line of the map gives no size that is a number, or no hash (a damaged line?)\n' "$pos" "$type"
       fails=$((fails + 1))
@@ -1288,7 +1290,7 @@ do_verify() {
       printf 'PASS  %4d  %-18s %s bytes\n' "$pos" "$type" "$size"
       passed=$((passed + 1))
     elif [ -n "$TAPE_SHA" ]; then
-      printf 'FAIL  %4d  %-18s hash %s, the front index says %s\n' "$pos" "$type" "$TAPE_SHA" "$hash"
+      printf 'FAIL  %4d  %-18s hash %s, the front index says %s\n' "$pos" "$type" "$TAPE_SHA" "$(safe_str "$hash")"
       fails=$((fails + 1))
     else
       printf 'FAIL  %4d  %-18s cannot be read from the tape\n' "$pos" "$type"
@@ -1533,7 +1535,7 @@ do_find_envelope() {
   open_envelopes
   local pos nunits
   for pos in $OPENED; do
-    say "The key opens the envelope at file $pos ($(file_type_at "$pos" "$FILES_TXT"))."
+    say "The key opens the envelope at file $pos ($(safe_str "$(file_type_at "$pos" "$FILES_TXT")"))."
   done
   collect_units
   collect_ranges

@@ -1967,3 +1967,65 @@ fn a_refusal_on_file_0s_layout_keeps_its_old_way_on_when_the_seal_marker_does_no
         );
     }
 }
+
+/// S-5: `--info`, `--verify` and `--find-envelope` print values of the
+/// plain-text files (File 3's sizes, kinds and hashes, the seal marker's
+/// `front_index_sha256`). None reaches the terminal as it stands: an escape
+/// sequence in a damaged or foreign tape's map is shown as `?`.
+#[test]
+fn no_escape_sequence_of_a_plain_text_file_reaches_the_terminal() {
+    let t = two();
+    let (a, _, _) = tenant_envelopes(t);
+    let slices = t.slice_positions();
+    let last = t.files.len() - 1;
+    let h = Heir::of(t);
+    let mut map = text_of(t, 3);
+    map = entry_line_edited(&map, slices[0], "size_bytes", |v| {
+        format!("{v}\u{1b}]0;OWNED\u{7}\u{1b}[31m")
+    });
+    map = entry_line_edited(&map, slices[1], "type", |_| {
+        "\"data_slice\u{1b}[2J\"".to_string()
+    });
+    map = entry_line_edited(&map, slices[2], "sha256_encrypted", |_| {
+        "\"ab\u{1b}[2Jcd\"".to_string()
+    });
+    map = entry_line_edited(&map, a, "type", |_| {
+        "\"tenant_envelope\u{1b}[2J\"".to_string()
+    });
+    h.replace(3, map.as_bytes());
+    let seal = text_of(t, last);
+    let bound = seal
+        .lines()
+        .find(|l| l.starts_with("front_index_sha256 = "))
+        .unwrap();
+    h.replace(
+        last,
+        seal.replace(
+            bound,
+            &bound.replace("sha256 = \"", "sha256 = \"\u{1b}[2J\u{7}"),
+        )
+        .as_bytes(),
+    );
+    let ka = key(&h, Who::TenantA);
+    for args in [
+        vec!["--info"],
+        vec!["--verify"],
+        vec!["--find-envelope", "--key", &ka],
+    ] {
+        let o = h.run(&args);
+        let all = o.all();
+        assert!(
+            !all.contains('\u{1b}') && !all.contains('\u{7}'),
+            "{args:?}: {all:?}"
+        );
+        // The run reached what it prints of the map.
+        match args[0] {
+            "--info" => assert!(all.contains("OWNED"), "{all:?}"),
+            "--verify" => assert!(all.contains("the front index says ab??2Jcd"), "{all:?}"),
+            _ => assert!(
+                all.contains(&format!("The key opens the envelope at file {a} (")),
+                "{all:?}"
+            ),
+        }
+    }
+}
