@@ -1557,10 +1557,14 @@ fn verify_fails_a_front_index_that_did_not_read_and_names_the_map_it_judged_by()
     }
 }
 
+/// What rewrites one value of a map's line: given the value as written, it
+/// returns the value to write.
+type Edit = fn(&str) -> String;
+
 /// A front index's text with one line of its entry at `pos` rewritten: `edit`
 /// is given the value of `key` as written and returns the value to write.
 /// Every other byte stays: one damaged line of the plain-text map.
-fn entry_line_edited(text: &str, pos: usize, key: &str, edit: fn(&str) -> String) -> String {
+fn entry_line_edited(text: &str, pos: usize, key: &str, edit: Edit) -> String {
     let entry = text
         .find(&format!("\nposition = {pos}\n"))
         .unwrap_or_else(|| panic!("the map has no entry {pos}"));
@@ -1579,7 +1583,7 @@ fn entry_line_edited(text: &str, pos: usize, key: &str, edit: fn(&str) -> String
 }
 
 /// File 3 of `t` with one line of its entry at `pos` rewritten.
-fn front_index_with(t: &Tape, pos: usize, key: &str, edit: fn(&str) -> String) -> Vec<u8> {
+fn front_index_with(t: &Tape, pos: usize, key: &str, edit: Edit) -> Vec<u8> {
     entry_line_edited(&text_of(t, 3), pos, key, edit).into_bytes()
 }
 
@@ -1651,7 +1655,7 @@ fn assert_unit_restored(t: &Tape, name: &str, dest: &std::path::Path, all: &str)
 fn one_changed_line_of_an_envelope_in_file_3_costs_a_try_and_not_the_envelope() {
     let t = two();
     let (a, _, _) = tenant_envelopes(t);
-    let cases: [(&str, &str, fn(&str) -> String); 3] = [
+    let cases: [(&str, &str, Edit); 3] = [
         ("hash", "sha256_encrypted", another_hash),
         ("size", "size_bytes", one_more),
         ("type", "type", |_| "\"tenant_envelopf\"".to_string()),
@@ -1750,8 +1754,7 @@ fn a_letter(v: &str) -> String {
 fn a_size_with_a_leading_zero_or_a_letter_in_another_tenants_line_does_not_end_the_run() {
     let t = two();
     let (_, _, b) = tenant_envelopes(t);
-    let cases: [(&str, fn(&str) -> String); 2] =
-        [("a leading zero", leading_zero), ("a letter", a_letter)];
+    let cases: [(&str, Edit); 2] = [("a leading zero", leading_zero), ("a letter", a_letter)];
     for (name, edit) in cases {
         let h = Heir::of(t);
         h.replace(3, &front_index_with(t, b, "size_bytes", edit));
