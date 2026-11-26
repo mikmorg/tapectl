@@ -1353,18 +1353,24 @@ fn an_unreadable_file_0_is_warned_about_and_every_mode_runs_as_on_the_sound_tape
     );
     assert_eq!(from_map(&o.stdout), from_map(&want.stdout));
 
-    // --restore: every file of the unit, as the source had it.
-    let dest = h.dest("out");
-    let o = h.run(&["--restore", "--key", &ka, "--to", dstr(&dest)]);
-    let all = o.all();
-    assert_eq!(o.code, 0, "{all}");
-    assert!(o.stderr.contains(FILE0_WARNING), "{all}");
-    assert!(o.stdout.contains("RESTORE COMPLETE"), "{all}");
-    let got = heir::tree(&dest);
-    for (path, bytes) in unit_files(t, heir::UNIT_A) {
-        assert_eq!(got.get(path), Some(bytes), "{path}: {all}");
+    // --restore: every unit of the tape, each with its tenant's key, and every
+    // file of it as the source had it.
+    for (who, unit) in [(Who::TenantA, heir::UNIT_A), (Who::TenantB, heir::UNIT_B)] {
+        let dest = h.dest(&format!("out-{unit}"));
+        let o = h.run(&["--restore", "--key", &key(&h, who), "--to", dstr(&dest)]);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{unit}: {all}");
+        assert!(o.stderr.contains(FILE0_WARNING), "{unit}: {all}");
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{unit}: {all}");
+        let got = heir::tree(&dest);
+        for (path, bytes) in unit_files(t, unit) {
+            assert_eq!(got.get(path), Some(bytes), "{unit} {path}: {all}");
+        }
+        assert!(
+            !dest.join(".tapectl-damaged-files.txt").exists(),
+            "{unit}: {all}"
+        );
     }
-    assert!(!dest.join(".tapectl-damaged-files.txt").exists(), "{all}");
 }
 
 /// DI-1 and File 1's sentence on `--verify`: a file that will not read is a
