@@ -1494,7 +1494,10 @@ fn a_drive_that_gives_nothing_is_asked_about_and_the_run_stops() {
     for n in [0, 3, t.files.len() - 1] {
         fail_read(&dead, n);
     }
-    for (name, h) in [("an empty drive", &empty), ("three unreadable files", &dead)] {
+    for (name, h) in [
+        ("an empty drive", &empty),
+        ("three unreadable files", &dead),
+    ] {
         let o = h.run(&["--info"]);
         assert_eq!(o.code, 1, "{name}: {}", o.all());
         assert!(
