@@ -1279,3 +1279,233 @@ fn a_damaged_file_among_quoted_names_is_the_only_one_reported() {
         "{all}"
     );
 }
+
+// ---- #611, ADR-0012 item 313: a damaged tape ----
+
+/// Make the read of tape file `n` of the cartridge in the drive fail with an
+/// I/O error (the stand-in `dd`'s `.fail.N`).
+fn fail_read(h: &Heir, n: usize) {
+    std::fs::write(h.root.path().join("files").join(format!(".fail.{n}")), "").unwrap();
+}
+
+/// The text of tape file `n` of `t`, without its padding.
+fn text_of(t: &Tape, n: usize) -> String {
+    String::from_utf8_lossy(&t.files[n])
+        .trim_end_matches('\0')
+        .to_string()
+}
+
+const FILE0_WARNING: &str = "WARNING: File 0 cannot be read from /dev/nst0";
+
+/// DI-1 (`volume-format-v3.md` 1.2 rule 2): a File 0 that gives a read error
+/// is a damaged File 0, warned about and never a hard stop. Every mode runs
+/// as it does on the sound tape, and nothing asks whether a cartridge is
+/// loaded, since the rest of the tape reads.
+#[test]
+fn an_unreadable_file_0_is_warned_about_and_every_mode_runs_as_on_the_sound_tape() {
+    let t = two();
+    let good = Heir::of(t);
+    let h = Heir::of(t);
+    fail_read(&h, 0);
+    let ka = key(&h, Who::TenantA);
+    let ke = key(&h, Who::Escrow);
+    // The label and the date in the index banner are File 0's; no other line
+    // of these modes' output is. The script names itself by its path, which
+    // is each harness's own.
+    let body = |h: &Heir, s: &str| -> String {
+        s.replace(h.root.path().to_str().unwrap(), "ROOT")
+            .lines()
+            .filter(|l| !l.starts_with("Index read from tape:"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    for args in [
+        vec!["--find-envelope", "--key", &ka],
+        vec!["--list", "--key", &ka],
+        vec!["--where", heir::UNIT_A, "--key", &ka],
+        vec!["--where", "--all", "--key", &ke],
+        vec!["--find", "deep", "--key", &ke],
+    ] {
+        let want = good.run(&args);
+        assert_eq!(want.code, 0, "{args:?} on the sound tape: {}", want.all());
+        let o = h.run(&args);
+        assert_eq!(o.code, want.code, "{args:?}: {}", o.all());
+        assert!(o.stderr.contains(FILE0_WARNING), "{args:?}: {}", o.stderr);
+        assert!(
+            !o.all().contains("is a cartridge loaded"),
+            "{args:?}: {}",
+            o.all()
+        );
+        assert_eq!(body(&h, &o.stdout), body(&good, &want.stdout), "{args:?}");
+    }
+
+    // --info: the map and the seal, as on the sound tape; File 0's own facts
+    // (the first two lines) are not known.
+    let want = good.run(&["--info"]);
+    let o = h.run(&["--info"]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stderr.contains(FILE0_WARNING), "{}", o.stderr);
+    let from_map = |s: &str| -> String { s.lines().skip(2).map(|l| format!("{l}\n")).collect() };
+    assert!(
+        from_map(&want.stdout).contains("the tape is complete, every planned file is on it"),
+        "{}",
+        want.stdout
+    );
+    assert_eq!(from_map(&o.stdout), from_map(&want.stdout));
+
+    // --restore: every file of the unit, as the source had it.
+    let dest = h.dest("out");
+    let o = h.run(&["--restore", "--key", &ka, "--to", dstr(&dest)]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(o.stderr.contains(FILE0_WARNING), "{all}");
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{all}");
+    let got = heir::tree(&dest);
+    for (path, bytes) in unit_files(t, heir::UNIT_A) {
+        assert_eq!(got.get(path), Some(bytes), "{path}: {all}");
+    }
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists(), "{all}");
+}
+
+/// DI-1 and File 1's sentence on `--verify`: a file that will not read is a
+/// FAIL, File 0 too, and the run does not end `VERIFY PASSED`. Every other
+/// file is still judged.
+#[test]
+fn verify_fails_an_unreadable_file_0_and_judges_every_other_file() {
+    let t = two();
+    let h = Heir::of(t);
+    fail_read(&h, 0);
+    let o = h.run(&["--verify"]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(o.stderr.contains(FILE0_WARNING), "{all}");
+    let fail: Vec<&str> = o.stdout.lines().filter(|l| l.starts_with("FAIL")).collect();
+    assert_eq!(fail.len(), 1, "{all}");
+    assert!(
+        fail[0].starts_with("FAIL     0  ") && fail[0].contains("cannot be read from the tape"),
+        "{all}"
+    );
+    assert_eq!(
+        o.stdout.matches("PASS ").count(),
+        t.files.len() - 1,
+        "every other file has a PASS line: {all}"
+    );
+    assert!(!o.stdout.contains("VERIFY PASSED"), "{all}");
+    assert!(o.stdout.contains("VERIFY FAILED: 1 file(s)"), "{all}");
+}
+
+/// DI-1 keeps the fence (ADR-0012 item 313): with File 0 unreadable the seal
+/// marker's `requires` decides, and a feature this script does not know is
+/// refused by name.
+#[test]
+fn an_unreadable_file_0_leaves_the_seals_requires_to_refuse_an_unknown_feature() {
+    let t = two();
+    let h = Heir::of(t);
+    fail_read(&h, 0);
+    let last = t.files.len() - 1;
+    let seal = text_of(t, last);
+    assert!(seal.contains("requires = []"), "{seal}");
+    h.replace(
+        last,
+        seal.replace("requires = []", "requires = [\"future-thing\"]")
+            .as_bytes(),
+    );
+    let dest = h.dest("out");
+    for args in [
+        vec!["--info"],
+        vec![
+            "--restore",
+            "--key",
+            &key(&h, Who::TenantA),
+            "--to",
+            dstr(&dest),
+        ],
+    ] {
+        let o = h.run(&args);
+        assert_eq!(o.code, 1, "{args:?}: {}", o.all());
+        assert!(o.stderr.contains(FILE0_WARNING), "{args:?}: {}", o.stderr);
+        assert!(
+            o.stderr
+                .contains("the seal marker requires feature(s) this RESTORE.sh does not know")
+                && o.stderr.contains("future-thing"),
+            "{args:?}: {}",
+            o.stderr
+        );
+    }
+    assert!(heir::tree(&dest).is_empty(), "nothing was restored");
+}
+
+/// DI-1: File 0 and the seal marker both unreadable. The tape is read as an
+/// unsealed one from its front index, and the script says so, exactly as it
+/// does for a File 0 that reads as garbage on a tape with no readable seal.
+#[test]
+fn an_unreadable_file_0_and_seal_read_as_an_unsealed_tape_as_a_garbage_file_0_does() {
+    let t = two();
+    let last = t.files.len() - 1;
+    let garbage = Heir::of(t);
+    garbage.replace(0, &heir::noise(4096, 7));
+    fail_read(&garbage, last);
+    let h = Heir::of(t);
+    fail_read(&h, 0);
+    fail_read(&h, last);
+    let kb = key(&h, Who::TenantB);
+
+    let want = garbage.run(&["--info"]);
+    let o = h.run(&["--info"]);
+    assert_eq!(want.code, 0, "{}", want.all());
+    assert!(
+        want.stdout.contains("Seal marker: NOT FOUND"),
+        "{}",
+        want.all()
+    );
+    assert_eq!(o.code, want.code, "{}", o.all());
+    assert_eq!(o.stdout, want.stdout);
+    assert!(
+        o.stderr.contains(FILE0_WARNING)
+            && o.stderr.contains("no seal marker found as the last file")
+            && !o.all().contains("is a cartridge loaded"),
+        "{}",
+        o.stderr
+    );
+
+    let (dw, dh) = (garbage.dest("out"), h.dest("out"));
+    let want = garbage.run(&["--restore", "--key", &kb, "--to", dstr(&dw)]);
+    let o = h.run(&["--restore", "--key", &kb, "--to", dstr(&dh)]);
+    assert_eq!(want.code, 0, "{}", want.all());
+    assert_eq!(o.code, want.code, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.all());
+    assert_eq!(heir::tree(&dh), heir::tree(&dw));
+    let got = heir::tree(&dh);
+    for (path, bytes) in unit_files(t, heir::UNIT_B) {
+        assert_eq!(got.get(path), Some(bytes), "{path}");
+    }
+}
+
+/// DI-1: the question the old message asked ("is a cartridge loaded and is
+/// DEVICE the right drive?") is still the right one when NOTHING reads: an
+/// empty drive, or a tape whose File 0, front index and seal marker all fail.
+/// It is decided by the later files, never by File 0 alone.
+#[test]
+fn a_drive_that_gives_nothing_is_asked_about_and_the_run_stops() {
+    let t = two();
+    let empty = Heir::of(t);
+    empty.empty_bay();
+    let dead = Heir::of(t);
+    for n in [0, 3, t.files.len() - 1] {
+        fail_read(&dead, n);
+    }
+    for (name, h) in [("an empty drive", &empty), ("three unreadable files", &dead)] {
+        let o = h.run(&["--info"]);
+        assert_eq!(o.code, 1, "{name}: {}", o.all());
+        assert!(
+            o.stderr
+                .contains("FATAL: nothing can be read from /dev/nst0")
+                && o.stderr
+                    .contains("is a cartridge loaded and is /dev/nst0 the right drive?")
+                && o.stderr.contains("there is no map of the tape")
+                && o.stderr.contains("fsf N"),
+            "{name}: {}",
+            o.stderr
+        );
+    }
+}
