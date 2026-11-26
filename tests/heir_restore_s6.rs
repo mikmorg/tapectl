@@ -1556,3 +1556,163 @@ fn verify_fails_a_front_index_that_did_not_read_and_names_the_map_it_judged_by()
         );
     }
 }
+
+/// A front index's text with one line of its entry at `pos` rewritten: `edit`
+/// is given the value of `key` as written and returns the value to write.
+/// Every other byte stays: one damaged line of the plain-text map.
+fn entry_line_edited(text: &str, pos: usize, key: &str, edit: fn(&str) -> String) -> String {
+    let entry = text
+        .find(&format!("\nposition = {pos}\n"))
+        .unwrap_or_else(|| panic!("the map has no entry {pos}"));
+    let start = entry
+        + text[entry..]
+            .find(&format!("\n{key} = "))
+            .unwrap_or_else(|| panic!("entry {pos} has no {key}"))
+        + 1;
+    let end = start + text[start..].find('\n').unwrap_or(text.len() - start);
+    assert!(
+        !text[entry + 1..start].contains("[[files]]"),
+        "{key} of entry {pos}"
+    );
+    let value = text[start..end].split_once(" = ").unwrap().1;
+    format!("{}{key} = {}{}", &text[..start], edit(value), &text[end..])
+}
+
+/// File 3 of `t` with one line of its entry at `pos` rewritten.
+fn front_index_with(t: &Tape, pos: usize, key: &str, edit: fn(&str) -> String) -> Vec<u8> {
+    entry_line_edited(&text_of(t, 3), pos, key, edit).into_bytes()
+}
+
+/// A quoted sha256 with its first digit changed.
+fn another_hash(v: &str) -> String {
+    let mut b = v.as_bytes().to_vec();
+    b[1] = if b[1] == b'0' { b'1' } else { b'0' };
+    String::from_utf8(b).unwrap()
+}
+
+/// A size one byte greater.
+fn one_more(v: &str) -> String {
+    (v.parse::<u64>().unwrap() + 1).to_string()
+}
+
+/// The tape files of tenant A's envelope on `t`, and of the other tenant's:
+/// `(A's primary, its backup, the other tenant's primary)`. A's is the one its
+/// key opens on the sound tape, and a backup is the `_backup` entry with its
+/// primary's ciphertext hash.
+fn tenant_envelopes(t: &Tape) -> (usize, usize, usize) {
+    let h = Heir::of(t);
+    let o = h.run(&["--find-envelope", "--key", &key(&h, Who::TenantA)]);
+    let primaries = t.positions_of("tenant_envelope");
+    let a = *primaries
+        .iter()
+        .find(|p| {
+            o.stdout
+                .contains(&format!("The key opens the envelope at file {p} "))
+        })
+        .unwrap_or_else(|| panic!("tenant A's key opens no envelope: {}", o.all()));
+    let backup = t
+        .entries
+        .iter()
+        .find(|e| {
+            e.type_label == "tenant_envelope_backup"
+                && e.sha256_encrypted == t.entries[a].sha256_encrypted
+        })
+        .unwrap()
+        .position as usize;
+    let other = *primaries.iter().find(|p| **p != a).unwrap();
+    (a, backup, other)
+}
+
+fn restore_a(h: &Heir, dest: &std::path::Path) -> heir::Out {
+    h.run(&[
+        "--restore",
+        "--key",
+        &key(h, Who::TenantA),
+        "--to",
+        dstr(dest),
+    ])
+}
+
+fn assert_unit_restored(t: &Tape, name: &str, dest: &std::path::Path, all: &str) {
+    let got = heir::tree(dest);
+    for (path, bytes) in unit_files(t, name) {
+        assert_eq!(got.get(path), Some(bytes), "{path}: {all}");
+    }
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists(), "{all}");
+}
+
+/// DI-4 (a), `volume-format-v3.md` 7.2 steps 3 and 4 as ADR-0012 item 313
+/// amends them: one changed byte in File 3's line for an envelope (its hash,
+/// its size or its type) makes the tape's two ends disagree, and costs a try.
+/// The envelope is intact, the seal marker's own copy of the map says so, and
+/// `age` authenticates what it opens: the tenant's envelope opens and the unit
+/// restores whole, as it does when File 3 is lost altogether.
+#[test]
+fn one_changed_line_of_an_envelope_in_file_3_costs_a_try_and_not_the_envelope() {
+    let t = two();
+    let (a, _, _) = tenant_envelopes(t);
+    let cases: [(&str, &str, fn(&str) -> String); 3] = [
+        ("hash", "sha256_encrypted", another_hash),
+        ("size", "size_bytes", one_more),
+        ("type", "type", |_| "\"tenant_envelopf\"".to_string()),
+    ];
+    for (name, line, edit) in cases {
+        let h = Heir::of(t);
+        h.replace(3, &front_index_with(t, a, line, edit));
+        let ka = key(&h, Who::TenantA);
+        let o = h.run(&["--find-envelope", "--key", &ka]);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{name}: {all}");
+        assert!(
+            o.stdout
+                .contains(&format!("The key opens the envelope at file {a} ")),
+            "{name}: {all}"
+        );
+        assert!(
+            o.stderr.contains("the two ends of the tape disagree") && !all.contains("DAMAGED"),
+            "{name}: {all}"
+        );
+        let o = h.run(&["--list", "--key", &ka]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        let dest = h.dest("out");
+        let o = restore_a(&h, &dest);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{name}: {all}");
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{name}: {all}");
+        assert_unit_restored(t, heir::UNIT_A, &dest, &all);
+    }
+}
+
+/// DI-4 (a): a backup is paired through either map. Here the primary IS
+/// damaged and File 3's hash line for it is changed too, so File 3 pairs it
+/// with no backup; the seal marker's copy does, and the backup opens. With the
+/// backup damaged as well, the envelope matches neither map and is DAMAGED,
+/// as before.
+#[test]
+fn a_damaged_envelope_whose_line_is_changed_too_is_replaced_by_its_backup_through_the_seals_copy() {
+    let t = two();
+    let (a, backup, _) = tenant_envelopes(t);
+    let h = Heir::of(t);
+    h.replace(3, &front_index_with(t, a, "sha256_encrypted", another_hash));
+    h.flip(a, 200);
+    let dest = h.dest("out");
+    let o = restore_a(&h, &dest);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(
+        o.stderr.contains(&format!(
+            "reading the backup copy of the envelope at file {a}: file {backup}."
+        )),
+        "{all}"
+    );
+    assert_unit_restored(t, heir::UNIT_A, &dest, &all);
+
+    h.flip(backup, 200);
+    let o = h.run(&["--find-envelope", "--key", &key(&h, Who::TenantA)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("envelope(s) on this tape are DAMAGED"),
+        "{}",
+        o.stderr
+    );
+}

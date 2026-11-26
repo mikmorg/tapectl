@@ -919,6 +919,10 @@ file_hash_at() { file_field 4 "$1" "$2"; }
 
 LABEL="" UUID="" TOTAL_FILES="" FRONT_INDEX=3 SEAL_MARKER="" TAPECTL_VERSION="" MEDIA_TYPE="" CREATED_AT=""
 FILES_TXT="" FILES_SOURCE=""
+# The seal marker's own copy of the map, where File 3 reads and the two ends of
+# the tape disagree (learn_end): neither vouches for the other, so an envelope
+# is looked for through both (volume-format-v3.md 7.2 steps 3 and 4).
+ALT_TXT=""
 ENDED_AFTER="" SEAL_STATE="" SEAL_BINDS="" SEAL_FILE_COUNT="" SEAL_SEALED_AT=""
 FRONT_INDEX_HASH=""
 
@@ -1093,14 +1097,16 @@ learn_end() {
   # is not trusted (volume-format-v3.md 7.2 step 3, R2): the tape reads as
   # unsealed, its ended_after is not used, and the two ends are said to disagree.
   if [ "$SEAL_BINDS" = no ]; then
-    warn "the two ends of the tape disagree: the seal marker binds front_index_sha256 $want, and File 3's hash is $FRONT_INDEX_HASH. The tape is read as unsealed; the seal's ended_after is not used. Every file is still checked against File 3's hashes as it is read."
+    warn "the two ends of the tape disagree: the seal marker binds front_index_sha256 $want, and File 3's hash is $FRONT_INDEX_HASH. The tape is read as unsealed; the seal's ended_after is not used. Every file is still checked against File 3's hashes as it is read; an envelope that differs from File 3's is tried by the seal marker's copy of the map too."
     SEAL_STATE=disagrees
+    ALT_TXT="$WORK/files_from_seal.txt"
     ENDED_AFTER=""
     return 0
   fi
   if [ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -gt "$TOTAL_FILES" ]; then
     warn "the two ends of the tape disagree: the seal marker counts $SEAL_FILE_COUNT files and the plan (File 0) has $TOTAL_FILES. The tape is read as unsealed; the seal's ended_after is not used."
     SEAL_STATE=disagrees
+    ALT_TXT="$WORK/files_from_seal.txt"
     SEAL_BINDS=no
     ENDED_AFTER=""
     return 0
@@ -1322,23 +1328,23 @@ END { emit() }
 '
 
 envelope_list() {
-  awk -F'|' '$2 == "tenant_envelope" || $2 == "operator_envelope" { print $1 "|" $2 }' "$FILES_TXT"
+  awk -F'|' '($2 == "tenant_envelope" || $2 == "operator_envelope") && !seen[$1]++ { print $1 "|" $2 }' "$FILES_TXT" ${ALT_TXT:+"$ALT_TXT"}
 }
 
-# The backup of the primary at $1: the *_backup entry with the same ciphertext
-# hash (never found by position arithmetic).
-backup_of() {
+# The backup of the primary at $1, by the map $2: the *_backup entry with the
+# same ciphertext hash (never found by position arithmetic).
+backup_of() { # <position> <map>
   local h
-  h=$(file_hash_at "$1" "$FILES_TXT")
+  h=$(file_hash_at "$1" "$2")
   [ -n "$h" ] || return 1
-  awk -F'|' -v h="$h" '$2 ~ /_backup$/ && ($4 "") == (h "") { print $1; exit }' "$FILES_TXT"
+  awk -F'|' -v h="$h" '$2 ~ /_backup$/ && ($4 "") == (h "") { print $1; exit }' "$2"
 }
 
 # Try one envelope file. Echo-free: results in globals.
 #   0  opened, extracted into $WORK/env.<primary>
 #   2  not for the key given (age: no identity matched; rage: No matching keys found)
 #   3  damaged or unreadable
-try_envelope_at() { # <position of this copy> <primary position> <true bytes> <hash>
+try_envelope_at() { # <position of this copy> <primary position> <true bytes> <hash> [<whose they are>]
   local pos=$1 primary=$2 size=$3 hash=$4 dir="$WORK/env.$2" arc="" trc="" text
   rm -rf "$dir"
   mkdir -p "$dir" || die_io "cannot make $dir" "" "$WORK"
@@ -1351,7 +1357,7 @@ try_envelope_at() { # <position of this copy> <primary position> <true bytes> <h
     return 3
   fi
   if [ "$(sha_of_file "$WORK/envelope.enc")" != "$hash" ]; then
-    note "envelope file $pos differs from the front index's hash: damaged."
+    note "envelope file $pos differs from ${5:-the front index}'s hash: damaged."
     rm -f "$WORK/envelope.enc"
     return 3
   fi
@@ -1389,25 +1395,37 @@ OPENED="" # positions of the primaries that opened, space separated
 
 # Walk the primaries; open each the key opens. A copy that is damaged is
 # replaced by its backup (§1.3); a backup whose primary opened is never read.
+# Where the two ends of the tape disagree (ALT_TXT), an envelope no copy of
+# which passes by File 3's lines is tried again by the seal marker's: a wrong
+# line in a plain-text map costs a try, and age authenticates what it opens.
 open_envelopes() {
-  local list pos type size hash bpos rc
+  local list pos type size hash bpos rc map by
   list=$(envelope_list)
   [ -n "$list" ] || die "the front index lists no envelope: this tape has nothing a key can open."
   OPENED=""
   DAMAGED_ENVELOPES=0
   while IFS='|' read -r pos type; do
-    size=$(file_size_at "$pos" "$FILES_TXT")
-    hash=$(file_hash_at "$pos" "$FILES_TXT")
-    rc=0
-    try_envelope_at "$pos" "$pos" "$size" "$hash" || rc=$?
-    if [ "$rc" = 3 ]; then
-      bpos=$(backup_of "$pos" || true)
-      if [ -n "$bpos" ]; then
-        note "reading the backup copy of the envelope at file $pos: file $bpos."
-        rc=0
-        try_envelope_at "$bpos" "$pos" "$size" "$hash" || rc=$?
+    rc=3
+    by=""
+    for map in "$FILES_TXT" ${ALT_TXT:+"$ALT_TXT"}; do
+      [ "$rc" = 3 ] || break
+      if [ "$map" != "$FILES_TXT" ]; then
+        by="the seal marker's copy of the front index"
+        note "the two ends of the tape disagree: trying the envelope at file $pos by $by."
       fi
-    fi
+      size=$(file_size_at "$pos" "$map")
+      hash=$(file_hash_at "$pos" "$map")
+      rc=0
+      try_envelope_at "$pos" "$pos" "$size" "$hash" "$by" || rc=$?
+      if [ "$rc" = 3 ]; then
+        bpos=$(backup_of "$pos" "$map" || true)
+        if [ -n "$bpos" ]; then
+          note "reading the backup copy of the envelope at file $pos: file $bpos."
+          rc=0
+          try_envelope_at "$bpos" "$pos" "$size" "$hash" "$by" || rc=$?
+        fi
+      fi
+    done
     case $rc in
     0) OPENED="$OPENED $pos" ;;
     3) DAMAGED_ENVELOPES=$((DAMAGED_ENVELOPES + 1)) ;;
