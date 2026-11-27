@@ -1010,20 +1010,25 @@ check_requires() { # <what> <file>
        $way"
 }
 
-# The seal marker's own claims. Where File 0 states no magic or no
-# layout_version (it is damaged, or did not read), the seal marker's
-# layout_version decides in its place (volume-format-v3.md 1.2 rule 2): one
-# other than 3 is another layout, refused by name as File 0's would be. A File
-# 0 that states its layout is taken at its word, as before. Then the seal's
-# `requires`, whatever File 0 states.
-check_seal_claims() {
+# The seal marker's own claims. A layout_version other than 3 is another
+# layout, refused by name (volume-format-v3.md 1.2 rule 1). Where File 0
+# states no magic or no layout_version (it is damaged, or did not read), the
+# seal's decides in its place (rule 2), whether the seal keeps its parse rules
+# or not. Where File 0 states Layout 3, a seal that keeps them ($1 is valid:
+# seal_valid passed) is refused all the same; one that does not is no seal,
+# and states nothing. Then the seal's `requires`, whatever File 0 states.
+check_seal_claims() { # [valid]
   local lv
   lv=$(toml_val "$WORK/seal.toml" layout_version)
-  if [ -n "$lv" ] && [ "$lv" != 3 ] &&
-    { [ -z "$(toml_val "$WORK/file0.txt" magic)" ] || [ -z "$(toml_val "$WORK/file0.txt" layout_version)" ]; }; then
-    die "the seal marker at the end of this tape states layout_version $(safe_str "$lv"), and File 0 states no magic or no layout_version: this is read as a tapectl volume of Layout $(safe_str "$lv"). This RESTORE.sh reads Layout 3 only.
+  if [ -n "$lv" ] && [ "$lv" != 3 ]; then
+    if [ -z "$(toml_val "$WORK/file0.txt" magic)" ] || [ -z "$(toml_val "$WORK/file0.txt" layout_version)" ]; then
+      die "the seal marker at the end of this tape states layout_version $(safe_str "$lv"), and File 0 states no magic or no layout_version: this is read as a tapectl volume of Layout $(safe_str "$lv"). This RESTORE.sh reads Layout 3 only.
        Read it with the tapectl that wrote it, or with the RESTORE.sh in its own File 2:
          mt -f $DEVICE rewind; mt -f $DEVICE fsf 2; dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE-OLD.sh"
+    elif [ "${1:-}" = valid ]; then
+      die "the seal marker at the end of this tape states layout_version $(safe_str "$lv"), and File 0 states Layout 3: the two ends of the tape disagree. This RESTORE.sh refuses a tape whose seal marker states another layout, and reads Layout 3 only.
+       If it is a tapectl volume of Layout $(safe_str "$lv"), read it with the tapectl that wrote it. If the seal marker is the damaged file, restore by hand, by the steps of File 1: mt -f $DEVICE rewind; mt -f $DEVICE fsf 1; dd if=$DEVICE bs=512k | tr -d '\\0' | less"
+    fi
   fi
   check_requires "the seal marker" "$WORK/seal.toml"
 }
@@ -1173,6 +1178,7 @@ learn_end() {
     warn "the last file is not a valid seal marker: the tape is read as unsealed."
     return 0
   fi
+  check_seal_claims valid
   local want
   want=$(toml_val "$WORK/seal.toml" front_index_sha256)
   if [ -n "$FRONT_INDEX_HASH" ]; then
@@ -1236,7 +1242,7 @@ establish() {
   fi
   warn "the front index (file $FRONT_INDEX) is unreadable or inconsistent: falling back to the seal marker's own copy of it. The front of the tape may be damaged; treat this recovery as degraded."
   if read_seal && seal_valid; then
-    check_seal_claims
+    check_seal_claims valid
     FILES_TXT="$WORK/files_from_seal.txt"
     FILES_SOURCE="the seal marker's copy of the front index"
     SEAL_STATE=$([ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ] && echo short || echo full)
@@ -1882,7 +1888,7 @@ probe_cartridge() { # <dir> <slice>
     learn_end
   elif read_seal && seal_valid; then
     echo "WARNING: the front index of this cartridge is unreadable: using the seal marker's copy of it." >&2
-    check_seal_claims
+    check_seal_claims valid
     FILES_TXT="$WORK/files_from_seal.txt"
     FILES_SOURCE="the seal marker's copy of the front index"
     SEAL_STATE=$([ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ] && echo short || echo full)

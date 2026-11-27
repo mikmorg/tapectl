@@ -2129,9 +2129,11 @@ fn no_escape_sequence_of_a_plain_text_file_reaches_the_terminal() {
 /// `volume-format-v3.md` 1.2 rule 2: where File 0 states no magic or no
 /// layout_version (it did not read, or is damaged), the seal marker's own
 /// `layout_version` decides. One that is not 3 is another layout, refused by
-/// name as File 0's would be. A File 0 that reads and states Layout 3 is
-/// taken at its word, as before: the seal marker's `layout_version` is then
-/// not looked at, and the tape reads as it did.
+/// name as File 0's would be. And by rule 1 (F9 of the read of #611's fixes),
+/// a seal marker that keeps its parse rules and states another layout is
+/// refused where File 0 states Layout 3 too, whether File 3 reads or not;
+/// the words say the two ends disagree. A seal that breaks its parse rules
+/// is no seal and states nothing: the tape reads as unsealed.
 #[test]
 fn the_seal_markers_layout_version_decides_when_file_0_states_none() {
     let t = two();
@@ -2175,13 +2177,64 @@ fn the_seal_markers_layout_version_decides_when_file_0_states_none() {
         assert!(heir::tree(&dest).is_empty(), "{name}: nothing was restored");
     }
 
-    let good = Heir::of(t).run(&["--info"]);
+    // File 0 states Layout 3 (this arm pinned "the run goes on" before F9).
     let sound = Heir::of(t);
     sound.replace(last, seal4.as_bytes());
-    let o = sound.run(&["--info"]);
+    let no_file_3 = Heir::of(t);
+    no_file_3.replace(last, seal4.as_bytes());
+    fail_read(&no_file_3, 3);
+    for (name, h) in [
+        ("File 3 reads", &sound),
+        ("File 3 does not read", &no_file_3),
+    ] {
+        let dest = h.dest("out");
+        for args in [
+            vec!["--info"],
+            vec![
+                "--restore",
+                "--key",
+                &key(h, Who::TenantA),
+                "--to",
+                dstr(&dest),
+            ],
+        ] {
+            let o = h.run(&args);
+            assert_eq!(o.code, 1, "{name} {args:?}: {}", o.all());
+            assert!(o.stdout.is_empty(), "{name} {args:?}: {}", o.all());
+            assert!(
+                o.stderr.contains(
+                    "FATAL: the seal marker at the end of this tape states layout_version 4, and File 0 states Layout 3: the two ends of the tape disagree."
+                ) && o.stderr.contains("If it is a tapectl volume of Layout 4, read it with the tapectl that wrote it.")
+                    && o.stderr.contains("by the steps of File 1")
+                    && !o.stderr.contains("RESTORE.sh in its own File 2"),
+                "{name} {args:?}: {}",
+                o.stderr
+            );
+        }
+        assert!(heir::tree(&dest).is_empty(), "{name}: nothing was restored");
+    }
+
+    // A seal that breaks rule S1 is no seal: stating 4, it refuses nothing,
+    // and the tape reads as it does with such a seal stating 3.
+    let fc = format!("\nfile_count = {}\n", t.files.len());
+    let broken = |s: &str| -> Vec<u8> {
+        assert!(s.contains(&fc), "{s}");
+        s.replacen(&fc, &format!("\nfile_count = {}\n", t.files.len() + 1), 1)
+            .into_bytes()
+    };
+    let want = Heir::of(t);
+    want.replace(last, &broken(&seal));
+    let want = want.run(&["--info"]);
+    let invalid = Heir::of(t);
+    invalid.replace(last, &broken(&seal4));
+    let o = invalid.run(&["--info"]);
     assert_eq!(o.code, 0, "{}", o.all());
-    assert_eq!(o.stdout, good.stdout);
-    assert!(!o.all().contains("Layout 4"), "{}", o.all());
+    assert!(
+        o.stderr.contains("the tape is read as unsealed") && !o.all().contains("Layout 4"),
+        "{}",
+        o.all()
+    );
+    assert_eq!(o.stdout, want.stdout, "{}", o.all());
 }
 
 /// The two units, ended early inside the second slice of the plan: the tape
@@ -2884,5 +2937,43 @@ fn a_cartridge_judged_by_its_seal_marker_alone_is_fenced_by_its_claims() {
             && !all.contains("FATAL"),
         "{all}"
     );
+    assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
+}
+
+/// F9 at the prompt: a cartridge whose File 0 states Layout 3 and whose seal
+/// marker, keeping its parse rules, states another layout is refused by
+/// name, whether it is judged by its front index or, File 3 failing, by its
+/// seal marker's copy alone. The prompt asks again and the sound cartridge
+/// is then taken.
+#[test]
+fn a_cartridge_whose_seal_marker_states_another_layout_is_refused_whatever_file_0_states() {
+    let t = span2();
+    let second = t[1].label.as_str();
+    let last = t[1].files.len() - 1;
+    let base = Heir::of_series(&[&t[0], &t[1]]);
+    let want_dest = base.dest("out");
+    let o = restore_span(&base, &want_dest, &[second]);
+    assert_eq!(o.code, 0, "{}", o.all());
+
+    let h = Heir::of_series(&[&t[0], &t[1]]);
+    for cart in ["LAYOUT4", "LAYOUT4-NO-FILE-3"] {
+        h.copy_cart(second, cart);
+        edit_cart_text(&h, cart, last, |s| {
+            s.replacen("\nlayout_version = 3\n", "\nlayout_version = 4\n", 1)
+        });
+    }
+    h.fail_file("LAYOUT4-NO-FILE-3", 3);
+    let dest = h.dest("out");
+    let o = restore_span(&h, &dest, &["LAYOUT4", "LAYOUT4-NO-FILE-3", second]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert_eq!(all.matches(heir::PROMPT).count(), 3, "{all}");
+    assert_eq!(
+        all.matches("NOTE: the seal marker at the end of this tape states layout_version 4, and File 0 states Layout 3: the two ends of the tape disagree.")
+            .count(),
+        2,
+        "{all}"
+    );
+    assert!(!all.contains("FATAL"), "{all}");
     assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
 }
