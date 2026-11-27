@@ -1321,7 +1321,10 @@ do_verify() {
     else
       printf 'FAIL  %4d  %-18s cannot be read from the tape\n' "$pos" "$type"
       fails=$((fails + 1))
-      if [ -z "$ENDED_AFTER" ]; then
+      # On a tape with no seal a file that does not read may be the end of the
+      # data, and the walk stops there. A file before the front index is not:
+      # the front index, after it, was read to get this map.
+      if [ -z "$ENDED_AFTER" ] && [ "$pos" -gt "$FRONT_INDEX" ]; then
         printf 'NOTE  the tape has no seal, so its end is not known: nothing after file %d was tried.\n' "$pos"
         break
       fi

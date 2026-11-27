@@ -2322,3 +2322,53 @@ fn done_on_a_start_tape_whose_file_0_does_not_read_still_restores_what_it_holds(
     assert_eq!(heir::tree(&dest), want_tree, "{all}");
     assert_eq!(damaged_list(&dest), damaged_list(&want_dest), "{all}");
 }
+
+/// `--verify` on a tape with no seal stops at the first file that does not
+/// read: that may be the end of the data. A File 0 that does not read is not
+/// the end, since the front index after it was read: every later file is
+/// judged, and the run ends VERIFY FAILED with file 0's row. The stop at the
+/// true end stays.
+#[test]
+fn verify_on_an_unsealed_tape_does_not_stop_at_a_file_0_that_does_not_read() {
+    let t = two();
+    let last = t.files.len() - 1;
+    let h = Heir::of(t);
+    h.cut_after(last);
+    fail_read(&h, 0);
+    let o = h.run(&["--verify"]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    let fail: Vec<&str> = o.stdout.lines().filter(|l| l.starts_with("FAIL")).collect();
+    assert_eq!(fail.len(), 1, "{all}");
+    assert!(
+        fail[0].starts_with("FAIL     0  ") && fail[0].contains("cannot be read from the tape"),
+        "{all}"
+    );
+    assert_eq!(
+        o.stdout.matches("PASS ").count(),
+        last - 1,
+        "every file after file 0 and before the missing seal is judged: {all}"
+    );
+    assert!(!o.stdout.contains("nothing after file"), "{all}");
+    assert!(o.stdout.contains("there is no seal marker"), "{all}");
+    assert!(
+        o.stdout.lines().last().unwrap().starts_with(
+            "VERIFY FAILED: 1 file(s) differ from the front index or cannot be read; "
+        ),
+        "{all}"
+    );
+
+    // A slice that does not read on a tape with no seal still ends the walk.
+    let p = t.slice_positions()[1];
+    let h = Heir::of(t);
+    h.cut_after(last);
+    fail_read(&h, p);
+    let o = h.run(&["--verify"]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains(&format!("nothing after file {p} was tried")),
+        "{}",
+        o.stdout
+    );
+}
