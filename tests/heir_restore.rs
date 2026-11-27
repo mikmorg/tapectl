@@ -7631,3 +7631,76 @@ fn a_write_error_on_the_plain_cut_names_the_work_directory_and_not_the_slice() {
     );
     assert!(!all.contains("RESTORE INCOMPLETE"), "{all}");
 }
+
+// ---- #611 D-5: no path goes through awk -v ----
+
+/// #611 D-5 (ADR-0012 item 313): a `--to` or `--work` with a backslash in its
+/// name is a directory like another, under every awk: no awk is given a path
+/// through `-v`, which reads its backslashes (gawk and BusyBox awk then could
+/// not open `my\data`'s files and the run ended early). A unit whose slices
+/// are not all on the tape (`report_absent`'s list of hard links), a path
+/// restore (`resolve_paths`' three files) and a whole restore with `--work`.
+#[test]
+fn a_backslash_in_to_or_work_is_a_directory_like_another_under_every_awk() {
+    let mut ran = 0;
+    for (name, body) in awks() {
+        // The short tape: the big unit has only its first slice here.
+        let h = Heir::of(short());
+        put_awk(&h, &body);
+        let to = h.root.path().join("my\\data").join("short");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &key(&h, Who::TenantB),
+            "--to",
+            dest_str(&to),
+        ]);
+        let all = o.all();
+        assert_eq!(o.code, 1, "{name}: {all}");
+        assert!(
+            o.stdout.contains("NOT ON THIS CARTRIDGE: slices "),
+            "{name}: {all}"
+        );
+        assert!(o.stdout.contains("RESTORE INCOMPLETE: "), "{name}: {all}");
+        assert!(
+            to.join(".tapectl-damaged-files.txt").is_file(),
+            "{name}: {all}"
+        );
+        // A path restore.
+        let h = Heir::of(two());
+        put_awk(&h, &body);
+        let ka = key(&h, Who::TenantA);
+        let one = h.root.path().join("my\\data").join("one");
+        let deep = format!("inner/{UNIT_A}-deep.dat");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ka,
+            "--to",
+            dest_str(&one),
+            "--unit",
+            UNIT_A,
+            "--path",
+            &deep,
+        ]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert!(one.join(&deep).is_file(), "{name}");
+        // A whole restore, its work directory under --work.
+        let whole = h.dest("whole");
+        let work = h.root.path().join("w\\ork");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ka,
+            "--to",
+            dest_str(&whole),
+            "--work",
+            dest_str(&work),
+        ]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{name}: {}", o.all());
+        assert_restored(two(), UNIT_A, &whole);
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}

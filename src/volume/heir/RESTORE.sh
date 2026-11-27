@@ -1401,7 +1401,7 @@ backup_of() { # <position> <map>
   local h
   h=$(file_hash_at "$1" "$2")
   [ -n "$h" ] || return 1
-  awk -F'|' -v h="$h" '$2 ~ /_backup$/ && ($4 "") == (h "") { print $1; exit }' "$2"
+  BACKUP_HASH="$h" awk -F'|' '$2 ~ /_backup$/ && ($4 "") == (ENVIRON["BACKUP_HASH"] "") { print $1; exit }' "$2"
 }
 
 # Try one envelope file. Echo-free: results in globals.
@@ -1625,7 +1625,7 @@ choose_units() { # [listing]: with it, several units are not refused
     END { for (n in row) print row[n] }
   ' "$WORK/want.txt" "$WORK/units.txt" | sort -t'|' -k3,3 >"$WORK/chosen.txt"
   for u in ${UNITS[@]+"${UNITS[@]}"}; do
-    if ! awk -F'|' -v n="$u" '($3 "") == (n "") { f = 1 } END { exit f ? 0 : 1 }' "$WORK/chosen.txt"; then
+    if ! WANT_UNIT="$u" awk -F'|' '($3 "") == (ENVIRON["WANT_UNIT"] "") { f = 1 } END { exit f ? 0 : 1 }' "$WORK/chosen.txt"; then
       echo "FATAL: unit '$(safe_str "$u")'${VERSION:+ version $VERSION} is not in the envelope(s) your key opened. Units there:" >&2
       awk -F'|' '$9 != "" { printf "         %s  version %s\n", $3, $4 }' "$WORK/units.txt" >&2
       exit 1
@@ -1853,7 +1853,7 @@ probe_cartridge() { # <dir> <slice>
     exit 2
   fi
   h16=${NEED_HASH:0:16}
-  pos=$(awk -F'|' -v h="$NEED_HASH" -v s="$NEED_SIZE" '$2 == "data_slice" && ($4 "") == (h "") && ($3 "") == (s "") { print $1; exit }' "$FILES_TXT")
+  pos=$(NEED_HASH="$NEED_HASH" NEED_SIZE="$NEED_SIZE" awk -F'|' '$2 == "data_slice" && ($4 "") == (ENVIRON["NEED_HASH"] "") && ($3 "") == (ENVIRON["NEED_SIZE"] "") { print $1; exit }' "$FILES_TXT")
   if [ -z "$pos" ]; then
     echo "NOTE: This cartridge (label $(safe_str "$label")) lists no data slice with the sha256 of slice $k ($h16...) in its front index, so it does not hold that slice. Nothing is taken from it." >&2
     exit 2
@@ -2794,7 +2794,8 @@ report_absent() { # <damaged paths file>
   # go to a file and awk counts them all, so no pipe is cut short under
   # pipefail however many there are.
   local hp ht sl
-  nh=$(awk -F'\t' -v out="$WORK/hardlinks.absent" '
+  nh=$(ABSENT_OUT="$WORK/hardlinks.absent" awk -F'\t' '
+    BEGIN { out = ENVIRON["ABSENT_OUT"] }
     FILENAME == ARGV[1] { gone[$1 + 0] = 1; next }
     FILENAME == ARGV[2] { want[$0] = 1; next }
     /^#/ { next }
@@ -3148,7 +3149,8 @@ feed_members() { # <member number>
 # paths brought only as a hard link's first name) and $WORK/missing.paths (the
 # wanted paths the table does not have).
 resolve_paths() { # <wanted paths file> <table>
-  awk -F'\t' -v rows="$WORK/wanted.rows" -v brought="$WORK/brought.paths" -v missing="$WORK/missing.paths" '
+  ROWS_OUT="$WORK/wanted.rows" BROUGHT_OUT="$WORK/brought.paths" MISSING_OUT="$WORK/missing.paths" awk -F'\t' '
+    BEGIN { rows = ENVIRON["ROWS_OUT"]; brought = ENVIRON["BROUGHT_OUT"]; missing = ENVIRON["MISSING_OUT"] }
     FILENAME == ARGV[1] { want[$0 ""] = 1; next }
     /^#/ { next }
     { n++; line[n] = $0; path[n] = $7 ""; kind[n] = $1; target[n] = $8 ""; at[$7 ""] = n }
