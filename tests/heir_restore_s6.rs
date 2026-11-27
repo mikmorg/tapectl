@@ -3163,3 +3163,33 @@ fn a_cartridge_refused_on_file_0s_word_at_the_prompt_says_what_its_seal_marker_s
     assert!(!all.contains("FATAL"), "{all}");
     assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
 }
+
+/// F4 of the read of #611's fixes: File 0's `total_files` is a number off a
+/// plain-text file like the others, held to at most 18 digits (DI-4(c)). A
+/// value of 19 or 20 digits is a damaged line, never bash's own words: the
+/// plan's count is then the front index's, and the tape reads as the sound
+/// one does.
+#[test]
+fn a_total_files_too_long_to_be_a_number_is_a_damaged_line() {
+    let t = two();
+    let good = Heir::of(t).run(&["--info"]);
+    let file0 = text_of(t, 0);
+    let line = format!("\ntotal_files = {}\n", t.files.len());
+    assert!(file0.contains(&line), "{file0}");
+    for digits in ["9999999999999999999", "99999999999999999999"] {
+        let h = Heir::of(t);
+        h.replace(
+            0,
+            file0
+                .replacen(&line, &format!("\ntotal_files = {digits}\n"), 1)
+                .as_bytes(),
+        );
+        let o = h.run(&["--info"]);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{digits}: {all}");
+        assert_no_bash_error(&all, digits);
+        assert!(!all.contains("RESTORE.sh: line "), "{digits}: {all}");
+        assert!(!all.contains("not consistent"), "{digits}: {all}");
+        assert_eq!(o.stdout, good.stdout, "{digits}: {all}");
+    }
+}

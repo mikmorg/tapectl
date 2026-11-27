@@ -1079,7 +1079,7 @@ file0_fields() {
   TOTAL_FILES=$(toml_val "$WORK/file0.txt" total_files)
   if tape_uint "$FRONT_INDEX"; then FRONT_INDEX=$REPLY; else FRONT_INDEX=3; fi
   if tape_uint "$SEAL_MARKER"; then SEAL_MARKER=$REPLY; else SEAL_MARKER=""; fi
-  is_uint "$TOTAL_FILES" || TOTAL_FILES=""
+  if tape_uint "$TOTAL_FILES"; then TOTAL_FILES=$REPLY; else TOTAL_FILES=""; fi
 }
 
 # Rung 1: File 3. Leaves the parsed map in $WORK/files_from_index.txt.
