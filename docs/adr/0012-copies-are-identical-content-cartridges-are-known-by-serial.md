@@ -4125,16 +4125,16 @@ stated options. Each item below gives the option chosen in the CTO's words.
      the machine's cores (C-4). The pin moves in a commit of its own, and the hash it moves to
      is added to this item when it is known.
 
-     **The hash it moved to:** `b26d9595abe12845335ff3bf1a1157e8793b1fe06491fd79a55222f5cbe7e034`
-     (4,544 lines), in four commits that each change that one constant (`e3d94879`,
-     `d901aed2`, `a93f85f1`, `4d5ec342`): the fixes, a follow-up to D-4, and the fixes of two
-     independent reads.
+     **The hash it moved to:** `588764052013e84989f80fd56965250c34f407c8e03a003d9bc8e3a6363a19eb`
+     (4,562 lines), in five commits that each change that one constant (`e3d94879`,
+     `d901aed2`, `a93f85f1`, `4d5ec342`, `fe7924e8`): the fixes, a follow-up to D-4, and the
+     fixes of three independent reads.
 
      **What the independent reads added.** The go asks for an independent read of the fix's
      own diff. Each round of fixes got one, by an agent that had not written the lines it
-     read. The first three each found something in the lines read, and those were fixed in
-     the same pin move or recorded on #611; the outcome of the fourth, of the last round, is
-     in the run record of the landing. Further readings of the coordinator's, for the CTO to
+     read. The first four each found something in the lines read, and those were fixed in a
+     later pin move or recorded on #611; the outcome of the fifth, which read the last
+     round's one fix alone, is in the run record of the landing. Further readings of the coordinator's, for the CTO to
      overrule:
      - **Three defects older than the fixes are fixed with them.** The second read found
        them beside the lines it read. They are not on #611's first list. "Fix all before
@@ -4151,6 +4151,25 @@ stated options. Each item below gives the option chosen in the CTO's words.
        - The cleanup ignores a second INT, HUP or TERM. Before, a second Ctrl-C left the
          work directory, with the decrypted envelopes, in `--to`, which File 1 says does
          not happen. The price: the cleanup's own waits end only by themselves or by KILL.
+         The fourth read rated that price a medium fault and found no state in which a
+         wait does not end. **Ruled:** told of it, the CTO kept the cleanup as it is
+         (2026-11-27, "Flow with both recommendations").
+     - **The final per-file check reads no list that it did not make in the same call.** The
+       fourth read found that a unit could be judged by the lists the unit before it left in
+       the work directory, where the open of its own failed (a work directory that stops
+       taking writes during a run): with as many rows in the two units, a damaged file was
+       reported whole. The candidate before this item had the narrow form of it (the output
+       of `sha256sum` alone); the count's fix above had widened it to the lists of rows.
+       **Ruled:** told of it, the CTO chose one more round of fix and read before the landing
+       (the same answer). The check now removes every list of its own first, ends the run
+       when one cannot be removed or made, and ends it where an awk ends non-zero on a list.
+     - **One fixture of the write path's tests is changed on this branch**, which item 314's
+       letter does not name. `budget()`, in the tests of `src/volume/write.rs`, set a fill
+       ceiling by a division, and the budget made from it came to the figure asked or to one
+       byte under it, by the size of the volume's own files. File 2 is 50 blocks of 4 KiB
+       where it was 49, and a test that holds the budget to the figure then failed in most
+       runs. The fixture now sets the ceiling that gives the figure itself. No line of
+       tapectl outside its tests changes.
      - **The split check deals its rows by size**, each to the piece that has the fewest
        bytes so far. As first written it cut the list into runs of equal row count; the
        file table is in path order, so one piece got nearly all the bytes of a tree whose
