@@ -1101,7 +1101,9 @@ try_front_index() {
 }
 
 # The seal marker: the last file before end of data (mt eod, then back over
-# two filemarks; GNU mt spells end of data eom), else File 0's pointer. It is
+# two filemarks; GNU mt spells end of data eom), else its planned position:
+# File 0's pointer, or $1, the map's seal_marker entry, where File 0 gives
+# none (volume-format-v3.md 1.2 rule 6). It is
 # found by filemarks, never by READ POSITION or LOCATE. Sets SEAL_* and leaves
 # the seal's copy of the map in $WORK/files_from_seal.txt on success.
 # The most a seal read takes of the last tape file: 64 MiB, 128 blocks. A seal is
@@ -1112,8 +1114,8 @@ try_front_index() {
 # GiBs, and no more of it than this is read.
 SEAL_MAX_BLOCKS=128
 
-read_seal() {
-  local ok=0
+read_seal() { # [the planned position by the map]
+  local ok=0 at=${SEAL_MARKER:-${1:-}}
   CUR=""
   rm -f "$WORK/seal.raw" "$WORK/seal.stripped"
   if { "$MT" -f "$DEVICE" eod 2>/dev/null || "$MT" -f "$DEVICE" eom 2>/dev/null; } &&
@@ -1123,8 +1125,8 @@ read_seal() {
     if dd if="$DEVICE" bs="$BLOCK" count="$SEAL_MAX_BLOCKS" 2>"$WORK/dd.err" | tr -d '\0' >"$WORK/seal.stripped" &&
       [ -s "$WORK/seal.stripped" ]; then ok=1; fi
   fi
-  if [ "$ok" = 0 ] && [ -n "$SEAL_MARKER" ]; then
-    if fetch "$SEAL_MARKER" "$WORK/seal.raw" "" "$SEAL_MAX_BLOCKS"; then
+  if [ "$ok" = 0 ] && [ -n "$at" ]; then
+    if fetch "$at" "$WORK/seal.raw" "" "$SEAL_MAX_BLOCKS"; then
       tr -d '\0' <"$WORK/seal.raw" >"$WORK/seal.stripped"
       rm -f "$WORK/seal.raw"
       ok=1
@@ -1169,7 +1171,8 @@ learn_end() {
   ENDED_AFTER=""
   SEAL_STATE=unsealed
   SEAL_BINDS=""
-  if ! read_seal; then
+  # The map is File 3's here: its last entry is the seal_marker one.
+  if ! read_seal "$(last_planned)"; then
     warn "no seal marker found as the last file: the tape is read as unsealed. A planned file that is not on the tape fails when it is read."
     return 0
   fi

@@ -3193,3 +3193,42 @@ fn a_total_files_too_long_to_be_a_number_is_a_damaged_line() {
         assert_eq!(o.stdout, good.stdout, "{digits}: {all}");
     }
 }
+
+/// F5 of the read of #611's fixes: where `mt` cannot space to end of data,
+/// the seal marker is read at its planned position (`volume-format-v3.md`
+/// 1.2 rule 6): File 0's pointer, or File 3's `seal_marker` entry when File 0
+/// gives none. With File 0 unread a sealed tape is read as sealed, as with
+/// File 0 readable, not called unsealed.
+#[test]
+fn with_file_0_unread_and_no_end_of_data_the_seal_is_found_by_the_front_index() {
+    let t = two();
+    let no_eod = [("FAKE_MT_NO_EOD", "1")];
+    let good = Heir::of(t).run_with(&["--info"], &no_eod);
+    assert!(
+        good.stdout.contains("the tape is complete"),
+        "{}",
+        good.all()
+    );
+    let h = Heir::of(t);
+    fail_read(&h, 0);
+    let o = h.run_with(&["--info"], &no_eod);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains("the tape is complete, every planned file is on it")
+            && !o.all().contains("no seal marker found"),
+        "{}",
+        o.all()
+    );
+    let o = h.run_with(&["--verify"], &no_eod);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(
+        o.stdout.contains(&format!(
+            "PASS  {:4}  seal_marker          full seal",
+            t.files.len() - 1
+        )) && !o.stdout.contains("there is no seal marker"),
+        "{all}"
+    );
+    assert!(o.stdout.contains("VERIFY FAILED: 1 file(s)"), "{all}");
+}
