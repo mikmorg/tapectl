@@ -1577,6 +1577,50 @@ fn an_unreadable_file_0_leaves_the_seals_requires_to_refuse_an_unknown_feature()
         );
     }
     assert!(heir::tree(&dest).is_empty(), "nothing was restored");
+
+    // The fence does not depend on the seal keeping its parse rules: a seal
+    // that names the feature and breaks rule S1 (its file_count is one off) is
+    // refused by name too, with File 0 unread and with File 0 sound. Only the
+    // check before `seal_valid` reaches it (H1 of the read of the fixes'
+    // fixes); without it the tape would be read as an unsealed one.
+    let fc = format!("\nfile_count = {}\n", t.files.len());
+    assert!(seal.contains(&fc), "{seal}");
+    let broken = seal
+        .replace("requires = []", "requires = [\"future-thing\"]")
+        .replacen(&fc, &format!("\nfile_count = {}\n", t.files.len() + 1), 1);
+    let unread = Heir::of(t);
+    fail_read(&unread, 0);
+    unread.replace(last, broken.as_bytes());
+    let sound = Heir::of(t);
+    sound.replace(last, broken.as_bytes());
+    for (name, h) in [("File 0 does not read", &unread), ("File 0 reads", &sound)] {
+        let dest = h.dest("out");
+        for args in [
+            vec!["--info"],
+            vec![
+                "--restore",
+                "--key",
+                &key(h, Who::TenantA),
+                "--to",
+                dstr(&dest),
+            ],
+        ] {
+            let o = h.run(&args);
+            assert_eq!(o.code, 1, "broken seal, {name} {args:?}: {}", o.all());
+            assert!(
+                o.stderr
+                    .contains("the seal marker requires feature(s) this RESTORE.sh does not know")
+                    && o.stderr.contains("future-thing")
+                    && !o.stderr.contains("the tape is read as unsealed"),
+                "broken seal, {name} {args:?}: {}",
+                o.stderr
+            );
+        }
+        assert!(
+            heir::tree(&dest).is_empty(),
+            "broken seal, {name}: nothing was restored"
+        );
+    }
 }
 
 /// DI-1: File 0 and the seal marker both unreadable. The tape is read as an
@@ -2288,6 +2332,48 @@ fn the_seal_markers_layout_version_decides_when_file_0_states_none() {
         o.all()
     );
     assert_eq!(o.stdout, want.stdout, "{}", o.all());
+
+    // Rule 2 holds "whether the seal keeps its parse rules or not": where
+    // File 0 states none, the same broken seal stating 4 is refused. Only the
+    // check before `seal_valid` reaches it (H1 of the read of the fixes'
+    // fixes): the one after it sees valid seals alone.
+    let unread = Heir::of(t);
+    unread.replace(last, &broken(&seal4));
+    fail_read(&unread, 0);
+    let garbage = Heir::of(t);
+    garbage.replace(last, &broken(&seal4));
+    garbage.replace(0, &heir::noise(4096, 7));
+    for (name, h) in [
+        ("File 0 does not read", &unread),
+        ("File 0 is garbage", &garbage),
+    ] {
+        let dest = h.dest("out");
+        for args in [
+            vec!["--info"],
+            vec![
+                "--restore",
+                "--key",
+                &key(h, Who::TenantA),
+                "--to",
+                dstr(&dest),
+            ],
+        ] {
+            let o = h.run(&args);
+            assert_eq!(o.code, 1, "broken seal, {name} {args:?}: {}", o.all());
+            assert!(
+                o.stderr.contains(
+                    "FATAL: the seal marker at the end of this tape states layout_version 4, and File 0 states no magic or no layout_version"
+                ) && o.stderr.contains("a tapectl volume of Layout 4")
+                    && !o.stderr.contains("the tape is read as unsealed"),
+                "broken seal, {name} {args:?}: {}",
+                o.stderr
+            );
+        }
+        assert!(
+            heir::tree(&dest).is_empty(),
+            "broken seal, {name}: nothing was restored"
+        );
+    }
 }
 
 /// The two units, ended early inside the second slice of the plan: the tape
