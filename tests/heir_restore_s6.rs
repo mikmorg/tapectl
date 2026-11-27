@@ -2463,3 +2463,62 @@ fn an_envelope_is_not_called_damaged_before_the_seal_markers_copy_was_tried() {
         o.stderr
     );
 }
+
+/// A cartridge is never taken for the one in the drive because its File 0
+/// fails too. The run starts on a tape whose File 0 does not read, so that
+/// tape is known by its front index, not by a File 0 that gave nothing. A
+/// cartridge NOTHING of which reads, offered at the prompt, is named as
+/// unreadable and the prompt asks again; with `done` answered while it is in
+/// the drive, nothing is read from it and the start tape's slices are said to
+/// be on a tape that is not in the drive.
+#[test]
+fn a_cartridge_nothing_of_which_reads_is_not_taken_for_a_start_tape_with_no_file_0() {
+    let t = span2();
+    let (first, start) = (t[0].label.as_str(), t[1].label.as_str());
+    let base = Heir::of_series(&[&t[0], &t[1]]);
+    let want_dest = base.dest("out");
+    let o = restore_span(&base, &want_dest, &[start]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let dead_heir = || -> Heir {
+        let h = Heir::of_series(&[&t[1], &t[0]]);
+        fail_read(&h, 0);
+        h.copy_cart(first, "DEAD");
+        for n in [0, 3, t[0].files.len() - 1] {
+            h.fail_file("DEAD", n);
+        }
+        h
+    };
+
+    // ENTER with the dead cartridge loaded, then the two sound ones in turn.
+    let h = dead_heir();
+    let dest = h.dest("out");
+    let o = restore_span(&h, &dest, &["DEAD", first, start]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert_eq!(all.matches(heir::PROMPT).count(), 3, "{all}");
+    assert!(
+        all.contains("NOTE: this cartridge is unreadable: its first file cannot be read (")
+            && !all.contains("is the same cartridge"),
+        "{all}"
+    );
+    assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
+
+    // `done` with the dead cartridge in the drive.
+    let h = dead_heir();
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, _| {
+            assert_eq!(k, 1, "asked {k} times");
+            h.load("DEAD");
+            Some("done".into())
+        },
+    );
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(all.contains("NOT IN THE DRIVE"), "{all}");
+    for wrong in ["could not be read at file", "differs from the front index"] {
+        assert!(!all.contains(wrong), "{wrong}: {all}");
+    }
+}

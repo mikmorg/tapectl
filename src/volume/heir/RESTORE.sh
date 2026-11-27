@@ -1183,8 +1183,12 @@ establish() {
   # A File 0 with no readable uuid cannot be recognised by it again: its bytes
   # as read now are what the same cartridge gives later.
   LOADED_F0SHA=$(sha_of_file "$WORK/file0.raw")
+  # A File 0 that did not read is no bytes to know the cartridge by (any
+  # cartridge whose File 0 fails gives none): its front index stands in.
+  [ "$FILE0_UNREAD" = 0 ] || LOADED_F0SHA=""
   START_LABEL=$LABEL
   if try_front_index; then
+    [ "$FILE0_UNREAD" = 0 ] || LOADED_F0SHA="fi:$FRONT_INDEX_HASH"
     FILES_TXT="$WORK/files_from_index.txt"
     FILES_SOURCE="front index (File $FRONT_INDEX)"
     learn_end
@@ -1770,7 +1774,7 @@ ask_cartridge() { # <slice>
 # then (check_seal_claims).
 probe_cartridge() { # <dir> <slice>
   trap - EXIT
-  local dir=$1 k=$2 rc=0 magic lv label uuid pos feats v h16 f0=""
+  local dir=$1 k=$2 rc=0 magic lv label uuid pos feats v h16 f0="" fi=""
   WORK=$dir
   tape_init
   CUR=""
@@ -1806,7 +1810,18 @@ probe_cartridge() { # <dir> <slice>
     echo "NOTE: this cartridge requires feature(s) $(safe_str "$feats"), which this RESTORE.sh does not know, so nothing is taken from it." >&2
     exit 2
   fi
+  file0_fields
   F0SHA=$(sha_of_file "$WORK/file0.raw")
+  if [ "$rc" -ne 0 ]; then
+    # No File 0 to know it by: its front index stands in, as in establish. A
+    # cartridge is never the one in the drive because its File 0 fails too.
+    F0SHA=""
+    fi=0
+    if try_front_index; then
+      fi=1
+      F0SHA="fi:$FRONT_INDEX_HASH"
+    fi
+  fi
   if { [ -n "$uuid" ] && [ "$uuid" = "$LOADED_UUID" ]; } ||
     { [ -z "$LOADED_UUID" ] && [ -n "$LOADED_F0SHA" ] && [ "$F0SHA" = "$LOADED_F0SHA" ]; }; then
     # The cartridge the facts describe, back in the drive after a refusal.
@@ -1814,8 +1829,7 @@ probe_cartridge() { # <dir> <slice>
     echo "NOTE: this is the same cartridge as the one already in the drive (label $(safe_str "$label")), which does not hold slice $k. Eject it and load the cartridge that does." >&2
     exit 3
   fi
-  file0_fields
-  if try_front_index; then
+  if [ "$fi" = 1 ] || { [ -z "$fi" ] && try_front_index; }; then
     FILES_TXT="$WORK/files_from_index.txt"
     FILES_SOURCE="front index (File $FRONT_INDEX)"
     learn_end
