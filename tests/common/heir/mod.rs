@@ -1168,6 +1168,20 @@ impl Running {
             .unwrap();
         assert!(st.success(), "kill -{sig}");
     }
+    /// Send `kill -SIG` to the script's whole process group, as a terminal
+    /// sends Ctrl-C (a run from [`Heir::spawn_group`] only: any other shares
+    /// the test's group).
+    pub fn signal_group(&self, sig: &str) {
+        let st = Command::new("kill")
+            .args([
+                format!("-{sig}"),
+                "--".into(),
+                format!("-{}", self.child.id()),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success(), "kill -{sig} -- -pgid");
+    }
     /// Wait for the end (at most 60 s) and return what it said.
     pub fn finish(&mut self) -> Out {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -1338,6 +1352,16 @@ impl Heir {
     /// Start the script with its standard input a pipe the test writes to;
     /// both its streams go to one file, so the order is the script's own.
     pub fn spawn(&self, args: &[&str], envs: &[(&str, &str)]) -> Running {
+        self.spawn_in(args, envs, false)
+    }
+
+    /// [`Heir::spawn`], the script the leader of a process group of its own,
+    /// as a shell's foreground job is (for [`Running::signal_group`]).
+    pub fn spawn_group(&self, args: &[&str], envs: &[(&str, &str)]) -> Running {
+        self.spawn_in(args, envs, true)
+    }
+
+    fn spawn_in(&self, args: &[&str], envs: &[(&str, &str)], group: bool) -> Running {
         let out_path = self.root.path().join("state/run.out");
         let out = fs::File::create(&out_path).unwrap();
         let mut c = Command::new("bash");
@@ -1355,6 +1379,9 @@ impl Heir {
             .stderr(Stdio::from(out));
         for (k, v) in envs {
             c.env(k, v);
+        }
+        if group {
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
         }
         fs::create_dir_all(self.root.path().join("tmp")).unwrap();
         let mut child = c.spawn().expect("spawn RESTORE.sh");

@@ -195,3 +195,156 @@ fn a_kill_while_the_check_runs_in_pieces_leaves_no_sha256sum_behind() {
         .collect();
     assert!(left.is_empty(), "{left:?}: {text}");
 }
+
+/// Every process of this run still alive (a zombie has no environment left
+/// to read), whatever its name.
+fn any_of_run(h: &Heir) -> Vec<(u32, String)> {
+    let mark = format!("FAKE_TAPE={}", h.root.path().join("state").display());
+    pids()
+        .into_iter()
+        .filter_map(|pid| {
+            let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+            if !env.split(|b| *b == 0).any(|v| v == mark.as_bytes()) {
+                return None;
+            }
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+            Some((pid, comm.trim().to_string()))
+        })
+        .collect()
+}
+
+/// A `chmod` that takes 3 s over the work directory, the cleanup's first
+/// step on it, and leaves `state/in-cleanup` when it begins: a second signal
+/// sent then lands in the cleanup.
+fn slow_cleanup(h: &Heir) {
+    let real = heir::host_tool("chmod").expect("chmod");
+    h.put_tool(
+        "chmod",
+        &format!(
+            "#!/bin/bash\n\
+             case \"$1 $2\" in \"-R u+rwx\") : >\"$FAKE_TAPE/in-cleanup\"; sleep 3 ;; esac\n\
+             exec \"{}\" \"$@\"\n",
+            real.display()
+        ),
+    );
+}
+
+/// The run's end (at most 30 s), its status and what it said.
+fn end_of(r: &mut heir::Running) -> (i32, String) {
+    let started = Instant::now();
+    loop {
+        if let Some(code) = r.try_wait() {
+            return (code, r.text());
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            let _ = r.child.kill();
+            panic!("the run did not end within 30 s: {}", r.text());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_file(h: &Heir, r: &heir::Running, name: &str) {
+    let until = Instant::now() + Duration::from_secs(60);
+    while !h.root.path().join("state").join(name).exists() {
+        assert!(Instant::now() < until, "no {name}: {}", r.text());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn work_dirs_in(dest: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dest)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tapectl-work"))
+        .collect()
+}
+
+/// #611 G2 (ADR-0012 item 313): a second signal during the cleanup does not
+/// stop it. Ctrl-C (INT) while a slice is read, then INT again while the
+/// cleanup removes the work directory (a `chmod` stand-in that takes 3 s),
+/// sent to the script and, separately, to its whole process group as a
+/// terminal sends it: the run ends with the first signal's status, the work
+/// directory (with the decrypted envelopes) is gone, and no process of the
+/// run is left. The cleanup ignores the three signals as its first act, and
+/// what it runs inherits that.
+#[test]
+fn a_second_ctrl_c_during_the_cleanup_does_not_stop_it() {
+    let t = Tape::build(&Shape::two());
+    let p = slice_pos(&t, UNIT_B, 2);
+    let slow = format!("{p}:30");
+    for group in [false, true] {
+        let h = Heir::of(&t);
+        slow_cleanup(&h);
+        let dest = h.dest("out");
+        let kb = h.key(Who::TenantB).to_string_lossy().into_owned();
+        let args = ["--restore", "--key", &kb, "--to", dest.to_str().unwrap()];
+        let envs = [("FAKE_DD_SLOW", slow.as_str())];
+        let mut r = if group {
+            h.spawn_group(&args, &envs)
+        } else {
+            h.spawn(&args, &envs)
+        };
+        let send = |r: &heir::Running, sig: &str| {
+            if group {
+                r.signal_group(sig)
+            } else {
+                r.signal(sig)
+            }
+        };
+        wait_for_file(&h, &r, "dd.slow");
+        // Positive control: the work directory holds the decrypted envelopes.
+        let w = work_dirs_in(&dest);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            std::fs::read_dir(dest.join(&w[0])).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("env.")),
+            "{}",
+            r.text()
+        );
+        send(&r, "INT");
+        wait_for_file(&h, &r, "in-cleanup");
+        send(&r, "INT");
+        let (code, text) = end_of(&mut r);
+        let what = format!("group {group}: {text}");
+        assert_eq!(code, 130, "{what}");
+        assert_eq!(work_dirs_in(&dest), Vec::<String>::new(), "{what}");
+        assert_eq!(any_of_run(&h), vec![], "{what}");
+    }
+}
+
+/// #611 G2: a TERM that lands as the cleanup after RESTORE COMPLETE runs
+/// (here, while its `chmod` stand-in takes 3 s), to the script or to its
+/// group, does not stop it: the run ends 0, as it said, with no work
+/// directory and no process of the run left.
+#[test]
+fn a_term_during_the_cleanup_after_restore_complete_does_not_stop_it() {
+    let t = Tape::build(&Shape::two());
+    for group in [false, true] {
+        let h = Heir::of(&t);
+        slow_cleanup(&h);
+        let dest = h.dest("out");
+        let kb = h.key(Who::TenantB).to_string_lossy().into_owned();
+        let args = ["--restore", "--key", &kb, "--to", dest.to_str().unwrap()];
+        let mut r = if group {
+            h.spawn_group(&args, &[])
+        } else {
+            h.spawn(&args, &[])
+        };
+        wait_for_file(&h, &r, "in-cleanup");
+        assert!(r.text().contains("RESTORE COMPLETE"), "{}", r.text());
+        if group {
+            r.signal_group("TERM");
+        } else {
+            r.signal("TERM");
+        }
+        let (code, text) = end_of(&mut r);
+        let what = format!("group {group}: {text}");
+        assert_eq!(code, 0, "{what}");
+        assert_eq!(work_dirs_in(&dest), Vec::<String>::new(), "{what}");
+        assert_eq!(any_of_run(&h), vec![], "{what}");
+    }
+}

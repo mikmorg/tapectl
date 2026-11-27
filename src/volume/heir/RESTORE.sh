@@ -166,6 +166,11 @@ say() { printf '%s\n' "$*"; }
 
 cleanup() {
   local rc=$?
+  # A second signal must not stop the cleanup halfway (the work directory,
+  # with the decrypted envelopes, left in --to): the three are ignored, not
+  # handled, so that what the cleanup runs (rm, chmod) ignores a terminal's
+  # Ctrl-C too. What runs already (a read ahead, tar) keeps its own.
+  trap '' INT HUP TERM
   trap - EXIT
   # Order: a read ahead is stopped, tar's input is closed and tar ends, a
   # member it had begun is removed (the member being fed when a signal came),
