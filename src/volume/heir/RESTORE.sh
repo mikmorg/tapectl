@@ -2583,19 +2583,41 @@ check_job() { # <destination> <pieces>
   wait
 }
 
-# check.fast cut into $2 contiguous pieces, checked at once, and their lines
-# joined in the pieces' order into check.out, as one sha256sum over the whole
-# list writes them. A piece is held to its own count: one whose sha256sum did
-# not print one line for each of its rows gives, for each, a line that is no
-# pass, so its rows are hashed alone and no other row's pairing moves. The job
+# check.fast dealt into $2 pieces, checked at once, and their lines joined
+# back in the rows' order into check.out, as one sha256sum over the whole
+# list writes them. Each row goes to the piece with the fewest bytes so far:
+# its size (check.size, the table's; one that is not all digits counts as 0)
+# plus 1, so that rows of no size spread too; a tie goes to the lowest
+# piece. A table in path order keeps big files together, so pieces cut by
+# row count could leave one of them nearly all the bytes. With $2 no more
+# than the rows every piece gets a row: a piece given nothing has load 0 and
+# each row dealt adds at least 1, so the first $2 rows go one to each.
+# check.piece names each row's piece, in order, and the join takes the next
+# line of the piece each row names. A piece is held to its own count: one
+# whose sha256sum did not print one line for each of its rows gives, for
+# each, a blank line, which is no pass, so its rows are hashed alone and no
+# other row's pairing moves. A piece's output missing or short at the join
+# ends it early, and file_check, counting check.out's lines, then hashes
+# every row alone. The reads of a piece that is not there are quiet. The job
 # runs in a process group of its own, as the read ahead's does, and its id is
 # kept in AHEAD_PID while it runs, so that the way out stops every piece
-# (ahead_kill). Returns 0 when every piece ended 0 and gave its count.
+# (ahead_kill). The piece files are removed once joined, so the split holds
+# no more room than the one check while the rest is hashed. Returns 0 when
+# every piece ended 0 and gave its count.
 check_split() { # <destination> <pieces>
   local n=$2 i rc given got frc=0
-  rm -f "$WORK"/check.fast.* "$WORK"/check.out.* "$WORK"/check.rc.*
-  CHECK_FAST="$WORK/check.fast" awk -v n="$n" -v rows="$(wc -l <"$WORK/check.fast" | tr -d ' ')" '
-    { print > (ENVIRON["CHECK_FAST"] "." (int((NR - 1) * n / rows) + 1)) }
+  rm -f "$WORK"/check.fast.* "$WORK"/check.out.* "$WORK"/check.rc.* "$WORK/check.piece"
+  CHECK="$WORK/check" awk -v n="$n" '
+    BEGIN { for (i = 1; i <= n; i++) load[i] = 0 }
+    {
+      s = 0
+      if ((getline s < (ENVIRON["CHECK"] ".size")) <= 0 || s !~ /^[0-9]+$/) s = 0
+      p = 1
+      for (i = 2; i <= n; i++) if (load[i] < load[p]) p = i
+      load[p] += s + 1
+      print > (ENVIRON["CHECK"] ".fast." p)
+      print p > (ENVIRON["CHECK"] ".piece")
+    }
   ' "$WORK/check.fast"
   set -m
   (check_job "$1" "$n") </dev/null >/dev/null 2>/dev/null 3<&- 4>&- &
@@ -2603,20 +2625,21 @@ check_split() { # <destination> <pieces>
   set +m
   wait "$AHEAD_PID" 2>/dev/null || true
   AHEAD_PID=""
-  : >"$WORK/check.out"
   for ((i = 1; i <= n; i++)); do
     rc=""
-    read -r rc <"$WORK/check.rc.$i" 2>/dev/null || true
+    { read -r rc <"$WORK/check.rc.$i"; } 2>/dev/null || true
     [ "$rc" = 0 ] || frc=1
-    given=$(wc -l <"$WORK/check.fast.$i" | tr -d ' ')
+    given=$({ wc -l <"$WORK/check.fast.$i"; } 2>/dev/null | tr -d ' ' || true)
     got=$({ wc -l <"$WORK/check.out.$i"; } 2>/dev/null | tr -d ' ' || true)
-    if [ "$got" = "$given" ]; then
-      cat "$WORK/check.out.$i" >>"$WORK/check.out"
-    else
+    if [ -z "$given" ] || [ "$got" != "$given" ]; then
       frc=1
-      awk '{ print "" }' "$WORK/check.fast.$i" >>"$WORK/check.out"
+      { awk '{ print "" }' "$WORK/check.fast.$i" >"$WORK/check.out.$i"; } 2>/dev/null || true
     fi
   done
+  CHECK="$WORK/check" awk '
+    { if ((getline line < (ENVIRON["CHECK"] ".out." $1)) > 0) print line; else exit }
+  ' "$WORK/check.piece" 2>/dev/null >"$WORK/check.out" || true
+  rm -f "$WORK"/check.fast.* "$WORK"/check.out.* "$WORK"/check.rc.* "$WORK/check.piece" "$WORK/check.size"
   return "$frc"
 }
 
@@ -2640,8 +2663,10 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
   # write to one fails (a full disk): a row lost from them is never hashed.
   # So the rows are counted through a pipe too, and the rows passed plus the
   # rows listed as failing must be that count (below); an awk that ends
-  # non-zero on the same failure is left to that count.
-  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") == 0 { print $6 "  ./" $7 }' "$table" >"$WORK/check.fast" || true
+  # non-zero on the same failure is left to that count. Each fast row's
+  # size goes to check.size, by which check_split deals the rows.
+  rm -f "$WORK/check.size"
+  CHECK="$WORK/check" awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") == 0 { print $6 "  ./" $7; print $5 > (ENVIRON["CHECK"] ".size") }' "$table" >"$WORK/check.fast" || true
   awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") > 0 { print $6 "\t" $7 }' "$table" >"$WORK/check.slow" || true
   CHECK_ROWS=$(awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ { n++ } END { print n + 0 }' "$table")
   if [ -s "$WORK/check.fast" ]; then

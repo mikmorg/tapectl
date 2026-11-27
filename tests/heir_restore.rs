@@ -7981,8 +7981,11 @@ fn a_backslash_in_to_or_work_is_a_directory_like_another_under_every_awk() {
 // ---- #611 C-4: the final check split across the machine's cores ----
 
 /// A tree of 40 files and its file table, for the check by itself: a file
-/// whose name holds a backslash (hashed alone, the slow path), files damaged in
-/// what is the first, a middle and the last of four pieces, and one missing.
+/// whose name holds a backslash (hashed alone, the slow path), three files
+/// damaged and one missing. Every 7th file from the first is 100 times its
+/// text, the others 1 to 3 times: dealt by size, the rows go to the pieces
+/// neither in runs nor in turn, and the three damaged ones (rows 1, 20 and
+/// 40) to three different pieces of four.
 fn check_tree(root: &Path) -> std::path::PathBuf {
     use sha2::{Digest, Sha256};
     let dest = root.join("dest");
@@ -8000,7 +8003,8 @@ fn check_tree(root: &Path) -> std::path::PathBuf {
             ),
             _ => (format!("f{i:02}.txt"), format!("f{i:02}.txt")),
         };
-        let bytes = format!("content {i}\n").repeat(i);
+        let times = if i % 7 == 1 { 100 } else { i % 3 + 1 };
+        let bytes = format!("content {i}\n").repeat(times);
         std::fs::write(dest.join(&on_disk), &bytes).unwrap();
         let sum: String = Sha256::digest(bytes.as_bytes())
             .iter()
@@ -8089,21 +8093,141 @@ fn file_check_run(
         .unwrap()
 }
 
-/// #611 C-4 (ADR-0012 item 313): the check cut into contiguous pieces, run at
-/// once, gives `check.out` and the list of failed paths BYTE FOR BYTE as the
-/// one `sha256sum -c` over the whole list does, on one damaged tree: failures
-/// in the first, a middle and the last piece, a missing file, a name hashed
-/// alone (a backslash) and names uutils would quote. A piece whose
-/// `sha256sum` printed one line short (a stand-in) has its rows hashed alone:
-/// the list is still the same, and no other piece's pairing moves.
+/// The fast rows of `table` (a path with no backslash), in order: the path
+/// as `sha256sum -c` is given it and the table's size field.
+fn fast_rows(table: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(table)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .filter(|f| !f[6].contains('\\'))
+        .map(|f| (format!("./{}", f[6]), f[4].to_string()))
+        .collect()
+}
+
+/// The split's rule, as the script is to deal (C-4b): each row to the piece
+/// with the fewest bytes so far, its size (0 unless all digits) plus 1, a
+/// tie to the lowest. The piece (from 1) of each row.
+fn dealt_by_rule(sizes: &[String], n: usize) -> Vec<usize> {
+    let mut load = vec![0f64; n];
+    sizes
+        .iter()
+        .map(|s| {
+            let size = if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+                s.parse::<f64>().unwrap()
+            } else {
+                0.0
+            };
+            let mut p = 0;
+            for i in 1..n {
+                if load[i] < load[p] {
+                    p = i;
+                }
+            }
+            load[p] += size + 1.0;
+            p + 1
+        })
+        .collect()
+}
+
+/// A bin directory with a `sha256sum` that keeps a copy of each list it
+/// checks in `<bin>/lists` (the pieces, as the job gave them) and, for the
+/// list `check.fast.<cut>`, prints its last line no more; `awk` as `awk_body`.
+fn recording_bin(
+    root: &Path,
+    name: &str,
+    awk_body: &str,
+    cut: Option<usize>,
+) -> std::path::PathBuf {
+    let real = heir::host_tool("sha256sum").expect("sha256sum");
+    let bin = root.join(name);
+    let lists = bin.join("lists");
+    std::fs::create_dir_all(&lists).unwrap();
+    let cut = cut.map_or("none".to_string(), |c| c.to_string());
+    for (tool, body) in [
+        (
+            "sha256sum",
+            format!(
+                "#!/bin/bash\nfor a; do last=$a; done\n\
+                 if [ \"${{1:-}}\" = -c ]; then cp \"$last\" {l}/; fi\n\
+                 case \"$1 $last\" in\n\
+                 \"-c \"*/check.fast.{cut}) : >{l}/cut; \"{r}\" \"$@\" | sed '$d'; exit \"${{PIPESTATUS[0]}}\" ;;\n\
+                 esac\nexec \"{r}\" \"$@\"\n",
+                l = lists.display(),
+                r = real.display()
+            ),
+        ),
+        ("awk", format!("#!/bin/sh\n{awk_body}")),
+    ] {
+        let p = bin.join(tool);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
+/// The piece (from 1) each fast row of `table` went to, read from the lists
+/// `recording_bin`'s `sha256sum` kept; the lists are removed after.
+fn dealt_by_script(bin: &Path, table: &Path) -> Vec<usize> {
+    let lists = bin.join("lists");
+    let mut at = std::collections::BTreeMap::new();
+    for e in std::fs::read_dir(&lists).unwrap() {
+        let p = e.unwrap().path();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        if let Some(k) = name.strip_prefix("check.fast.") {
+            let k: usize = k.parse().unwrap();
+            for l in std::fs::read_to_string(&p).unwrap().lines() {
+                at.insert(l.split_once("  ").unwrap().1.to_string(), k);
+            }
+        }
+        std::fs::remove_file(&p).unwrap();
+    }
+    fast_rows(table)
+        .iter()
+        .map(|(path, _)| *at.get(path).unwrap_or(&0))
+        .collect()
+}
+
+/// What the split leaves in the work directory `w` beside the one check's
+/// files: nothing (C-4b: its pieces are removed once joined).
+fn split_leftovers(w: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(w)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            n.starts_with("check.fast.")
+                || n.starts_with("check.out.")
+                || n.starts_with("check.rc.")
+                || n == "check.piece"
+                || n == "check.size"
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// #611 C-4 and C-4b (ADR-0012 item 313): the check dealt into pieces by
+/// size, run at once, gives `check.out` and the list of failed paths BYTE FOR
+/// BYTE as the one `sha256sum -c` over the whole list does, on one damaged
+/// tree: a missing file, a name hashed alone (a backslash), names uutils
+/// would quote, and three damaged files that the pieces' own lists show
+/// dealt to three different pieces of four, the dealing neither in runs nor
+/// in turn. A piece whose `sha256sum` printed one line short (a stand-in, on
+/// the piece of one damaged file) has its rows hashed alone: the list is
+/// still the same, and no other piece's pairing moves. No piece file is left.
 #[test]
 fn the_split_check_gives_the_one_checks_lines_and_list_byte_for_byte() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let table = check_tree(root);
-    let none = root.join("none");
-    std::fs::create_dir_all(&none).unwrap();
-    let one = run_file_check(root, &table, 1, "w1", &none);
+    let real_awk = format!(
+        "exec {} \"$@\"\n",
+        heir::host_tool("awk").unwrap().display()
+    );
+    let sizes: Vec<String> = fast_rows(&table).into_iter().map(|(_, s)| s).collect();
+    let bin = recording_bin(root, "rec", &real_awk, None);
+    let one = run_file_check(root, &table, 1, "w1", &bin);
     assert_eq!(one.trim(), "rows=40 failed=5", "{one}");
     let read = |w: &str, f: &str| std::fs::read(root.join(w).join(f)).unwrap();
     // The positive control: the single check's list is the damage made.
@@ -8111,18 +8235,33 @@ fn the_split_check_gives_the_one_checks_lines_and_list_byte_for_byte() {
         String::from_utf8(read("w1", "failed")).unwrap(),
         "back\\\\slash.txt\nf01.txt\nf20.txt\nf25.txt\nf40.txt\n"
     );
-    assert!(
-        !root.join("w1/check.fast.1").exists(),
+    assert_eq!(
+        dealt_by_script(&bin, &table),
+        vec![0; sizes.len()],
         "one piece is the single check"
     );
+    // The fast rows of f01, f20 and f40 (f15 is hashed alone).
+    let damaged = [0usize, 18, 38];
     for n in [2usize, 4, 8] {
         let w = format!("w{n}");
-        let got = run_file_check(root, &table, n, &w, &none);
+        let got = run_file_check(root, &table, n, &w, &bin);
         assert_eq!(got, one, "{n} pieces");
+        let dealt = dealt_by_script(&bin, &table);
+        assert_eq!(dealt, dealt_by_rule(&sizes, n), "{n} pieces: the dealing");
         assert!(
-            root.join(&w).join(format!("check.fast.{n}")).exists(),
-            "{n} pieces were cut"
+            dealt.windows(2).any(|p| p[1] < p[0]),
+            "{n} pieces: dealt in runs {dealt:?}"
         );
+        assert!(
+            dealt.iter().enumerate().any(|(k, p)| *p != k % n + 1),
+            "{n} pieces: dealt in turn {dealt:?}"
+        );
+        if n == 4 {
+            let mut d: Vec<usize> = damaged.iter().map(|k| dealt[*k]).collect();
+            d.sort_unstable();
+            d.dedup();
+            assert_eq!(d.len(), 3, "the damaged rows' pieces: {dealt:?}");
+        }
         assert_eq!(
             read(&w, "check.out"),
             read("w1", "check.out"),
@@ -8133,28 +8272,15 @@ fn the_split_check_gives_the_one_checks_lines_and_list_byte_for_byte() {
             read("w1", "failed"),
             "{n} pieces: the list"
         );
+        assert_eq!(
+            split_leftovers(&root.join(&w)),
+            Vec::<String>::new(),
+            "{n} pieces"
+        );
     }
-    // A piece cut short: piece 2's sha256sum prints its last line no more.
-    let real = heir::host_tool("sha256sum").expect("sha256sum");
-    let short = root.join("short");
-    std::fs::create_dir_all(&short).unwrap();
-    let stand_in = short.join("sha256sum");
-    std::fs::write(
-        &stand_in,
-        format!(
-            "#!/bin/bash\nfor a; do last=$a; done\n\
-             case \"$1 $last\" in\n\
-             \"-c \"*/check.fast.2) \"{r}\" \"$@\" | sed '$d'; exit \"${{PIPESTATUS[0]}}\" ;;\n\
-             esac\nexec \"{r}\" \"$@\"\n",
-            r = real.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(
-        &stand_in,
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .unwrap();
+    // A piece cut short, at four: the piece f20 is dealt to, a middle row.
+    let cut = dealt_by_rule(&sizes, 4)[damaged[1]];
+    let short = recording_bin(root, "short", &real_awk, Some(cut));
     let got = run_file_check(root, &table, 4, "wshort", &short);
     assert_eq!(got, one, "a piece cut short");
     assert_eq!(
@@ -8164,12 +8290,205 @@ fn the_split_check_gives_the_one_checks_lines_and_list_byte_for_byte() {
     );
     let lines = |w: &str, f: &str| read(w, f).split(|b| *b == b'\n').count();
     assert_eq!(lines("wshort", "check.out"), lines("w1", "check.out"));
-    // The positive control: the stand-in did cut piece 2 short.
-    assert_eq!(
-        lines("wshort", "check.out.2") + 1,
-        lines("wshort", "check.fast.2"),
-        "piece 2 was cut short"
+    // The positive control: the stand-in did cut that piece short.
+    assert!(short.join("lists/cut").exists(), "piece {cut} was not cut");
+    assert_eq!(split_leftovers(&root.join("wshort")), Vec::<String>::new());
+}
+
+/// #611 C-4b (ADR-0012 item 313): rows are dealt by the table's size. A
+/// table whose first four rows are 1,000 times the others' size puts those
+/// four in four different pieces, at four pieces and at eight (cut by row
+/// count, they were all in the first); a big row every 8th row spreads over
+/// all eight pieces at eight (dealt in turn, they would all be in one).
+#[test]
+fn the_split_check_deals_the_big_rows_over_the_pieces() {
+    use sha2::{Digest, Sha256};
+    let real_awk = format!(
+        "exec {} \"$@\"\n",
+        heir::host_tool("awk").unwrap().display()
     );
+    // (which of 64 rows are big (from 0), the piece counts, how many pieces
+    // the big rows must be in at n pieces).
+    type Case = (fn(usize) -> bool, &'static [usize], fn(usize) -> usize);
+    let cases: [Case; 2] = [(|k| k < 4, &[4, 8], |_| 4), (|k| k % 8 == 0, &[8], |n| n)];
+    let rows = 64;
+    for (big, counts, spread) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 1\n");
+        for k in 0..rows {
+            let bytes = if big(k) {
+                "b".repeat(10_000)
+            } else {
+                "s".repeat(10)
+            };
+            std::fs::write(dest.join(format!("r{k:03}")), &bytes).unwrap();
+            let sum: String = Sha256::digest(bytes.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            table.push_str(&format!("f\t1\t0\t1\t{}\t{sum}\tr{k:03}\t\n", bytes.len()));
+        }
+        let t = root.join("table.tsv");
+        std::fs::write(&t, table).unwrap();
+        let bin = recording_bin(root, "rec", &real_awk, None);
+        for n in counts {
+            let got = run_file_check(root, &t, *n, &format!("w{n}"), &bin);
+            assert_eq!(got.trim(), format!("rows={rows} failed=0"));
+            let dealt = dealt_by_script(&bin, &t);
+            let mut pieces: Vec<usize> = (0..rows).filter(|k| big(*k)).map(|k| dealt[k]).collect();
+            pieces.sort_unstable();
+            pieces.dedup();
+            assert_eq!(pieces.len(), spread(*n), "{n} pieces: {dealt:?}");
+        }
+    }
+}
+
+/// #611 C-4b (ADR-0012 item 313): a size field that is not all digits
+/// counts as 0 when the rows are dealt (mawk reads `nan` as a number, which
+/// no comparison orders): `nan`, `inf`, `1e999`, `-5`, empty, text and a
+/// number of 30 digits. Under every awk, the dealing is the rule's, and the
+/// split check gives the one check's lines and list byte for byte.
+#[test]
+fn hostile_size_fields_deal_as_no_size_and_give_the_one_checks_lines_under_every_awk() {
+    use sha2::{Digest, Sha256};
+    let hostile = ["nan", "inf", "1e999", "-5", "", "text", &"9".repeat(30)];
+    let mut ran = 0;
+    for (name, body) in awks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 1\n");
+        for k in 0..35usize {
+            let bytes = format!("content {k}\n");
+            let size = if k % 5 == 2 {
+                hostile[(k / 5) % hostile.len()].to_string()
+            } else {
+                ((k * 7919) % 1000).to_string()
+            };
+            let disk = if [0, 17, 34].contains(&k) {
+                "damaged\n"
+            } else {
+                bytes.as_str()
+            };
+            std::fs::write(dest.join(format!("f {k}.txt")), disk).unwrap();
+            let sum: String = Sha256::digest(bytes.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            table.push_str(&format!("f\t1\t0\t1\t{size}\t{sum}\tf {k}.txt\t\n"));
+        }
+        let t = root.join("table.tsv");
+        std::fs::write(&t, table).unwrap();
+        let sizes: Vec<String> = fast_rows(&t).into_iter().map(|(_, s)| s).collect();
+        assert!(sizes.iter().any(|s| s == "nan") && sizes.iter().any(|s| s.len() == 30));
+        let bin = recording_bin(root, "rec", &body, None);
+        let one = run_file_check(root, &t, 1, "w1", &bin);
+        assert_eq!(one.trim(), "rows=35 failed=3", "{name}");
+        let _ = dealt_by_script(&bin, &t);
+        let read = |w: &str, f: &str| std::fs::read(root.join(w).join(f)).unwrap();
+        for n in [2usize, 4, 8] {
+            let w = format!("w{n}");
+            let got = run_file_check(root, &t, n, &w, &bin);
+            assert_eq!(got, one, "{name} {n}");
+            assert_eq!(
+                dealt_by_script(&bin, &t),
+                dealt_by_rule(&sizes, n),
+                "{name} {n}: the dealing"
+            );
+            assert_eq!(read(&w, "check.out"), read("w1", "check.out"), "{name} {n}");
+            assert_eq!(read(&w, "failed"), read("w1", "failed"), "{name} {n}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
+/// #611 C-4b and G9 (ADR-0012 item 313): a piece file that is not there, or
+/// short, never gives a wrong verdict and never puts a raw bash or awk line
+/// before the heir. Three stand-ins under every awk, at four pieces: (a) a
+/// piece's list never written (the deal leaves it out, as a work directory
+/// with no room for a new file does): its rows are hashed alone; (b) the
+/// work directory full (`ulimit -f 0`) as a short piece's blank lines are
+/// written: that piece's output is short at the join, which ends early;
+/// (c) a piece's output removed as the join begins: the join ends early. In
+/// each, `file_check` (counting `check.out`'s lines) hashes the rows alone:
+/// the list is the one check's, and nothing is printed.
+#[test]
+fn a_piece_missing_or_short_at_the_join_gives_the_one_checks_list_and_no_raw_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let table = check_tree(root);
+    let sizes: Vec<String> = fast_rows(&table).into_iter().map(|(_, s)| s).collect();
+    let real_awk = format!(
+        "exec {} \"$@\"\n",
+        heir::host_tool("awk").unwrap().display()
+    );
+    let base = recording_bin(root, "base", &real_awk, None);
+    let one = run_file_check(root, &table, 1, "w1", &base);
+    let read = |w: &str, f: &str| std::fs::read(root.join(w).join(f)).unwrap();
+    // Piece 2 at four, by the rule (it holds rows: four pieces, 39 rows).
+    assert!(dealt_by_rule(&sizes, 4).contains(&2));
+    let mut ran = 0;
+    for (name, body) in awks() {
+        // The stand-in's words: what it does, by the program it is given.
+        let cases = [
+            (
+                "a",
+                "case \"$*\" in *'load[p]'*) awk_real \"$@\"; rc=$?; rm -f \"${CHECK:?}.fast.2\"; : >\"$MARK\"; exit $rc ;; esac",
+            ),
+            (
+                "b",
+                "case \"$*\" in *'{ print \"\" }'*) : >\"$MARK\"; ulimit -f 0 ;; esac",
+            ),
+            (
+                "c",
+                "case \"$*\" in *'getline line'*) rm -f \"${CHECK:?}.out.2\"; : >\"$MARK\" ;; esac",
+            ),
+        ];
+        for (case, words) in cases {
+            let what = format!("{name} ({case})");
+            let mark = root.join(format!("mark-{ran}-{case}"));
+            let awk = format!(
+                "awk_real() {{ {body}; }}\nMARK={m}\ntrap '' XFSZ\n{words}\nawk_real \"$@\"\n",
+                body = body.trim_end().replace("exec ", ""),
+                m = mark.display()
+            );
+            // (b) needs a piece whose sha256sum printed a line short.
+            let cut = (case == "b").then_some(2);
+            let bin = recording_bin(root, &format!("bin-{ran}-{case}"), &awk, cut);
+            let w = format!("w-{ran}-{case}");
+            let o = file_check_run(root, &table, 4, &w, &bin, "");
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.success(), "{what}: {err}");
+            assert_eq!(out, one, "{what}");
+            assert_eq!(err, "", "{what}: a raw line");
+            assert_eq!(read(&w, "failed"), read("w1", "failed"), "{what}");
+            // The positive control: the stand-in acted.
+            assert!(mark.exists(), "{what}: the stand-in did not act");
+            if case != "a" {
+                assert!(
+                    lines_of(&root.join(&w).join("check.out"))
+                        < lines_of(&root.join(&w).join("check.fast")),
+                    "{what}: the join did not end early"
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
+fn lines_of(p: &Path) -> usize {
+    std::fs::read(p)
+        .unwrap()
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count()
 }
 
 /// The count of pieces: the machine's cores, from `nproc`, or `getconf
