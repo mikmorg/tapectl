@@ -2779,3 +2779,110 @@ fn a_file_0_longer_than_16_mib_is_no_file_0_and_is_not_read_whole() {
     assert_eq!(from_map(&o.stdout), from_map(&good.stdout), "{}", o.all());
     every_read_of_file_is_capped(&h, 0, "a sound tape");
 }
+
+/// The two edits of a seal marker's claims a Layout 3 reader refuses: a
+/// feature it does not know, and another layout.
+const SEAL_CLAIMS: [(&str, &str, &str); 2] = [
+    ("FEATURE", "requires = []", "requires = [\"future-thing\"]"),
+    (
+        "LAYOUT4",
+        "\nlayout_version = 3\n",
+        "\nlayout_version = 4\n",
+    ),
+];
+
+/// F3 of the read of #611's fixes: the seal marker's claims are the fence
+/// where neither File 0 nor File 3 reads (`establish`'s fallback, the map
+/// the seal's own copy). A seal marker that names a feature this script does
+/// not know, or states another layout, is refused by name there too, and
+/// nothing is restored.
+#[test]
+fn with_file_0_and_file_3_unread_the_seal_markers_claims_still_refuse() {
+    let t = two();
+    let last = t.files.len() - 1;
+    for (name, from, to) in SEAL_CLAIMS {
+        let h = Heir::of(t);
+        fail_read(&h, 0);
+        fail_read(&h, 3);
+        let seal = text_of(t, last);
+        assert!(seal.contains(from), "{name}: {seal}");
+        h.replace(last, seal.replacen(from, to, 1).as_bytes());
+        let dest = h.dest("out");
+        for args in [
+            vec!["--info"],
+            vec![
+                "--restore",
+                "--key",
+                &key(&h, Who::TenantA),
+                "--to",
+                dstr(&dest),
+            ],
+        ] {
+            let o = h.run(&args);
+            assert_eq!(o.code, 1, "{name} {args:?}: {}", o.all());
+            assert!(o.stdout.is_empty(), "{name} {args:?}: {}", o.all());
+            let refusal = if name == "FEATURE" {
+                "FATAL: the seal marker requires feature(s) this RESTORE.sh does not know: future-thing."
+            } else {
+                "FATAL: the seal marker at the end of this tape states layout_version 4"
+            };
+            assert!(
+                o.stderr.contains(FILE0_WARNING)
+                    && o.stderr
+                        .contains("falling back to the seal marker's own copy of it")
+                    && o.stderr.contains(refusal),
+                "{name} {args:?}: {}",
+                o.stderr
+            );
+        }
+        assert!(heir::tree(&dest).is_empty(), "{name}: nothing was restored");
+    }
+}
+
+/// F3: the same fence at the prompt, for a cartridge whose File 0 and File 3
+/// both fail, so that it is judged by its seal marker's copy of the map
+/// alone. One whose seal marker names an unknown feature, or states another
+/// layout, is refused by name, the prompt asks again, and the sound
+/// cartridge is then taken.
+#[test]
+fn a_cartridge_judged_by_its_seal_marker_alone_is_fenced_by_its_claims() {
+    let t = span2();
+    let second = t[1].label.as_str();
+    let last = t[1].files.len() - 1;
+    let base = Heir::of_series(&[&t[0], &t[1]]);
+    let want_dest = base.dest("out");
+    let o = restore_span(&base, &want_dest, &[second]);
+    assert_eq!(o.code, 0, "{}", o.all());
+
+    let h = Heir::of_series(&[&t[0], &t[1]]);
+    for (cart, from, to) in SEAL_CLAIMS {
+        h.copy_cart(second, cart);
+        h.fail_file(cart, 0);
+        h.fail_file(cart, 3);
+        edit_cart_text(&h, cart, last, |s| {
+            assert!(s.contains(from), "{cart}: {s}");
+            s.replacen(from, to, 1)
+        });
+    }
+    let dest = h.dest("out");
+    let o = restore_span(&h, &dest, &["FEATURE", "LAYOUT4", second]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert_eq!(all.matches(heir::PROMPT).count(), 3, "{all}");
+    assert_eq!(
+        all.matches(
+            "the front index of this cartridge is unreadable: using the seal marker's copy of it"
+        )
+        .count(),
+        2,
+        "each refused cartridge is judged by its seal marker's copy: {all}"
+    );
+    assert!(
+        all.contains(
+            "NOTE: the seal marker requires feature(s) this RESTORE.sh does not know: future-thing."
+        ) && all.contains("NOTE: the seal marker at the end of this tape states layout_version 4")
+            && !all.contains("FATAL"),
+        "{all}"
+    );
+    assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
+}
