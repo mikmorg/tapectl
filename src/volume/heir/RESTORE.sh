@@ -3485,6 +3485,37 @@ do_repair() {
   restore_paths "$TO" repair
 }
 
+# A restore of several units makes each unit's directory under --to of its
+# name (DIR/UNIT), so the name is held to the rule tapectl names a unit by
+# (validate_unit_name): components between slashes, none empty and none
+# longer than 64 bytes, each of letters, digits, dots, underscores and dashes
+# and beginning with neither a dot nor a dash (so neither . nor ..), and the
+# whole at most 200 bytes. It is the name as bash holds it, the one that is
+# joined to --to (a NUL byte, which bash drops, is not in it). Returns 0, with
+# the rule the name breaks in REPLY, when it breaks one.
+NAME_REFUSED="" # the units a restore of several refused by their names
+unit_name_refused() { # <name>
+  local s=$1 seg
+  REPLY=""
+  if [ -z "$s" ]; then
+    REPLY="it is empty"
+  elif [ "${#s}" -gt 200 ]; then
+    REPLY="it is longer than 200 bytes"
+  fi
+  while [ -z "$REPLY" ]; do
+    seg=${s%%/*}
+    case $seg in
+    '') REPLY="it has an empty component" ;;
+    .* | -*) REPLY="a component of it begins with a dot or a dash" ;;
+    *[!A-Za-z0-9._-]*) REPLY="it holds a byte that is not a letter, a digit, a dot, an underscore, a dash or a slash" ;;
+    *) [ "${#seg}" -le 64 ] || REPLY="a component of it is longer than 64 bytes" ;;
+    esac
+    [ "$seg" != "$s" ] || break
+    s=${s#*/}
+  done
+  [ -n "$REPLY" ]
+}
+
 do_restore() {
   tar_init
   if [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; then
@@ -3516,6 +3547,7 @@ do_restore() {
     if [ "$n" -gt 1 ] && [ "$OVERWRITE" = 0 ]; then
       while IFS= read -r row; do
         IFS='|' read -r _ _ name _ <<<"$row"
+        ! unit_name_refused "$name" || continue
         dest="$TO/$name"
         if [ ! -f "$dest/.tapectl-damaged-files.txt" ] && [ -n "$(ls -A -- "$dest" 2>/dev/null)" ]; then
           die "$(safe_str "$dest") is not empty and holds no damaged-file list, so it is not an earlier run of this unit that stopped short. $(units_with_lists)Restore into an empty or new directory, or give --overwrite to replace files that are there."
@@ -3525,8 +3557,16 @@ do_restore() {
     # fd 3, so that nothing a unit's restore runs can read the list from stdin.
     while IFS= read -r row <&3; do
       IFS='|' read -r _ _ name _ <<<"$row"
-      if [ "$n" -eq 1 ]; then dest=$TO; else dest="$TO/$name"; fi
       [ "$QUIT" = 0 ] || break
+      if [ "$n" -eq 1 ]; then
+        dest=$TO
+      elif unit_name_refused "$name"; then
+        warn "unit $(safe_str "$name") is not restored: a restore of several units makes each one's directory under --to of its name, and this name is not one tapectl gives a unit ($REPLY), so its directory might not be under --to. The envelope is damaged, or was not made by tapectl. Nothing of this unit was written; to restore it alone, into a directory of its own: --unit NAME --to DIR."
+        NAME_REFUSED="${NAME_REFUSED:+$NAME_REFUSED, }$(safe_str "$name")"
+        continue
+      else
+        dest="$TO/$name"
+      fi
       restore_one "$row" "$dest"
     done 3<"$WORK/chosen.txt"
   fi
@@ -3538,6 +3578,9 @@ do_restore() {
   if [ -n "$TABLE_REFUSED" ]; then
     say "RESTORE INCOMPLETE: the file table of unit(s) $TABLE_REFUSED holds a path that would leave the destination or is not written as a path is written, so nothing of it was restored: restore it from another copy of this tape."
   fi
+  if [ -n "$NAME_REFUSED" ]; then
+    say "RESTORE INCOMPLETE: unit(s) $NAME_REFUSED have a name that is not one tapectl gives a unit, so nothing of them was restored under --to (see the WARNING): restore each alone, --unit NAME --to DIR."
+  fi
   if [ "$DAMAGED_TOTAL" -gt 0 ]; then
     say "RESTORE INCOMPLETE: $DAMAGED_TOTAL path(s) are damaged or left out; restore them from another copy (the list is the one repair: give it to --paths-from on a tape that holds the same version)."
     return 1
@@ -3546,7 +3589,7 @@ do_restore() {
     say "RESTORE INCOMPLETE: tar ended with a status other than 0, and --no-file-check runs no check to say what it restored. Run again without --no-file-check to learn which files are whole."
     return 1
   fi
-  [ -z "$TABLE_REFUSED" ] || return 1
+  [ -z "$TABLE_REFUSED" ] && [ -z "$NAME_REFUSED" ] || return 1
   if [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; then
     say "RESTORE COMPLETE: the named path(s) of unit $(safe_str "$U_NAME") are restored into $TO."
   else

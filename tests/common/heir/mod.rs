@@ -172,6 +172,9 @@ pub struct Shape {
     /// Edit each staging's file table (`tables/`) before the build, to give
     /// a tape a table no writer makes (a crafted envelope's).
     pub table_edit: Option<fn(&Path)>,
+    /// Edit each unit as the build is given it (its name in the manifest, for
+    /// one), to give a tape a manifest no writer makes (a crafted envelope's).
+    pub unit_edit: Option<fn(&mut build::BuildUnit)>,
 }
 
 /// A name holding a terminal escape sequence: ESC ] 0 ; ... BEL.
@@ -244,6 +247,7 @@ impl Shape {
             links: 0,
             control_names: false,
             table_edit: None,
+            unit_edit: None,
         }
     }
     /// One big unit of tenant A, compressed.
@@ -263,6 +267,7 @@ impl Shape {
             links: 0,
             control_names: false,
             table_edit: None,
+            unit_edit: None,
         }
     }
 }
@@ -494,10 +499,13 @@ fn write_tape(
     ctx: &Ctx,
     shape: &Shape,
     units: &[UnitTruth],
-    bu: Vec<build::BuildUnit>,
+    mut bu: Vec<build::BuildUnit>,
     n: usize,
     warn: Option<usize>,
 ) -> Tape {
+    if let Some(edit) = shape.unit_edit {
+        bu.iter_mut().for_each(edit);
+    }
     let label = label_of(n);
     let volume_uuid = volume_uuid_of(n);
     let ids: Vec<i64> = bu.iter().map(|u| u.stage_set_id).collect();

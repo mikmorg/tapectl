@@ -7320,3 +7320,164 @@ fn a_table_path_with_a_nul_byte_is_refused_under_every_awk() {
     }
     assert!(ran >= 3, "at least one awk ran each case");
 }
+
+// ---- #611 S-1: a unit's name joined to --to ----
+
+fn u_outside(u: &mut tapectl::volume::build::BuildUnit) {
+    if u.unit_name == UNIT_A {
+        u.unit_name = "../outside/planted".to_string();
+    }
+}
+fn u_inner(u: &mut tapectl::volume::build::BuildUnit) {
+    if u.unit_name == UNIT_A {
+        u.unit_name = "inner/../../outside".to_string();
+    }
+}
+
+/// #611 S-1 (ADR-0012 item 313): a restore of several units makes each one's
+/// directory of its name under `--to`, so a manifest whose unit name is not one
+/// tapectl gives a unit (here one with a `..` component, as only a crafted
+/// envelope has) has that unit refused by name before any directory is looked
+/// at or made: nothing of it is written, nothing beside `--to` is made, the
+/// other unit is restored, and the run ends RESTORE INCOMPLETE. The same unit
+/// restored alone goes into `--to` itself, where its name is no path.
+#[test]
+fn a_unit_name_that_is_not_a_unit_name_is_refused_before_its_directory_is_made() {
+    type UnitEdit = fn(&mut tapectl::volume::build::BuildUnit);
+    let cases: [(UnitEdit, &str); 2] = [
+        (u_outside, "../outside/planted"),
+        (u_inner, "inner/../../outside"),
+    ];
+    for (edit, bad) in cases {
+        let mut shape = Shape::two();
+        shape.unit_edit = Some(edit);
+        let t = Tape::build(&shape);
+        let h = Heir::of(&t);
+        let ke = key(&h, Who::Escrow);
+        let boxed = h.dest("box");
+        let to = boxed.join("to");
+        let o = h.run(&restore_all(&ke, &to));
+        let all = o.all();
+        assert_eq!(o.code, 1, "{bad}: {all}");
+        assert!(
+            o.stderr.contains(&format!(
+                "WARNING: unit {bad} is not restored: a restore of several units makes"
+            )) && o
+                .stderr
+                .contains("(a component of it begins with a dot or a dash)"),
+            "{bad}: {}",
+            o.stderr
+        );
+        assert!(
+            o.stdout.contains(&format!(
+                "RESTORE INCOMPLETE: unit(s) {bad} have a name that is not one tapectl gives a unit"
+            )),
+            "{bad}: {all}"
+        );
+        assert!(!o.stdout.contains("RESTORE COMPLETE"), "{bad}: {all}");
+        let mut beside: Vec<String> = std::fs::read_dir(&boxed)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        beside.sort();
+        assert_eq!(beside, ["to"], "{bad}: nothing made beside --to: {all}");
+        let mut under: Vec<String> = std::fs::read_dir(&to)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        under.sort();
+        assert_eq!(under, [UNIT_B], "{bad}: {all}");
+        assert_restored(&t, UNIT_B, &to.join(UNIT_B));
+        // Alone, the unit goes into --to itself: its name is no path there.
+        let alone = h.dest("alone");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ke,
+            "--unit",
+            bad,
+            "--to",
+            dest_str(&alone),
+        ]);
+        assert_eq!(o.code, 0, "{bad}: {}", o.all());
+        assert_restored(&t, UNIT_A, &alone);
+    }
+}
+
+/// The script's rule for a unit name (`unit_name_refused`) is tapectl's own
+/// (`naming::validate_unit_name`), name for name, on names each rule of it
+/// takes or refuses, run by bash under `LC_ALL=C` as the script runs.
+#[test]
+fn the_scripts_unit_name_rule_is_the_one_tapectl_names_a_unit_by() {
+    let text = tapectl::volume::heir::RESTORE_SH;
+    let start = text.find("\nunit_name_refused() {").expect("the function") + 1;
+    let end = text[start..].find("\n}\n").unwrap() + start + 3;
+    let func = &text[start..end];
+    let long = |n: usize| "a".repeat(n);
+    let names: Vec<String> = vec![
+        "photos".into(),
+        "tv/breaking-bad/s01".into(),
+        "media/movies/2019/the_film.4k".into(),
+        "7".into(),
+        "a.b-c_d".into(),
+        "x-".into(),
+        "x.".into(),
+        "".into(),
+        "/leading".into(),
+        "trailing/".into(),
+        "dou//ble".into(),
+        ".".into(),
+        "..".into(),
+        "../x".into(),
+        "a/../b".into(),
+        "a/./b".into(),
+        ".hidden".into(),
+        "a/.hidden".into(),
+        "-dash".into(),
+        "a/-dash".into(),
+        "has space".into(),
+        "back\\slash".into(),
+        "tab\there".into(),
+        "new\nline".into(),
+        "esc\u{1b}[0m".into(),
+        "caf\u{e9}".into(),
+        "pipe|x".into(),
+        "star*".into(),
+        long(64),
+        long(65),
+        format!("{}/{}/{}/{}", long(50), long(50), long(50), long(47)),
+        format!("{}/{}/{}/{}", long(50), long(50), long(50), long(48)),
+    ];
+    let mut script = format!("export LC_ALL=C\n{func}\n");
+    for n in &names {
+        script.push_str(&format!(
+            "if unit_name_refused {}; then echo refused; else echo taken; fi\n",
+            shell_quote(n)
+        ));
+    }
+    let o = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let got: Vec<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(got.len(), names.len());
+    for (n, g) in names.iter().zip(&got) {
+        let want = if tapectl::naming::validate_unit_name(n).is_ok() {
+            "taken"
+        } else {
+            "refused"
+        };
+        assert_eq!(g, want, "{n:?}");
+    }
+    assert!(got.iter().any(|g| g == "taken") && got.iter().any(|g| g == "refused"));
+}
+
+/// `s` as one word of a bash command line.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
