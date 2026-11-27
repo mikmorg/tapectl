@@ -4083,3 +4083,175 @@ move with it.
 
      Every verdict, its order and its words are kept, as are item 267 and the rule that no tape
      device is open at a prompt.
+
+## Amendment, 2026-11-26: the review's decisions before the tag
+
+The review of 2026-11-26 (`docs/audits/2026-11-26-pragmatic-design-and-defect-review.md`) ended
+in nine decisions for the CTO, RD-1 to RD-9. The CTO ruled each on 2026-11-26, by choosing among
+stated options. Each item below gives the option chosen in the CTO's words.
+
+313. **RESTORE.sh's pin moves once more before the tag** (RD-1: "Fix all before tag"), under
+     item 243's on-tape authorization, for the findings of #611 and for nothing else:
+     - the high: an unreadable File 0 is no longer a hard stop (DI-1);
+     - the mediums: DI-3, DI-4, D-1 and S-1;
+     - the lows: DI-9, S-5, D-3, D-4, D-5, D-6 and D-7.
+
+     Three readings the fixes rest on, the coordinator's, for the CTO to overrule:
+     - **DI-4 amends `volume-format-v3.md` §7.2, steps 3 and 4.** Where the tape's two ends
+       disagree, an envelope is no longer called damaged on File 3's word alone: one that
+       matches the seal's own copy of the map is given to `age`, which authenticates it. A
+       number read from a plain-text file is held to plain digits before it is used.
+       **The third form of DI-4 is dropped, by the CTO on 2026-11-27 ("Drop it.").** Letting
+       the manifest decide where a slice's line of File 3 differs would make two sentences of
+       File 1 false in that case, and File 1's pins do not move. Such a slice is left out and
+       its files are listed, as before.
+     - **DI-9 keeps the refusal.** A File 0 whose `magic` or `requires` names something this
+       script does not know is still refused (§1.2 rule 1; the 2026-10-06 item 15). What
+       changes is its words: they say what the seal marker states, where it differs, and they
+       no longer send the heir to the script already in hand. DI-1 keeps the fence too: with
+       File 0 unreadable, the seal's `requires` decides (§1.2 rule 2).
+     - **D-1 is fixed in the script only.** tapectl's own check accepts a NUL in a path too,
+       but hands the name whole to the system, which refuses it. Its refusal by name is 2.0.1's
+       (item 314).
+     - **DI-1 reaches further than `bootstrap`.** With an unreadable File 0 no longer a stop,
+       what File 0 used to give must come from elsewhere, so the same fix covers: the seal
+       marker's `layout_version` deciding when File 0 states none (§1.2 rule 2); the plan's
+       file count taken from the front index, so a short seal is not called complete; a
+       cartridge at the prompt judged by its front index and seal when its File 0 does not
+       read, and never taken for the one already in the drive because both File 0s fail; and
+       `--verify` on an unsealed tape going on past an unreadable File 0.
+
+     With them, by the CTO's choice ("Include it"), the final per-file check is split across
+     the machine's cores (C-4). The pin moves in a commit of its own, and the hash it moves to
+     is added to this item when it is known.
+
+     **The hash it moved to:** `588764052013e84989f80fd56965250c34f407c8e03a003d9bc8e3a6363a19eb`
+     (4,562 lines), in five commits that each change that one constant (`e3d94879`,
+     `d901aed2`, `a93f85f1`, `4d5ec342`, `fe7924e8`): the fixes, a follow-up to D-4, and the
+     fixes of three independent reads.
+
+     **What the independent reads added.** The go asks for an independent read of the fix's
+     own diff. Each round of fixes got one, by an agent that had not written the lines it
+     read. The first four each found something in the lines read, and those were fixed in a
+     later pin move or recorded on #611; the outcome of the fifth, which read the last
+     round's one fix alone, is in the run record of the landing. Further readings of the coordinator's, for the CTO to
+     overrule:
+     - **Three defects older than the fixes are fixed with them.** The second read found
+       them beside the lines it read. They are not on #611's first list. "Fix all before
+       tag" is read to cover them: a tape's script cannot be patched once written.
+       - A file-table row with an empty field among its first seven is refused, and its
+         eighth field, when not empty, is held to the path rule whatever the row's kind.
+         Before, the script's two readers split such a row differently, and a crafted
+         envelope could have a file outside `--to` removed. `volume-format-v3.md` §1.6 now
+         states that a writer writes no such row.
+       - The final per-file check ends the run, naming the work directory, when the number
+         of files it passed and listed as failing is not the number the table gives.
+         Before, an awk that reports no write error (BusyBox) could lose rows of the
+         check's lists in a full work directory, and a damaged file was then reported whole.
+       - The cleanup ignores a second INT, HUP or TERM. Before, a second Ctrl-C left the
+         work directory, with the decrypted envelopes, in `--to`, which File 1 says does
+         not happen. The price: the cleanup's own waits end only by themselves or by KILL.
+         The fourth read rated that price a medium fault and found no state in which a
+         wait does not end. **Ruled:** told of it, the CTO kept the cleanup as it is
+         (2026-11-27, "Flow with both recommendations").
+     - **The final per-file check reads no list that it did not make in the same call.** The
+       fourth read found that a unit could be judged by the lists the unit before it left in
+       the work directory, where the open of its own failed (a work directory that stops
+       taking writes during a run): with as many rows in the two units, a damaged file was
+       reported whole. The candidate before this item had the narrow form of it (the output
+       of `sha256sum` alone); the count's fix above had widened it to the lists of rows.
+       **Ruled:** told of it, the CTO chose one more round of fix and read before the landing
+       (the same answer). The check now removes every list of its own first, ends the run
+       when one cannot be removed or made, and ends it where an awk ends non-zero on a list.
+     - **One fixture of the write path's tests is changed on this branch**, which item 314's
+       letter does not name. `budget()`, in the tests of `src/volume/write.rs`, set a fill
+       ceiling by a division, and the budget made from it came to the figure asked or to one
+       byte under it, by the size of the volume's own files. File 2 is 50 blocks of 4 KiB
+       where it was 49, and a test that holds the budget to the figure then failed in most
+       runs. The fixture now sets the ceiling that gives the figure itself. No line of
+       tapectl outside its tests changes.
+     - **The split check deals its rows by size**, each to the piece that has the fewest
+       bytes so far. As first written it cut the list into runs of equal row count; the
+       file table is in path order, so one piece got nearly all the bytes of a tree whose
+       large files are neighbours. Measured on the build host (16 cores, where the
+       processor is the limit): 8 GiB with four 1 GiB files first, 63 s in one piece, 57 s in eight
+       runs, 10 s in eight pieces by size. A destination limited by one disk is not
+       measured, nor is home2; a one-against-many timing on home2 is owed before the tag.
+     - **The piece count comes from the machine alone** (`nproc`, else `getconf`, at most
+       eight). The variable the first form read in its place is removed, by item 318: File
+       2 gains no new input.
+     - **File 0 and the front index are read no further than 16 MiB.** A File 0 longer
+       than that is a damaged File 0, warned about and passed over (§1.2 rule 2), and never
+       a hard stop. A longer front index is not consistent.
+     - **A seal marker that keeps its parse rules and states another layout is refused
+       whatever File 0 states** (§1.2 rule 1). The refusal before the seal is validated
+       stays, for a damaged seal that states another layout where File 0 states none, or
+       names an unknown feature.
+     - **With File 0 giving no label, `--info` prints the front index's, else the seal's,
+       and says which.** That label identifies no cartridge: the prompt's rule is unchanged.
+
+     Left as found, by the same readings, each recorded on #611: wordings, branches no test
+     can fail, and a fault of bash 5.2 itself (a signal that lands inside a command
+     substitution can end the run with status 2; the cleanup still runs whole).
+
+     **The go** ("Build, prove, land"): the coordinator builds the branch and proves it, lands
+     it on `master`, runs the whole chain on the new commit and writes its record. The proof is
+     a failing test first for each fix, the u26 container as uid 1000, the gate's heir legs, a
+     pull request's CI and an independent read of the fix's own diff. The tag stays Stage 7's
+     first step, the CTO's and the operator's.
+
+314. **The branch of item 313 holds RESTORE.sh, its tests and its pin, and nothing else of
+     tapectl** ("All in 2.0.1"). Every change this amendment makes to tapectl itself is built
+     in 2.0.1:
+     - the seven mediums of the review (RD-2: A-1, A-2 with LC-1, A-3, S-2, DI-2, DI-5, DI-8).
+       The coordinator had recommended three of them before the tag; the CTO chose all in 2.0.1;
+     - items 315, 316 and 320, and the second half of item 317.
+
+315. **Item 310's count leaves out released versions** (RD-3: "Yes, in 2.0.1"). This amends item
+     310: Tier 3 holds whenever no version *that is still in service* has a copy on a tape that
+     counts. A copy of a `reclaimable` or `purged` version is not a copy for this refusal, as it
+     is not for any other floor.
+
+316. **The erase says what it would cost, and a retirement can be taken back** (RD-4; all three
+     chosen). These amend the 2026-10-12 item 51 and item 216:
+     - `cartridge erase` of a given-up volume shows, before the typed label, each version on
+       the tape that has no other copy now;
+     - where the catalog does not hold a sealed tape's volume, the text says so in those words
+       and names `catalog rebuild --from-volume`, as does `db import`'s closing line;
+     - a new command returns a `volume retire`d volume to service while its cartridge is not
+       yet erased.
+
+317. **The heir's script is made repairable** (RD-5: "Test now, kit in 2.0.1").
+     - Now, first on the branch of item 313: a test that the tree's RESTORE.sh restores the
+       recorded tape, whose own script is an older one. From then on every RESTORE.sh must read
+       every older Layout 3 tape, which is what File 1 already tells the heir.
+     - In 2.0.1: the Heir Kit carries the current RESTORE.sh beside tapectl. This amends
+       ADR-0009's list of the kit's contents.
+
+318. **A rule on what may enter File 2** (RD-6: "Rule now, keep read-ahead"). From the commit
+     item 313's pin moves to:
+     - RESTORE.sh gains no new mode;
+     - a new capability for the heir goes into File 1's text, the envelope, or the kit's tapectl.
+
+     The read-ahead of item 309 stays.
+
+     Coordinator's reading, for the CTO to overrule: "no new mode" covers a new option too; a
+     fix may add lines; and a fix that adds a mechanism (a background job, a new external
+     tool) is asked of the CTO as its own item, as item 313's split check was.
+
+319. **A feature freeze from the tag** (RD-7: "Freeze at the tag"). After `v2.0.0`, no new
+     capability is built without a ruling that names the unit, the collection or the decision
+     that needs it. Three kinds of work stay open: defects, security, and the heir's path.
+     Work that makes an existing capability faster (#601) is not a new capability. The order
+     after the tag: 2.0.1 (item 314), then the destructive commands moved into one library
+     module with one shape (the review's R3), then gathering records on ADR-0014's pattern
+     (R4).
+
+320. **`tapectl setup --yes` mints no escrow identity without being told to** (RD-9: "Require a
+     flag"). This amends item 188: unattended, `setup` refuses to mint the permanent escrow
+     identity unless a flag asks for it, as `first-run.sh --auto` does without `--mint-escrow`.
+     In 2.0.1.
+
+321. **Item 289 stands for 2.0.0** (RD-8: "Keep for 2.0.0"). The queue is filled to the early
+     warning, and a unit lies across the end of a full tape. The review named what that asks
+     of the heir; nothing changes.

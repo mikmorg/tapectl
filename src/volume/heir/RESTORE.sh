@@ -166,6 +166,11 @@ say() { printf '%s\n' "$*"; }
 
 cleanup() {
   local rc=$?
+  # A second signal must not stop the cleanup halfway (the work directory,
+  # with the decrypted envelopes, left in --to): the three are ignored, not
+  # handled, so that what the cleanup runs (rm, chmod) ignores a terminal's
+  # Ctrl-C too. What runs already (a read ahead, tar) keeps its own.
+  trap '' INT HUP TERM
   trap - EXIT
   # Order: a read ahead is stopped, tar's input is closed and tar ends, a
   # member it had begun is removed (the member being fed when a signal came),
@@ -180,21 +185,41 @@ cleanup() {
     # INSIDE the work directory (nothing is written outside it: #561, item
     # 271) and held open on fd 8 while the directory is removed; touch then
     # reads it through /proc/self/fd/8, as the last step, to the nanosecond.
-    local held=0
+    # The work directory is removed whether or not the time can be kept, and
+    # when it is not kept a NOTE says why (lost).
+    local held=0 lost=""
     chmod -R u+rwx "$WORK" 2>/dev/null || true
-    if [ -n "$WORK_MADE_IN" ] && [ -d "$WORK_MADE_IN" ] && [ -d /proc/self/fd ] &&
-      touch -r "$WORK_MADE_IN" "$WORK/.mtime.ref" 2>/dev/null &&
-      { exec 8<"$WORK/.mtime.ref"; } 2>/dev/null; then
-      held=1
+    if [ -n "$WORK_MADE_IN" ] && [ -d "$WORK_MADE_IN" ]; then
+      if [ ! -d /proc/self/fd ]; then
+        lost="there is no /proc/self/fd here to keep it by"
+      elif touch -r "$WORK_MADE_IN" "$WORK/.mtime.ref" 2>/dev/null &&
+        { exec 8<"$WORK/.mtime.ref"; } 2>/dev/null; then
+        held=1
+      else
+        lost="the file that keeps it could not be made in the work directory"
+      fi
     fi
     if ! rm -rf "$WORK" 2>/dev/null; then
       # The restored root may have been given a mode that forbids it.
       chmod u+w "$WORK_MADE_IN" 2>/dev/null || true
-      rm -rf "$WORK" 2>/dev/null || warn "could not remove the work directory $WORK"
+      if ! rm -rf "$WORK" 2>/dev/null && [ "$held" = 1 ]; then
+        # A file held open is not removed on some file systems (an NFS client
+        # keeps it as .nfsXXXX in its directory until it is closed): it is let
+        # go, and the directory removed without it.
+        exec 8<&-
+        held=0
+        lost="the work directory could not be removed while the file that keeps it was open (a network file system?)"
+      fi
+      [ ! -d "$WORK" ] || rm -rf "$WORK" 2>/dev/null || warn "could not remove the work directory $WORK"
     fi
     if [ "$held" = 1 ]; then
-      touch -r /proc/self/fd/8 "$WORK_MADE_IN" 2>/dev/null || true
+      touch -r /proc/self/fd/8 "$WORK_MADE_IN" 2>/dev/null || lost="touch could not set it"
       exec 8<&-
+    fi
+    # Said where the work directory was in --to, whose time is the unit root's,
+    # and was removed: one that could not be removed changed nothing of it.
+    if [ -n "$lost" ] && [ "$MODE" = restore ] && [ "$WORK_MADE_IN" = "$TO" ] && [ ! -d "$WORK" ]; then
+      note "the work directory's removal changed the modification time of $TO, and it is not set back: $lost."
     fi
   fi
   exit "$rc"
@@ -220,6 +245,15 @@ removed_option() {
 }
 
 is_uint() { case ${1:-} in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
+
+# A number off a plain-text file of the tape (File 0, the front index), before
+# it is bash's arithmetic or head's argument: decimal digits, at most 18 (no
+# overflow), left in REPLY read as base 10, so that a leading zero is never
+# octal. Returns 1 for anything else: a damaged line.
+tape_uint() { # <text>
+  is_uint "${1:-}" && [ "${#1}" -le 18 ] || return 1
+  REPLY=$((10#$1))
+}
 
 # Text that came off a tape, made safe to show.
 safe_str() { printf '%s' "${1:0:120}" | tr -c 'A-Za-z0-9 ._/:=,+-' '?'; }
@@ -565,10 +599,11 @@ dd_detail() { # [file of dd's words]
 }
 
 # Read tape file $1 into file $2, at most $3 bytes of it (all of it when $3 is
-# empty). Returns 1 when the tape cannot give it. A work directory that
-# cannot take it ends the run, saying that.
-fetch() { # <tape file> <out> [<bytes>]
-  local pos=$1 out=$2 size=${3:-} msg="" rc=0
+# empty), or, with $3 empty, no more than $4 blocks of it: dd stops there and
+# reads no further. Returns 1 when the tape cannot give it. A work directory
+# that cannot take it ends the run, saying that.
+fetch() { # <tape file> <out> [<bytes>] [<blocks>]
+  local pos=$1 out=$2 size=${3:-} blocks=${4:-} msg="" rc=0
   seek_to "$pos" || return 1
   CUR=""
   if [ -n "$size" ]; then
@@ -577,7 +612,7 @@ fetch() { # <tape file> <out> [<bytes>]
       cat >/dev/null
     }; } 2>&1) || rc=$?
   else
-    msg=$({ dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | cat >"$out"; } 2>&1) || rc=$?
+    msg=$({ dd if="$DEVICE" bs="$BLOCK" ${blocks:+"count=$blocks"} 2>"$WORK/dd.err" | cat >"$out"; } 2>&1) || rc=$?
   fi
   # The copy is written by head, whose status the group's last command (cat)
   # hides: what head said is read from its words.
@@ -589,7 +624,21 @@ fetch() { # <tape file> <out> [<bytes>]
     return 1
   fi
   [ -s "$out" ] || return 1
+  # A read cut at its count may have stopped inside the file: the head's
+  # place is not known. A shorter file was read whole, filemark and all.
+  if [ -n "$blocks" ] && [ "$(($(wc -c <"$out")))" -ge $((blocks * BLOCK)) ]; then return 0; fi
   CUR=$((pos + 1))
+}
+
+# File 0 and the front index are read no further than 16 MiB, as tapectl's own
+# reader holds them (SMALL_FILE_CAP): a longer file is neither, and only one
+# block past that is read, to know it. 0: read into $2; 1: not read; 2: longer.
+SMALL_MAX_BLOCKS=32
+SMALL_MAX_BYTES=$((SMALL_MAX_BLOCKS * BLOCK))
+fetch_small() { # <tape file> <out>
+  fetch "$1" "$2" "" $((SMALL_MAX_BLOCKS + 1)) || return 1
+  [ "$(($(wc -c <"$2")))" -gt "$SMALL_MAX_BYTES" ] || return 0
+  return 2
 }
 
 # Read tape file $1 into file $2, its first $3 bytes, as fetch does, and hash
@@ -890,11 +939,12 @@ END { if (p != "") print p "|" t "|" s "|" h }
 
 # A front index (or the seal's copy of it) is a total, ordered map: positions
 # 0, 1, 2 ... with no gap, one front_index entry at 3, one seal_marker entry
-# and it last, and (when given) exactly `total` entries.
+# and it last, and (when given) exactly `total` entries. A position is written
+# as a plain decimal number, with no leading zero: bash would read one as octal.
 AWK_CONSISTENT='
 BEGIN { FS = "|" }
 {
-  if ($1 !~ /^[0-9][0-9]*$/) bad = "a position is not a non-negative integer"
+  if ($1 !~ /^(0|[1-9][0-9]*)$/) bad = "a position is not a non-negative integer, written plainly"
   else if (($1 + 0) != NR - 1) bad = "positions are not contiguous from 0"
   if (($2 "") == "front_index") { fi++; if (($1 + 0) != 3) bad = "the front_index entry is not at position 3" }
   if (($2 "") == "seal_marker") { sm++; smrow = NR }
@@ -919,13 +969,34 @@ file_hash_at() { file_field 4 "$1" "$2"; }
 
 LABEL="" UUID="" TOTAL_FILES="" FRONT_INDEX=3 SEAL_MARKER="" TAPECTL_VERSION="" MEDIA_TYPE="" CREATED_AT=""
 FILES_TXT="" FILES_SOURCE=""
+# The seal marker's own copy of the map, where File 3 reads and the two ends of
+# the tape disagree (learn_end): neither vouches for the other, so an envelope
+# is looked for through both (volume-format-v3.md 7.2 steps 3 and 4).
+ALT_TXT=""
 ENDED_AFTER="" SEAL_STATE="" SEAL_BINDS="" SEAL_FILE_COUNT="" SEAL_SEALED_AT=""
 FRONT_INDEX_HASH=""
+LABEL_FROM="" # where the label came from, when File 0 gave none (label_from_map)
+
+# The way on from a refusal on File 0's word. The refusal stays (volume-
+# format-v3.md 1.2 rule 1); its words are $1 unless the seal marker reads and
+# states Layout 3 and no feature. Then File 0 may be the damaged one, and the
+# RESTORE.sh in this tape's File 2 is this same script: the words say what the
+# seal states and point to File 1's steps by hand (ADR-0012 item 313).
+file0_way_on() { # <the way on otherwise>
+  local lv=""
+  if read_seal; then lv=$(toml_val "$WORK/seal.toml" layout_version || true); fi
+  if [ "$lv" = 3 ] && [ -z "$(requires_of "$WORK/seal.toml" || true)" ]; then
+    printf '%s' "But the seal marker at the end of this tape states layout_version = 3 and requires no feature, which is what this script reads: File 0 may be damaged. This script refuses on File 0's word all the same, and so does the RESTORE.sh in this tape's File 2 if it is this script.
+       Restore by hand, by the steps of File 1: mt -f $DEVICE rewind; mt -f $DEVICE fsf 1; dd if=$DEVICE bs=512k | tr -d '\\0' | less"
+  else
+    printf '%s' "$1"
+  fi
+}
 
 die_other_layout() { # <magic> <layout_version>
   die "this is a tapectl volume of Layout $(safe_str "${2:-unknown}") (magic $(safe_str "${1:-none}")), label $(safe_str "$LABEL"). This RESTORE.sh reads Layout 3 only.
-       Read it with the tapectl that wrote it, or with the RESTORE.sh in its own File 2:
-         mt -f $DEVICE rewind; mt -f $DEVICE fsf 2; dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE-OLD.sh"
+       $(file0_way_on "Read it with the tapectl that wrote it, or with the RESTORE.sh in its own File 2:
+         mt -f $DEVICE rewind; mt -f $DEVICE fsf 2; dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE-OLD.sh")"
 }
 
 # $1 is a TOML text with a `requires` list; the feature names it holds.
@@ -938,27 +1009,65 @@ requires_of() {
 # A feature this script does not know is refused by name; this script knows
 # none (Layout 3's `requires` is empty on every tape).
 check_requires() { # <what> <file>
-  local feats
+  local feats way="Use a newer tapectl, the tapectl that wrote this tape, or the RESTORE.sh in this tape's own File 2."
   feats=$(requires_of "$2")
-  [ -z "$feats" ] ||
-    die "$1 requires feature(s) this RESTORE.sh does not know: $(safe_str "$feats").
-       Use a newer tapectl, the tapectl that wrote this tape, or the RESTORE.sh in this tape's own File 2."
+  [ -n "$feats" ] || return 0
+  [ "$1" != "File 0" ] || way=$(file0_way_on "$way")
+  die "$1 requires feature(s) this RESTORE.sh does not know: $(safe_str "$feats").
+       $way"
 }
+
+# The seal marker's own claims. A layout_version other than 3 is another
+# layout, refused by name (volume-format-v3.md 1.2 rule 1). Where File 0
+# states no magic or no layout_version (it is damaged, or did not read), the
+# seal's decides in its place (rule 2), whether the seal keeps its parse rules
+# or not. Where File 0 states Layout 3, a seal that keeps them ($1 is valid:
+# seal_valid passed) is refused all the same; one that does not is no seal,
+# and states nothing. Then the seal's `requires`, whatever File 0 states.
+check_seal_claims() { # [valid]
+  local lv
+  lv=$(toml_val "$WORK/seal.toml" layout_version)
+  if [ -n "$lv" ] && [ "$lv" != 3 ]; then
+    if [ -z "$(toml_val "$WORK/file0.txt" magic)" ] || [ -z "$(toml_val "$WORK/file0.txt" layout_version)" ]; then
+      die "the seal marker at the end of this tape states layout_version $(safe_str "$lv"), and File 0 states no magic or no layout_version: this is read as a tapectl volume of Layout $(safe_str "$lv"). This RESTORE.sh reads Layout 3 only.
+       Read it with the tapectl that wrote it, or with the RESTORE.sh in its own File 2:
+         mt -f $DEVICE rewind; mt -f $DEVICE fsf 2; dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE-OLD.sh"
+    elif [ "${1:-}" = valid ]; then
+      die "the seal marker at the end of this tape states layout_version $(safe_str "$lv"), and File 0 states Layout 3: the two ends of the tape disagree. This RESTORE.sh refuses a tape whose seal marker states another layout, and reads Layout 3 only.
+       If it is a tapectl volume of Layout $(safe_str "$lv"), read it with the tapectl that wrote it. If the seal marker is the damaged file, restore by hand, by the steps of File 1: mt -f $DEVICE rewind; mt -f $DEVICE fsf 1; dd if=$DEVICE bs=512k | tr -d '\\0' | less"
+    fi
+  fi
+  check_requires "the seal marker" "$WORK/seal.toml"
+}
+
+# 1 when File 0 gave nothing (a read error, or no bytes) or more than a File 0
+# can be (fetch_small). Nothing it states is
+# needed to restore, so that is a damaged File 0 and never a hard stop
+# (volume-format-v3.md 1.2 rule 2): the run goes on with no File 0 facts, as
+# for a File 0 that reads and states nothing. Whether a cartridge is loaded at
+# all is asked only when nothing after it reads either (establish).
+FILE0_UNREAD=0
 
 bootstrap() {
   tape_init
-  if ! fetch 0 "$WORK/file0.raw"; then
-    die "cannot read File 0 from $DEVICE: is a cartridge loaded and is $DEVICE the right drive? ($(dd_detail))"
+  local magic lv why got=0
+  fetch_small 0 "$WORK/file0.raw" || got=$?
+  if [ "$got" != 0 ]; then
+    FILE0_UNREAD=1
+    : >"$WORK/file0.raw"
+    why=$(dd_detail)
+    why="cannot be read from $DEVICE${why:+ ($why)}"
+    [ "$got" = 1 ] || why="on $DEVICE is longer than 16 MiB, more than a tapectl File 0 can be: no more of it is read"
+    warn "File 0 $why. Going on without it, as for a damaged File 0: this is read as a Layout 3 tape, and if a seal marker reads, its own claims decide."
   fi
   tr -d '\0' <"$WORK/file0.raw" >"$WORK/file0.txt"
-  local magic lv
   magic=$(toml_val "$WORK/file0.txt" magic)
   lv=$(toml_val "$WORK/file0.txt" layout_version)
   LABEL=$(toml_val "$WORK/file0.txt" label)
   if [ -n "$magic" ] && [ "$magic" != tapectl-volume-v3 ]; then die_other_layout "$magic" "$lv"; fi
   if [ -n "$lv" ] && [ "$lv" != 3 ]; then die_other_layout "$magic" "$lv"; fi
-  if [ -z "$magic" ] || [ -z "$lv" ]; then
-    warn "File 0 states no magic or no layout_version (a damaged File 0?). Going on as a Layout 3 tape; the seal marker's own claims decide."
+  if [ "$FILE0_UNREAD" = 0 ] && { [ -z "$magic" ] || [ -z "$lv" ]; }; then
+    warn "File 0 states no magic or no layout_version (a damaged File 0?). Going on as a Layout 3 tape; if a seal marker reads, its own claims decide."
   fi
   check_requires "File 0" "$WORK/file0.txt"
   file0_fields
@@ -974,14 +1083,17 @@ file0_fields() {
   FRONT_INDEX=$(toml_val "$WORK/file0.txt" front_index)
   SEAL_MARKER=$(toml_val "$WORK/file0.txt" seal_marker)
   TOTAL_FILES=$(toml_val "$WORK/file0.txt" total_files)
-  is_uint "$FRONT_INDEX" || FRONT_INDEX=3
-  is_uint "$SEAL_MARKER" || SEAL_MARKER=""
-  is_uint "$TOTAL_FILES" || TOTAL_FILES=""
+  if tape_uint "$FRONT_INDEX"; then FRONT_INDEX=$REPLY; else FRONT_INDEX=3; fi
+  if tape_uint "$SEAL_MARKER"; then SEAL_MARKER=$REPLY; else SEAL_MARKER=""; fi
+  if tape_uint "$TOTAL_FILES"; then TOTAL_FILES=$REPLY; else TOTAL_FILES=""; fi
 }
 
 # Rung 1: File 3. Leaves the parsed map in $WORK/files_from_index.txt.
 try_front_index() {
-  fetch "$FRONT_INDEX" "$WORK/front_index.raw" || return 1
+  local got=0
+  fetch_small "$FRONT_INDEX" "$WORK/front_index.raw" || got=$?
+  [ "$got" != 2 ] || note "the front index is not consistent: tape file $FRONT_INDEX is longer than 16 MiB, more than a tapectl front index can be, and no more of it is read."
+  [ "$got" = 0 ] || return 1
   tr -d '\0' <"$WORK/front_index.raw" >"$WORK/front_index.stripped"
   grep '^\[index\]' "$WORK/front_index.stripped" >/dev/null 2>&1 || return 1
   sed -n '/^\[index\]/,$p' "$WORK/front_index.stripped" >"$WORK/index.toml"
@@ -995,7 +1107,9 @@ try_front_index() {
 }
 
 # The seal marker: the last file before end of data (mt eod, then back over
-# two filemarks; GNU mt spells end of data eom), else File 0's pointer. It is
+# two filemarks; GNU mt spells end of data eom), else its planned position:
+# File 0's pointer, or $1, the map's seal_marker entry, where File 0 gives
+# none (volume-format-v3.md 1.2 rule 6). It is
 # found by filemarks, never by READ POSITION or LOCATE. Sets SEAL_* and leaves
 # the seal's copy of the map in $WORK/files_from_seal.txt on success.
 # The most a seal read takes of the last tape file: 64 MiB, 128 blocks. A seal is
@@ -1005,10 +1119,9 @@ try_front_index() {
 # times that. The last file of an unsealed tape is its last data slice, up to
 # GiBs, and no more of it than this is read.
 SEAL_MAX_BLOCKS=128
-SEAL_MAX_BYTES=$((SEAL_MAX_BLOCKS * BLOCK))
 
-read_seal() {
-  local ok=0
+read_seal() { # [the planned position by the map]
+  local ok=0 at=${SEAL_MARKER:-${1:-}}
   CUR=""
   rm -f "$WORK/seal.raw" "$WORK/seal.stripped"
   if { "$MT" -f "$DEVICE" eod 2>/dev/null || "$MT" -f "$DEVICE" eom 2>/dev/null; } &&
@@ -1018,8 +1131,8 @@ read_seal() {
     if dd if="$DEVICE" bs="$BLOCK" count="$SEAL_MAX_BLOCKS" 2>"$WORK/dd.err" | tr -d '\0' >"$WORK/seal.stripped" &&
       [ -s "$WORK/seal.stripped" ]; then ok=1; fi
   fi
-  if [ "$ok" = 0 ] && [ -n "$SEAL_MARKER" ]; then
-    if fetch "$SEAL_MARKER" "$WORK/seal.raw" "$SEAL_MAX_BYTES"; then
+  if [ "$ok" = 0 ] && [ -n "$at" ]; then
+    if fetch "$at" "$WORK/seal.raw" "" "$SEAL_MAX_BLOCKS"; then
       tr -d '\0' <"$WORK/seal.raw" >"$WORK/seal.stripped"
       rm -f "$WORK/seal.raw"
       ok=1
@@ -1064,16 +1177,18 @@ learn_end() {
   ENDED_AFTER=""
   SEAL_STATE=unsealed
   SEAL_BINDS=""
-  if ! read_seal; then
+  # The map is File 3's here: its last entry is the seal_marker one.
+  if ! read_seal "$(last_planned)"; then
     warn "no seal marker found as the last file: the tape is read as unsealed. A planned file that is not on the tape fails when it is read."
     return 0
   fi
-  check_requires "the seal marker" "$WORK/seal.toml"
+  check_seal_claims
   if ! seal_valid; then
     ENDED_AFTER=""
     warn "the last file is not a valid seal marker: the tape is read as unsealed."
     return 0
   fi
+  check_seal_claims valid
   local want
   want=$(toml_val "$WORK/seal.toml" front_index_sha256)
   if [ -n "$FRONT_INDEX_HASH" ]; then
@@ -1083,23 +1198,55 @@ learn_end() {
   # is not trusted (volume-format-v3.md 7.2 step 3, R2): the tape reads as
   # unsealed, its ended_after is not used, and the two ends are said to disagree.
   if [ "$SEAL_BINDS" = no ]; then
-    warn "the two ends of the tape disagree: the seal marker binds front_index_sha256 $want, and File 3's hash is $FRONT_INDEX_HASH. The tape is read as unsealed; the seal's ended_after is not used. Every file is still checked against File 3's hashes as it is read."
+    warn "the two ends of the tape disagree: the seal marker binds front_index_sha256 $(safe_str "$want"), and File 3's hash is $FRONT_INDEX_HASH. The tape is read as unsealed; the seal's ended_after is not used. Every file is still checked against File 3's hashes as it is read; an envelope that differs from File 3's is tried by the seal marker's copy of the map too."
     SEAL_STATE=disagrees
+    ALT_TXT="$WORK/files_from_seal.txt"
     ENDED_AFTER=""
     return 0
   fi
-  if [ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -gt "$TOTAL_FILES" ]; then
-    warn "the two ends of the tape disagree: the seal marker counts $SEAL_FILE_COUNT files and the plan (File 0) has $TOTAL_FILES. The tape is read as unsealed; the seal's ended_after is not used."
+  # The plan's count is File 0's. Where File 0 does not give it (it is damaged,
+  # or did not read), it is the front index's own: File 3 lists every file the
+  # write planned, and it is the map here.
+  local plan=$TOTAL_FILES whose="File 0"
+  if [ -z "$plan" ]; then
+    plan=$(($(wc -l <"$FILES_TXT")))
+    whose="the front index"
+  fi
+  if [ "$SEAL_FILE_COUNT" -gt "$plan" ]; then
+    warn "the two ends of the tape disagree: the seal marker counts $SEAL_FILE_COUNT files and the plan ($whose) has $plan. The tape is read as unsealed; the seal's ended_after is not used."
     SEAL_STATE=disagrees
+    ALT_TXT="$WORK/files_from_seal.txt"
     SEAL_BINDS=no
     ENDED_AFTER=""
     return 0
   fi
-  if [ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ]; then
+  if [ "$SEAL_FILE_COUNT" -lt "$plan" ]; then
     SEAL_STATE=short
   else
     SEAL_STATE=full
   fi
+}
+
+# Where File 0 gives no label (it is damaged, or did not read), the volume's
+# label as the front index states it, else a valid seal marker (volume-format-
+# v3.md 4 and 5): LABEL_FROM says which. It names the tape in words only; a
+# cartridge is never known by its label. No file but File 0 states the uuid.
+label_from_map() {
+  LABEL_FROM=""
+  [ -z "$LABEL" ] || return 0
+  if [ "$FILES_TXT" = "$WORK/files_from_index.txt" ]; then
+    LABEL=$(toml_val "$WORK/index.toml" volume)
+    LABEL_FROM="the front index"
+  fi
+  case $SEAL_STATE in
+  full | short | disagrees)
+    if [ -z "$LABEL" ]; then
+      LABEL=$(toml_val "$WORK/seal.toml" volume)
+      LABEL_FROM="the seal marker"
+    fi
+    ;;
+  esac
+  [ -n "$LABEL" ] || LABEL_FROM=""
 }
 
 # The files of the plan up to the end of the tape, the seal last (R3: no read
@@ -1114,23 +1261,39 @@ establish() {
   # A File 0 with no readable uuid cannot be recognised by it again: its bytes
   # as read now are what the same cartridge gives later.
   LOADED_F0SHA=$(sha_of_file "$WORK/file0.raw")
-  START_LABEL=$LABEL
+  # A File 0 that did not read is no bytes to know the cartridge by (any
+  # cartridge whose File 0 fails gives none): its front index stands in.
+  [ "$FILE0_UNREAD" = 0 ] || LOADED_F0SHA=""
   if try_front_index; then
+    [ "$FILE0_UNREAD" = 0 ] || LOADED_F0SHA="fi:$FRONT_INDEX_HASH"
     FILES_TXT="$WORK/files_from_index.txt"
     FILES_SOURCE="front index (File $FRONT_INDEX)"
     learn_end
+    label_from_map
+    START_LABEL=$LABEL
     return 0
   fi
   warn "the front index (file $FRONT_INDEX) is unreadable or inconsistent: falling back to the seal marker's own copy of it. The front of the tape may be damaged; treat this recovery as degraded."
   if read_seal && seal_valid; then
-    check_requires "the seal marker" "$WORK/seal.toml"
+    check_seal_claims valid
     FILES_TXT="$WORK/files_from_seal.txt"
     FILES_SOURCE="the seal marker's copy of the front index"
     SEAL_STATE=$([ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ] && echo short || echo full)
     SEAL_BINDS=""
+    label_from_map
+    START_LABEL=$LABEL
     return 0
   fi
-  die "neither the front index nor the seal marker can be read, so there is no map of the tape.
+  local none="neither the front index nor the seal marker can be read, so there is no map of the tape."
+  if [ "$FILE0_UNREAD" = 1 ]; then
+    # Whether the tape gave any bytes at all decides the question to ask.
+    if [ -s "$WORK/front_index.raw" ] || [ -s "$WORK/seal.stripped" ]; then
+      none="File 0 gives nothing this script can use, and what the front index and the seal marker give is no map of the tape (no consistent front index, no valid seal marker): both ends of the tape are damaged, or this is not a tapectl tape."
+    else
+      none="nothing can be read from $DEVICE (not File 0, the front index or the seal marker): is a cartridge loaded and is $DEVICE the right drive? If it is, both ends of the tape are damaged and there is no map of the tape."
+    fi
+  fi
+  die "$none
        The manual way, with no script: mt -f $DEVICE rewind; then for each file
        mt -f $DEVICE fsf N; dd if=$DEVICE bs=512k | tr -d '\\0' | less
        File 1 (mt fsf 1) is the system guide that says how to go on."
@@ -1167,8 +1330,16 @@ info_own_size() { # <type>
 
 do_info() {
   establish
-  local pos type size hash last
-  say "Tape: $(safe_str "$LABEL")   uuid $(safe_str "$UUID")"
+  local pos type size hash last lab uu
+  lab=$(safe_str "$LABEL")
+  if [ -n "$LABEL_FROM" ]; then
+    lab="$lab (File 0 gives no label: this one is $LABEL_FROM's)"
+  elif [ -z "$LABEL" ]; then
+    lab="not known (File 0 gives no label, and neither the front index nor a valid seal marker states one)"
+  fi
+  uu=$(safe_str "$UUID")
+  [ -n "$UUID" ] || uu="not known (File 0 gives none)"
+  say "Tape: $lab   uuid $uu"
   say "Layout 3, written by tapectl $(safe_str "$TAPECTL_VERSION") on $(safe_str "$MEDIA_TYPE") media, $(safe_str "$CREATED_AT")"
   say "The map is read from the $FILES_SOURCE"
   case $SEAL_STATE in
@@ -1189,7 +1360,7 @@ do_info() {
       printf '  %4d  %-24s %s\n' "$pos" "seal_marker" "$(info_own_size seal_marker)"
       break
     fi
-    if [ -n "$size" ]; then size="$size bytes"; else size=$(info_own_size "$type"); fi
+    if [ -n "$size" ]; then size="$(safe_str "$size") bytes"; else size=$(info_own_size "$type"); fi
     printf '  %4d  %-24s %s\n' "$pos" "$(safe_str "$type")" "$size"
   done <"$FILES_TXT"
   if [ -n "$ENDED_AFTER" ] && [ "$SEAL_STATE" = short ]; then
@@ -1202,7 +1373,11 @@ do_info() {
 
 do_verify() {
   establish
-  local pos type size hash fails=0 passed=0 bound="" fi_hash last stop
+  local pos type size hash fails=0 passed=0 bound="" fi_hash last stop map="the front index"
+  # The map the files are judged against, for a mismatch and for the last
+  # line: File 3 itself, or the seal marker's copy of it when File 3 did not
+  # read (establish).
+  [ -n "$FRONT_INDEX_HASH" ] || map=$FILES_SOURCE
   last=$(last_planned)
   stop=$last
   [ -z "$ENDED_AFTER" ] || stop=$ENDED_AFTER
@@ -1214,7 +1389,10 @@ do_verify() {
       local want
       want=$(toml_val "$WORK/seal.toml" front_index_sha256 2>/dev/null || true)
       if [ -z "$fi_hash" ]; then
-        printf 'NOTE  %4d  front_index          not read: the map above is the seal marker'"'"'s copy of it\n' "$pos"
+        # File 3 is a file of the tape as any other: one that did not read, or
+        # did not read as a front index, is a FAIL (File 1 says so of --verify).
+        printf 'FAIL  %4d  front_index          not read, or not a consistent front index: the map here is the seal marker'"'"'s copy of it\n' "$pos"
+        fails=$((fails + 1))
       elif [ "$SEAL_BINDS" = no ]; then
         printf 'FAIL  %4d  front_index          the seal marker binds another hash\n' "$pos"
         fails=$((fails + 1))
@@ -1227,21 +1405,27 @@ do_verify() {
       fi
       continue
     fi
-    if [ -z "$size" ] || [ -z "$hash" ]; then
-      printf 'FAIL  %4d  %-18s the front index gives it no size or hash\n' "$pos" "$type"
+    # A kind and a hash are the map's own text, shown as text off a tape is.
+    type=$(safe_str "$type")
+    if ! tape_uint "$size" || [ -z "$hash" ]; then
+      printf 'FAIL  %4d  %-18s its line of the map gives no size that is a number, or no hash (a damaged line?)\n' "$pos" "$type"
       fails=$((fails + 1))
       continue
     fi
+    size=$REPLY
     if hash_tape_file "$pos" "$size" && [ "$TAPE_SHA" = "$hash" ]; then
       printf 'PASS  %4d  %-18s %s bytes\n' "$pos" "$type" "$size"
       passed=$((passed + 1))
     elif [ -n "$TAPE_SHA" ]; then
-      printf 'FAIL  %4d  %-18s hash %s, the front index says %s\n' "$pos" "$type" "$TAPE_SHA" "$hash"
+      printf 'FAIL  %4d  %-18s hash %s, %s says %s\n' "$pos" "$type" "$TAPE_SHA" "$map" "$(safe_str "$hash")"
       fails=$((fails + 1))
     else
       printf 'FAIL  %4d  %-18s cannot be read from the tape\n' "$pos" "$type"
       fails=$((fails + 1))
-      if [ -z "$ENDED_AFTER" ]; then
+      # On a tape with no seal a file that does not read may be the end of the
+      # data, and the walk stops there. A file before the front index is not:
+      # the front index, after it, was read to get this map.
+      if [ -z "$ENDED_AFTER" ] && [ "$pos" -gt "$FRONT_INDEX" ]; then
         printf 'NOTE  the tape has no seal, so its end is not known: nothing after file %d was tried.\n' "$pos"
         break
       fi
@@ -1262,7 +1446,7 @@ do_verify() {
     say "VERIFY INCOMPLETE: $passed file(s) match, and the tape is unsealed."
     return 1
   fi
-  say "VERIFY FAILED: $fails file(s) differ from the front index or cannot be read; $passed match."
+  say "VERIFY FAILED: $fails file(s) differ from $map or cannot be read; $passed match."
   return 1
 }
 
@@ -1304,23 +1488,23 @@ END { emit() }
 '
 
 envelope_list() {
-  awk -F'|' '$2 == "tenant_envelope" || $2 == "operator_envelope" { print $1 "|" $2 }' "$FILES_TXT"
+  awk -F'|' '($2 == "tenant_envelope" || $2 == "operator_envelope") && !seen[$1]++ { print $1 "|" $2 }' "$FILES_TXT" ${ALT_TXT:+"$ALT_TXT"}
 }
 
-# The backup of the primary at $1: the *_backup entry with the same ciphertext
-# hash (never found by position arithmetic).
-backup_of() {
+# The backup of the primary at $1, by the map $2: the *_backup entry with the
+# same ciphertext hash (never found by position arithmetic).
+backup_of() { # <position> <map>
   local h
-  h=$(file_hash_at "$1" "$FILES_TXT")
+  h=$(file_hash_at "$1" "$2")
   [ -n "$h" ] || return 1
-  awk -F'|' -v h="$h" '$2 ~ /_backup$/ && ($4 "") == (h "") { print $1; exit }' "$FILES_TXT"
+  BACKUP_HASH="$h" awk -F'|' '$2 ~ /_backup$/ && ($4 "") == (ENVIRON["BACKUP_HASH"] "") { print $1; exit }' "$2"
 }
 
 # Try one envelope file. Echo-free: results in globals.
 #   0  opened, extracted into $WORK/env.<primary>
 #   2  not for the key given (age: no identity matched; rage: No matching keys found)
 #   3  damaged or unreadable
-try_envelope_at() { # <position of this copy> <primary position> <true bytes> <hash>
+try_envelope_at() { # <position of this copy> <primary position> <true bytes> <hash> [<whose they are>]
   local pos=$1 primary=$2 size=$3 hash=$4 dir="$WORK/env.$2" arc="" trc="" text
   rm -rf "$dir"
   mkdir -p "$dir" || die_io "cannot make $dir" "" "$WORK"
@@ -1328,12 +1512,23 @@ try_envelope_at() { # <position of this copy> <primary position> <true bytes> <h
     note "the copy of envelope $primary at file $pos is after the end of this tape; not read."
     return 3
   fi
+  if ! tape_uint "$size"; then
+    note "the line ${5:-the front index} has for envelope file $pos gives no size that is a number: a damaged line of the map."
+    return 3
+  fi
+  size=$REPLY
   if ! fetch "$pos" "$WORK/envelope.enc" "$size"; then
     note "envelope file $pos cannot be read from the tape."
     return 3
   fi
   if [ "$(sha_of_file "$WORK/envelope.enc")" != "$hash" ]; then
-    note "envelope file $pos differs from the front index's hash: damaged."
+    # It is called damaged once no map is left to try it by: where the two ends
+    # of the tape disagree, File 3's line may be the damaged one (open_envelopes).
+    if [ -z "${5:-}" ] && [ -n "$ALT_TXT" ]; then
+      note "envelope file $pos differs from the hash File 3's line gives it; the seal marker's copy of the map is tried before it is called damaged."
+    else
+      note "envelope file $pos differs from ${5:-the front index}'s hash: damaged."
+    fi
     rm -f "$WORK/envelope.enc"
     return 3
   fi
@@ -1371,25 +1566,37 @@ OPENED="" # positions of the primaries that opened, space separated
 
 # Walk the primaries; open each the key opens. A copy that is damaged is
 # replaced by its backup (§1.3); a backup whose primary opened is never read.
+# Where the two ends of the tape disagree (ALT_TXT), an envelope no copy of
+# which passes by File 3's lines is tried again by the seal marker's: a wrong
+# line in a plain-text map costs a try, and age authenticates what it opens.
 open_envelopes() {
-  local list pos type size hash bpos rc
+  local list pos type size hash bpos rc map by
   list=$(envelope_list)
   [ -n "$list" ] || die "the front index lists no envelope: this tape has nothing a key can open."
   OPENED=""
   DAMAGED_ENVELOPES=0
   while IFS='|' read -r pos type; do
-    size=$(file_size_at "$pos" "$FILES_TXT")
-    hash=$(file_hash_at "$pos" "$FILES_TXT")
-    rc=0
-    try_envelope_at "$pos" "$pos" "$size" "$hash" || rc=$?
-    if [ "$rc" = 3 ]; then
-      bpos=$(backup_of "$pos" || true)
-      if [ -n "$bpos" ]; then
-        note "reading the backup copy of the envelope at file $pos: file $bpos."
-        rc=0
-        try_envelope_at "$bpos" "$pos" "$size" "$hash" || rc=$?
+    rc=3
+    by=""
+    for map in "$FILES_TXT" ${ALT_TXT:+"$ALT_TXT"}; do
+      [ "$rc" = 3 ] || break
+      if [ "$map" != "$FILES_TXT" ]; then
+        by="the seal marker's copy of the front index"
+        note "the two ends of the tape disagree: trying the envelope at file $pos by $by."
       fi
-    fi
+      size=$(file_size_at "$pos" "$map")
+      hash=$(file_hash_at "$pos" "$map")
+      rc=0
+      try_envelope_at "$pos" "$pos" "$size" "$hash" "$by" || rc=$?
+      if [ "$rc" = 3 ]; then
+        bpos=$(backup_of "$pos" "$map" || true)
+        if [ -n "$bpos" ]; then
+          note "reading the backup copy of the envelope at file $pos: file $bpos."
+          rc=0
+          try_envelope_at "$bpos" "$pos" "$size" "$hash" "$by" || rc=$?
+        fi
+      fi
+    done
     case $rc in
     0) OPENED="$OPENED $pos" ;;
     3) DAMAGED_ENVELOPES=$((DAMAGED_ENVELOPES + 1)) ;;
@@ -1410,7 +1617,8 @@ envelope_space_check() {
   local total=0 biggest=0 pos size
   while IFS='|' read -r pos _; do
     size=$(file_size_at "$pos" "$FILES_TXT")
-    is_uint "$size" || continue
+    tape_uint "$size" || continue
+    size=$REPLY
     total=$((total + size))
     [ "$size" -le "$biggest" ] || biggest=$size
   done <<EOF
@@ -1463,7 +1671,7 @@ do_find_envelope() {
   open_envelopes
   local pos nunits
   for pos in $OPENED; do
-    say "The key opens the envelope at file $pos ($(file_type_at "$pos" "$FILES_TXT"))."
+    say "The key opens the envelope at file $pos ($(safe_str "$(file_type_at "$pos" "$FILES_TXT")"))."
   done
   collect_units
   collect_ranges
@@ -1513,7 +1721,7 @@ choose_units() { # [listing]: with it, several units are not refused
     END { for (n in row) print row[n] }
   ' "$WORK/want.txt" "$WORK/units.txt" | sort -t'|' -k3,3 >"$WORK/chosen.txt"
   for u in ${UNITS[@]+"${UNITS[@]}"}; do
-    if ! awk -F'|' -v n="$u" '($3 "") == (n "") { f = 1 } END { exit f ? 0 : 1 }' "$WORK/chosen.txt"; then
+    if ! WANT_UNIT="$u" awk -F'|' '($3 "") == (ENVIRON["WANT_UNIT"] "") { f = 1 } END { exit f ? 0 : 1 }' "$WORK/chosen.txt"; then
       echo "FATAL: unit '$(safe_str "$u")'${VERSION:+ version $VERSION} is not in the envelope(s) your key opened. Units there:" >&2
       awk -F'|' '$9 != "" { printf "         %s  version %s\n", $3, $4 }' "$WORK/units.txt" >&2
       exit 1
@@ -1655,9 +1863,14 @@ ask_cartridge() { # <slice>
 # through files in $1, so that nothing it refuses ends the restore (#521).
 # Exit 0: it gives slice $2 (its facts are in $1/vars); 3: it is the cartridge
 # already in the drive; anything else: refused, and the words say why.
+# File 0 is no part of the rule a cartridge is taken by (its front index lists
+# the slice's sha256 at a position its own seal marker covers, R8). One that
+# does not read, or states nothing, is warned about (f0), and that rule
+# decides; the seal marker's layout_version and `requires` are the fences
+# then (check_seal_claims).
 probe_cartridge() { # <dir> <slice>
   trap - EXIT
-  local dir=$1 k=$2 rc=0 magic lv label uuid pos feats v h16
+  local dir=$1 k=$2 rc=0 magic lv label uuid pos feats v h16 f0="" fi=""
   WORK=$dir
   tape_init
   CUR=""
@@ -1665,35 +1878,54 @@ probe_cartridge() { # <dir> <slice>
     echo "NOTE: this cartridge is unreadable: the drive cannot reach its first file. Nothing is taken from it." >&2
     exit 2
   }
-  dd if="$DEVICE" bs="$BLOCK" of="$WORK/file0.raw" 2>"$WORK/dd.err" || rc=$?
+  dd if="$DEVICE" bs="$BLOCK" count=$((SMALL_MAX_BLOCKS + 1)) of="$WORK/file0.raw" 2>"$WORK/dd.err" || rc=$?
+  CUR=1
   if [ "$rc" -ne 0 ]; then
-    echo "NOTE: this cartridge is unreadable: its first file cannot be read ($(dd_detail)). Nothing is taken from it." >&2
-    exit 2
-  fi
-  if [ ! -s "$WORK/file0.raw" ]; then
+    CUR=""
+    f0="its first file cannot be read ($(dd_detail))"
+    : >"$WORK/file0.raw"
+  elif [ ! -s "$WORK/file0.raw" ]; then
     echo "NOTE: this cartridge is blank: nothing can be read at its first file. Nothing is taken from it." >&2
     exit 2
+  elif [ "$(($(wc -c <"$WORK/file0.raw")))" -gt "$SMALL_MAX_BYTES" ]; then
+    # dd stopped inside it (fetch_small). It is no File 0, to know the
+    # cartridge by or to read: as one that does not read.
+    rc=1
+    CUR=""
+    f0="its first file is longer than 16 MiB, more than a tapectl File 0 can be (no more of it is read)"
+    : >"$WORK/file0.raw"
   fi
-  CUR=1
   tr -d '\0' <"$WORK/file0.raw" >"$WORK/file0.txt"
   magic=$(toml_val "$WORK/file0.txt" magic)
   lv=$(toml_val "$WORK/file0.txt" layout_version)
   label=$(toml_val "$WORK/file0.txt" label)
   uuid=$(toml_val "$WORK/file0.txt" uuid)
-  if [ -z "$magic$lv$label$uuid" ]; then
-    echo "NOTE: this cartridge is not a tapectl volume: its first file states no magic, layout_version, label or uuid. Nothing is taken from it." >&2
-    exit 2
+  if [ -z "$f0" ] && [ -z "$magic$lv$label$uuid" ]; then
+    f0="its first file states no magic, layout_version, label or uuid"
   fi
+  [ -z "$f0" ] || echo "WARNING: this cartridge: $f0 (a damaged File 0?). Its front index and its seal marker decide whether it is taken." >&2
+  # Its own facts, before a refusal: file0_way_on reads ITS seal marker.
+  file0_fields
   if { [ -n "$magic" ] && [ "$magic" != tapectl-volume-v3 ]; } || { [ -n "$lv" ] && [ "$lv" != 3 ]; }; then
-    echo "NOTE: this cartridge is a tapectl volume of Layout $(safe_str "${lv:-unknown}") (magic $(safe_str "${magic:-none}")), label $(safe_str "$label"); this RESTORE.sh reads Layout 3 only, so nothing is taken from it. Read it with the tapectl that wrote it or with the RESTORE.sh in its own File 2." >&2
+    echo "NOTE: this cartridge is a tapectl volume of Layout $(safe_str "${lv:-unknown}") (magic $(safe_str "${magic:-none}")), label $(safe_str "$label"); this RESTORE.sh reads Layout 3 only, so nothing is taken from it. $(file0_way_on "Read it with the tapectl that wrote it or with the RESTORE.sh in its own File 2.")" >&2
     exit 2
   fi
   feats=$(requires_of "$WORK/file0.txt")
   if [ -n "$feats" ]; then
-    echo "NOTE: this cartridge requires feature(s) $(safe_str "$feats"), which this RESTORE.sh does not know, so nothing is taken from it." >&2
+    echo "NOTE: this cartridge requires feature(s) $(safe_str "$feats"), which this RESTORE.sh does not know, so nothing is taken from it. $(file0_way_on "Use a newer tapectl, the tapectl that wrote this tape, or the RESTORE.sh in this tape's own File 2.")" >&2
     exit 2
   fi
   F0SHA=$(sha_of_file "$WORK/file0.raw")
+  if [ "$rc" -ne 0 ]; then
+    # No File 0 to know it by: its front index stands in, as in establish. A
+    # cartridge is never the one in the drive because its File 0 fails too.
+    F0SHA=""
+    fi=0
+    if try_front_index; then
+      fi=1
+      F0SHA="fi:$FRONT_INDEX_HASH"
+    fi
+  fi
   if { [ -n "$uuid" ] && [ "$uuid" = "$LOADED_UUID" ]; } ||
     { [ -z "$LOADED_UUID" ] && [ -n "$LOADED_F0SHA" ] && [ "$F0SHA" = "$LOADED_F0SHA" ]; }; then
     # The cartridge the facts describe, back in the drive after a refusal.
@@ -1701,20 +1933,23 @@ probe_cartridge() { # <dir> <slice>
     echo "NOTE: this is the same cartridge as the one already in the drive (label $(safe_str "$label")), which does not hold slice $k. Eject it and load the cartridge that does." >&2
     exit 3
   fi
-  file0_fields
-  if try_front_index; then
+  if [ "$fi" = 1 ] || { [ -z "$fi" ] && try_front_index; }; then
     FILES_TXT="$WORK/files_from_index.txt"
     FILES_SOURCE="front index (File $FRONT_INDEX)"
     learn_end
   elif read_seal && seal_valid; then
     echo "WARNING: the front index of this cartridge is unreadable: using the seal marker's copy of it." >&2
-    check_requires "the seal marker" "$WORK/seal.toml"
+    check_seal_claims valid
     FILES_TXT="$WORK/files_from_seal.txt"
     FILES_SOURCE="the seal marker's copy of the front index"
     SEAL_STATE=$([ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ] && echo short || echo full)
     SEAL_BINDS=""
   else
-    echo "NOTE: neither the front index nor the seal marker of this cartridge can be read, so nothing is taken from it." >&2
+    case $f0 in
+    *"cannot be read"*) echo "NOTE: this cartridge is unreadable: $f0, and neither its front index nor its seal marker reads. Nothing is taken from it." >&2 ;;
+    ?*) echo "NOTE: this cartridge is not a tapectl volume: $f0, and it has no front index and no seal marker that reads. Nothing is taken from it." >&2 ;;
+    *) echo "NOTE: neither the front index nor the seal marker of this cartridge can be read, so nothing is taken from it." >&2 ;;
+    esac
     exit 2
   fi
   if [ -z "$ENDED_AFTER" ] || { [ "$SEAL_STATE" != full ] && [ "$SEAL_STATE" != short ]; }; then
@@ -1722,7 +1957,7 @@ probe_cartridge() { # <dir> <slice>
     exit 2
   fi
   h16=${NEED_HASH:0:16}
-  pos=$(awk -F'|' -v h="$NEED_HASH" -v s="$NEED_SIZE" '$2 == "data_slice" && ($4 "") == (h "") && ($3 "") == (s "") { print $1; exit }' "$FILES_TXT")
+  pos=$(NEED_HASH="$NEED_HASH" NEED_SIZE="$NEED_SIZE" awk -F'|' '$2 == "data_slice" && ($4 "") == (ENVIRON["NEED_HASH"] "") && ($3 "") == (ENVIRON["NEED_SIZE"] "") { print $1; exit }' "$FILES_TXT")
   if [ -z "$pos" ]; then
     echo "NOTE: This cartridge (label $(safe_str "$label")) lists no data slice with the sha256 of slice $k ($h16...) in its front index, so it does not hold that slice. Nothing is taken from it." >&2
     exit 2
@@ -1731,8 +1966,9 @@ probe_cartridge() { # <dir> <slice>
     echo "NOTE: This cartridge (label $(safe_str "$label")) lists slice $k (sha256 $h16...) at tape file $pos, but the tape ended after file $ENDED_AFTER (its seal marker says so): that slice is not on it. Nothing is taken from it." >&2
     exit 2
   fi
+  label_from_map
   {
-    for v in F0SHA LABEL UUID FILES_TXT FILES_SOURCE ENDED_AFTER SEAL_STATE SEAL_BINDS SEAL_FILE_COUNT TOTAL_FILES FRONT_INDEX SEAL_MARKER; do
+    for v in F0SHA LABEL LABEL_FROM UUID FILES_TXT FILES_SOURCE ENDED_AFTER SEAL_STATE SEAL_BINDS SEAL_FILE_COUNT TOTAL_FILES FRONT_INDEX SEAL_MARKER; do
       printf '%s=%q\n' "$v" "${!v-}"
     done
   } >"$dir/vars"
@@ -1744,7 +1980,7 @@ CART_SEQ=0
 # it is the loaded cartridge: its facts are taken, and SL_HERE says which of
 # the unit's slices it holds.
 accept_cartridge() { # <slice>
-  local k=$1 sub rc=0 a b j
+  local k=$1 sub rc=0 a b j from=""
   CART_SEQ=$((CART_SEQ + 1))
   sub="$WORK/cart.$CART_SEQ"
   mkdir -p "$sub" || die_io "cannot make a directory for the cartridge" "" "$WORK"
@@ -1753,6 +1989,8 @@ accept_cartridge() { # <slice>
   (probe_cartridge "$sub" "$k") 2>"$sub/err" || rc=$?
   CUR=""
   sed 's/^FATAL: /NOTE: /' "$sub/err" >&2 || true
+  # What the probe read of a cartridge that is not taken is not kept.
+  { [ "$rc" = 0 ] && [ -f "$sub/vars" ]; } || rm -rf "$sub" || true
   if [ "$rc" = 3 ]; then
     return 1
   fi
@@ -1789,7 +2027,8 @@ accept_cartridge() { # <slice>
     [ -n "${SL_HERE[$j]:-}" ] || break
     b=$j
   done
-  echo "This cartridge identifies as: $(safe_str "$LABEL")" >&2
+  [ -z "$LABEL_FROM" ] || from=" (its File 0 gives no label: this one is its ${LABEL_FROM#the }'s)"
+  echo "This cartridge identifies as: $(safe_str "${LABEL:-a tape whose File 0 gives no label}")$from" >&2
   echo "It gives slice(s) $a to $b of $(safe_str "$U_NAME"): its front index lists each one's sha256, at positions its seal marker covers." >&2
   return 0
 }
@@ -1814,6 +2053,7 @@ recheck_drive() { # <slice asked for>
   NEED_HASH=${SL_SHAE[$1]} NEED_SIZE=${SL_ENC[$1]}
   (probe_cartridge "$sub" "$1") 2>/dev/null || rc=$?
   CUR=""
+  rm -rf "$sub" || true
   DRIVE_HOLDS=""
   if [ "$rc" = 3 ] || [ "$rc" = 4 ]; then
     FOREIGN_LOADED=0
@@ -2125,6 +2365,14 @@ prepare_slice() { # <slice number>
   if is_full_text "$text"; then
     feeder_fatal "writing slice $k into the work directory failed: $(printf '%s' "$text" | head -n 1). The work directory $WORK is full or not writable. Nothing on the tape is wrong: free space there or give --work DIR on a larger disk."
   fi
+  # age ended 0, and tee or sha256sum said something that is not a full disk (a
+  # file too large for the work directory's file system, an I/O error): the
+  # work directory did not take the cut, and the slice is not judged by it. An
+  # age that did not end 0 is the slice's verdict, below (bash's own "Killed"
+  # for an age the system killed lands in msg too).
+  if [ -n "$msg" ] && [ "$arc" = 0 ]; then
+    die_io "writing slice $k into the work directory failed" "$msg" "$WORK"
+  fi
   if [ "$arc" != 0 ]; then
     if not_a_recipient "$text"; then
       why="no key given opens it (a slice can be sealed to an older key than the envelope: give each key with --key)"
@@ -2292,15 +2540,109 @@ members_in_slices() { # <table> <bad.slices file: number|why>
 }
 
 # Remove the partial file of a long member whose run broke (its row is the
-# one that begins in slice $2).
+# one that begins in slice $2). Its rows come through a pipe, as
+# scrub_inflight's do.
 remove_partial() { # <table> <first slice of the run> <dest>
   local esc
-  while IFS= read -r esc; do
-    unesc "$esc"
-    rm -f -- "$3/$REPLY" 2>/dev/null || true
-  done <<EOF
-$(awk -F'\t' -v s="$2" '!/^#/ && ($2 + 0) == (s + 0) && $1 == "f" { print $7 }' "$1")
-EOF
+  awk -F'\t' -v s="$2" '!/^#/ && ($2 + 0) == (s + 0) && $1 == "f" { print $7 }' "$1" |
+    while IFS= read -r esc; do
+      unesc "$esc"
+      rm -f -- "$3/$REPLY" 2>/dev/null || true
+    done || true
+}
+
+# How many pieces the check of $1 rows is cut into (REPLY): the machine's
+# cores, from nproc, or getconf where there is no nproc, at most 8 and never
+# more than the rows; 1 when the count is not known.
+check_pieces() { # <rows>
+  local n=""
+  if command -v nproc >/dev/null 2>&1; then
+    n=$(nproc 2>/dev/null || true)
+  elif command -v getconf >/dev/null 2>&1; then
+    n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+  fi
+  if tape_uint "$n"; then n=$REPLY; else n=1; fi
+  [ "$n" -le 8 ] || n=8
+  [ "$n" -le "$1" ] || n=$1
+  [ "$n" -ge 1 ] || n=1
+  REPLY=$n
+}
+
+# The job of a split check: one sha256sum -c --strict on each piece at once,
+# each writing its own lines and its status, all in the job's process group.
+check_job() { # <destination> <pieces>
+  trap - EXIT INT HUP TERM
+  local i
+  for ((i = 1; i <= $2; i++)); do
+    {
+      rc=0
+      (cd "$1" && sha256sum -c --strict "$WORK/check.fast.$i" 2>/dev/null) >"$WORK/check.out.$i" || rc=$?
+      echo "$rc" >"$WORK/check.rc.$i"
+    } &
+  done
+  wait
+}
+
+# check.fast dealt into $2 pieces, checked at once, and their lines joined
+# back in the rows' order into check.out, as one sha256sum over the whole
+# list writes them. Each row goes to the piece with the fewest bytes so far:
+# its size (check.size, the table's; one that is not all digits counts as 0)
+# plus 1, so that rows of no size spread too; a tie goes to the lowest
+# piece. A table in path order keeps big files together, so pieces cut by
+# row count could leave one of them nearly all the bytes. With $2 no more
+# than the rows every piece gets a row: a piece given nothing has load 0 and
+# each row dealt adds at least 1, so the first $2 rows go one to each.
+# check.piece names each row's piece, in order, and the join takes the next
+# line of the piece each row names. A piece is held to its own count: one
+# whose sha256sum did not print one line for each of its rows gives, for
+# each, a blank line, which is no pass, so its rows are hashed alone and no
+# other row's pairing moves. A piece's output missing or short at the join
+# ends it early, and file_check, counting check.out's lines, then hashes
+# every row alone. The reads of a piece that is not there are quiet, and so
+# is the join's open of check.out: file_check, which removed it first, ends
+# the run when it is not there. The job runs in a process group of its own,
+# as the read ahead's does, and its id is kept in AHEAD_PID while it runs, so
+# that the way out stops every piece (ahead_kill). The piece files are
+# removed once joined, so the split holds no more room than the one check
+# while the rest is hashed. Returns 0 when every piece ended 0 and gave its
+# count.
+check_split() { # <destination> <pieces>
+  local n=$2 i rc given got frc=0
+  rm -f "$WORK"/check.fast.* "$WORK"/check.out.* "$WORK"/check.rc.* "$WORK/check.piece"
+  CHECK="$WORK/check" awk -v n="$n" '
+    BEGIN { for (i = 1; i <= n; i++) load[i] = 0 }
+    {
+      s = 0
+      if ((getline s < (ENVIRON["CHECK"] ".size")) <= 0 || s !~ /^[0-9]+$/) s = 0
+      p = 1
+      for (i = 2; i <= n; i++) if (load[i] < load[p]) p = i
+      load[p] += s + 1
+      print > (ENVIRON["CHECK"] ".fast." p)
+      print p > (ENVIRON["CHECK"] ".piece")
+    }
+  ' "$WORK/check.fast"
+  set -m
+  (check_job "$1" "$n") </dev/null >/dev/null 2>/dev/null 3<&- 4>&- &
+  AHEAD_PID=$!
+  set +m
+  wait "$AHEAD_PID" 2>/dev/null || true
+  AHEAD_PID=""
+  for ((i = 1; i <= n; i++)); do
+    rc=""
+    { read -r rc <"$WORK/check.rc.$i"; } 2>/dev/null || true
+    [ "$rc" = 0 ] || frc=1
+    given=$({ wc -l <"$WORK/check.fast.$i"; } 2>/dev/null | tr -d ' ' || true)
+    got=$({ wc -l <"$WORK/check.out.$i"; } 2>/dev/null | tr -d ' ' || true)
+    if [ -z "$given" ] || [ "$got" != "$given" ]; then
+      frc=1
+      { awk '{ print "" }' "$WORK/check.fast.$i" >"$WORK/check.out.$i"; } 2>/dev/null || true
+    fi
+  done
+  CHECK="$WORK/check" awk '
+    { if ((getline line < (ENVIRON["CHECK"] ".out." $1)) > 0) print line; else exit }
+  ' "$WORK/check.piece" 2>/dev/null >"$WORK/check.out" || true
+  rm -f "$WORK"/check.fast.* "$WORK"/check.out.* "$WORK"/check.rc.* "$WORK/check.piece" "$WORK/check.size"
+  return "$frc"
 }
 
 # Hash every regular file the table lists, on disk. Writes the escaped paths
@@ -2309,18 +2651,39 @@ EOF
 CHECK_ROWS=0
 CHECK_FAILED=0
 file_check() { # <table> <destination> <out: escaped paths that fail>
-  local table=$1 dest=$2 out=$3 h esc path sum
+  local table=$1 dest=$2 out=$3 h esc path sum passed=0 f
   : >"$out"
   CHECK_ROWS=0
   CHECK_FAILED=0
+  # Every list read below is this call's own: check.fast, check.size,
+  # check.slow, check.out, and check_split's check.piece, check.fast.N,
+  # check.out.N and check.rc.N. A list an earlier check left (the unit
+  # before's), read where this call's could not be opened, would judge this
+  # unit by that unit's rows and OK lines; so all are removed first, and one
+  # still there ends the run. ($out is emptied above, or set -e ends it.)
+  rm -f -- "$WORK"/check.* 2>/dev/null || true
+  for f in "$WORK"/check.*; do
+    if [ -e "$f" ] || [ -L "$f" ]; then die_io "the per-file check could not remove a list an earlier check left" "$f"; fi
+  done
   # Rows with no backslash in the path: one sha256sum -c --strict over the
-  # list. No name is ever read back from its output (uutils' sha256sum quotes
-  # a name with a space or a non-ASCII byte under LC_ALL=C, GNU's does not):
+  # list, or over each of its pieces at once (check_split). No name is ever
+  # read back from its output (uutils' sha256sum quotes a name with a space
+  # or a non-ASCII byte under LC_ALL=C, GNU's does not):
   # --strict prints exactly one line per entry, in order, so the k-th line
   # ending ": OK" is the k-th row's pass. The rest are done one by one.
-  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") == 0 { print $6 "  ./" $7 }' "$table" >"$WORK/check.fast"
-  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") > 0 { print $6 "\t" $7 }' "$table" >"$WORK/check.slow"
-  CHECK_ROWS=$(($(wc -l <"$WORK/check.fast") + $(wc -l <"$WORK/check.slow")))
+  # The lists are files in the work directory, and BusyBox awk ends 0 when a
+  # write to one fails (a full disk): a row lost from them is never hashed.
+  # So the rows are counted through a pipe too, and the rows passed plus the
+  # rows listed as failing must be that count (below). A list whose open
+  # fails, or an awk that ends non-zero on a failed write (gawk, mawk), ends
+  # the run there: the count cannot see a row altered inside its line. A
+  # status above 128 is a signal's, left to the trap and the count. Each
+  # fast row's size goes to check.size, by which check_split deals the rows.
+  CHECK="$WORK/check" awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") == 0 { print $6 "  ./" $7; print $5 > (ENVIRON["CHECK"] ".size") }' "$table" >"$WORK/check.fast" ||
+    [ "$?" -gt 128 ] || die_io "the per-file check could not write its list of the files to hash" "$WORK/check.fast"
+  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") > 0 { print $6 "\t" $7 }' "$table" >"$WORK/check.slow" ||
+    [ "$?" -gt 128 ] || die_io "the per-file check could not write its list of the files to hash one by one" "$WORK/check.slow"
+  CHECK_ROWS=$(awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ { n++ } END { print n + 0 }' "$table")
   if [ -s "$WORK/check.fast" ]; then
     # A file counts as checked only when sha256sum SAID it matches: what the
     # check did not positively pass is damaged, so a sha256sum that printed
@@ -2328,13 +2691,21 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
     # make a restore look whole. When the output is not one line per row, no
     # row is trusted and every one is hashed alone.
     local frc=0 flines=0
-    (cd "$dest" && sha256sum -c --strict "$WORK/check.fast" 2>/dev/null) >"$WORK/check.out" || frc=$?
+    check_pieces "$(wc -l <"$WORK/check.fast" | tr -d ' ')"
+    if [ "$REPLY" -gt 1 ]; then
+      check_split "$dest" "$REPLY" || frc=$?
+    else
+      (cd "$dest" && sha256sum -c --strict "$WORK/check.fast" 2>/dev/null) >"$WORK/check.out" || frc=$?
+    fi
+    # Removed above, check.out is missing only when its open failed.
+    [ -f "$WORK/check.out" ] || die_io "the per-file check could not write sha256sum's lines" "$WORK/check.out"
     flines=$(wc -l <"$WORK/check.out" | tr -d ' ')
     if [ "$flines" -ne "$(wc -l <"$WORK/check.fast" | tr -d ' ')" ]; then
       frc=2
-      : >"$WORK/check.out"
+      : >"$WORK/check.out" || die_io "the per-file check could not empty sha256sum's lines" "$WORK/check.out"
     fi
-    if [ "$frc" -eq 0 ] && [ "$(grep -c ': OK$' "$WORK/check.out" || true)" -eq "$flines" ]; then
+    passed=$(grep -c ': OK$' "$WORK/check.out" || true)
+    if [ "$frc" -eq 0 ] && [ "$passed" -eq "$flines" ]; then
       : # every fast row passed
     else
       # Pair each row with its line by position; a row whose line does not
@@ -2342,7 +2713,8 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
       awk -F'\t' '
         FILENAME == ARGV[1] { ok[FNR] = ($0 ~ /: OK$/); next }
         { p = $0; sub(/^[0-9a-f]+  \.\//, "", p); if (ok[FNR] != 1) print substr($0, 1, index($0, "  ") - 1) "\t" p }
-      ' "$WORK/check.out" "$WORK/check.fast" >>"$WORK/check.slow"
+      ' "$WORK/check.out" "$WORK/check.fast" >>"$WORK/check.slow" ||
+        [ "$?" -gt 128 ] || die_io "the per-file check could not add to its list of the files to hash one by one" "$WORK/check.slow"
     fi
   fi
   if [ -s "$WORK/check.slow" ]; then
@@ -2351,10 +2723,16 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
       path=$REPLY
       sum=""
       if [ -f "$dest/$path" ]; then sum=$(sha_of_file "$dest/$path" 2>/dev/null || true); fi
-      [ "$sum" = "$h" ] || printf '%s\n' "$esc" >>"$out"
+      if [ "$sum" = "$h" ]; then
+        passed=$((passed + 1))
+      else
+        printf '%s\n' "$esc" >>"$out" || die_io "the per-file check could not write its list of the files that fail it" "$out"
+      fi
     done <"$WORK/check.slow"
   fi
   CHECK_FAILED=$(wc -l <"$out" | tr -d ' ')
+  [ $((passed + CHECK_FAILED)) -eq "$CHECK_ROWS" ] ||
+    die_io "the per-file check's lists were cut short in the work directory" "$((passed + CHECK_FAILED)) of the $CHECK_ROWS regular file(s) the table lists were checked"
 }
 
 # Extract one tar run's stream from our standard input. It runs as a process
@@ -2405,20 +2783,15 @@ tar_close() { # [tenths of a second to wait for tar]
 # never lost. The one before it too: slice k's cat has returned when slice k+1
 # is being prepared, but tar may still hold the last 64 KiB (1 MiB under
 # uutils) of k in its pipe, and a signal kills it inside a member of k.
+# The rows come through a pipe, never a here-document: bash writes one of more
+# than 64 KiB (any, for an older bash) to a file in TMPDIR, the work directory,
+# which may be the full disk that ended the run (#611). The loop is the pipe's
+# last command, a subshell: it sets nothing the cleanup reads after it.
 scrub_inflight() {
   [ -n "$INFLIGHT_TABLE" ] && [ -f "$INFLIGHT_TABLE" ] && [ -n "$WORK" ] && [ -f "$WORK/slices.off" ] || return 0
   [ "$FEEDING" -gt 0 ] || return 0
   local sz sha esc f
-  while IFS=$'\t' read -r sz sha esc; do
-    [ -n "$esc" ] || continue
-    unesc "$esc"
-    f="$INFLIGHT_DEST/$REPLY"
-    [ -f "$f" ] || continue
-    if [ "$(wc -c <"$f" | tr -d ' ')" != "$sz" ] || [ "$(sha_of_file "$f" 2>/dev/null || true)" != "$sha" ]; then
-      rm -f -- "$f" 2>/dev/null || true
-    fi
-  done <<EOF
-$(awk -F'\t' -v at="$FEEDING" '
+  awk -F'\t' -v at="$FEEDING" '
     FILENAME == ARGV[1] { n++; off[$1 + 0] = $2 + 0; sz[$1 + 0] = $3 + 0; next }
     /^#/ { next }
     $1 == "f" {
@@ -2428,8 +2801,16 @@ $(awk -F'\t' -v at="$FEEDING" '
       while (last < n && off[last] + sz[last] < $4 + 0) last++
       if (last >= (at > 1 ? at - 1 : at)) print $5 "\t" $6 "\t" $7
     }
-  ' "$WORK/slices.off" "$INFLIGHT_TABLE")
-EOF
+  ' "$WORK/slices.off" "$INFLIGHT_TABLE" |
+    while IFS=$'\t' read -r sz sha esc; do
+      [ -n "$esc" ] || continue
+      unesc "$esc"
+      f="$INFLIGHT_DEST/$REPLY"
+      [ -f "$f" ] || continue
+      if [ "$(wc -c <"$f" | tr -d ' ')" != "$sz" ] || [ "$(sha_of_file "$f" 2>/dev/null || true)" != "$sha" ]; then
+        rm -f -- "$f" 2>/dev/null || true
+      fi
+    done
 }
 
 DAMAGED_TOTAL=0
@@ -2442,9 +2823,24 @@ UNITS_DONE=0
 # words, a TAB, and the path as the table writes it; nothing is printed for a
 # table whose every path passes. tesc() is 1.5's escape: a backslash, a TAB, a
 # newline and a carriage return written out, and each byte that is not part
-# of a well-formed UTF-8 sequence \xHH.
+# of a well-formed UTF-8 sequence \xHH. Before them, the row: a NUL byte is in
+# no name, and bash drops one from a path before it is used (..<NUL>/x would
+# be ../x), so a row that holds one is refused, shown with it written \x00.
+# gawk and mawk see the NUL; BusyBox awk ends the row at it, so the row it sees
+# has not the eight fields every row has (volume-format-v3.md 1.6), and is
+# refused for that. A row with an empty field among the first seven is refused
+# too: tapectl writes none (a letter, four numbers, a hash or -, a path, the
+# root .), and bash's IFS=$'\t' read takes two TABs for one, so a later reader
+# would take a field for the one after it (field 8 for the path). Field 8,
+# when it is not empty, is held to the path rule whatever the row's kind, as
+# tapectl's own reader holds it.
 AWK_TABLE_PATHS='
-BEGIN { for (i = 1; i < 256; i++) ord_of[sprintf("%c", i)] = i }
+BEGIN { for (i = 1; i < 256; i++) ord_of[sprintf("%c", i)] = i; nul = sprintf("%c", 0) }
+function nul_shown(s,    out, i) {
+  out = ""
+  while ((i = index(s, nul)) > 0) { out = out substr(s, 1, i - 1) "\\x00"; s = substr(s, i + 1) }
+  return out s
+}
 function tesc(s,    out, i, n, c, b, k, need, lo, hi, j, ok) {
   out = ""
   n = length(s)
@@ -2488,11 +2884,14 @@ function refused(p,    d, t, nd, np) {
 }
 /^#/ { next }
 {
+  if (nul != "" && index($0, nul) > 0) { print "its row holds a NUL byte\t" nul_shown($7); exit }
+  if (NF != 8) { print "its row has " NF " fields, not eight\t" $7; exit }
+  for (i = 1; i <= 7; i++) if ($i == "") { print "its row\047s field " i " is empty\t" $7; exit }
   w = refused($7)
   if (w != "") { print w "\t" $7; exit }
-  if ($1 == "h") {
+  if ($8 != "") {
     w = refused($8)
-    if (w != "") { print "its hard link\047s target: " w "\t" $8; exit }
+    if (w != "") { print "its " ($1 == "h" ? "hard link\047s" : "link") " target: " w "\t" $8; exit }
   }
 }
 '
@@ -2642,7 +3041,8 @@ report_absent() { # <damaged paths file>
   # go to a file and awk counts them all, so no pipe is cut short under
   # pipefail however many there are.
   local hp ht sl
-  nh=$(awk -F'\t' -v out="$WORK/hardlinks.absent" '
+  nh=$(ABSENT_OUT="$WORK/hardlinks.absent" awk -F'\t' '
+    BEGIN { out = ENVIRON["ABSENT_OUT"] }
     FILENAME == ARGV[1] { gone[$1 + 0] = 1; next }
     FILENAME == ARGV[2] { want[$0] = 1; next }
     /^#/ { next }
@@ -2996,7 +3396,8 @@ feed_members() { # <member number>
 # paths brought only as a hard link's first name) and $WORK/missing.paths (the
 # wanted paths the table does not have).
 resolve_paths() { # <wanted paths file> <table>
-  awk -F'\t' -v rows="$WORK/wanted.rows" -v brought="$WORK/brought.paths" -v missing="$WORK/missing.paths" '
+  ROWS_OUT="$WORK/wanted.rows" BROUGHT_OUT="$WORK/brought.paths" MISSING_OUT="$WORK/missing.paths" awk -F'\t' '
+    BEGIN { rows = ENVIRON["ROWS_OUT"]; brought = ENVIRON["BROUGHT_OUT"]; missing = ENVIRON["MISSING_OUT"] }
     FILENAME == ARGV[1] { want[$0 ""] = 1; next }
     /^#/ { next }
     { n++; line[n] = $0; path[n] = $7 ""; kind[n] = $1; target[n] = $8 ""; at[$7 ""] = n }
@@ -3342,6 +3743,37 @@ do_repair() {
   restore_paths "$TO" repair
 }
 
+# A restore of several units makes each unit's directory under --to of its
+# name (DIR/UNIT), so the name is held to the rule tapectl names a unit by
+# (validate_unit_name): components between slashes, none empty and none
+# longer than 64 bytes, each of letters, digits, dots, underscores and dashes
+# and beginning with neither a dot nor a dash (so neither . nor ..), and the
+# whole at most 200 bytes. It is the name as bash holds it, the one that is
+# joined to --to (a NUL byte, which bash drops, is not in it). Returns 0, with
+# the rule the name breaks in REPLY, when it breaks one.
+NAME_REFUSED="" # the units a restore of several refused by their names
+unit_name_refused() { # <name>
+  local s=$1 seg
+  REPLY=""
+  if [ -z "$s" ]; then
+    REPLY="it is empty"
+  elif [ "${#s}" -gt 200 ]; then
+    REPLY="it is longer than 200 bytes"
+  fi
+  while [ -z "$REPLY" ]; do
+    seg=${s%%/*}
+    case $seg in
+    '') REPLY="it has an empty component" ;;
+    .* | -*) REPLY="a component of it begins with a dot or a dash" ;;
+    *[!A-Za-z0-9._-]*) REPLY="it holds a byte that is not a letter, a digit, a dot, an underscore, a dash or a slash" ;;
+    *) [ "${#seg}" -le 64 ] || REPLY="a component of it is longer than 64 bytes" ;;
+    esac
+    [ "$seg" != "$s" ] || break
+    s=${s#*/}
+  done
+  [ -n "$REPLY" ]
+}
+
 do_restore() {
   tar_init
   if [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; then
@@ -3373,6 +3805,7 @@ do_restore() {
     if [ "$n" -gt 1 ] && [ "$OVERWRITE" = 0 ]; then
       while IFS= read -r row; do
         IFS='|' read -r _ _ name _ <<<"$row"
+        ! unit_name_refused "$name" || continue
         dest="$TO/$name"
         if [ ! -f "$dest/.tapectl-damaged-files.txt" ] && [ -n "$(ls -A -- "$dest" 2>/dev/null)" ]; then
           die "$(safe_str "$dest") is not empty and holds no damaged-file list, so it is not an earlier run of this unit that stopped short. $(units_with_lists)Restore into an empty or new directory, or give --overwrite to replace files that are there."
@@ -3382,8 +3815,16 @@ do_restore() {
     # fd 3, so that nothing a unit's restore runs can read the list from stdin.
     while IFS= read -r row <&3; do
       IFS='|' read -r _ _ name _ <<<"$row"
-      if [ "$n" -eq 1 ]; then dest=$TO; else dest="$TO/$name"; fi
       [ "$QUIT" = 0 ] || break
+      if [ "$n" -eq 1 ]; then
+        dest=$TO
+      elif unit_name_refused "$name"; then
+        warn "unit $(safe_str "$name") is not restored: a restore of several units makes each one's directory under --to of its name, and this name is not one tapectl gives a unit ($REPLY), so its directory might not be under --to. The envelope is damaged, or was not made by tapectl. Nothing of this unit was written; to restore it alone, into a directory of its own: --unit NAME --to DIR."
+        NAME_REFUSED="${NAME_REFUSED:+$NAME_REFUSED, }$(safe_str "$name")"
+        continue
+      else
+        dest="$TO/$name"
+      fi
       restore_one "$row" "$dest"
     done 3<"$WORK/chosen.txt"
   fi
@@ -3395,6 +3836,9 @@ do_restore() {
   if [ -n "$TABLE_REFUSED" ]; then
     say "RESTORE INCOMPLETE: the file table of unit(s) $TABLE_REFUSED holds a path that would leave the destination or is not written as a path is written, so nothing of it was restored: restore it from another copy of this tape."
   fi
+  if [ -n "$NAME_REFUSED" ]; then
+    say "RESTORE INCOMPLETE: unit(s) $NAME_REFUSED have a name that is not one tapectl gives a unit, so nothing of them was restored under --to (see the WARNING): restore each alone, --unit NAME --to DIR."
+  fi
   if [ "$DAMAGED_TOTAL" -gt 0 ]; then
     say "RESTORE INCOMPLETE: $DAMAGED_TOTAL path(s) are damaged or left out; restore them from another copy (the list is the one repair: give it to --paths-from on a tape that holds the same version)."
     return 1
@@ -3403,7 +3847,7 @@ do_restore() {
     say "RESTORE INCOMPLETE: tar ended with a status other than 0, and --no-file-check runs no check to say what it restored. Run again without --no-file-check to learn which files are whole."
     return 1
   fi
-  [ -z "$TABLE_REFUSED" ] || return 1
+  [ -z "$TABLE_REFUSED" ] && [ -z "$NAME_REFUSED" ] || return 1
   if [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; then
     say "RESTORE COMPLETE: the named path(s) of unit $(safe_str "$U_NAME") are restored into $TO."
   else

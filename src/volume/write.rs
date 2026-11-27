@@ -27737,10 +27737,20 @@ mod tests {
                     )
                     .unwrap();
                 let backend = &mut f.config.backends.lto[0];
+                // The quotient is a rounded float and the budget truncates
+                // its product with the capacity, so the quotient alone gives
+                // `fill` or one byte under it, by the figures: the volume's
+                // own files move by a block from one build to the next
+                // ([`wide_fixed`]), and a test that holds the budget to
+                // `fill` then failed in some runs and not in others. The
+                // next float up, as often as needed, gives `fill` itself.
                 backend.fill_ceiling = fill as f64 / capacity as f64;
+                while backend.fill_budget_bytes(capacity) < fill {
+                    backend.fill_ceiling = f64::from_bits(backend.fill_ceiling.to_bits() + 1);
+                }
                 backend.post_warning_bytes = post_warning.then(|| "1G".to_string());
                 let got = backend.fill_budget_bytes(capacity);
-                assert!(got.abs_diff(fill) <= 1, "the fill budget: {got} for {fill}");
+                assert_eq!(got, fill, "the fill budget");
             }
 
             /// A slice wide enough that half of one is more than another

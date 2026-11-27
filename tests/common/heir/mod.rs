@@ -172,6 +172,9 @@ pub struct Shape {
     /// Edit each staging's file table (`tables/`) before the build, to give
     /// a tape a table no writer makes (a crafted envelope's).
     pub table_edit: Option<fn(&Path)>,
+    /// Edit each unit as the build is given it (its name in the manifest, for
+    /// one), to give a tape a manifest no writer makes (a crafted envelope's).
+    pub unit_edit: Option<fn(&mut build::BuildUnit)>,
 }
 
 /// A name holding a terminal escape sequence: ESC ] 0 ; ... BEL.
@@ -244,6 +247,7 @@ impl Shape {
             links: 0,
             control_names: false,
             table_edit: None,
+            unit_edit: None,
         }
     }
     /// One big unit of tenant A, compressed.
@@ -263,6 +267,7 @@ impl Shape {
             links: 0,
             control_names: false,
             table_edit: None,
+            unit_edit: None,
         }
     }
 }
@@ -494,10 +499,13 @@ fn write_tape(
     ctx: &Ctx,
     shape: &Shape,
     units: &[UnitTruth],
-    bu: Vec<build::BuildUnit>,
+    mut bu: Vec<build::BuildUnit>,
     n: usize,
     warn: Option<usize>,
 ) -> Tape {
+    if let Some(edit) = shape.unit_edit {
+        bu.iter_mut().for_each(edit);
+    }
     let label = label_of(n);
     let volume_uuid = volume_uuid_of(n);
     let ids: Vec<i64> = bu.iter().map(|u| u.stage_set_id).collect();
@@ -1001,13 +1009,19 @@ fi
 f="$D/$pos"
 if [ ! -f "$f" ]; then echo "?" >"$T/pos"; exit 0; fi
 if [ -n "$count" ]; then
-  # A part of the file was read: the head is inside it, at no file start.
   if [ -n "$of" ]; then
     head -c $((bs * count)) "$f" >"$of" || { echo "?" >"$T/pos"; exit 1; }
   else
     head -c $((bs * count)) "$f" || { echo "?" >"$T/pos"; exit 1; }
   fi
-  echo "$pos+" >"$T/pos"
+  # A file shorter than the count was read whole, and its filemark with it,
+  # as st does: the head is at the next file. Otherwise dd stopped at the
+  # count, inside the file, at no file start.
+  if [ "$(wc -c <"$f")" -lt $((bs * count)) ]; then
+    echo $((pos + 1)) >"$T/pos"
+  else
+    echo "$pos+" >"$T/pos"
+  fi
   exit 0
 fi
 if [ -n "$of" ]; then
@@ -1067,6 +1081,10 @@ const HOST_TOOLS: &[&str] = &[
     "find",
     "xargs",
     "timeout",
+    // The final check is cut into one piece for each core they count (#611
+    // C-4); neither is required.
+    "nproc",
+    "getconf",
 ];
 
 pub fn host_tool(name: &str) -> Option<PathBuf> {
@@ -1149,6 +1167,20 @@ impl Running {
             .status()
             .unwrap();
         assert!(st.success(), "kill -{sig}");
+    }
+    /// Send `kill -SIG` to the script's whole process group, as a terminal
+    /// sends Ctrl-C (a run from [`Heir::spawn_group`] only: any other shares
+    /// the test's group).
+    pub fn signal_group(&self, sig: &str) {
+        let st = Command::new("kill")
+            .args([
+                format!("-{sig}"),
+                "--".into(),
+                format!("-{}", self.child.id()),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success(), "kill -{sig} -- -pgid");
     }
     /// Wait for the end (at most 60 s) and return what it said.
     pub fn finish(&mut self) -> Out {
@@ -1320,6 +1352,16 @@ impl Heir {
     /// Start the script with its standard input a pipe the test writes to;
     /// both its streams go to one file, so the order is the script's own.
     pub fn spawn(&self, args: &[&str], envs: &[(&str, &str)]) -> Running {
+        self.spawn_in(args, envs, false)
+    }
+
+    /// [`Heir::spawn`], the script the leader of a process group of its own,
+    /// as a shell's foreground job is (for [`Running::signal_group`]).
+    pub fn spawn_group(&self, args: &[&str], envs: &[(&str, &str)]) -> Running {
+        self.spawn_in(args, envs, true)
+    }
+
+    fn spawn_in(&self, args: &[&str], envs: &[(&str, &str)], group: bool) -> Running {
         let out_path = self.root.path().join("state/run.out");
         let out = fs::File::create(&out_path).unwrap();
         let mut c = Command::new("bash");
@@ -1337,6 +1379,9 @@ impl Heir {
             .stderr(Stdio::from(out));
         for (k, v) in envs {
             c.env(k, v);
+        }
+        if group {
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
         }
         fs::create_dir_all(self.root.path().join("tmp")).unwrap();
         let mut child = c.spawn().expect("spawn RESTORE.sh");

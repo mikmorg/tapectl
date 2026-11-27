@@ -421,7 +421,10 @@ each member of the staging's tar stream, **in stream order**:
 
 **Every row has eight fields** (**determined**, read from the template's bytes): the tab
 before `link target` is always written, so a row that is not `h` ends in a tab and an empty
-field. A writer writes, and a reader requires, eight fields.
+field. A writer writes, and a reader requires, eight fields. **None of the first seven is
+ever empty** (**determined**, ADR-0012 item 313): a kind's letter, four numbers, a hash or
+`-`, a path (the root is `.`). A reader may refuse a row that has an empty one, and one
+whose `link target`, when present, breaks the rule for a path; RESTORE.sh refuses both.
 
 **Rows in stream order; a folder is two ranges** (#562): a folder's own member comes
 where the sorted list put it, and its contents follow later members; restoring a folder
@@ -1361,10 +1364,16 @@ where it is and rewinds only for a file behind it. Besides those five tools the 
    its `front_index_sha256` must match File 3's hash. Absent or mismatched: the tape is
    unsealed or damaged; proceed knowing trailing slices may be missing. If File 3 is
    unreadable, the seal's embedded copy is the same map (validate its hashes against the
-   files before trusting it).
+   files before trusting it). If File 3 reads and the two disagree, neither vouches for
+   the other, and an envelope is not called damaged on File 3's word alone: step 4 says
+   what decides (item 313).
 4. For each envelope position: `dd` it out, check its hash against the front index, `age
-   -d -i KEY`. The one that decrypts is yours: `MANIFEST.toml`, `RECOVERY.md`, `tables/`
-   (each staging's file table and id map, §1.6) and `index/`. age's "no identity matched"
+   -d -i KEY`. Where the two ends disagree (step 3) and the seal's embedded copy is sound
+   by itself, an envelope that matches that copy's hash is given to `age` too, and a backup
+   is paired through either map: `age` authenticates what it decrypts, so a wrong line in
+   a plain-text map can cost a try and never a wrong answer. The one that decrypts is
+   yours: `MANIFEST.toml`, `RECOVERY.md`, `tables/` (each staging's file table and id map,
+   §1.6) and `index/`. age's "no identity matched"
    means the key is not a recipient; any other failure after a key matched means the
    envelope is damaged, and its backup (§1.3, the `*_backup` entry with the same
    `sha256_encrypted`) is read instead.

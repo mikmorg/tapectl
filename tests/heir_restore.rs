@@ -452,13 +452,27 @@ fn another_layout_is_refused_by_name_with_its_label() {
         o.stderr.contains("a tapectl volume of Layout 2")
             && o.stderr.contains("magic tapectl-volume-v2")
             && o.stderr.contains(LABEL)
-            && o.stderr.contains("Layout 3 only")
-            && o.stderr.contains("RESTORE.sh in its own File 2"),
+            && o.stderr.contains("Layout 3 only"),
         "{}",
         o.stderr
     );
-    // Nothing but File 0 was read.
-    assert_eq!(h.dd_reads(), vec![0]);
+    // This is a Layout 3 tape whose File 0 alone was changed, so its seal
+    // marker still states Layout 3 and no feature. The refusal stays, and
+    // says so: File 0 may be the damaged one, and the RESTORE.sh in this
+    // tape's File 2, the script that is running, is not the way on (ADR-0012
+    // item 313, DI-9). A tape whose seal marker does not vouch keeps the old
+    // way on: `tests/heir_restore_s6.rs`.
+    assert!(
+        o.stderr.contains(
+            "the seal marker at the end of this tape states layout_version = 3 and requires no feature"
+        ) && o.stderr.contains("File 0 may be damaged")
+            && o.stderr.contains("by the steps of File 1")
+            && !o.stderr.contains("RESTORE.sh in its own File 2"),
+        "{}",
+        o.stderr
+    );
+    // Nothing but File 0 and the seal marker was read.
+    assert_eq!(h.dd_reads(), vec![0, t.files.len() - 1]);
 }
 
 #[test]
@@ -5492,6 +5506,12 @@ fn a_signal_just_after_a_slice_was_fed_leaves_no_partial_file_from_that_slice() 
 /// tapectl's, one the drive cannot read, one with no readable seal, one that
 /// lists the slice past its seal, and one that lists no such slice. A
 /// cartridge whose front index is unreadable is read by the seal's copy.
+///
+/// File 0 is no part of that rule (ADR-0012 item 313): a cartridge whose File
+/// 0 alone does not read, or states nothing, is taken or refused by its front
+/// index and seal marker (`tests/heir_restore_s6.rs`). So the cartridge that
+/// is not tapectl's is one NO file of which is tapectl's, and the one the
+/// drive cannot read gives neither its File 0, its front index nor its seal.
 #[test]
 fn a_cartridge_is_taken_only_by_the_next_slices_hash_at_a_position_its_seal_covers() {
     let t = span3();
@@ -5503,11 +5523,17 @@ fn a_cartridge_is_taken_only_by_the_next_slices_hash_at_a_position_its_seal_cove
             .replace("layout_version = 3", "layout_version = 2")
     });
     h.shelve("LAYOUT2", &f);
-    let mut f = t[2].files.clone();
+    let mut f: Vec<Vec<u8>> = t[2]
+        .files
+        .iter()
+        .map(|_| b"a file of some other tape".to_vec())
+        .collect();
     f[0] = b"the first file of some other tape".to_vec();
     h.shelve("NOTTAPE", &f);
     h.copy_cart("HEIR02", "UNREAD");
-    h.fail_file("UNREAD", 0);
+    for n in [0, 3, t[1].files.len() - 1] {
+        h.fail_file("UNREAD", n);
+    }
     let mut f = t[1].files.clone();
     let last = f.len() - 1;
     f[last] = b"junk where the seal marker was".to_vec();
@@ -7183,5 +7209,2325 @@ fn a_table_path_that_leaves_to_is_refused_and_nothing_outside_to_is_touched() {
         );
         assert_eq!(std::fs::read(up.join("sentinel.txt")).unwrap(), b"keep up");
         assert!(!Path::new("/abs-sentinel.txt").exists());
+    }
+}
+
+// ---- #611 D-1: a raw NUL byte in a file-table path ----
+
+fn t_nul_path(p: &Path) {
+    craft_row(p, "f", "..\0/..\0/sentinel.txt")
+}
+fn t_nul_link(p: &Path) {
+    craft_row(p, "h", "..\0/..\0/sentinel.txt")
+}
+fn t_nul_lead(p: &Path) {
+    craft_row(p, "f", "\0/abs-sentinel.txt")
+}
+
+/// #611 D-1 (ADR-0012 item 313): a file-table row whose path, or hard link's
+/// target, holds a raw NUL byte is refused before anything is removed, made or
+/// linked, under every awk: bash drops the NUL from a path it is given
+/// (`..<NUL>/x` would be `../x`), so the row is refused by what each awk sees.
+/// gawk and mawk see the NUL (shown `\x00`); BusyBox awk ends the row at it,
+/// and the row it sees has not the eight fields of §1.6. Nothing of the unit
+/// is written, nothing beside or above `--to` is touched, `--all` goes on.
+#[test]
+fn a_table_path_with_a_nul_byte_is_refused_under_every_awk() {
+    // The case, and the path as gawk and mawk show it (a hard link's target is
+    // not shown: the row's path is).
+    let cases: [(TableEdit, &str, Option<&str>); 3] = [
+        (t_nul_path, "path", Some("..\\x00/..\\x00/sentinel.txt")),
+        (t_nul_link, "target", None),
+        (t_nul_lead, "leading", Some("\\x00/abs-sentinel.txt")),
+    ];
+    let listing = |d: &Path| {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let mut ran = 0;
+    for (edit, shown, printed) in cases {
+        let mut shape = Shape::two();
+        shape.table_edit = Some(edit);
+        let t = Tape::build(&shape);
+        for (name, body) in awks() {
+            let h = Heir::of(&t);
+            put_awk(&h, &body);
+            let ke = key(&h, Who::Escrow);
+            let up = h.dest("up");
+            let boxed = up.join("box");
+            std::fs::create_dir_all(&boxed).unwrap();
+            std::fs::write(up.join("sentinel.txt"), b"keep up").unwrap();
+            std::fs::write(boxed.join("sentinel.txt"), b"keep box").unwrap();
+            let to = boxed.join("to");
+            let o = h.run(&restore_all(&ke, &to));
+            let all = o.all();
+            assert_eq!(o.code, 1, "{name} {shown}: {all}");
+            assert!(
+                o.stderr.contains(&format!(
+                    "the file table of unit {UNIT_A} holds a path this script will not write"
+                )),
+                "{name} {shown}: {}",
+                o.stderr
+            );
+            if name == "busybox awk" {
+                // The row it sees ends at the NUL: short of fields, or, with
+                // the NUL in the last field, a target of `..`.
+                assert!(
+                    o.stderr.contains("fields, not eight")
+                        || o.stderr.contains("target: it has a .. component"),
+                    "{name} {shown}: {}",
+                    o.stderr
+                );
+            } else {
+                assert!(
+                    o.stderr.contains("its row holds a NUL byte"),
+                    "{name} {shown}: {}",
+                    o.stderr
+                );
+                if let Some(p) = printed {
+                    assert!(o.stderr.contains(p), "{name} {shown}: {}", o.stderr);
+                }
+            }
+            assert!(
+                !all.contains("null byte"),
+                "{name} {shown}: bash saw it: {all}"
+            );
+            assert!(
+                o.stdout.contains(&format!(
+                    "RESTORE INCOMPLETE: the file table of unit(s) {UNIT_A} holds a path"
+                )),
+                "{name} {shown}: {all}"
+            );
+            assert!(
+                !to.join(UNIT_A).exists(),
+                "{name} {shown}: nothing of unit A"
+            );
+            assert_restored(&t, UNIT_B, &to.join(UNIT_B));
+            assert_eq!(listing(&boxed), ["sentinel.txt", "to"], "{name} {shown}");
+            assert_eq!(listing(&up), ["box", "sentinel.txt"], "{name} {shown}");
+            assert_eq!(
+                std::fs::read(boxed.join("sentinel.txt")).unwrap(),
+                b"keep box"
+            );
+            assert_eq!(std::fs::read(up.join("sentinel.txt")).unwrap(), b"keep up");
+            assert!(!Path::new("/abs-sentinel.txt").exists());
+            ran += 1;
+        }
+    }
+    assert!(ran >= 3, "at least one awk ran each case");
+}
+
+// ---- #611 G1: an empty field in a file-table row ----
+
+/// Unit B's long member's row with its size field empty and a field 8 that
+/// leaves `--to` (the second reader's G1): awk reads the two TABs as an empty
+/// field, bash's `IFS=$'\t' read` as one separator, which made field 8 the
+/// path `load_members` held.
+fn t_empty_size(p: &Path) {
+    let large = format!("{UNIT_B}-large.bin");
+    let text = std::fs::read_to_string(p).unwrap();
+    if !text.contains(&large) {
+        return;
+    }
+    let mut out = String::new();
+    for l in text.lines() {
+        let mut f: Vec<&str> = l.split('\t').collect();
+        if f.len() == 8 && f[6] == large {
+            f[4] = "";
+            f[7] = "../../victim";
+        }
+        out.push_str(&f.join("\t"));
+        out.push('\n');
+    }
+    std::fs::write(p, out).unwrap();
+}
+
+/// #611 G1 (ADR-0012 item 313): a file-table row with an empty field among
+/// the first seven is refused at the table check, under every awk, before a
+/// path restore touches anything: the long member's row with its size empty
+/// and `../../victim` as field 8, restored by `--path` with a later slice of
+/// its run bad, leaves the file beside `--to`'s parent where it was (the
+/// broken run's partial file was removed by the path bash read, field 8).
+#[test]
+fn a_table_row_with_an_empty_field_is_refused_before_a_path_restore_touches_anything() {
+    let mut shape = Shape::two();
+    shape.table_edit = Some(t_empty_size);
+    let t = Tape::build(&shape);
+    assert_eq!(t.slice_positions(), two().slice_positions());
+    let large = format!("{UNIT_B}-large.bin");
+    let listing = |d: &Path| {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let mut ran = 0;
+    for (name, body) in awks() {
+        let h = Heir::of(&t);
+        put_awk(&h, &body);
+        let kb = key(&h, Who::TenantB);
+        // The slice after the one the long member begins in: its run breaks there.
+        let o = h.run(&["--list", "--key", &kb, "--unit", UNIT_B]);
+        let first: usize = o
+            .stdout
+            .lines()
+            .find(|l| l.contains(&large))
+            .map(|l| l.split_whitespace().nth(1).unwrap().parse().unwrap())
+            .unwrap_or_else(|| panic!("{name}: {}", o.all()));
+        h.flip(slice_pos(&t, UNIT_B, first + 1), 4000);
+        let up = h.dest("up");
+        let boxed = up.join("box");
+        std::fs::create_dir_all(&boxed).unwrap();
+        std::fs::write(up.join("victim"), b"keep up").unwrap();
+        let to = boxed.join("to");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &kb,
+            "--to",
+            dest_str(&to),
+            "--unit",
+            UNIT_B,
+            "--path",
+            &large,
+        ]);
+        let all = o.all();
+        assert_eq!(listing(&up), ["box", "victim"], "{name}: {all}");
+        assert_eq!(std::fs::read(up.join("victim")).unwrap(), b"keep up");
+        assert_eq!(o.code, 1, "{name}: {all}");
+        assert!(
+            o.stderr.contains(&format!(
+                "the file table of unit {UNIT_B} holds a path this script will not write: {large} (its row's field 5 is empty)"
+            )),
+            "{name}: {}",
+            o.stderr
+        );
+        assert_eq!(listing(&boxed), ["to"], "{name}");
+        assert_eq!(listing(&to), Vec::<String>::new(), "{name}");
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
+/// The recorded tape's file tables (`tests/fixtures/recorded-2.0.0`), as the
+/// script reads them out of its envelopes: a `--list` of each tenant's units
+/// with an `awk` that keeps a copy of every table it is given.
+fn recorded_tables(dir: &Path) -> Vec<std::path::PathBuf> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recorded-2.0.0");
+    let expected: toml::Value =
+        toml::from_str(&std::fs::read_to_string(fixture.join("EXPECTED.toml")).unwrap()).unwrap();
+    let label = expected["tape"]["label"].as_str().unwrap().to_string();
+    let mut files = Vec::new();
+    while let Ok(b) = std::fs::read(fixture.join(format!("file-{:03}", files.len()))) {
+        files.push(b);
+    }
+    let keys: Vec<(&'static str, std::path::PathBuf)> = ["tenant-alpha", "tenant-bravo"]
+        .into_iter()
+        .map(|n| (n, fixture.join("keys").join(format!("{n}.key"))))
+        .collect();
+    let key_refs: Vec<(&'static str, &Path)> =
+        keys.iter().map(|(n, p)| (*n, p.as_path())).collect();
+    let h = Heir::recorded(
+        &files,
+        tapectl::volume::heir::RESTORE_SH.as_bytes(),
+        &label,
+        &key_refs,
+    );
+    let real = heir::host_tool("awk").expect("awk");
+    let kept = dir.join("tables");
+    std::fs::create_dir_all(&kept).unwrap();
+    h.put_tool(
+        "awk",
+        &format!(
+            "#!/bin/bash\n\
+             for a; do\n\
+               case $a in\n\
+               *.ids.tsv) ;;\n\
+               */tables/*.tsv) cp \"$a\" {k}/ ;;\n\
+               esac\n\
+             done\n\
+             exec \"{r}\" \"$@\"\n",
+            k = kept.display(),
+            r = real.display()
+        ),
+    );
+    for who in ["tenant-alpha", "tenant-bravo"] {
+        let k = h.keys[who].to_string_lossy().into_owned();
+        let o = h.run(&["--list", "--key", &k]);
+        assert_eq!(o.code, 0, "{who}: {}", o.all());
+    }
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(&kept)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// #611 G1 (ADR-0012 item 313): the table check (`AWK_TABLE_PATHS`) under
+/// every awk refuses a row with an empty field at each of positions 1 to 7,
+/// by name (tapectl writes a letter, four numbers, a hash or `-`, and a path,
+/// the root `.`: `filetable::write`), and holds field 8 to the path rule
+/// whenever it is not empty, whatever the row's kind (tapectl's reader,
+/// `filetable::Reader`'s `row`, does). The recorded tape's tables, whose
+/// rows are of every kind, still pass.
+#[test]
+fn the_table_check_refuses_an_empty_field_and_any_field_8_that_leaves_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = script_parts(&["AWK_INDEX_COMMON", "AWK_TABLE_PATHS"]);
+    let sha = "a".repeat(64);
+    let sound = [
+        "d\t1\t0\t512\t0\t-\t.\t".to_string(),
+        format!("f\t1\t512\t2048\t1000\t{sha}\tsafe.txt\t"),
+        format!("h\t1\t2048\t2560\t1000\t{sha}\tlink.txt\tsafe.txt"),
+    ];
+    // (rows, what the check prints: words TAB path, or nothing).
+    let mut cases: Vec<(Vec<String>, String)> = Vec::new();
+    for i in 0..7 {
+        let mut f: Vec<String> = sound[1].split('\t').map(str::to_string).collect();
+        f[i] = String::new();
+        let shown = if i == 6 { "" } else { "safe.txt" };
+        cases.push((
+            vec![sound[0].clone(), f.join("\t")],
+            format!("its row's field {} is empty\t{shown}", i + 1),
+        ));
+    }
+    // The reader's row, and a row that is not `h` with a field 8 that leaves.
+    cases.push((
+        vec![
+            sound[0].clone(),
+            format!("f\t1\t512\t2600\t\t{sha}\tsafe.txt\t../../victim"),
+        ],
+        "its row's field 5 is empty\tsafe.txt".to_string(),
+    ));
+    cases.push((
+        vec![
+            sound[0].clone(),
+            format!("f\t1\t512\t2048\t1000\t{sha}\tsafe.txt\t../x"),
+        ],
+        "its link target: it has a .. component\t../x".to_string(),
+    ));
+    cases.push((
+        vec![sound[0].clone(), format!("d\t1\t512\t1024\t0\t-\tdir\t/x")],
+        "its link target: it begins with /\t/x".to_string(),
+    ));
+    // The positive controls: the sound rows, and a hard link's target that leaves.
+    cases.push((sound.to_vec(), String::new()));
+    cases.push((
+        vec![
+            sound[0].clone(),
+            format!("h\t1\t512\t1024\t1000\t{sha}\tl\t../x"),
+        ],
+        "its hard link's target: it has a .. component\t../x".to_string(),
+    ));
+    let mut tables: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for (n, (rows, want)) in cases.iter().enumerate() {
+        let p = dir.path().join(format!("case-{n}.tsv"));
+        std::fs::write(
+            &p,
+            format!(
+                "#tapectl-file-table 1\n#stream_bytes 4096\n{}\n",
+                rows.join("\n")
+            ),
+        )
+        .unwrap();
+        tables.push((p, want.clone()));
+    }
+    let recorded = recorded_tables(dir.path());
+    assert!(recorded.len() >= 3, "{recorded:?}");
+    let mut kinds = std::collections::BTreeSet::new();
+    for p in &recorded {
+        for l in std::fs::read_to_string(p).unwrap().lines() {
+            if !l.starts_with('#') {
+                kinds.insert(l.split('\t').next().unwrap().to_string());
+            }
+        }
+        tables.push((p.clone(), String::new()));
+    }
+    assert_eq!(
+        kinds.into_iter().collect::<Vec<_>>(),
+        ["d", "f", "h", "l"],
+        "the recorded tables hold every kind of row a tree gives"
+    );
+    let mut ran = 0;
+    for (name, body) in awks() {
+        let bin = dir.path().join(format!("bin-{ran}"));
+        std::fs::create_dir_all(&bin).unwrap();
+        let awk = bin.join("awk");
+        std::fs::write(&awk, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&awk, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        for (p, want) in &tables {
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "{parts}\nawk -F'\\t' \"$AWK_INDEX_COMMON $AWK_TABLE_PATHS\" {}\n",
+                    shell_quote(&p.to_string_lossy())
+                ))
+                .env("LC_ALL", "C")
+                .env(
+                    "PATH",
+                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                )
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{name} {}", p.display());
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout).trim_end_matches('\n'),
+                want,
+                "{name} {}",
+                p.display()
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
+// ---- #611 S-1: a unit's name joined to --to ----
+
+fn u_outside(u: &mut tapectl::volume::build::BuildUnit) {
+    if u.unit_name == UNIT_A {
+        u.unit_name = "../outside/planted".to_string();
+    }
+}
+fn u_inner(u: &mut tapectl::volume::build::BuildUnit) {
+    if u.unit_name == UNIT_A {
+        u.unit_name = "inner/../../outside".to_string();
+    }
+}
+
+/// #611 S-1 (ADR-0012 item 313): a restore of several units makes each one's
+/// directory of its name under `--to`, so a manifest whose unit name is not one
+/// tapectl gives a unit (here one with a `..` component, as only a crafted
+/// envelope has) has that unit refused by name before any directory is looked
+/// at or made: nothing of it is written, nothing beside `--to` is made, the
+/// other unit is restored, and the run ends RESTORE INCOMPLETE. The same unit
+/// restored alone goes into `--to` itself, where its name is no path.
+#[test]
+fn a_unit_name_that_is_not_a_unit_name_is_refused_before_its_directory_is_made() {
+    type UnitEdit = fn(&mut tapectl::volume::build::BuildUnit);
+    let cases: [(UnitEdit, &str); 2] = [
+        (u_outside, "../outside/planted"),
+        (u_inner, "inner/../../outside"),
+    ];
+    for (edit, bad) in cases {
+        let mut shape = Shape::two();
+        shape.unit_edit = Some(edit);
+        let t = Tape::build(&shape);
+        let h = Heir::of(&t);
+        let ke = key(&h, Who::Escrow);
+        let boxed = h.dest("box");
+        let to = boxed.join("to");
+        let o = h.run(&restore_all(&ke, &to));
+        let all = o.all();
+        assert_eq!(o.code, 1, "{bad}: {all}");
+        assert!(
+            o.stderr.contains(&format!(
+                "WARNING: unit {bad} is not restored: a restore of several units makes"
+            )) && o
+                .stderr
+                .contains("(a component of it begins with a dot or a dash)"),
+            "{bad}: {}",
+            o.stderr
+        );
+        assert!(
+            o.stdout.contains(&format!(
+                "RESTORE INCOMPLETE: unit(s) {bad} have a name that is not one tapectl gives a unit"
+            )),
+            "{bad}: {all}"
+        );
+        assert!(!o.stdout.contains("RESTORE COMPLETE"), "{bad}: {all}");
+        let mut beside: Vec<String> = std::fs::read_dir(&boxed)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        beside.sort();
+        assert_eq!(beside, ["to"], "{bad}: nothing made beside --to: {all}");
+        let mut under: Vec<String> = std::fs::read_dir(&to)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        under.sort();
+        assert_eq!(under, [UNIT_B], "{bad}: {all}");
+        assert_restored(&t, UNIT_B, &to.join(UNIT_B));
+        // Alone, the unit goes into --to itself: its name is no path there.
+        let alone = h.dest("alone");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ke,
+            "--unit",
+            bad,
+            "--to",
+            dest_str(&alone),
+        ]);
+        assert_eq!(o.code, 0, "{bad}: {}", o.all());
+        assert_restored(&t, UNIT_A, &alone);
+    }
+}
+
+/// The script's rule for a unit name (`unit_name_refused`) is tapectl's own
+/// (`naming::validate_unit_name`), name for name, on names each rule of it
+/// takes or refuses, run by bash under `LC_ALL=C` as the script runs.
+#[test]
+fn the_scripts_unit_name_rule_is_the_one_tapectl_names_a_unit_by() {
+    let text = tapectl::volume::heir::RESTORE_SH;
+    let start = text.find("\nunit_name_refused() {").expect("the function") + 1;
+    let end = text[start..].find("\n}\n").unwrap() + start + 3;
+    let func = &text[start..end];
+    let long = |n: usize| "a".repeat(n);
+    let names: Vec<String> = vec![
+        "photos".into(),
+        "tv/breaking-bad/s01".into(),
+        "media/movies/2019/the_film.4k".into(),
+        "7".into(),
+        "a.b-c_d".into(),
+        "x-".into(),
+        "x.".into(),
+        "".into(),
+        "/leading".into(),
+        "trailing/".into(),
+        "dou//ble".into(),
+        ".".into(),
+        "..".into(),
+        "../x".into(),
+        "a/../b".into(),
+        "a/./b".into(),
+        ".hidden".into(),
+        "a/.hidden".into(),
+        "-dash".into(),
+        "a/-dash".into(),
+        "has space".into(),
+        "back\\slash".into(),
+        "tab\there".into(),
+        "new\nline".into(),
+        "esc\u{1b}[0m".into(),
+        "caf\u{e9}".into(),
+        "pipe|x".into(),
+        "star*".into(),
+        long(64),
+        long(65),
+        format!("{}/{}/{}/{}", long(50), long(50), long(50), long(47)),
+        format!("{}/{}/{}/{}", long(50), long(50), long(50), long(48)),
+    ];
+    let mut script = format!("export LC_ALL=C\n{func}\n");
+    for n in &names {
+        script.push_str(&format!(
+            "if unit_name_refused {}; then echo refused; else echo taken; fi\n",
+            shell_quote(n)
+        ));
+    }
+    let o = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let got: Vec<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(got.len(), names.len());
+    for (n, g) in names.iter().zip(&got) {
+        let want = if tapectl::naming::validate_unit_name(n).is_ok() {
+            "taken"
+        } else {
+            "refused"
+        };
+        assert_eq!(g, want, "{n:?}");
+    }
+    assert!(got.iter().any(|g| g == "taken") && got.iter().any(|g| g == "refused"));
+}
+
+/// `s` as one word of a bash command line.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+// ---- #611 D-3: the cleanup's scrub needs no room in the work directory ----
+
+/// The awk programs (`NAME='...'`) and shell functions (`name() {`) of the
+/// script, by name, as one text bash can source.
+fn script_parts(names: &[&str]) -> String {
+    let text = tapectl::volume::heir::RESTORE_SH;
+    let mut out = String::new();
+    for name in names {
+        let start = text
+            .find(&format!("\n{name}='\n"))
+            .or_else(|| text.find(&format!("\n{name}() {{")))
+            .unwrap_or_else(|| panic!("no {name} in the script"))
+            + 1;
+        let first = &text[start..start + text[start..].find('\n').unwrap()];
+        let end = if text[start..].starts_with(&format!("{name}='")) {
+            text[start..].find("\n'\n").unwrap() + start + 3
+        } else if first.ends_with(" }") {
+            // A function on one line.
+            start + first.len() + 1
+        } else {
+            text[start..].find("\n}\n").unwrap() + start + 3
+        };
+        out.push_str(&text[start..end]);
+    }
+    out
+}
+
+/// #611 D-3 (ADR-0012 item 313): the scrub of a partial member (`scrub_inflight`,
+/// the cleanup's) and the removal of a broken run's partial file
+/// (`remove_partial`) read their rows from no here-document: bash writes one
+/// of more than 64 KiB to a file in TMPDIR, which is the work directory, and a
+/// work directory that cannot take a file (here: `ulimit -f`, the error a
+/// full disk gives too) skipped the scrub silently. With 4,000 rows (more than
+/// a pipe holds), each removes the two files cut short, and each with 10 rows
+/// (the positive control: no temporary file either way).
+#[test]
+fn the_scrub_of_a_partial_member_needs_no_room_in_the_work_directory() {
+    let parts = script_parts(&[
+        "AWK_UNESC",
+        "unesc",
+        "sha_of_file",
+        "scrub_inflight",
+        "remove_partial",
+    ]);
+    for rows in [4000usize, 10] {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(dest.join("photos")).unwrap();
+        let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 99999999\n");
+        let zero = "0".repeat(64);
+        for i in 1..=rows {
+            table.push_str(&format!(
+                "f\t1\t{}\t{}\t100\t{zero}\tphotos/IMG_{i:06}.jpg\t\n",
+                i * 1024,
+                i * 1024 + 1024
+            ));
+        }
+        std::fs::write(work.join("table.tsv"), &table).unwrap();
+        std::fs::write(work.join("slices.off"), "1\t0\t99999999\n").unwrap();
+        let cut = |n: usize| dest.join(format!("photos/IMG_{n:06}.jpg"));
+        let script = format!(
+            "set -euo pipefail\nexport LC_ALL=C\n{parts}\n\
+             WORK={w}; export TMPDIR=$WORK; INFLIGHT_DEST={d}; INFLIGHT_TABLE=$WORK/table.tsv; FEEDING=1\n\
+             cut() {{ echo 'cut short' >{d}/photos/IMG_000007.jpg; echo 'cut short' >{d}/photos/IMG_000008.jpg; }}\n\
+             cut\n\
+             ( trap '' XFSZ; ulimit -f 1; scrub_inflight || echo 'scrub failed' )\n\
+             [ ! -e {d}/photos/IMG_000007.jpg ] && [ ! -e {d}/photos/IMG_000008.jpg ] || echo 'scrub left them'\n\
+             cut\n\
+             ( trap '' XFSZ; ulimit -f 1; remove_partial \"$WORK/table.tsv\" 1 {d} ) || echo 'remove_partial failed'\n\
+             [ ! -e {d}/photos/IMG_000007.jpg ] && [ ! -e {d}/photos/IMG_000008.jpg ] || echo 'remove_partial left them'\n\
+             # The positive control: a here-document of this size cannot be made here.\n\
+             ( trap '' XFSZ; ulimit -f 1; cat <<EOF >/dev/null\n$(cat \"$WORK/table.tsv\")\nEOF\n ) 2>/dev/null && echo 'here-document made' || echo 'here-document refused'\n",
+            w = work.display(),
+            d = dest.display()
+        );
+        let o = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success(), "{rows}: {out}\n{err}");
+        assert!(!cut(7).exists() && !cut(8).exists(), "{rows}: {out}\n{err}");
+        let control = if rows > 1000 {
+            "here-document refused"
+        } else {
+            "here-document made"
+        };
+        assert_eq!(out.trim(), control, "{rows}: {err}");
+    }
+}
+
+// ---- #611 D-4: a write error on the plain cut ----
+
+/// #611 D-4 (ADR-0012 item 313): when the work directory refuses the plain
+/// cut for a reason that is not "full" (here EFBIG: a stand-in `tee` writes
+/// 100 bytes of `slice.plain`, passes every byte on, says "File too large" and
+/// ends 1, as GNU tee does), age ends 0 and the slice's length is wrong: the
+/// verdict says what tee said and names the work directory, never the slice,
+/// and the run ends there, as for a full one. The tape was right.
+#[test]
+fn a_write_error_on_the_plain_cut_names_the_work_directory_and_not_the_slice() {
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::host_tool("tee").expect("tee");
+    h.put_tool(
+        "tee",
+        &format!(
+            "#!/bin/bash\n\
+             case \"${{1:-}}\" in\n\
+             */slice.plain)\n\
+               \"{real}\" \"$1.whole\" || exit 1\n\
+               head -c 100 \"$1.whole\" >\"$1\"\n\
+               echo \"tee: $1: File too large\" >&2\n\
+               exit 1\n\
+               ;;\n\
+             esac\n\
+             exec \"{real}\" \"$@\"\n",
+            real = real.display()
+        ),
+    );
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dest_str(&dest),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(
+        o.stderr
+            .contains("FATAL: writing slice 1 into the work directory failed: tee: ")
+            && o.stderr.contains("slice.plain: File too large"),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("The work directory ")
+            && o.stderr.contains("Nothing on the tape is wrong"),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        !all.contains("its decoded length is"),
+        "the slice is blamed: {all}"
+    );
+    assert!(!all.contains("RESTORE INCOMPLETE"), "{all}");
+}
+
+// ---- #611 D-5: no path goes through awk -v ----
+
+/// #611 D-5 (ADR-0012 item 313): a `--to` or `--work` with a backslash in its
+/// name is a directory like another, under every awk: no awk is given a path
+/// through `-v`, which reads its backslashes (gawk and BusyBox awk then could
+/// not open `my\data`'s files and the run ended early). A unit whose slices
+/// are not all on the tape (`report_absent`'s list of hard links), a path
+/// restore (`resolve_paths`' three files) and a whole restore with `--work`.
+#[test]
+fn a_backslash_in_to_or_work_is_a_directory_like_another_under_every_awk() {
+    let mut ran = 0;
+    for (name, body) in awks() {
+        // The short tape: the big unit has only its first slice here.
+        let h = Heir::of(short());
+        put_awk(&h, &body);
+        let to = h.root.path().join("my\\data").join("short");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &key(&h, Who::TenantB),
+            "--to",
+            dest_str(&to),
+        ]);
+        let all = o.all();
+        assert_eq!(o.code, 1, "{name}: {all}");
+        assert!(
+            o.stdout.contains("NOT ON THIS CARTRIDGE: slices "),
+            "{name}: {all}"
+        );
+        assert!(o.stdout.contains("RESTORE INCOMPLETE: "), "{name}: {all}");
+        assert!(
+            to.join(".tapectl-damaged-files.txt").is_file(),
+            "{name}: {all}"
+        );
+        // A path restore.
+        let h = Heir::of(two());
+        put_awk(&h, &body);
+        let ka = key(&h, Who::TenantA);
+        let one = h.root.path().join("my\\data").join("one");
+        let deep = format!("inner/{UNIT_A}-deep.dat");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ka,
+            "--to",
+            dest_str(&one),
+            "--unit",
+            UNIT_A,
+            "--path",
+            &deep,
+        ]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert!(one.join(&deep).is_file(), "{name}");
+        // A whole restore, its work directory under --work.
+        let whole = h.dest("whole");
+        let work = h.root.path().join("w\\ork");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ka,
+            "--to",
+            dest_str(&whole),
+            "--work",
+            dest_str(&work),
+        ]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{name}: {}", o.all());
+        assert_restored(two(), UNIT_A, &whole);
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
+// ---- #611 C-4: the final check split across the machine's cores ----
+
+/// A tree of 40 files and its file table, for the check by itself: a file
+/// whose name holds a backslash (hashed alone, the slow path), three files
+/// damaged and one missing. Every 7th file from the first is 100 times its
+/// text, the others 1 to 3 times: dealt by size, the rows go to the pieces
+/// neither in runs nor in turn, and the three damaged ones (rows 1, 20 and
+/// 40) to three different pieces of four.
+fn check_tree(root: &Path) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let dest = root.join("dest");
+    std::fs::create_dir_all(dest.join("sub dir")).unwrap();
+    let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 1\n");
+    for i in 1..=40 {
+        let (on_disk, escaped) = match i {
+            15 => (
+                "back\\slash.txt".to_string(),
+                "back\\\\slash.txt".to_string(),
+            ),
+            22 => (
+                "sub dir/caf\u{e9} 22.txt".to_string(),
+                "sub dir/caf\u{e9} 22.txt".to_string(),
+            ),
+            _ => (format!("f{i:02}.txt"), format!("f{i:02}.txt")),
+        };
+        let times = if i % 7 == 1 { 100 } else { i % 3 + 1 };
+        let bytes = format!("content {i}\n").repeat(times);
+        std::fs::write(dest.join(&on_disk), &bytes).unwrap();
+        let sum: String = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        table.push_str(&format!(
+            "f\t1\t0\t1\t{}\t{sum}\t{escaped}\t\n",
+            bytes.len()
+        ));
+    }
+    for (n, damage) in [(1, true), (20, true), (40, true), (25, false), (15, true)] {
+        let p = if n == 15 {
+            dest.join("back\\slash.txt")
+        } else {
+            dest.join(format!("f{n:02}.txt"))
+        };
+        if damage {
+            std::fs::write(&p, b"damaged\n").unwrap();
+        } else {
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+    let t = root.join("table.tsv");
+    std::fs::write(&t, table).unwrap();
+    t
+}
+
+/// Run `file_check`, cut from the script, on `table` and `<root>/dest` with
+/// an `nproc` that answers `pieces`, and `path`, first on the PATH; the work
+/// directory is `<root>/<work>`. Returns what it printed.
+fn run_file_check(root: &Path, table: &Path, pieces: usize, work: &str, path: &Path) -> String {
+    let o = file_check_run(root, table, pieces, work, path, "");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// `run_file_check`'s run, with the shell text `pre` run just before
+/// `file_check` (a limit, a stand-in function), and whatever its end.
+fn file_check_run(
+    root: &Path,
+    table: &Path,
+    pieces: usize,
+    work: &str,
+    path: &Path,
+    pre: &str,
+) -> std::process::Output {
+    let parts = script_parts(&[
+        "is_uint",
+        "tape_uint",
+        "die_io",
+        "AWK_UNESC",
+        "unesc",
+        "sha_of_file",
+        "check_pieces",
+        "check_job",
+        "check_split",
+        "file_check",
+    ]);
+    let w = root.join(work);
+    std::fs::create_dir_all(&w).unwrap();
+    let cores = root.join(format!("nproc-{work}"));
+    std::fs::create_dir_all(&cores).unwrap();
+    let nproc = cores.join("nproc");
+    std::fs::write(&nproc, format!("#!/bin/sh\necho {pieces}\n")).unwrap();
+    std::fs::set_permissions(&nproc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let script = format!(
+        "set -euo pipefail\nexport LC_ALL=C\n{parts}\nWORK={w}\nAHEAD_PID=\"\"\n{pre}\n\
+         file_check {t} {d} {w}/failed\necho \"rows=$CHECK_ROWS failed=$CHECK_FAILED\"\n",
+        w = w.display(),
+        t = table.display(),
+        d = root.join("dest").display()
+    );
+    std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:{}",
+                cores.display(),
+                path.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .unwrap()
+}
+
+/// The fast rows of `table` (a path with no backslash), in order: the path
+/// as `sha256sum -c` is given it and the table's size field.
+fn fast_rows(table: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(table)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .filter(|f| !f[6].contains('\\'))
+        .map(|f| (format!("./{}", f[6]), f[4].to_string()))
+        .collect()
+}
+
+/// The split's rule, as the script is to deal (C-4b): each row to the piece
+/// with the fewest bytes so far, its size (0 unless all digits) plus 1, a
+/// tie to the lowest. The piece (from 1) of each row.
+fn dealt_by_rule(sizes: &[String], n: usize) -> Vec<usize> {
+    let mut load = vec![0f64; n];
+    sizes
+        .iter()
+        .map(|s| {
+            let size = if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+                s.parse::<f64>().unwrap()
+            } else {
+                0.0
+            };
+            let mut p = 0;
+            for i in 1..n {
+                if load[i] < load[p] {
+                    p = i;
+                }
+            }
+            load[p] += size + 1.0;
+            p + 1
+        })
+        .collect()
+}
+
+/// A bin directory with a `sha256sum` that keeps a copy of each list it
+/// checks in `<bin>/lists` (the pieces, as the job gave them) and, for the
+/// list `check.fast.<cut>`, prints its last line no more; `awk` as `awk_body`.
+fn recording_bin(
+    root: &Path,
+    name: &str,
+    awk_body: &str,
+    cut: Option<usize>,
+) -> std::path::PathBuf {
+    let real = heir::host_tool("sha256sum").expect("sha256sum");
+    let bin = root.join(name);
+    let lists = bin.join("lists");
+    std::fs::create_dir_all(&lists).unwrap();
+    let cut = cut.map_or("none".to_string(), |c| c.to_string());
+    for (tool, body) in [
+        (
+            "sha256sum",
+            format!(
+                "#!/bin/bash\nfor a; do last=$a; done\n\
+                 if [ \"${{1:-}}\" = -c ]; then cp \"$last\" {l}/; fi\n\
+                 case \"$1 $last\" in\n\
+                 \"-c \"*/check.fast.{cut}) : >{l}/cut; \"{r}\" \"$@\" | sed '$d'; exit \"${{PIPESTATUS[0]}}\" ;;\n\
+                 esac\nexec \"{r}\" \"$@\"\n",
+                l = lists.display(),
+                r = real.display()
+            ),
+        ),
+        ("awk", format!("#!/bin/sh\n{awk_body}")),
+    ] {
+        let p = bin.join(tool);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
+/// The piece (from 1) each fast row of `table` went to, read from the lists
+/// `recording_bin`'s `sha256sum` kept; the lists are removed after.
+fn dealt_by_script(bin: &Path, table: &Path) -> Vec<usize> {
+    let lists = bin.join("lists");
+    let mut at = std::collections::BTreeMap::new();
+    for e in std::fs::read_dir(&lists).unwrap() {
+        let p = e.unwrap().path();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        if let Some(k) = name.strip_prefix("check.fast.") {
+            let k: usize = k.parse().unwrap();
+            for l in std::fs::read_to_string(&p).unwrap().lines() {
+                at.insert(l.split_once("  ").unwrap().1.to_string(), k);
+            }
+        }
+        std::fs::remove_file(&p).unwrap();
+    }
+    fast_rows(table)
+        .iter()
+        .map(|(path, _)| *at.get(path).unwrap_or(&0))
+        .collect()
+}
+
+/// What the split leaves in the work directory `w` beside the one check's
+/// files: nothing (C-4b: its pieces are removed once joined).
+fn split_leftovers(w: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(w)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            n.starts_with("check.fast.")
+                || n.starts_with("check.out.")
+                || n.starts_with("check.rc.")
+                || n == "check.piece"
+                || n == "check.size"
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// #611 C-4 and C-4b (ADR-0012 item 313): the check dealt into pieces by
+/// size, run at once, gives `check.out` and the list of failed paths BYTE FOR
+/// BYTE as the one `sha256sum -c` over the whole list does, on one damaged
+/// tree: a missing file, a name hashed alone (a backslash), names uutils
+/// would quote, and three damaged files that the pieces' own lists show
+/// dealt to three different pieces of four, the dealing neither in runs nor
+/// in turn. A piece whose `sha256sum` printed one line short (a stand-in, on
+/// the piece of one damaged file) has its rows hashed alone: the list is
+/// still the same, and no other piece's pairing moves. No piece file is left.
+#[test]
+fn the_split_check_gives_the_one_checks_lines_and_list_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let table = check_tree(root);
+    let real_awk = format!(
+        "exec {} \"$@\"\n",
+        heir::host_tool("awk").unwrap().display()
+    );
+    let sizes: Vec<String> = fast_rows(&table).into_iter().map(|(_, s)| s).collect();
+    let bin = recording_bin(root, "rec", &real_awk, None);
+    let one = run_file_check(root, &table, 1, "w1", &bin);
+    assert_eq!(one.trim(), "rows=40 failed=5", "{one}");
+    let read = |w: &str, f: &str| std::fs::read(root.join(w).join(f)).unwrap();
+    // The positive control: the single check's list is the damage made.
+    assert_eq!(
+        String::from_utf8(read("w1", "failed")).unwrap(),
+        "back\\\\slash.txt\nf01.txt\nf20.txt\nf25.txt\nf40.txt\n"
+    );
+    assert_eq!(
+        dealt_by_script(&bin, &table),
+        vec![0; sizes.len()],
+        "one piece is the single check"
+    );
+    // The fast rows of f01, f20 and f40 (f15 is hashed alone).
+    let damaged = [0usize, 18, 38];
+    for n in [2usize, 4, 8] {
+        let w = format!("w{n}");
+        let got = run_file_check(root, &table, n, &w, &bin);
+        assert_eq!(got, one, "{n} pieces");
+        let dealt = dealt_by_script(&bin, &table);
+        assert_eq!(dealt, dealt_by_rule(&sizes, n), "{n} pieces: the dealing");
+        assert!(
+            dealt.windows(2).any(|p| p[1] < p[0]),
+            "{n} pieces: dealt in runs {dealt:?}"
+        );
+        assert!(
+            dealt.iter().enumerate().any(|(k, p)| *p != k % n + 1),
+            "{n} pieces: dealt in turn {dealt:?}"
+        );
+        if n == 4 {
+            let mut d: Vec<usize> = damaged.iter().map(|k| dealt[*k]).collect();
+            d.sort_unstable();
+            d.dedup();
+            assert_eq!(d.len(), 3, "the damaged rows' pieces: {dealt:?}");
+        }
+        assert_eq!(
+            read(&w, "check.out"),
+            read("w1", "check.out"),
+            "{n} pieces: check.out"
+        );
+        assert_eq!(
+            read(&w, "failed"),
+            read("w1", "failed"),
+            "{n} pieces: the list"
+        );
+        assert_eq!(
+            split_leftovers(&root.join(&w)),
+            Vec::<String>::new(),
+            "{n} pieces"
+        );
+    }
+    // A piece cut short, at four: the piece f20 is dealt to, a middle row.
+    let cut = dealt_by_rule(&sizes, 4)[damaged[1]];
+    let short = recording_bin(root, "short", &real_awk, Some(cut));
+    let got = run_file_check(root, &table, 4, "wshort", &short);
+    assert_eq!(got, one, "a piece cut short");
+    assert_eq!(
+        read("wshort", "failed"),
+        read("w1", "failed"),
+        "a piece cut short"
+    );
+    let lines = |w: &str, f: &str| read(w, f).split(|b| *b == b'\n').count();
+    assert_eq!(lines("wshort", "check.out"), lines("w1", "check.out"));
+    // The positive control: the stand-in did cut that piece short.
+    assert!(short.join("lists/cut").exists(), "piece {cut} was not cut");
+    assert_eq!(split_leftovers(&root.join("wshort")), Vec::<String>::new());
+}
+
+/// #611 C-4b (ADR-0012 item 313): rows are dealt by the table's size. A
+/// table whose first four rows are 1,000 times the others' size puts those
+/// four in four different pieces, at four pieces and at eight (cut by row
+/// count, they were all in the first); a big row every 8th row spreads over
+/// all eight pieces at eight (dealt in turn, they would all be in one).
+#[test]
+fn the_split_check_deals_the_big_rows_over_the_pieces() {
+    use sha2::{Digest, Sha256};
+    let real_awk = format!(
+        "exec {} \"$@\"\n",
+        heir::host_tool("awk").unwrap().display()
+    );
+    // (which of 64 rows are big (from 0), the piece counts, how many pieces
+    // the big rows must be in at n pieces).
+    type Case = (fn(usize) -> bool, &'static [usize], fn(usize) -> usize);
+    let cases: [Case; 2] = [(|k| k < 4, &[4, 8], |_| 4), (|k| k % 8 == 0, &[8], |n| n)];
+    let rows = 64;
+    for (big, counts, spread) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 1\n");
+        for k in 0..rows {
+            let bytes = if big(k) {
+                "b".repeat(10_000)
+            } else {
+                "s".repeat(10)
+            };
+            std::fs::write(dest.join(format!("r{k:03}")), &bytes).unwrap();
+            let sum: String = Sha256::digest(bytes.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            table.push_str(&format!("f\t1\t0\t1\t{}\t{sum}\tr{k:03}\t\n", bytes.len()));
+        }
+        let t = root.join("table.tsv");
+        std::fs::write(&t, table).unwrap();
+        let bin = recording_bin(root, "rec", &real_awk, None);
+        for n in counts {
+            let got = run_file_check(root, &t, *n, &format!("w{n}"), &bin);
+            assert_eq!(got.trim(), format!("rows={rows} failed=0"));
+            let dealt = dealt_by_script(&bin, &t);
+            let mut pieces: Vec<usize> = (0..rows).filter(|k| big(*k)).map(|k| dealt[k]).collect();
+            pieces.sort_unstable();
+            pieces.dedup();
+            assert_eq!(pieces.len(), spread(*n), "{n} pieces: {dealt:?}");
+        }
+    }
+}
+
+/// #611 C-4b (ADR-0012 item 313): a size field that is not all digits
+/// counts as 0 when the rows are dealt (mawk reads `nan` as a number, which
+/// no comparison orders): `nan`, `inf`, `1e999`, `-5`, empty, text and a
+/// number of 30 digits. Under every awk, the dealing is the rule's, and the
+/// split check gives the one check's lines and list byte for byte.
+#[test]
+fn hostile_size_fields_deal_as_no_size_and_give_the_one_checks_lines_under_every_awk() {
+    use sha2::{Digest, Sha256};
+    let hostile = ["nan", "inf", "1e999", "-5", "", "text", &"9".repeat(30)];
+    let mut ran = 0;
+    for (name, body) in awks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 1\n");
+        for k in 0..35usize {
+            let bytes = format!("content {k}\n");
+            let size = if k % 5 == 2 {
+                hostile[(k / 5) % hostile.len()].to_string()
+            } else {
+                ((k * 7919) % 1000).to_string()
+            };
+            let disk = if [0, 17, 34].contains(&k) {
+                "damaged\n"
+            } else {
+                bytes.as_str()
+            };
+            std::fs::write(dest.join(format!("f {k}.txt")), disk).unwrap();
+            let sum: String = Sha256::digest(bytes.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            table.push_str(&format!("f\t1\t0\t1\t{size}\t{sum}\tf {k}.txt\t\n"));
+        }
+        let t = root.join("table.tsv");
+        std::fs::write(&t, table).unwrap();
+        let sizes: Vec<String> = fast_rows(&t).into_iter().map(|(_, s)| s).collect();
+        assert!(sizes.iter().any(|s| s == "nan") && sizes.iter().any(|s| s.len() == 30));
+        let bin = recording_bin(root, "rec", &body, None);
+        let one = run_file_check(root, &t, 1, "w1", &bin);
+        assert_eq!(one.trim(), "rows=35 failed=3", "{name}");
+        let _ = dealt_by_script(&bin, &t);
+        let read = |w: &str, f: &str| std::fs::read(root.join(w).join(f)).unwrap();
+        for n in [2usize, 4, 8] {
+            let w = format!("w{n}");
+            let got = run_file_check(root, &t, n, &w, &bin);
+            assert_eq!(got, one, "{name} {n}");
+            assert_eq!(
+                dealt_by_script(&bin, &t),
+                dealt_by_rule(&sizes, n),
+                "{name} {n}: the dealing"
+            );
+            assert_eq!(read(&w, "check.out"), read("w1", "check.out"), "{name} {n}");
+            assert_eq!(read(&w, "failed"), read("w1", "failed"), "{name} {n}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
+/// #611 C-4b and G9 (ADR-0012 item 313): a piece file that is not there, or
+/// short, never gives a wrong verdict and never puts a raw bash or awk line
+/// before the heir. Three stand-ins under every awk, at four pieces: (a) a
+/// piece's list never written (the deal leaves it out, as a work directory
+/// with no room for a new file does): its rows are hashed alone; (b) the
+/// work directory full (`ulimit -f 0`) as a short piece's blank lines are
+/// written: that piece's output is short at the join, which ends early;
+/// (c) a piece's output removed as the join begins: the join ends early. In
+/// each, `file_check` (counting `check.out`'s lines) hashes the rows alone:
+/// the list is the one check's, and nothing is printed.
+#[test]
+fn a_piece_missing_or_short_at_the_join_gives_the_one_checks_list_and_no_raw_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let table = check_tree(root);
+    let sizes: Vec<String> = fast_rows(&table).into_iter().map(|(_, s)| s).collect();
+    let real_awk = format!(
+        "exec {} \"$@\"\n",
+        heir::host_tool("awk").unwrap().display()
+    );
+    let base = recording_bin(root, "base", &real_awk, None);
+    let one = run_file_check(root, &table, 1, "w1", &base);
+    let read = |w: &str, f: &str| std::fs::read(root.join(w).join(f)).unwrap();
+    // Piece 2 at four, by the rule (it holds rows: four pieces, 39 rows).
+    assert!(dealt_by_rule(&sizes, 4).contains(&2));
+    let mut ran = 0;
+    for (name, body) in awks() {
+        // The stand-in's words: what it does, by the program it is given.
+        let cases = [
+            (
+                "a",
+                "case \"$*\" in *'load[p]'*) awk_real \"$@\"; rc=$?; rm -f \"${CHECK:?}.fast.2\"; : >\"$MARK\"; exit $rc ;; esac",
+            ),
+            (
+                "b",
+                "case \"$*\" in *'{ print \"\" }'*) : >\"$MARK\"; ulimit -f 0 ;; esac",
+            ),
+            (
+                "c",
+                "case \"$*\" in *'getline line'*) rm -f \"${CHECK:?}.out.2\"; : >\"$MARK\" ;; esac",
+            ),
+        ];
+        for (case, words) in cases {
+            let what = format!("{name} ({case})");
+            let mark = root.join(format!("mark-{ran}-{case}"));
+            let awk = format!(
+                "awk_real() {{ {body}; }}\nMARK={m}\ntrap '' XFSZ\n{words}\nawk_real \"$@\"\n",
+                body = body.trim_end().replace("exec ", ""),
+                m = mark.display()
+            );
+            // (b) needs a piece whose sha256sum printed a line short.
+            let cut = (case == "b").then_some(2);
+            let bin = recording_bin(root, &format!("bin-{ran}-{case}"), &awk, cut);
+            let w = format!("w-{ran}-{case}");
+            let o = file_check_run(root, &table, 4, &w, &bin, "");
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.success(), "{what}: {err}");
+            assert_eq!(out, one, "{what}");
+            assert_eq!(err, "", "{what}: a raw line");
+            assert_eq!(read(&w, "failed"), read("w1", "failed"), "{what}");
+            // The positive control: the stand-in acted.
+            assert!(mark.exists(), "{what}: the stand-in did not act");
+            if case != "a" {
+                assert!(
+                    lines_of(&root.join(&w).join("check.out"))
+                        < lines_of(&root.join(&w).join("check.fast")),
+                    "{what}: the join did not end early"
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
+fn lines_of(p: &Path) -> usize {
+    std::fs::read(p)
+        .unwrap()
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count()
+}
+
+/// The count of pieces: the machine's cores, from `nproc`, or `getconf
+/// _NPROCESSORS_ONLN` where there is no nproc, at most 8 and never more than
+/// the rows; 1 when neither says (no tool, or an answer that is not a number),
+/// and the one-process check then runs. Neither tool is required
+/// (`check_tools` does not name them). Nothing else sets the count: the
+/// environment variable TAPECTL_CHECK_PIECES the tests once set is no input
+/// of File 2 (ADR-0012 item 318), and a value of it changes nothing.
+#[test]
+fn the_check_is_cut_into_as_many_pieces_as_cores_at_most_eight() {
+    let parts = script_parts(&["is_uint", "tape_uint", "check_pieces"]);
+    let text = tapectl::volume::heir::RESTORE_SH;
+    assert!(!text.contains("TOOLS_RESTORE=(dd head sha256sum age tar nproc"));
+    // nproc's answer, getconf's, TAPECTL_CHECK_PIECES (ignored), the rows, the pieces.
+    type Case = (
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        usize,
+        usize,
+    );
+    let cases: [Case; 9] = [
+        (None, None, None, 100, 1),
+        (Some("1"), None, None, 100, 1),
+        (Some("garbage"), None, None, 100, 1),
+        (Some(""), None, None, 100, 1),
+        (Some("64"), None, None, 100, 8),
+        (Some("4"), None, None, 3, 3),
+        (Some("6"), None, None, 100, 6),
+        (None, Some("6"), None, 100, 6),
+        (Some("8"), None, Some("3"), 100, 8),
+    ];
+    for (nproc, getconf, forced, rows, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path();
+        for (tool, answer) in [("nproc", nproc), ("getconf", getconf)] {
+            if let Some(a) = answer {
+                let p = bin.join(tool);
+                std::fs::write(&p, format!("#!/bin/sh\necho '{a}'\n")).unwrap();
+                std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                    .unwrap();
+            }
+        }
+        let mut c = std::process::Command::new(heir::host_tool("bash").unwrap());
+        c.arg("-c")
+            .arg(format!("{parts}\ncheck_pieces {rows}\necho \"$REPLY\"\n"))
+            .env_clear()
+            .env("PATH", bin)
+            .env("LC_ALL", "C");
+        if let Some(f) = forced {
+            c.env("TAPECTL_CHECK_PIECES", f);
+        }
+        let o = c.output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout).trim(),
+            want.to_string(),
+            "nproc {nproc:?} getconf {getconf:?} forced {forced:?} rows {rows}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+}
+
+/// A whole restore with the check in one process and in pieces (an `nproc`
+/// that answers 1, then 4): the same verdict lines, the same damaged-file
+/// list, byte for byte (a tar stand-in drops one file and damages another of
+/// the big unit).
+#[test]
+fn a_restore_checked_in_pieces_writes_the_same_list_and_words_as_one_checked_whole() {
+    let t = two();
+    let mut outs = Vec::new();
+    for pieces in ["1", "4"] {
+        let h = Heir::of(t);
+        h.put_tool("nproc", &format!("#!/bin/sh\necho {pieces}\n"));
+        let real = heir::host_tool("tar").unwrap();
+        let victim = &unit_files(t, UNIT_B)[0].0;
+        h.put_tool("tar", &heir::dropping_tar(&real, victim));
+        let dest = h.dest("out");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &key(&h, Who::TenantB),
+            "--to",
+            dest_str(&dest),
+        ]);
+        assert_eq!(o.code, 1, "{pieces}: {}", o.all());
+        let list = std::fs::read(dest.join(".tapectl-damaged-files.txt")).unwrap();
+        let words: Vec<String> = o
+            .stdout
+            .lines()
+            .filter(|l| {
+                l.starts_with("File check:") || l.starts_with("DAMAGED:") || l.starts_with("  ")
+            })
+            .map(|l| l.replace(dest_str(&dest), "DEST"))
+            .collect();
+        outs.push((list, words));
+    }
+    assert!(
+        outs[0].1.iter().any(|l| l.contains("File check: 1 of ")),
+        "{:?}",
+        outs[0].1
+    );
+    assert_eq!(outs[0], outs[1]);
+}
+
+/// #611 D-4, the other side: an `age` killed while it decrypts a slice (here
+/// by itself, with SIGKILL, as the kernel's out-of-memory killer does) leaves
+/// bash's own "Killed" line where tee's words are read. That is no word of the
+/// work directory: the slice is left out with age's verdict, as before D-4's
+/// fix, and the run goes on to its list; it is never "Nothing on the tape is
+/// wrong".
+#[test]
+fn an_age_killed_on_a_slice_is_no_write_error_of_the_work_directory() {
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::heir_age_binary();
+    h.put_tool(
+        "age",
+        &format!(
+            "#!/bin/bash\n\
+             case $(ls -l /proc/$$/fd/0) in\n\
+             */slice.enc) kill -9 $$ ;;\n\
+             esac\n\
+             exec \"{}\" \"$@\"\n",
+            real.display()
+        ),
+    );
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dest_str(&dest),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(
+        o.stderr.contains("slice 1: age could not decrypt it: "),
+        "{}",
+        o.stderr
+    );
+    assert!(!all.contains("FATAL: writing slice"), "{all}");
+    assert!(!all.contains("Nothing on the tape is wrong"), "{all}");
+    assert!(o.stdout.contains("RESTORE INCOMPLETE: "), "{all}");
+}
+
+// ---- #611 G3: no row of the check goes unhashed without the run saying so ----
+
+/// A tree under `<root>/dest` and its table: `fast` files with plain names
+/// of 100 bytes (checked by one `sha256sum -c`), then `slow` whose names
+/// hold a backslash (hashed alone); the rows numbered in `damaged` (from 1,
+/// over both) have other bytes on disk.
+fn g3_tree(root: &Path, fast: usize, slow: usize, damaged: &[usize]) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let dest = root.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 1\n");
+    for i in 1..=fast + slow {
+        let pad = "p".repeat(94);
+        let (on_disk, esc) = if i <= fast {
+            let n = format!("f{i:04}-{pad}");
+            (n.clone(), n)
+        } else {
+            (format!("b{i:04}\\{pad}"), format!("b{i:04}\\\\{pad}"))
+        };
+        let bytes = format!("content {i}\n");
+        let disk = if damaged.contains(&i) {
+            "damaged\n".to_string()
+        } else {
+            bytes.clone()
+        };
+        std::fs::write(dest.join(&on_disk), disk).unwrap();
+        let sum: String = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        table.push_str(&format!("f\t1\t0\t1\t{}\t{sum}\t{esc}\t\n", bytes.len()));
+    }
+    let t = root.join("table.tsv");
+    std::fs::write(&t, table).unwrap();
+    t
+}
+
+/// #611 G3 (ADR-0012 item 313): BusyBox awk ends 0 when a write fails, so
+/// the check's lists in the work directory (`check.fast`, `check.slow`, the
+/// rows appended to `check.slow` after the fast pass) could be cut short
+/// silently, and the rows lost were never hashed: a damaged file then read
+/// `failed=0`. The rows the check passed plus those it listed as failing
+/// must be every row the table gives it, counted through a pipe; where they
+/// are not, the run ends by the work directory's FATAL, and so it does when
+/// the failed list itself cannot be written. `ulimit -f` stands in for the
+/// full work directory, sized so that the loss falls (a) in `check.fast`,
+/// (b) in `check.slow`, (c) in the append; (d) no size can cut the failed
+/// list first (each of its rows is first a longer row of `check.slow`), so
+/// the limit falls to 0 as the rows hashed alone begin. Under every awk, in
+/// one piece and in four; without the limit, each tree's count is the truth.
+#[test]
+fn a_check_list_cut_short_ends_the_run_with_the_work_directorys_fatal() {
+    // (case, fast rows, slow rows, damaged, limit in KiB, what is cut, truth).
+    type Case = (
+        &'static str,
+        usize,
+        usize,
+        Vec<usize>,
+        &'static str,
+        &'static str,
+    );
+    let all_fast: Vec<usize> = (1..=100).collect();
+    let cases: [Case; 4] = [
+        ("a", 200, 5, vec![150], "ulimit -f 16", "rows=205 failed=1"),
+        ("b", 5, 200, vec![150], "ulimit -f 16", "rows=205 failed=1"),
+        (
+            "c",
+            100,
+            60,
+            all_fast,
+            "ulimit -f 20",
+            "rows=160 failed=100",
+        ),
+        (
+            "d",
+            10,
+            5,
+            vec![2, 5, 9],
+            "eval \"unesc_real() $(declare -f unesc | tail -n +2)\"\n\
+             unesc() { unesc_real \"$1\"; ulimit -f 0; }",
+            "rows=15 failed=3",
+        ),
+    ];
+    let lines = |p: &Path| {
+        std::fs::read(p)
+            .unwrap()
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
+    };
+    let mut ran = 0;
+    for (name, body) in awks() {
+        for (case, fast, slow, damaged, limit, truth) in &cases {
+            for pieces in [1usize, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let table = g3_tree(root, *fast, *slow, damaged);
+                let bin = root.join("bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                let awk = bin.join("awk");
+                std::fs::write(&awk, format!("#!/bin/sh\n{body}")).unwrap();
+                std::fs::set_permissions(&awk, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                    .unwrap();
+                let what = format!("{name} ({case}) {pieces} piece(s)");
+                // The positive control: the tree's truth with room.
+                let o = file_check_run(root, &table, pieces, "room", &bin, "");
+                assert_eq!(
+                    String::from_utf8_lossy(&o.stdout).trim(),
+                    *truth,
+                    "{what}: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                let pre = format!("trap '' XFSZ\n{limit}");
+                let o = file_check_run(root, &table, pieces, "full", &bin, &pre);
+                let out = String::from_utf8_lossy(&o.stdout);
+                let err = String::from_utf8_lossy(&o.stderr);
+                let w = root.join("full");
+                assert!(!out.contains("rows="), "{what}: a count: {out}\n{err}");
+                assert_eq!(o.status.code(), Some(1), "{what}: {out}\n{err}");
+                assert!(
+                    err.contains("FATAL: ")
+                        && err.contains(&format!(
+                            "The work directory {} cannot take it",
+                            w.display()
+                        )),
+                    "{what}: {err}"
+                );
+                // Where the loss fell.
+                let (f, s) = (w.join("check.fast"), w.join("check.slow"));
+                match *case {
+                    "a" => assert!(lines(&f) < *fast, "{what}: check.fast whole"),
+                    "b" => {
+                        assert_eq!(lines(&f), *fast, "{what}");
+                        assert!(lines(&s) < *slow, "{what}: check.slow whole");
+                    }
+                    "c" => {
+                        assert_eq!(lines(&f), *fast, "{what}");
+                        assert!(lines(&s) >= *slow, "{what}: check.slow cut first");
+                        assert!(lines(&s) < *slow + *fast, "{what}: the append whole");
+                    }
+                    _ => {
+                        assert_eq!(lines(&s), *slow + damaged.len(), "{what}");
+                        assert_eq!(
+                            std::fs::metadata(w.join("failed")).unwrap().len(),
+                            0,
+                            "{what}: the failed list was written"
+                        );
+                    }
+                }
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
+// ---- #611 J1, J2, J3: the check reads no list this call did not make ----
+
+/// Two small units of two tenants, made alike: each lists the same number of
+/// regular files and none has a backslash in its name (every row is a fast
+/// row), so the lists the first unit's check leaves in the work directory
+/// have as many rows as the second unit's.
+fn twins() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.units = vec![
+            (UNIT_A.into(), TENANT_A, false),
+            (UNIT_B.into(), TENANT_B, false),
+        ];
+        Tape::build(&shape)
+    })
+}
+
+/// The file of the later unit the stand-in tar damages (it has no hard
+/// link, so one row fails).
+fn twin_victim() -> String {
+    format!("inner/{UNIT_B}-deep.dat")
+}
+
+/// A tar stand-in for `twins()`: the real tar runs, and when it restored the
+/// later unit (`-C <to>/bravo-unit`) it damages the victim (bytes added) and
+/// runs `act`, shell text with `$w` each work directory beside the unit's
+/// directory and `$S` the state directory. `act` writes `$S/acted` when it
+/// did what it should and `$S/no-bite` when a permission it set did not
+/// bite (uid 0 writes through any mode).
+fn twin_tar(act: &str) -> String {
+    let real = heir::host_tool("tar").unwrap();
+    format!(
+        r#"#!/bin/bash
+dest=""
+args=("$@")
+for ((i = 0; i < ${{#args[@]}}; i++)); do
+  if [ "${{args[$i]}}" = -C ]; then dest=${{args[$((i + 1))]}}; fi
+done
+"{real}" "$@"
+rc=$?
+case $dest in
+*/{unit})
+  S=$FAKE_TAPE
+  chmod u+w "$dest/{victim}" && echo damaged >>"$dest/{victim}"
+  for w in "$(dirname "$dest")"/.tapectl-work.*; do
+    : "$w"
+{act}
+  done ;;
+esac
+exit $rc
+"#,
+        real = real.display(),
+        unit = UNIT_B,
+        victim = twin_victim(),
+        act = act
+    )
+}
+
+/// The shell text that makes each of `names` (left in `$w` by the earlier
+/// unit's check) readable but not writable, and says whether that bit.
+fn unwritable(names: &[&str]) -> String {
+    format!(
+        r#"    for l in {}; do
+      if [ -f "$w/$l" ]; then
+        chmod 444 "$w/$l"
+        if ( : >>"$w/$l" ) 2>/dev/null; then echo "$l" >>"$S/no-bite"; else echo "$l" >>"$S/acted"; fi
+      else
+        echo "$l" >>"$S/missing"
+      fi
+    done"#,
+        names.join(" ")
+    )
+}
+
+/// A heir of `twins()` whose `nproc` answers `pieces`, with the tar stand-in
+/// `tar` (None: the host's).
+fn twin_heir(pieces: usize, tar: Option<&str>) -> Heir {
+    let h = Heir::of(twins());
+    h.put_tool("nproc", &format!("#!/bin/sh\necho {pieces}\n"));
+    if let Some(body) = tar {
+        h.put_tool("tar", body);
+    }
+    h
+}
+
+fn twin_args(h: &Heir, dest: &Path) -> Vec<String> {
+    vec![
+        "--restore".into(),
+        "--key".into(),
+        key(h, Who::Escrow),
+        "--all".into(),
+        "--to".into(),
+        dest_str(dest).into(),
+    ]
+}
+
+/// `--restore --all` of `twins()` with the escrow key into a new `out`.
+fn twin_run(h: &Heir) -> (heir::Out, std::path::PathBuf) {
+    let dest = h.dest("out");
+    let args = twin_args(h, &dest);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    (h.run(&args), dest)
+}
+
+/// What the stand-ins wrote to the state directory under `name`.
+fn state_mark(h: &Heir, name: &str) -> String {
+    std::fs::read_to_string(h.root.path().join("state").join(name)).unwrap_or_default()
+}
+
+/// The stand-in acted, and its permission change bit: a run as uid 0 (which
+/// writes through any mode) proves nothing here and fails loudly.
+fn assert_bit(h: &Heir, what: &str) {
+    assert_eq!(
+        state_mark(h, "no-bite"),
+        "",
+        "{what}: the permission change did not bite (uid 0?): this test cannot run here"
+    );
+    assert_eq!(state_mark(h, "missing"), "", "{what}: a list was not there");
+    assert!(
+        !state_mark(h, "acted").is_empty(),
+        "{what}: the stand-in did not act"
+    );
+}
+
+/// The regular files each unit's check counts, from a sound run's lines
+/// (the two must be equal and at least 4: four pieces each get a row).
+fn twin_rows(o: &heir::Out) -> usize {
+    let counts: Vec<usize> = o
+        .stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("File check: all "))
+        .map(|l| l.split(' ').next().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(counts.len(), 2, "{}", o.all());
+    assert_eq!(
+        counts[0],
+        counts[1],
+        "the units differ in rows: {}",
+        o.all()
+    );
+    assert!(counts[0] >= 4, "{}", o.all());
+    counts[0]
+}
+
+/// The truth of a twin run whose victim was damaged: the earlier unit whole,
+/// the victim alone on the later unit's damaged-file list, RESTORE
+/// INCOMPLETE, no FATAL.
+fn assert_twin_truth(o: &heir::Out, dest: &Path, n: usize, what: &str) {
+    let all = o.all();
+    assert_eq!(o.code, 1, "{what}: {all}");
+    assert!(!all.contains("FATAL"), "{what}: {all}");
+    assert_eq!(
+        o.stdout
+            .matches(&format!("File check: all {n} regular file(s) match"))
+            .count(),
+        1,
+        "{what}: {all}"
+    );
+    assert!(
+        o.stdout.contains(&format!(
+            "File check: 1 of {n} regular file(s) are missing or differ"
+        )),
+        "{what}: {all}"
+    );
+    assert!(
+        o.stdout
+            .contains("RESTORE INCOMPLETE: 1 path(s) are damaged"),
+        "{what}: {all}"
+    );
+    assert!(!o.stdout.contains("RESTORE COMPLETE"), "{what}: {all}");
+    let list = std::fs::read_to_string(dest.join(UNIT_B).join(".tapectl-damaged-files.txt"))
+        .unwrap_or_else(|e| panic!("{what}: no list: {e}\n{all}"));
+    let rows: Vec<&str> = list.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert_eq!(rows, vec![twin_victim().as_str()], "{what}: {all}");
+    assert!(
+        !dest
+            .join(UNIT_A)
+            .join(".tapectl-damaged-files.txt")
+            .exists(),
+        "{what}"
+    );
+}
+
+/// A twin run ended by the work directory's FATAL (`words` its first line's
+/// start), with no verdict for the later unit and none for the run.
+fn assert_twin_fatal(o: &heir::Out, n: usize, words: &str, what: &str) {
+    let all = o.all();
+    assert_eq!(o.code, 1, "{what}: {all}");
+    assert!(
+        o.stderr.contains(&format!("FATAL: {words}")),
+        "{what}: {all}"
+    );
+    assert!(o.stderr.contains("cannot take it"), "{what}: {all}");
+    assert_eq!(o.stdout.matches("File check:").count(), 1, "{what}: {all}");
+    assert_eq!(
+        o.stdout
+            .matches(&format!("File check: all {n} regular file(s) match"))
+            .count(),
+        1,
+        "{what}: {all}"
+    );
+    assert!(!o.stdout.contains("RESTORE COMPLETE"), "{what}: {all}");
+    assert!(!o.stdout.contains("RESTORE INCOMPLETE"), "{what}: {all}");
+}
+
+/// The control of every twin test: a sound run says the truth (RESTORE
+/// COMPLETE, both units all match), and the damaging stand-in alone gives the
+/// damaged truth. Returns the rows each unit counts.
+fn twin_control(pieces: usize) -> usize {
+    let h = twin_heir(pieces, None);
+    let (o, _) = twin_run(&h);
+    assert_eq!(o.code, 0, "{pieces}: {}", o.all());
+    assert!(
+        o.stdout.contains("RESTORE COMPLETE: 2 unit(s)"),
+        "{}",
+        o.all()
+    );
+    let n = twin_rows(&o);
+    let h = twin_heir(pieces, Some(&twin_tar("    echo tar >>\"$S/acted\"")));
+    let (o, dest) = twin_run(&h);
+    assert_twin_truth(&o, &dest, n, &format!("control, {pieces} piece(s)"));
+    assert!(
+        !state_mark(&h, "acted").is_empty(),
+        "the stand-in tar did not run"
+    );
+    n
+}
+
+/// #611 J1 and J2 (ADR-0012 item 313): `file_check` writes its lists in the
+/// one work directory of the run, and nothing removed `check.fast`,
+/// `check.slow` or `check.out` between units, so where the open of one
+/// failed (`|| true` on the list-writing awks, J1; `check.out`'s open in
+/// the one check and the split's join, J2), the list the unit before left
+/// was read in its place: with as many rows as this unit's, "all N regular
+/// file(s) match" and RESTORE COMPLETE for a unit whose damaged file was
+/// never hashed. Each list left by the first unit is made readable but not
+/// writable before the second unit's check, alone and the three together,
+/// at one piece and four: every list is removed at the check's start and
+/// written again, so the verdict is the truth.
+#[test]
+fn a_list_the_unit_before_left_unwritable_is_never_read_as_this_units() {
+    for pieces in [1usize, 4] {
+        let n = twin_control(pieces);
+        let sets: [&[&str]; 4] = [
+            &["check.fast"],
+            &["check.slow"],
+            &["check.out"],
+            &["check.fast", "check.slow", "check.out"],
+        ];
+        for names in sets {
+            let what = format!("{names:?}, {pieces} piece(s)");
+            let h = twin_heir(pieces, Some(&twin_tar(&unwritable(names))));
+            let (o, dest) = twin_run(&h);
+            assert_bit(&h, &what);
+            assert_twin_truth(&o, &dest, n, &what);
+        }
+    }
+}
+
+/// #611 J2's split form (ADR-0012 item 313): with two pieces or more the
+/// join opens `check.out` after the hashing, behind a `2>/dev/null` that
+/// hides its failure. Every open for writing in the work directory fails
+/// from the second unit's first `sha256sum -c` on (a `sha256sum` stand-in
+/// makes every file there and the directory itself read-only, as a file
+/// system gone read-only does): the run ends with the work directory's
+/// FATAL, never with a verdict from the first unit's lines. At one piece
+/// `check.out` is opened before the hashing and the failing write is the
+/// rows' append.
+#[test]
+fn a_work_directory_gone_read_only_during_the_hashing_ends_the_run() {
+    let real = heir::host_tool("sha256sum").unwrap();
+    let sha = format!(
+        r#"#!/bin/bash
+case " $* " in
+*" -c "*)
+  if [ -e "$FAKE_TAPE/midhash.flag" ]; then
+    rm -f "$FAKE_TAPE/midhash.flag"
+    list=${{@: -1}}
+    w=$(dirname "$list")
+    chmod 444 "$w"/*
+    chmod 555 "$w"
+    if ( : >"$w/bite.probe" ) 2>/dev/null; then echo w >>"$FAKE_TAPE/no-bite"; else echo "$list" >>"$FAKE_TAPE/acted"; fi
+  fi ;;
+esac
+exec "{}" "$@"
+"#,
+        real.display()
+    );
+    for (pieces, words) in [
+        (
+            4usize,
+            "the per-file check could not write sha256sum's lines",
+        ),
+        (1, "the per-file check could not add to its list"),
+    ] {
+        let n = twin_control(pieces);
+        let what = format!("{pieces} piece(s)");
+        let h = twin_heir(pieces, Some(&twin_tar("    : >\"$S/midhash.flag\"")));
+        h.put_tool("sha256sum", &sha);
+        let (o, dest) = twin_run(&h);
+        assert_bit(&h, &what);
+        assert!(
+            state_mark(&h, "acted").contains("/check.fast"),
+            "{what}: {}",
+            state_mark(&h, "acted")
+        );
+        assert_twin_fatal(&o, n, words, &what);
+        assert!(
+            !dest
+                .join(UNIT_B)
+                .join(".tapectl-damaged-files.txt")
+                .exists(),
+            "{what}"
+        );
+    }
+}
+
+/// #611 J1 (ADR-0012 item 313): a list that cannot be removed at the
+/// check's start (the work directory made read-only once the second unit's
+/// files are restored, by an awk stand-in as the script lists what the
+/// slices left out, the first unit's lists in it) ends the run with the
+/// work directory's FATAL; the list is never read in place of this unit's.
+#[test]
+fn a_list_that_cannot_be_removed_ends_the_run() {
+    let real = heir::host_tool("awk").unwrap();
+    let awk = format!(
+        r#"#!/bin/bash
+case "$*" in
+*'bad[$1 ""] = 1'*)
+  if [ -e "$FAKE_TAPE/ro.flag" ]; then
+    rm -f "$FAKE_TAPE/ro.flag"
+    w=$(dirname "${{@: -2:1}}")
+    chmod 555 "$w"
+    if ( : >"$w/bite.probe" ) 2>/dev/null; then echo w >>"$FAKE_TAPE/no-bite"; else echo "$w" >>"$FAKE_TAPE/acted"; fi
+  fi ;;
+esac
+exec "{}" "$@"
+"#,
+        real.display()
+    );
+    for pieces in [1usize, 4] {
+        let n = twin_control(pieces);
+        let what = format!("{pieces} piece(s)");
+        let h = twin_heir(pieces, Some(&twin_tar("    : >\"$S/ro.flag\"")));
+        h.put_tool("awk", &awk);
+        let (o, _) = twin_run(&h);
+        assert_bit(&h, &what);
+        assert_twin_fatal(
+            &o,
+            n,
+            "the per-file check could not remove a list an earlier check left",
+            &what,
+        );
+    }
+}
+
+/// #611 J1 (ADR-0012 item 313): the split check's own files left by an
+/// earlier check (`check.fast.N`, `check.out.N`, `check.rc.N`,
+/// `check.piece`, `check.size`), planted with contents that would pass
+/// (the rows and OK lines of the file `empty`, which both units hold alike)
+/// and made readable but not writable before the second unit's check, each
+/// family alone and all together: each is removed and made again, and the
+/// verdict is the truth.
+#[test]
+fn a_piece_file_left_behind_is_never_read_as_this_checks() {
+    let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let plant = |files: &str| {
+        format!(
+            r#"    for f in {files}; do
+      case $f in
+      check.fast.*) for i in 1 2 3 4 5 6 7 8; do echo "{empty}  ./empty"; done >"$w/$f" ;;
+      check.out.*) for i in 1 2 3 4 5 6 7 8; do echo "./empty: OK"; done >"$w/$f" ;;
+      check.rc.*) echo 0 >"$w/$f" ;;
+      check.piece) for i in 1 2 3 4 1 2 3 4; do echo "$i"; done >"$w/$f" ;;
+      check.size) for i in 1 2 3 4 5 6 7 8; do echo 0; done >"$w/$f" ;;
+      esac
+      chmod 444 "$w/$f"
+      if ( : >>"$w/$f" ) 2>/dev/null; then echo "$f" >>"$S/no-bite"; else echo "$f" >>"$S/acted"; fi
+    done"#
+        )
+    };
+    let families = [
+        "check.fast.1 check.fast.2 check.fast.3 check.fast.4",
+        "check.out.1 check.out.2 check.out.3 check.out.4",
+        "check.rc.1 check.rc.2 check.rc.3 check.rc.4",
+        "check.piece",
+        "check.size",
+    ];
+    let all = families.join(" ");
+    for pieces in [1usize, 4] {
+        let n = twin_control(pieces);
+        for files in families.iter().copied().chain([all.as_str()]) {
+            let what = format!("{files}, {pieces} piece(s)");
+            let h = twin_heir(pieces, Some(&twin_tar(&plant(files))));
+            let (o, dest) = twin_run(&h);
+            assert_bit(&h, &what);
+            assert_twin_truth(&o, &dest, n, &what);
+        }
+    }
+}
+
+/// #611 J1 (ADR-0012 item 313): removing every list at the check's start
+/// trips on no sound run: a run of two units (the second unit's check finds
+/// the first's lists), its continuation (a unit with a damaged-file list:
+/// the check runs twice in one run, once for what passes and once for what
+/// was fed again) and a path restore, at one piece and four.
+#[test]
+fn a_sound_run_its_continuation_and_a_path_restore_still_end_whole() {
+    for pieces in [1usize, 4] {
+        let n = twin_control(pieces);
+        // The damaged run, then the same unit continued with the host's tar.
+        let h = twin_heir(pieces, Some(&twin_tar("    echo tar >>\"$S/acted\"")));
+        let (o, dest) = twin_run(&h);
+        assert_twin_truth(&o, &dest, n, "the damaged run");
+        let real = heir::host_tool("tar").unwrap();
+        h.link_tool("tar", &real);
+        let ke = key(&h, Who::Escrow);
+        let unit_dir = dest.join(UNIT_B);
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ke,
+            "--unit",
+            UNIT_B,
+            "--to",
+            dest_str(&unit_dir),
+        ]);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{pieces}: {all}");
+        assert!(!all.contains("FATAL"), "{pieces}: {all}");
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{pieces}: {all}");
+        assert_restored(twins(), UNIT_B, &unit_dir);
+        // A path restore of one file of the first unit, removed.
+        let unit_dir = dest.join(UNIT_A);
+        let small = format!("{UNIT_A}-small.txt");
+        std::fs::remove_file(unit_dir.join(&small)).unwrap();
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ke,
+            "--unit",
+            UNIT_A,
+            "--path",
+            &small,
+            "--to",
+            dest_str(&unit_dir),
+        ]);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{pieces}: {all}");
+        assert!(!all.contains("FATAL"), "{pieces}: {all}");
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{pieces}: {all}");
+        assert_restored(twins(), UNIT_A, &unit_dir);
+    }
+}
+
+/// #611 J1 and J3 (ADR-0012 item 313): an awk that writes one of the
+/// check's lists and ends non-zero (gawk and mawk on a failed open or
+/// write) ends the run with the work directory's FATAL there, though the
+/// lines it left count right: the count cannot see a row altered inside its
+/// line. A stand-in awk runs the host's, alters a row in place so that the
+/// damaged file would pass (line 2 becomes line 1 in `check.fast` or
+/// `check.slow`; the append gives the first fast row instead of the damaged
+/// one) and ends 2. The control: without the stand-in the truth. The
+/// stand-in is seen to have acted in the list it altered.
+#[test]
+fn an_awk_that_ends_non_zero_on_a_list_ends_the_run_whatever_the_count() {
+    let real = heir::host_tool("awk").unwrap();
+    // (the line, its program's mark, the table's damaged row, the stand-in's
+    // output, the list it alters).
+    let cases = [
+        (
+            "check.fast",
+            r#""  ./" $7"#,
+            2usize,
+            "| sed '1h;2g'",
+            "check.fast",
+        ),
+        (
+            "check.slow",
+            r#"print $6 "\t" $7"#,
+            7,
+            "| sed '1h;2g'",
+            "check.slow",
+        ),
+        (
+            "the append",
+            "ok[FNR] != 1",
+            2,
+            ">/dev/null; sed -n '1s#  \\./#\\t#p' \"${@: -1}\"",
+            "check.slow",
+        ),
+    ];
+    for (line, mark, damaged, out, list) in cases {
+        for pieces in [1usize, 4] {
+            let what = format!("{line}, {pieces} piece(s)");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let table = g3_tree(root, 5, 5, &[damaged]);
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            // The control: the truth.
+            let o = file_check_run(root, &table, pieces, "truth", &bin, "");
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout).trim(),
+                "rows=10 failed=1",
+                "{what}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let awk = bin.join("awk");
+            std::fs::write(
+                &awk,
+                format!(
+                    "#!/bin/bash\ncase \"$*\" in\n*'{mark}'*) \"{r}\" \"$@\" {out}; exit 2 ;;\nesac\nexec \"{r}\" \"$@\"\n",
+                    r = real.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&awk, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            let o = file_check_run(root, &table, pieces, "w", &bin, "");
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(!out.contains("rows="), "{what}: a verdict: {out}\n{err}");
+            assert_eq!(o.status.code(), Some(1), "{what}: {out}\n{err}");
+            assert!(
+                err.contains("FATAL: the per-file check could not ")
+                    && err.contains("cannot take it"),
+                "{what}: {err}"
+            );
+            // The stand-in acted: the list holds the first row's line twice
+            // (or, for the append, the first fast row in check.slow).
+            let text = std::fs::read_to_string(root.join("w").join(list)).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            if line == "the append" {
+                assert_eq!(lines.len(), 6, "{what}: {text}");
+                assert!(lines[5].contains("f0001-"), "{what}: {text}");
+            } else {
+                assert!(lines.len() >= 2 && lines[0] == lines[1], "{what}: {text}");
+            }
+        }
+    }
+}
+
+/// #611 J3's other side (ADR-0012 item 313): a status above 128 is a
+/// signal's, never a failed write's: an awk killed alone (here by itself,
+/// with KILL, as the out-of-memory killer does) after it wrote its whole
+/// list is no FATAL of the work directory; the count decides, and it is the
+/// truth.
+#[test]
+fn an_awk_killed_after_its_list_is_written_is_left_to_the_count() {
+    let real = heir::host_tool("awk").unwrap();
+    for (line, mark) in [
+        ("check.fast", r#""  ./" $7"#),
+        ("check.slow", r#"print $6 "\t" $7"#),
+        ("the append", "ok[FNR] != 1"),
+    ] {
+        for pieces in [1usize, 4] {
+            let what = format!("{line}, {pieces} piece(s)");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let table = g3_tree(root, 5, 5, &[2, 7]);
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let awk = bin.join("awk");
+            std::fs::write(
+                &awk,
+                format!(
+                    "#!/bin/bash\ncase \"$*\" in\n*'{mark}'*) \"{r}\" \"$@\"; : >\"$KILLED\"; kill -KILL $$ ;;\nesac\nexec \"{r}\" \"$@\"\n",
+                    r = real.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&awk, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            let killed = root.join("killed");
+            let pre = format!("export KILLED={}", killed.display());
+            let o = file_check_run(root, &table, pieces, "w", &bin, &pre);
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(killed.exists(), "{what}: the stand-in did not act: {err}");
+            assert!(o.status.success(), "{what}: {out}\n{err}");
+            assert_eq!(out.trim(), "rows=10 failed=2", "{what}: {err}");
+            assert!(!err.contains("FATAL"), "{what}: {err}");
+        }
+    }
+}
+
+/// #611 J2 (ADR-0012 item 313): `check.out` was removed at the check's
+/// start, so where its open fails (here the work directory made read-only
+/// once the rows' lists are written) there is none: the run ends with the
+/// work directory's FATAL, at one piece (the one check's open) and at four
+/// (the join's, whose `2>/dev/null` hides bash's line), never with a raw
+/// error of a read of it, and never with a verdict.
+#[test]
+fn a_check_out_that_cannot_be_made_ends_the_run() {
+    for pieces in [1usize, 4] {
+        let what = format!("{pieces} piece(s)");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let table = g3_tree(root, 5, 0, &[2]);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let pre = r#"awk() {
+  local rc=0
+  command awk "$@" || rc=$?
+  case "$*" in
+  *'print $6 "\t" $7'*)
+    chmod 555 "$WORK"
+    if ( : >"$WORK/bite.probe" ) 2>/dev/null; then echo NO-BITE >&2; fi ;;
+  esac
+  return $rc
+}"#;
+        let o = file_check_run(root, &table, pieces, "w", &bin, pre);
+        let out = String::from_utf8_lossy(&o.stdout);
+        let err = String::from_utf8_lossy(&o.stderr);
+        std::fs::set_permissions(
+            root.join("w"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(
+            !err.contains("NO-BITE"),
+            "{what}: the read-only work directory did not bite (uid 0?): this test cannot run here"
+        );
+        assert!(!out.contains("rows="), "{what}: a verdict: {out}\n{err}");
+        assert_eq!(o.status.code(), Some(1), "{what}: {out}\n{err}");
+        assert!(
+            err.contains("FATAL: the per-file check could not write sha256sum's lines")
+                && err.contains("cannot take it"),
+            "{what}: {err}"
+        );
+        assert!(!root.join("w").join("check.out").exists(), "{what}");
+    }
+}
+
+/// #611 J2 (ADR-0012 item 313): where sha256sum's lines are not one for
+/// each row, `check.out` is emptied and every row hashed alone; an emptying
+/// that fails (`check.out` made read-only after a `sha256sum` stand-in
+/// printed one line) ends the run with the work directory's FATAL, never
+/// with bash's line and status alone.
+#[test]
+fn a_check_out_that_cannot_be_emptied_ends_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let table = g3_tree(root, 5, 0, &[2]);
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let pre = r#"sha256sum() {
+  command sha256sum "$@" | head -n 1
+  chmod 444 "$WORK/check.out"
+  if ( : >>"$WORK/check.out" ) 2>/dev/null; then echo NO-BITE >&2; fi
+}"#;
+    let o = file_check_run(root, &table, 1, "w", &bin, pre);
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !err.contains("NO-BITE"),
+        "the read-only check.out did not bite (uid 0?): this test cannot run here"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("w").join("check.out"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the stand-in did not act: {err}"
+    );
+    assert!(!out.contains("rows="), "a verdict: {out}\n{err}");
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}");
+    assert!(
+        err.contains("FATAL: the per-file check could not empty sha256sum's lines")
+            && err.contains("cannot take it"),
+        "{err}"
+    );
+}
+
+/// #611 J1/J3 (ADR-0012 item 313), rule 2: a signal that lands while an awk
+/// writes one of the check's lists (a stand-in awk that sleeps 3 s first),
+/// INT or TERM, sent to the script alone and to its whole process group as
+/// a terminal sends it, ends the run with the signal's status (130, 143)
+/// and none of the work directory's words: the awk's status after a signal
+/// is no failed write. The work directory is gone after.
+#[test]
+fn a_signal_while_a_list_is_written_ends_the_run_with_its_status() {
+    let real = heir::host_tool("awk").unwrap();
+    for (line, mark) in [
+        ("check.fast", r#""  ./" $7"#),
+        ("check.slow", r#"print $6 "\t" $7"#),
+        ("the append", "ok[FNR] != 1"),
+    ] {
+        for (sig, code) in [("INT", 130), ("TERM", 143)] {
+            for group in [false, true] {
+                let what = format!("{line}, {sig}, group {group}");
+                let h = twin_heir(1, Some(&twin_tar("    echo tar >>\"$S/acted\"")));
+                h.put_tool(
+                    "awk",
+                    &format!(
+                        "#!/bin/sh\ncase \"$*\" in\n*'{mark}'*) if [ ! -e \"$FAKE_TAPE/awk.slow\" ]; then : >\"$FAKE_TAPE/awk.slow\"; sleep 3; fi ;;\nesac\nexec \"{}\" \"$@\"\n",
+                        real.display()
+                    ),
+                );
+                let dest = h.dest("out");
+                let args = twin_args(&h, &dest);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let mut r = if group {
+                    h.spawn_group(&args, &[])
+                } else {
+                    h.spawn(&args, &[])
+                };
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !h.root.path().join("state/awk.slow").exists() {
+                    assert!(
+                        std::time::Instant::now() < until && r.try_wait().is_none(),
+                        "{what}: the slow awk never ran: {}",
+                        r.text()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                if group {
+                    r.signal_group(sig);
+                } else {
+                    r.signal(sig);
+                }
+                let o = r.finish();
+                assert_eq!(o.code, code, "{what}: {}", o.stdout);
+                assert!(!o.stdout.contains("FATAL"), "{what}: {}", o.stdout);
+                assert!(!o.stdout.contains("cannot take it"), "{what}: {}", o.stdout);
+                let left: Vec<_> = std::fs::read_dir(&dest)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".tapectl-work"))
+                    .collect();
+                assert!(left.is_empty(), "{what}: {left:?}");
+            }
+        }
     }
 }
