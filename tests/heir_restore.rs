@@ -7572,3 +7572,62 @@ fn the_scrub_of_a_partial_member_needs_no_room_in_the_work_directory() {
         assert_eq!(out.trim(), control, "{rows}: {err}");
     }
 }
+
+// ---- #611 D-4: a write error on the plain cut ----
+
+/// #611 D-4 (ADR-0012 item 313): when the work directory refuses the plain
+/// cut for a reason that is not "full" (here EFBIG: a stand-in `tee` writes
+/// 100 bytes of `slice.plain`, passes every byte on, says "File too large" and
+/// ends 1, as GNU tee does), age ends 0 and the slice's length is wrong: the
+/// verdict says what tee said and names the work directory, never the slice,
+/// and the run ends there, as for a full one. The tape was right.
+#[test]
+fn a_write_error_on_the_plain_cut_names_the_work_directory_and_not_the_slice() {
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::host_tool("tee").expect("tee");
+    h.put_tool(
+        "tee",
+        &format!(
+            "#!/bin/bash\n\
+             case \"${{1:-}}\" in\n\
+             */slice.plain)\n\
+               \"{real}\" \"$1.whole\" || exit 1\n\
+               head -c 100 \"$1.whole\" >\"$1\"\n\
+               echo \"tee: $1: File too large\" >&2\n\
+               exit 1\n\
+               ;;\n\
+             esac\n\
+             exec \"{real}\" \"$@\"\n",
+            real = real.display()
+        ),
+    );
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dest_str(&dest),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(
+        o.stderr
+            .contains("FATAL: writing slice 1 into the work directory failed: tee: ")
+            && o.stderr.contains("slice.plain: File too large"),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("The work directory ")
+            && o.stderr.contains("Nothing on the tape is wrong"),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        !all.contains("its decoded length is"),
+        "the slice is blamed: {all}"
+    );
+    assert!(!all.contains("RESTORE INCOMPLETE"), "{all}");
+}
