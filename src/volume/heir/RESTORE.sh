@@ -1148,15 +1148,23 @@ learn_end() {
     ENDED_AFTER=""
     return 0
   fi
-  if [ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -gt "$TOTAL_FILES" ]; then
-    warn "the two ends of the tape disagree: the seal marker counts $SEAL_FILE_COUNT files and the plan (File 0) has $TOTAL_FILES. The tape is read as unsealed; the seal's ended_after is not used."
+  # The plan's count is File 0's. Where File 0 does not give it (it is damaged,
+  # or did not read), it is the front index's own: File 3 lists every file the
+  # write planned, and it is the map here.
+  local plan=$TOTAL_FILES whose="File 0"
+  if [ -z "$plan" ]; then
+    plan=$(($(wc -l <"$FILES_TXT")))
+    whose="the front index"
+  fi
+  if [ "$SEAL_FILE_COUNT" -gt "$plan" ]; then
+    warn "the two ends of the tape disagree: the seal marker counts $SEAL_FILE_COUNT files and the plan ($whose) has $plan. The tape is read as unsealed; the seal's ended_after is not used."
     SEAL_STATE=disagrees
     ALT_TXT="$WORK/files_from_seal.txt"
     SEAL_BINDS=no
     ENDED_AFTER=""
     return 0
   fi
-  if [ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ]; then
+  if [ "$SEAL_FILE_COUNT" -lt "$plan" ]; then
     SEAL_STATE=short
   else
     SEAL_STATE=full

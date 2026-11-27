@@ -2098,3 +2098,77 @@ fn the_seal_markers_layout_version_decides_when_file_0_states_none() {
     assert_eq!(o.stdout, good.stdout);
     assert!(!o.all().contains("Layout 4"), "{}", o.all());
 }
+
+/// The two units, ended early inside the second slice of the plan: the tape
+/// is sealed short.
+fn short_tape() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.warning_in_slice = Some(1);
+        Tape::build(&shape)
+    })
+}
+
+/// A short seal is classed short when File 0 does not give the plan's count.
+/// The front index lists every file the write planned, so its own count is
+/// the plan's where File 0's is absent (File 0 unread, or garbage). `--info`
+/// and `--verify` then say of a short-sealed tape what they say with File 0
+/// readable, apart from File 0's own lines and row: never "the tape is
+/// complete, every planned file is on it".
+#[test]
+fn a_short_seal_is_classed_short_when_file_0_does_not_give_the_plan() {
+    let t = short_tape();
+    let good = Heir::of(t);
+    let unread = Heir::of(t);
+    fail_read(&unread, 0);
+    let garbage = Heir::of(t);
+    garbage.replace(0, &heir::noise(4096, 7));
+
+    // --info: everything after File 0's own two lines.
+    let from_map = |s: &str| -> String { s.lines().skip(2).map(|l| format!("{l}\n")).collect() };
+    let want = good.run(&["--info"]);
+    assert_eq!(want.code, 0, "{}", want.all());
+    assert!(
+        want.stdout.contains("this tape ended EARLY") && want.stdout.contains("NOT ON TAPE"),
+        "{}",
+        want.stdout
+    );
+    // --verify: every row but file 0's, and not the last line.
+    let rows = |s: &str| -> String {
+        let lines: Vec<&str> = s.lines().collect();
+        lines[..lines.len() - 1]
+            .iter()
+            .filter(|l| l.split_whitespace().nth(1) != Some("0"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let want_v = good.run(&["--verify"]);
+    assert_eq!(want_v.code, 0, "{}", want_v.all());
+    assert!(
+        want_v.stdout.contains("NOT ON TAPE") && want_v.stdout.contains("short seal"),
+        "{}",
+        want_v.stdout
+    );
+    for (name, h) in [
+        ("File 0 does not read", &unread),
+        ("File 0 is garbage", &garbage),
+    ] {
+        let o = h.run(&["--info"]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert_eq!(from_map(&o.stdout), from_map(&want.stdout), "{name}");
+        assert!(!o.stdout.contains("the tape is complete"), "{name}");
+        let o = h.run(&["--verify"]);
+        assert_eq!(o.code, 1, "{name}: {}", o.all());
+        assert_eq!(rows(&o.stdout), rows(&want_v.stdout), "{name}");
+        assert!(
+            o.stdout
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with("VERIFY FAILED: 1 file(s) "),
+            "{name}: {}",
+            o.stdout
+        );
+    }
+}
