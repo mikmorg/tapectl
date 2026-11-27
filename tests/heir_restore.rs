@@ -7481,3 +7481,94 @@ fn the_scripts_unit_name_rule_is_the_one_tapectl_names_a_unit_by() {
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
+
+// ---- #611 D-3: the cleanup's scrub needs no room in the work directory ----
+
+/// The awk programs (`NAME='...'`) and shell functions (`name() {`) of the
+/// script, by name, as one text bash can source.
+fn script_parts(names: &[&str]) -> String {
+    let text = tapectl::volume::heir::RESTORE_SH;
+    let mut out = String::new();
+    for name in names {
+        let start = text
+            .find(&format!("\n{name}='\n"))
+            .or_else(|| text.find(&format!("\n{name}() {{")))
+            .unwrap_or_else(|| panic!("no {name} in the script"))
+            + 1;
+        let end = if text[start..].starts_with(&format!("{name}='")) {
+            text[start..].find("\n'\n").unwrap() + start + 3
+        } else {
+            text[start..].find("\n}\n").unwrap() + start + 3
+        };
+        out.push_str(&text[start..end]);
+    }
+    out
+}
+
+/// #611 D-3 (ADR-0012 item 313): the scrub of a partial member (`scrub_inflight`,
+/// the cleanup's) and the removal of a broken run's partial file
+/// (`remove_partial`) read their rows from no here-document: bash writes one
+/// of more than 64 KiB to a file in TMPDIR, which is the work directory, and a
+/// work directory that cannot take a file (here: `ulimit -f`, the error a
+/// full disk gives too) skipped the scrub silently. With 4,000 rows (more than
+/// a pipe holds), each removes the two files cut short, and each with 10 rows
+/// (the positive control: no temporary file either way).
+#[test]
+fn the_scrub_of_a_partial_member_needs_no_room_in_the_work_directory() {
+    let parts = script_parts(&[
+        "AWK_UNESC",
+        "unesc",
+        "sha_of_file",
+        "scrub_inflight",
+        "remove_partial",
+    ]);
+    for rows in [4000usize, 10] {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(dest.join("photos")).unwrap();
+        let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 99999999\n");
+        let zero = "0".repeat(64);
+        for i in 1..=rows {
+            table.push_str(&format!(
+                "f\t1\t{}\t{}\t100\t{zero}\tphotos/IMG_{i:06}.jpg\t\n",
+                i * 1024,
+                i * 1024 + 1024
+            ));
+        }
+        std::fs::write(work.join("table.tsv"), &table).unwrap();
+        std::fs::write(work.join("slices.off"), "1\t0\t99999999\n").unwrap();
+        let cut = |n: usize| dest.join(format!("photos/IMG_{n:06}.jpg"));
+        let script = format!(
+            "set -euo pipefail\nexport LC_ALL=C\n{parts}\n\
+             WORK={w}; export TMPDIR=$WORK; INFLIGHT_DEST={d}; INFLIGHT_TABLE=$WORK/table.tsv; FEEDING=1\n\
+             cut() {{ echo 'cut short' >{d}/photos/IMG_000007.jpg; echo 'cut short' >{d}/photos/IMG_000008.jpg; }}\n\
+             cut\n\
+             ( trap '' XFSZ; ulimit -f 1; scrub_inflight || echo 'scrub failed' )\n\
+             [ ! -e {d}/photos/IMG_000007.jpg ] && [ ! -e {d}/photos/IMG_000008.jpg ] || echo 'scrub left them'\n\
+             cut\n\
+             ( trap '' XFSZ; ulimit -f 1; remove_partial \"$WORK/table.tsv\" 1 {d} ) || echo 'remove_partial failed'\n\
+             [ ! -e {d}/photos/IMG_000007.jpg ] && [ ! -e {d}/photos/IMG_000008.jpg ] || echo 'remove_partial left them'\n\
+             # The positive control: a here-document of this size cannot be made here.\n\
+             ( trap '' XFSZ; ulimit -f 1; cat <<EOF >/dev/null\n$(cat \"$WORK/table.tsv\")\nEOF\n ) 2>/dev/null && echo 'here-document made' || echo 'here-document refused'\n",
+            w = work.display(),
+            d = dest.display()
+        );
+        let o = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success(), "{rows}: {out}\n{err}");
+        assert!(!cut(7).exists() && !cut(8).exists(), "{rows}: {out}\n{err}");
+        let control = if rows > 1000 {
+            "here-document refused"
+        } else {
+            "here-document made"
+        };
+        assert_eq!(out.trim(), control, "{rows}: {err}");
+    }
+}

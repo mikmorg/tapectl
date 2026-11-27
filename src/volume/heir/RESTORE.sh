@@ -2423,15 +2423,15 @@ members_in_slices() { # <table> <bad.slices file: number|why>
 }
 
 # Remove the partial file of a long member whose run broke (its row is the
-# one that begins in slice $2).
+# one that begins in slice $2). Its rows come through a pipe, as
+# scrub_inflight's do.
 remove_partial() { # <table> <first slice of the run> <dest>
   local esc
-  while IFS= read -r esc; do
-    unesc "$esc"
-    rm -f -- "$3/$REPLY" 2>/dev/null || true
-  done <<EOF
-$(awk -F'\t' -v s="$2" '!/^#/ && ($2 + 0) == (s + 0) && $1 == "f" { print $7 }' "$1")
-EOF
+  awk -F'\t' -v s="$2" '!/^#/ && ($2 + 0) == (s + 0) && $1 == "f" { print $7 }' "$1" |
+    while IFS= read -r esc; do
+      unesc "$esc"
+      rm -f -- "$3/$REPLY" 2>/dev/null || true
+    done || true
 }
 
 # Hash every regular file the table lists, on disk. Writes the escaped paths
@@ -2536,20 +2536,15 @@ tar_close() { # [tenths of a second to wait for tar]
 # never lost. The one before it too: slice k's cat has returned when slice k+1
 # is being prepared, but tar may still hold the last 64 KiB (1 MiB under
 # uutils) of k in its pipe, and a signal kills it inside a member of k.
+# The rows come through a pipe, never a here-document: bash writes one of more
+# than 64 KiB (any, for an older bash) to a file in TMPDIR, the work directory,
+# which may be the full disk that ended the run (#611). The loop is the pipe's
+# last command, a subshell: it sets nothing the cleanup reads after it.
 scrub_inflight() {
   [ -n "$INFLIGHT_TABLE" ] && [ -f "$INFLIGHT_TABLE" ] && [ -n "$WORK" ] && [ -f "$WORK/slices.off" ] || return 0
   [ "$FEEDING" -gt 0 ] || return 0
   local sz sha esc f
-  while IFS=$'\t' read -r sz sha esc; do
-    [ -n "$esc" ] || continue
-    unesc "$esc"
-    f="$INFLIGHT_DEST/$REPLY"
-    [ -f "$f" ] || continue
-    if [ "$(wc -c <"$f" | tr -d ' ')" != "$sz" ] || [ "$(sha_of_file "$f" 2>/dev/null || true)" != "$sha" ]; then
-      rm -f -- "$f" 2>/dev/null || true
-    fi
-  done <<EOF
-$(awk -F'\t' -v at="$FEEDING" '
+  awk -F'\t' -v at="$FEEDING" '
     FILENAME == ARGV[1] { n++; off[$1 + 0] = $2 + 0; sz[$1 + 0] = $3 + 0; next }
     /^#/ { next }
     $1 == "f" {
@@ -2559,8 +2554,16 @@ $(awk -F'\t' -v at="$FEEDING" '
       while (last < n && off[last] + sz[last] < $4 + 0) last++
       if (last >= (at > 1 ? at - 1 : at)) print $5 "\t" $6 "\t" $7
     }
-  ' "$WORK/slices.off" "$INFLIGHT_TABLE")
-EOF
+  ' "$WORK/slices.off" "$INFLIGHT_TABLE" |
+    while IFS=$'\t' read -r sz sha esc; do
+      [ -n "$esc" ] || continue
+      unesc "$esc"
+      f="$INFLIGHT_DEST/$REPLY"
+      [ -f "$f" ] || continue
+      if [ "$(wc -c <"$f" | tr -d ' ')" != "$sz" ] || [ "$(sha_of_file "$f" 2>/dev/null || true)" != "$sha" ]; then
+        rm -f -- "$f" 2>/dev/null || true
+      fi
+    done
 }
 
 DAMAGED_TOTAL=0
