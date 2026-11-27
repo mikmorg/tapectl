@@ -1422,7 +1422,13 @@ try_envelope_at() { # <position of this copy> <primary position> <true bytes> <h
     return 3
   fi
   if [ "$(sha_of_file "$WORK/envelope.enc")" != "$hash" ]; then
-    note "envelope file $pos differs from ${5:-the front index}'s hash: damaged."
+    # It is called damaged once no map is left to try it by: where the two ends
+    # of the tape disagree, File 3's line may be the damaged one (open_envelopes).
+    if [ -z "${5:-}" ] && [ -n "$ALT_TXT" ]; then
+      note "envelope file $pos differs from the hash File 3's line gives it; the seal marker's copy of the map is tried before it is called damaged."
+    else
+      note "envelope file $pos differs from ${5:-the front index}'s hash: damaged."
+    fi
     rm -f "$WORK/envelope.enc"
     return 3
   fi

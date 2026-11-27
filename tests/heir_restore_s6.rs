@@ -2404,3 +2404,62 @@ fn verifys_mismatch_row_names_the_map_it_judged_by() {
         "{row}"
     );
 }
+
+/// An envelope is called damaged only once no map is left to try it by. Where
+/// the two ends of the tape disagree and the envelope differs from File 3's
+/// line, the NOTE says that, and that the seal marker's copy of the map is
+/// tried; the word "damaged" as a verdict comes only when it matches neither.
+#[test]
+fn an_envelope_is_not_called_damaged_before_the_seal_markers_copy_was_tried() {
+    let t = two();
+    let (a, backup, _) = tenant_envelopes(t);
+    let ka_of = |h: &Heir| key(h, Who::TenantA);
+
+    // File 3's line is the damaged one: the envelope opens, and is never
+    // called damaged.
+    let h = Heir::of(t);
+    h.replace(3, &front_index_with(t, a, "sha256_encrypted", another_hash));
+    let o = h.run(&["--find-envelope", "--key", &ka_of(&h)]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(
+        all.contains(&format!(
+            "NOTE: envelope file {a} differs from the hash File 3's line gives it; the seal marker's copy of the map is tried before it is called damaged."
+        )) && !all.contains(": damaged.")
+            && !all.contains("DAMAGED"),
+        "{all}"
+    );
+
+    // Both copies ARE damaged: each is called damaged once it matched neither
+    // map, by the last map tried.
+    h.flip(a, 200);
+    h.flip(backup, 200);
+    let o = h.run(&["--find-envelope", "--key", &ka_of(&h)]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    for pos in [a, backup] {
+        assert!(
+            all.contains(&format!(
+                "NOTE: envelope file {pos} differs from the seal marker's copy of the front index's hash: damaged."
+            )),
+            "file {pos}: {all}"
+        );
+    }
+    assert!(
+        all.contains("envelope(s) on this tape are DAMAGED"),
+        "{all}"
+    );
+
+    // A tape whose two ends agree: the words are as they were.
+    let h = Heir::of(t);
+    h.flip(a, 200);
+    let o = h.run(&["--find-envelope", "--key", &ka_of(&h)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stderr.contains(&format!(
+            "NOTE: envelope file {a} differs from the front index's hash: damaged."
+        )),
+        "{}",
+        o.stderr
+    );
+}
