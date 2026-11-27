@@ -7495,8 +7495,12 @@ fn script_parts(names: &[&str]) -> String {
             .or_else(|| text.find(&format!("\n{name}() {{")))
             .unwrap_or_else(|| panic!("no {name} in the script"))
             + 1;
+        let first = &text[start..start + text[start..].find('\n').unwrap()];
         let end = if text[start..].starts_with(&format!("{name}='")) {
             text[start..].find("\n'\n").unwrap() + start + 3
+        } else if first.ends_with(" }") {
+            // A function on one line.
+            start + first.len() + 1
         } else {
             text[start..].find("\n}\n").unwrap() + start + 3
         };
@@ -7703,4 +7707,281 @@ fn a_backslash_in_to_or_work_is_a_directory_like_another_under_every_awk() {
         ran += 1;
     }
     assert!(ran > 0, "at least one awk ran");
+}
+
+// ---- #611 C-4: the final check split across the machine's cores ----
+
+/// A tree of 40 files and its file table, for the check by itself: a file
+/// whose name holds a backslash (hashed alone, the slow path), files damaged in
+/// what is the first, a middle and the last of four pieces, and one missing.
+fn check_tree(root: &Path) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let dest = root.join("dest");
+    std::fs::create_dir_all(dest.join("sub dir")).unwrap();
+    let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 1\n");
+    for i in 1..=40 {
+        let (on_disk, escaped) = match i {
+            15 => (
+                "back\\slash.txt".to_string(),
+                "back\\\\slash.txt".to_string(),
+            ),
+            22 => (
+                "sub dir/caf\u{e9} 22.txt".to_string(),
+                "sub dir/caf\u{e9} 22.txt".to_string(),
+            ),
+            _ => (format!("f{i:02}.txt"), format!("f{i:02}.txt")),
+        };
+        let bytes = format!("content {i}\n").repeat(i);
+        std::fs::write(dest.join(&on_disk), &bytes).unwrap();
+        let sum: String = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        table.push_str(&format!(
+            "f\t1\t0\t1\t{}\t{sum}\t{escaped}\t\n",
+            bytes.len()
+        ));
+    }
+    for (n, damage) in [(1, true), (20, true), (40, true), (25, false), (15, true)] {
+        let p = if n == 15 {
+            dest.join("back\\slash.txt")
+        } else {
+            dest.join(format!("f{n:02}.txt"))
+        };
+        if damage {
+            std::fs::write(&p, b"damaged\n").unwrap();
+        } else {
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+    let t = root.join("table.tsv");
+    std::fs::write(&t, table).unwrap();
+    t
+}
+
+/// Run `file_check`, cut from the script, on `table` and `<root>/dest` with
+/// TAPECTL_CHECK_PIECES=`pieces` and `path` first on the PATH; the work
+/// directory is `<root>/<work>`. Returns what it printed.
+fn run_file_check(root: &Path, table: &Path, pieces: usize, work: &str, path: &Path) -> String {
+    let parts = script_parts(&[
+        "is_uint",
+        "tape_uint",
+        "AWK_UNESC",
+        "unesc",
+        "sha_of_file",
+        "check_pieces",
+        "check_job",
+        "check_split",
+        "file_check",
+    ]);
+    let w = root.join(work);
+    std::fs::create_dir_all(&w).unwrap();
+    let script = format!(
+        "set -euo pipefail\nexport LC_ALL=C\n{parts}\nWORK={w}\nAHEAD_PID=\"\"\n\
+         file_check {t} {d} {w}/failed\necho \"rows=$CHECK_ROWS failed=$CHECK_FAILED\"\n",
+        w = w.display(),
+        t = table.display(),
+        d = root.join("dest").display()
+    );
+    let o = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("TAPECTL_CHECK_PIECES", pieces.to_string())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                path.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// #611 C-4 (ADR-0012 item 313): the check cut into contiguous pieces, run at
+/// once, gives `check.out` and the list of failed paths BYTE FOR BYTE as the
+/// one `sha256sum -c` over the whole list does, on one damaged tree: failures
+/// in the first, a middle and the last piece, a missing file, a name hashed
+/// alone (a backslash) and names uutils would quote. A piece whose
+/// `sha256sum` printed one line short (a stand-in) has its rows hashed alone:
+/// the list is still the same, and no other piece's pairing moves.
+#[test]
+fn the_split_check_gives_the_one_checks_lines_and_list_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let table = check_tree(root);
+    let none = root.join("none");
+    std::fs::create_dir_all(&none).unwrap();
+    let one = run_file_check(root, &table, 1, "w1", &none);
+    assert_eq!(one.trim(), "rows=40 failed=5", "{one}");
+    let read = |w: &str, f: &str| std::fs::read(root.join(w).join(f)).unwrap();
+    // The positive control: the single check's list is the damage made.
+    assert_eq!(
+        String::from_utf8(read("w1", "failed")).unwrap(),
+        "back\\\\slash.txt\nf01.txt\nf20.txt\nf25.txt\nf40.txt\n"
+    );
+    assert!(
+        !root.join("w1/check.fast.1").exists(),
+        "one piece is the single check"
+    );
+    for n in [2usize, 4, 8] {
+        let w = format!("w{n}");
+        let got = run_file_check(root, &table, n, &w, &none);
+        assert_eq!(got, one, "{n} pieces");
+        assert!(
+            root.join(&w).join(format!("check.fast.{n}")).exists(),
+            "{n} pieces were cut"
+        );
+        assert_eq!(
+            read(&w, "check.out"),
+            read("w1", "check.out"),
+            "{n} pieces: check.out"
+        );
+        assert_eq!(
+            read(&w, "failed"),
+            read("w1", "failed"),
+            "{n} pieces: the list"
+        );
+    }
+    // A piece cut short: piece 2's sha256sum prints its last line no more.
+    let real = heir::host_tool("sha256sum").expect("sha256sum");
+    let short = root.join("short");
+    std::fs::create_dir_all(&short).unwrap();
+    let stand_in = short.join("sha256sum");
+    std::fs::write(
+        &stand_in,
+        format!(
+            "#!/bin/bash\nfor a; do last=$a; done\n\
+             case \"$1 $last\" in\n\
+             \"-c \"*/check.fast.2) \"{r}\" \"$@\" | sed '$d'; exit \"${{PIPESTATUS[0]}}\" ;;\n\
+             esac\nexec \"{r}\" \"$@\"\n",
+            r = real.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &stand_in,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let got = run_file_check(root, &table, 4, "wshort", &short);
+    assert_eq!(got, one, "a piece cut short");
+    assert_eq!(
+        read("wshort", "failed"),
+        read("w1", "failed"),
+        "a piece cut short"
+    );
+    let lines = |w: &str, f: &str| read(w, f).split(|b| *b == b'\n').count();
+    assert_eq!(lines("wshort", "check.out"), lines("w1", "check.out"));
+    // The positive control: the stand-in did cut piece 2 short.
+    assert_eq!(
+        lines("wshort", "check.out.2") + 1,
+        lines("wshort", "check.fast.2"),
+        "piece 2 was cut short"
+    );
+}
+
+/// The count of pieces: the machine's cores, from `nproc`, or `getconf
+/// _NPROCESSORS_ONLN` where there is no nproc, at most 8 and never more than
+/// the rows; 1 when neither says (no tool, or an answer that is not a number),
+/// and the one-process check then runs. TAPECTL_CHECK_PIECES takes the
+/// cores' place. Neither tool is required (`check_tools` does not name them).
+#[test]
+fn the_check_is_cut_into_as_many_pieces_as_cores_at_most_eight() {
+    let parts = script_parts(&["is_uint", "tape_uint", "check_pieces"]);
+    let text = tapectl::volume::heir::RESTORE_SH;
+    assert!(!text.contains("TOOLS_RESTORE=(dd head sha256sum age tar nproc"));
+    // nproc's answer, getconf's, TAPECTL_CHECK_PIECES, the rows, the pieces.
+    type Case = (
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        usize,
+        usize,
+    );
+    let cases: [Case; 9] = [
+        (None, None, None, 100, 1),
+        (Some("1"), None, None, 100, 1),
+        (Some("garbage"), None, None, 100, 1),
+        (Some(""), None, None, 100, 1),
+        (Some("64"), None, None, 100, 8),
+        (Some("4"), None, None, 3, 3),
+        (Some("6"), None, None, 100, 6),
+        (None, Some("6"), None, 100, 6),
+        (Some("8"), None, Some("3"), 100, 3),
+    ];
+    for (nproc, getconf, forced, rows, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path();
+        for (tool, answer) in [("nproc", nproc), ("getconf", getconf)] {
+            if let Some(a) = answer {
+                let p = bin.join(tool);
+                std::fs::write(&p, format!("#!/bin/sh\necho '{a}'\n")).unwrap();
+                std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                    .unwrap();
+            }
+        }
+        let mut c = std::process::Command::new(heir::host_tool("bash").unwrap());
+        c.arg("-c")
+            .arg(format!("{parts}\ncheck_pieces {rows}\necho \"$REPLY\"\n"))
+            .env_clear()
+            .env("PATH", bin)
+            .env("LC_ALL", "C");
+        if let Some(f) = forced {
+            c.env("TAPECTL_CHECK_PIECES", f);
+        }
+        let o = c.output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout).trim(),
+            want.to_string(),
+            "nproc {nproc:?} getconf {getconf:?} forced {forced:?} rows {rows}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+}
+
+/// A whole restore with the check in pieces and in one process: the same
+/// verdict lines, the same damaged-file list, byte for byte (a tar stand-in
+/// drops one file and damages another of the big unit).
+#[test]
+fn a_restore_checked_in_pieces_writes_the_same_list_and_words_as_one_checked_whole() {
+    let t = two();
+    let mut outs = Vec::new();
+    for pieces in ["1", "4"] {
+        let h = Heir::of(t);
+        let real = heir::host_tool("tar").unwrap();
+        let victim = &unit_files(t, UNIT_B)[0].0;
+        h.put_tool("tar", &heir::dropping_tar(&real, victim));
+        let dest = h.dest("out");
+        let o = h.run_with(
+            &[
+                "--restore",
+                "--key",
+                &key(&h, Who::TenantB),
+                "--to",
+                dest_str(&dest),
+            ],
+            &[("TAPECTL_CHECK_PIECES", pieces)],
+        );
+        assert_eq!(o.code, 1, "{pieces}: {}", o.all());
+        let list = std::fs::read(dest.join(".tapectl-damaged-files.txt")).unwrap();
+        let words: Vec<String> = o
+            .stdout
+            .lines()
+            .filter(|l| {
+                l.starts_with("File check:") || l.starts_with("DAMAGED:") || l.starts_with("  ")
+            })
+            .map(|l| l.replace(dest_str(&dest), "DEST"))
+            .collect();
+        outs.push((list, words));
+    }
+    assert!(
+        outs[0].1.iter().any(|l| l.contains("File check: 1 of ")),
+        "{:?}",
+        outs[0].1
+    );
+    assert_eq!(outs[0], outs[1]);
 }

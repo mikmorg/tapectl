@@ -133,3 +133,65 @@ fn a_kill_while_a_slice_is_read_ahead_ends_at_once_where_nothing_reaps_orphans()
         .collect();
     assert!(left.is_empty(), "{left:?}: {text}");
 }
+
+/// #611 C-4 (ADR-0012 item 313): TERM while the final check runs in pieces
+/// (each piece's `sha256sum -c` a stand-in that sleeps first), where nothing
+/// reaps orphans: the run ends at once, as a TERM during the one-process check
+/// does (143, no work directory), and no `sha256sum` or its `sleep` is left
+/// running. The pieces are one job in a process group of its own, which the
+/// way out stops as it stops the read ahead (`ahead_kill`).
+#[test]
+fn a_kill_while_the_check_runs_in_pieces_leaves_no_sha256sum_behind() {
+    // SAFETY: as above.
+    let rc = unsafe { nix::libc::prctl(nix::libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    assert_eq!(rc, 0, "PR_SET_CHILD_SUBREAPER");
+    let t = Tape::build(&Shape::two());
+    let h = Heir::of(&t);
+    let real = heir::host_tool("sha256sum").expect("sha256sum");
+    h.put_tool(
+        "sha256sum",
+        &format!(
+            "#!/bin/bash\n\
+             if [ \"${{1:-}}\" = -c ]; then : >\"$FAKE_TAPE/check.slow\"; sleep 30; fi\n\
+             exec \"{}\" \"$@\"\n",
+            real.display()
+        ),
+    );
+    let dest = h.dest("out");
+    let kb = h.key(Who::TenantB).to_string_lossy().into_owned();
+    let args = ["--restore", "--key", &kb, "--to", dest.to_str().unwrap()];
+    let mut r = h.spawn(&args, &[("TAPECTL_CHECK_PIECES", "3")]);
+    let until = Instant::now() + Duration::from_secs(60);
+    while !h.root.path().join("state/check.slow").exists() {
+        assert!(Instant::now() < until, "{}", r.text());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    // Positive control: the pieces are running, each asleep.
+    let live = live_of_run(&h);
+    assert!(
+        live.iter().filter(|(_, c)| c == "sleep").count() >= 2,
+        "{live:?}"
+    );
+    r.signal("TERM");
+    let started = Instant::now();
+    let code = loop {
+        if let Some(code) = r.try_wait() {
+            break code;
+        }
+        if started.elapsed() > Duration::from_secs(15) {
+            let _ = r.child.kill();
+            panic!("the run did not end within 15 s of TERM: {}", r.text());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let text = r.text();
+    assert_eq!(code, 143, "{text}");
+    assert_eq!(live_of_run(&h), vec![], "{text}");
+    let left: Vec<String> = std::fs::read_dir(&dest)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tapectl-work"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}: {text}");
+}

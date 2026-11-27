@@ -1075,6 +1075,10 @@ const HOST_TOOLS: &[&str] = &[
     "find",
     "xargs",
     "timeout",
+    // The final check is cut into one piece for each core they count (#611
+    // C-4); neither is required.
+    "nproc",
+    "getconf",
 ];
 
 pub fn host_tool(name: &str) -> Option<PathBuf> {

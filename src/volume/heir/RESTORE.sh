@@ -2459,6 +2459,78 @@ remove_partial() { # <table> <first slice of the run> <dest>
     done || true
 }
 
+# How many pieces the check of $1 rows is cut into (REPLY): the machine's
+# cores, from nproc, or getconf where there is no nproc, at most 8 and never
+# more than the rows; 1 when the count is not known. TAPECTL_CHECK_PIECES,
+# when set, is the count in the cores' place (the tests set it).
+check_pieces() { # <rows>
+  local n=${TAPECTL_CHECK_PIECES:-}
+  if [ -z "$n" ]; then
+    if command -v nproc >/dev/null 2>&1; then
+      n=$(nproc 2>/dev/null || true)
+    elif command -v getconf >/dev/null 2>&1; then
+      n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+    fi
+  fi
+  if tape_uint "$n"; then n=$REPLY; else n=1; fi
+  [ "$n" -le 8 ] || n=8
+  [ "$n" -le "$1" ] || n=$1
+  [ "$n" -ge 1 ] || n=1
+  REPLY=$n
+}
+
+# The job of a split check: one sha256sum -c --strict on each piece at once,
+# each writing its own lines and its status, all in the job's process group.
+check_job() { # <destination> <pieces>
+  trap - EXIT INT HUP TERM
+  local i
+  for ((i = 1; i <= $2; i++)); do
+    {
+      rc=0
+      (cd "$1" && sha256sum -c --strict "$WORK/check.fast.$i" 2>/dev/null) >"$WORK/check.out.$i" || rc=$?
+      echo "$rc" >"$WORK/check.rc.$i"
+    } &
+  done
+  wait
+}
+
+# check.fast cut into $2 contiguous pieces, checked at once, and their lines
+# joined in the pieces' order into check.out, as one sha256sum over the whole
+# list writes them. A piece is held to its own count: one whose sha256sum did
+# not print one line for each of its rows gives, for each, a line that is no
+# pass, so its rows are hashed alone and no other row's pairing moves. The job
+# runs in a process group of its own, as the read ahead's does, and its id is
+# kept in AHEAD_PID while it runs, so that the way out stops every piece
+# (ahead_kill). Returns 0 when every piece ended 0 and gave its count.
+check_split() { # <destination> <pieces>
+  local n=$2 i rc given got frc=0
+  rm -f "$WORK"/check.fast.* "$WORK"/check.out.* "$WORK"/check.rc.*
+  CHECK_FAST="$WORK/check.fast" awk -v n="$n" -v rows="$(wc -l <"$WORK/check.fast" | tr -d ' ')" '
+    { print > (ENVIRON["CHECK_FAST"] "." (int((NR - 1) * n / rows) + 1)) }
+  ' "$WORK/check.fast"
+  set -m
+  (check_job "$1" "$n") </dev/null >/dev/null 2>/dev/null 3<&- 4>&- &
+  AHEAD_PID=$!
+  set +m
+  wait "$AHEAD_PID" 2>/dev/null || true
+  AHEAD_PID=""
+  : >"$WORK/check.out"
+  for ((i = 1; i <= n; i++)); do
+    rc=""
+    read -r rc <"$WORK/check.rc.$i" 2>/dev/null || true
+    [ "$rc" = 0 ] || frc=1
+    given=$(wc -l <"$WORK/check.fast.$i" | tr -d ' ')
+    got=$({ wc -l <"$WORK/check.out.$i"; } 2>/dev/null | tr -d ' ' || true)
+    if [ "$got" = "$given" ]; then
+      cat "$WORK/check.out.$i" >>"$WORK/check.out"
+    else
+      frc=1
+      awk '{ print "" }' "$WORK/check.fast.$i" >>"$WORK/check.out"
+    fi
+  done
+  return "$frc"
+}
+
 # Hash every regular file the table lists, on disk. Writes the escaped paths
 # that are missing or differ to $3. Prints nothing; the counts are in
 # CHECK_ROWS and CHECK_FAILED.
@@ -2470,8 +2542,9 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
   CHECK_ROWS=0
   CHECK_FAILED=0
   # Rows with no backslash in the path: one sha256sum -c --strict over the
-  # list. No name is ever read back from its output (uutils' sha256sum quotes
-  # a name with a space or a non-ASCII byte under LC_ALL=C, GNU's does not):
+  # list, or over each of its pieces at once (check_split). No name is ever
+  # read back from its output (uutils' sha256sum quotes a name with a space
+  # or a non-ASCII byte under LC_ALL=C, GNU's does not):
   # --strict prints exactly one line per entry, in order, so the k-th line
   # ending ": OK" is the k-th row's pass. The rest are done one by one.
   awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") == 0 { print $6 "  ./" $7 }' "$table" >"$WORK/check.fast"
@@ -2484,7 +2557,12 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
     # make a restore look whole. When the output is not one line per row, no
     # row is trusted and every one is hashed alone.
     local frc=0 flines=0
-    (cd "$dest" && sha256sum -c --strict "$WORK/check.fast" 2>/dev/null) >"$WORK/check.out" || frc=$?
+    check_pieces "$(wc -l <"$WORK/check.fast" | tr -d ' ')"
+    if [ "$REPLY" -gt 1 ]; then
+      check_split "$dest" "$REPLY" || frc=$?
+    else
+      (cd "$dest" && sha256sum -c --strict "$WORK/check.fast" 2>/dev/null) >"$WORK/check.out" || frc=$?
+    fi
     flines=$(wc -l <"$WORK/check.out" | tr -d ' ')
     if [ "$flines" -ne "$(wc -l <"$WORK/check.fast" | tr -d ' ')" ]; then
       frc=2
