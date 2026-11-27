@@ -1052,7 +1052,7 @@ bootstrap() {
     why=$(dd_detail)
     why="cannot be read from $DEVICE${why:+ ($why)}"
     [ "$got" = 1 ] || why="on $DEVICE is longer than 16 MiB, more than a tapectl File 0 can be: no more of it is read"
-    warn "File 0 $why. Going on without it, as for a damaged File 0: this is read as a Layout 3 tape, and the seal marker's own claims decide."
+    warn "File 0 $why. Going on without it, as for a damaged File 0: this is read as a Layout 3 tape, and if a seal marker reads, its own claims decide."
   fi
   tr -d '\0' <"$WORK/file0.raw" >"$WORK/file0.txt"
   magic=$(toml_val "$WORK/file0.txt" magic)
@@ -1061,7 +1061,7 @@ bootstrap() {
   if [ -n "$magic" ] && [ "$magic" != tapectl-volume-v3 ]; then die_other_layout "$magic" "$lv"; fi
   if [ -n "$lv" ] && [ "$lv" != 3 ]; then die_other_layout "$magic" "$lv"; fi
   if [ "$FILE0_UNREAD" = 0 ] && { [ -z "$magic" ] || [ -z "$lv" ]; }; then
-    warn "File 0 states no magic or no layout_version (a damaged File 0?). Going on as a Layout 3 tape; the seal marker's own claims decide."
+    warn "File 0 states no magic or no layout_version (a damaged File 0?). Going on as a Layout 3 tape; if a seal marker reads, its own claims decide."
   fi
   check_requires "File 0" "$WORK/file0.txt"
   file0_fields
@@ -1279,7 +1279,14 @@ establish() {
     return 0
   fi
   local none="neither the front index nor the seal marker can be read, so there is no map of the tape."
-  [ "$FILE0_UNREAD" = 0 ] || none="nothing can be read from $DEVICE (not File 0, the front index or the seal marker): is a cartridge loaded and is $DEVICE the right drive? If it is, both ends of the tape are damaged and there is no map of the tape."
+  if [ "$FILE0_UNREAD" = 1 ]; then
+    # Whether the tape gave any bytes at all decides the question to ask.
+    if [ -s "$WORK/front_index.raw" ] || [ -s "$WORK/seal.stripped" ]; then
+      none="File 0 gives nothing this script can use, and what the front index and the seal marker give is no map of the tape (no consistent front index, no valid seal marker): both ends of the tape are damaged, or this is not a tapectl tape."
+    else
+      none="nothing can be read from $DEVICE (not File 0, the front index or the seal marker): is a cartridge loaded and is $DEVICE the right drive? If it is, both ends of the tape are damaged and there is no map of the tape."
+    fi
+  fi
   die "$none
        The manual way, with no script: mt -f $DEVICE rewind; then for each file
        mt -f $DEVICE fsf N; dd if=$DEVICE bs=512k | tr -d '\\0' | less

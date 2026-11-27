@@ -3232,3 +3232,55 @@ fn with_file_0_unread_and_no_end_of_data_the_seal_is_found_by_the_front_index() 
     );
     assert!(o.stdout.contains("VERIFY FAILED: 1 file(s)"), "{all}");
 }
+
+/// F10 of the read of #611's fixes: two messages say only what is true in
+/// the state they are printed in. The warning about File 0 is printed before
+/// the seal marker is read, so it does not say the seal decides, only that it
+/// does if it reads. And where File 0 gives nothing but the front index and
+/// the seal marker DO give bytes that are no map, the stop does not say
+/// nothing can be read, nor ask whether a cartridge is loaded.
+#[test]
+fn the_words_for_a_tape_with_no_file_0_say_only_what_is_true() {
+    let t = two();
+    let last = t.files.len() - 1;
+    let unread = Heir::of(t);
+    fail_read(&unread, 0);
+    fail_read(&unread, last);
+    let garbage = Heir::of(t);
+    garbage.replace(0, &heir::noise(4096, 7));
+    fail_read(&garbage, last);
+    for (name, h) in [("File 0 unread", &unread), ("File 0 garbage", &garbage)] {
+        let o = h.run(&["--info"]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert!(
+            o.stderr.contains(
+                "this is read as a Layout 3 tape, and if a seal marker reads, its own claims decide."
+            ) || o.stderr.contains(
+                "Going on as a Layout 3 tape; if a seal marker reads, its own claims decide."
+            ),
+            "{name}: {}",
+            o.stderr
+        );
+        assert!(
+            !o.stderr.contains("the seal marker's own claims decide"),
+            "{name}: {}",
+            o.stderr
+        );
+    }
+
+    let no_map = Heir::of(t);
+    fail_read(&no_map, 0);
+    no_map.replace(3, &heir::noise(4096, 11));
+    no_map.replace(last, &heir::noise(4096, 12));
+    let o = no_map.run(&["--info"]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains(
+            "FATAL: File 0 gives nothing this script can use, and what the front index and the seal marker give is no map of the tape"
+        ) && o.stderr.contains("or this is not a tapectl tape")
+            && !o.stderr.contains("nothing can be read")
+            && !o.stderr.contains("is a cartridge loaded"),
+        "{}",
+        o.stderr
+    );
+}
