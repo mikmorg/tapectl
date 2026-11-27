@@ -180,21 +180,40 @@ cleanup() {
     # INSIDE the work directory (nothing is written outside it: #561, item
     # 271) and held open on fd 8 while the directory is removed; touch then
     # reads it through /proc/self/fd/8, as the last step, to the nanosecond.
-    local held=0
+    # The work directory is removed whether or not the time can be kept, and
+    # when it is not kept a NOTE says why (lost).
+    local held=0 lost=""
     chmod -R u+rwx "$WORK" 2>/dev/null || true
-    if [ -n "$WORK_MADE_IN" ] && [ -d "$WORK_MADE_IN" ] && [ -d /proc/self/fd ] &&
-      touch -r "$WORK_MADE_IN" "$WORK/.mtime.ref" 2>/dev/null &&
-      { exec 8<"$WORK/.mtime.ref"; } 2>/dev/null; then
-      held=1
+    if [ -n "$WORK_MADE_IN" ] && [ -d "$WORK_MADE_IN" ]; then
+      if [ ! -d /proc/self/fd ]; then
+        lost="there is no /proc/self/fd here to keep it by"
+      elif touch -r "$WORK_MADE_IN" "$WORK/.mtime.ref" 2>/dev/null &&
+        { exec 8<"$WORK/.mtime.ref"; } 2>/dev/null; then
+        held=1
+      else
+        lost="the file that keeps it could not be made in the work directory"
+      fi
     fi
     if ! rm -rf "$WORK" 2>/dev/null; then
       # The restored root may have been given a mode that forbids it.
       chmod u+w "$WORK_MADE_IN" 2>/dev/null || true
-      rm -rf "$WORK" 2>/dev/null || warn "could not remove the work directory $WORK"
+      if ! rm -rf "$WORK" 2>/dev/null && [ "$held" = 1 ]; then
+        # A file held open is not removed on some file systems (an NFS client
+        # keeps it as .nfsXXXX in its directory until it is closed): it is let
+        # go, and the directory removed without it.
+        exec 8<&-
+        held=0
+        lost="the work directory could not be removed while the file that keeps it was open (a network file system?)"
+      fi
+      [ ! -d "$WORK" ] || rm -rf "$WORK" 2>/dev/null || warn "could not remove the work directory $WORK"
     fi
     if [ "$held" = 1 ]; then
-      touch -r /proc/self/fd/8 "$WORK_MADE_IN" 2>/dev/null || true
+      touch -r /proc/self/fd/8 "$WORK_MADE_IN" 2>/dev/null || lost="touch could not set it"
       exec 8<&-
+    fi
+    # Said where the work directory was in --to, whose time is the unit root's.
+    if [ -n "$lost" ] && [ "$MODE" = restore ] && [ "$WORK_MADE_IN" = "$TO" ]; then
+      note "the work directory's removal changed the modification time of $TO, and it is not set back: $lost."
     fi
   fi
   exit "$rc"

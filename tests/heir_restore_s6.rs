@@ -155,6 +155,91 @@ fn the_roots_mtime_is_kept_and_nothing_is_written_to_tmpdir() {
     );
 }
 
+/// #611 D-6 (ADR-0012 item 313): where a file held open cannot be removed (an
+/// NFS client renames it `.nfsXXXX` in its directory until it is closed), the
+/// work directory is still removed: the reference file that keeps the root's
+/// mtime is let go, the directory removed, and a NOTE says the time is not
+/// kept. A stand-in `rm` acts as that client: while the script holds fd 8 (the
+/// reference file, which `rm` inherits), removing the work directory leaves
+/// the held file as `.nfs0001` and fails; once fd 8 is closed it is the real
+/// `rm`. Without the stand-in the root keeps its time to the nanosecond.
+#[test]
+fn the_work_directory_is_removed_where_a_file_held_open_cannot_be() {
+    use std::os::unix::fs::MetadataExt;
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::host_tool("rm").expect("rm");
+    h.put_tool(
+        "rm",
+        &format!(
+            "#!/bin/bash\n\
+             for a; do\n\
+               case ${{a##*/}} in\n\
+               .tapectl-work.*)\n\
+                 if [ -d \"$a\" ] && [ -e /proc/self/fd/8 ]; then\n\
+                   [ ! -e \"$a/.mtime.ref\" ] || mv \"$a/.mtime.ref\" \"$a/.nfs0001\"\n\
+                   find \"$a\" -mindepth 1 -maxdepth 1 ! -name .nfs0001 -exec \"{real}\" -rf {{}} +\n\
+                   echo \"rm: cannot remove '$a': Directory not empty\" >&2\n\
+                   exit 1\n\
+                 fi\n\
+                 ;;\n\
+               esac\n\
+             done\n\
+             exec \"{real}\" \"$@\"\n",
+            real = real.display()
+        ),
+    );
+    let dest = h.dest("nfs");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dstr(&dest),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{all}");
+    let left: Vec<String> = std::fs::read_dir(&dest)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tapectl-work"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}: {all}");
+    assert!(
+        !all.contains("could not remove the work directory"),
+        "{all}"
+    );
+    assert!(
+        o.stderr.contains(&format!(
+            "NOTE: the work directory's removal changed the modification time of {}, and it is not set back: ",
+            dest.display()
+        )),
+        "{}",
+        o.stderr
+    );
+    // The positive control: the stand-in did act (the time is not kept).
+    assert_ne!(
+        std::fs::metadata(&dest).unwrap().mtime(),
+        heir::ROOT_MTIME_SECS,
+        "{all}"
+    );
+    // Without it, the time is kept, to the nanosecond, and no NOTE says otherwise.
+    let h = Heir::of(t);
+    let dest = h.dest("local");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dstr(&dest),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let m = std::fs::metadata(&dest).unwrap();
+    assert_eq!((m.mtime(), m.mtime_nsec()), (heir::ROOT_MTIME_SECS, 0));
+    assert!(!o.stderr.contains("modification time"), "{}", o.stderr);
+}
+
 // ---- helpers ----
 
 fn unit_files<'a>(t: &'a Tape, name: &str) -> &'a [(String, Vec<u8>)] {
