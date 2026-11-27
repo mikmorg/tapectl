@@ -4125,6 +4125,56 @@ stated options. Each item below gives the option chosen in the CTO's words.
      the machine's cores (C-4). The pin moves in a commit of its own, and the hash it moves to
      is added to this item when it is known.
 
+     **The hash it moved to:** `b26d9595abe12845335ff3bf1a1157e8793b1fe06491fd79a55222f5cbe7e034`
+     (4,544 lines), in four commits that each change that one constant (`e3d94879`,
+     `d901aed2`, `a93f85f1`, `4d5ec342`): the fixes, a follow-up to D-4, and the fixes of two
+     independent reads.
+
+     **What the independent reads added.** The go asks for an independent read of the fix's
+     own diff. Each round of fixes got one, by an agent that had not written the lines it
+     read. The first three each found something in the lines read, and those were fixed in
+     the same pin move or recorded on #611; the outcome of the fourth, of the last round, is
+     in the run record of the landing. Further readings of the coordinator's, for the CTO to
+     overrule:
+     - **Three defects older than the fixes are fixed with them.** The second read found
+       them beside the lines it read. They are not on #611's first list. "Fix all before
+       tag" is read to cover them: a tape's script cannot be patched once written.
+       - A file-table row with an empty field among its first seven is refused, and its
+         eighth field, when not empty, is held to the path rule whatever the row's kind.
+         Before, the script's two readers split such a row differently, and a crafted
+         envelope could have a file outside `--to` removed. `volume-format-v3.md` §1.6 now
+         states that a writer writes no such row.
+       - The final per-file check ends the run, naming the work directory, when the number
+         of files it passed and listed as failing is not the number the table gives.
+         Before, an awk that reports no write error (BusyBox) could lose rows of the
+         check's lists in a full work directory, and a damaged file was then reported whole.
+       - The cleanup ignores a second INT, HUP or TERM. Before, a second Ctrl-C left the
+         work directory, with the decrypted envelopes, in `--to`, which File 1 says does
+         not happen. The price: the cleanup's own waits end only by themselves or by KILL.
+     - **The split check deals its rows by size**, each to the piece that has the fewest
+       bytes so far. As first written it cut the list into runs of equal row count; the
+       file table is in path order, so one piece got nearly all the bytes of a tree whose
+       large files are neighbours. Measured on the build host (16 cores, where the
+       processor is the limit): 8 GiB with four 1 GiB files first, 63 s in one piece, 57 s in eight
+       runs, 10 s in eight pieces by size. A destination limited by one disk is not
+       measured, nor is home2; a one-against-many timing on home2 is owed before the tag.
+     - **The piece count comes from the machine alone** (`nproc`, else `getconf`, at most
+       eight). The variable the first form read in its place is removed, by item 318: File
+       2 gains no new input.
+     - **File 0 and the front index are read no further than 16 MiB.** A File 0 longer
+       than that is a damaged File 0, warned about and passed over (§1.2 rule 2), and never
+       a hard stop. A longer front index is not consistent.
+     - **A seal marker that keeps its parse rules and states another layout is refused
+       whatever File 0 states** (§1.2 rule 1). The refusal before the seal is validated
+       stays, for a damaged seal that states another layout where File 0 states none, or
+       names an unknown feature.
+     - **With File 0 giving no label, `--info` prints the front index's, else the seal's,
+       and says which.** That label identifies no cartridge: the prompt's rule is unchanged.
+
+     Left as found, by the same readings, each recorded on #611: wordings, branches no test
+     can fail, and a fault of bash 5.2 itself (a signal that lands inside a command
+     substitution can end the run with status 2; the cleanup still runs whole).
+
      **The go** ("Build, prove, land"): the coordinator builds the branch and proves it, lands
      it on `master`, runs the whole chain on the new commit and writes its record. The proof is
      a failing test first for each fix, the u26 container as uid 1000, the gate's heir legs, a

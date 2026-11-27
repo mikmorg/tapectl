@@ -421,7 +421,10 @@ each member of the staging's tar stream, **in stream order**:
 
 **Every row has eight fields** (**determined**, read from the template's bytes): the tab
 before `link target` is always written, so a row that is not `h` ends in a tab and an empty
-field. A writer writes, and a reader requires, eight fields.
+field. A writer writes, and a reader requires, eight fields. **None of the first seven is
+ever empty** (**determined**, ADR-0012 item 313): a kind's letter, four numbers, a hash or
+`-`, a path (the root is `.`). A reader may refuse a row that has an empty one, and one
+whose `link target`, when present, breaks the rule for a path; RESTORE.sh refuses both.
 
 **Rows in stream order; a folder is two ranges** (#562): a folder's own member comes
 where the sorted list put it, and its contents follow later members; restoring a folder
