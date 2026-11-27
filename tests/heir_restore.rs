@@ -7321,6 +7321,275 @@ fn a_table_path_with_a_nul_byte_is_refused_under_every_awk() {
     assert!(ran >= 3, "at least one awk ran each case");
 }
 
+// ---- #611 G1: an empty field in a file-table row ----
+
+/// Unit B's long member's row with its size field empty and a field 8 that
+/// leaves `--to` (the second reader's G1): awk reads the two TABs as an empty
+/// field, bash's `IFS=$'\t' read` as one separator, which made field 8 the
+/// path `load_members` held.
+fn t_empty_size(p: &Path) {
+    let large = format!("{UNIT_B}-large.bin");
+    let text = std::fs::read_to_string(p).unwrap();
+    if !text.contains(&large) {
+        return;
+    }
+    let mut out = String::new();
+    for l in text.lines() {
+        let mut f: Vec<&str> = l.split('\t').collect();
+        if f.len() == 8 && f[6] == large {
+            f[4] = "";
+            f[7] = "../../victim";
+        }
+        out.push_str(&f.join("\t"));
+        out.push('\n');
+    }
+    std::fs::write(p, out).unwrap();
+}
+
+/// #611 G1 (ADR-0012 item 313): a file-table row with an empty field among
+/// the first seven is refused at the table check, under every awk, before a
+/// path restore touches anything: the long member's row with its size empty
+/// and `../../victim` as field 8, restored by `--path` with a later slice of
+/// its run bad, leaves the file beside `--to`'s parent where it was (the
+/// broken run's partial file was removed by the path bash read, field 8).
+#[test]
+fn a_table_row_with_an_empty_field_is_refused_before_a_path_restore_touches_anything() {
+    let mut shape = Shape::two();
+    shape.table_edit = Some(t_empty_size);
+    let t = Tape::build(&shape);
+    assert_eq!(t.slice_positions(), two().slice_positions());
+    let large = format!("{UNIT_B}-large.bin");
+    let listing = |d: &Path| {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let mut ran = 0;
+    for (name, body) in awks() {
+        let h = Heir::of(&t);
+        put_awk(&h, &body);
+        let kb = key(&h, Who::TenantB);
+        // The slice after the one the long member begins in: its run breaks there.
+        let o = h.run(&["--list", "--key", &kb, "--unit", UNIT_B]);
+        let first: usize = o
+            .stdout
+            .lines()
+            .find(|l| l.contains(&large))
+            .map(|l| l.split_whitespace().nth(1).unwrap().parse().unwrap())
+            .unwrap_or_else(|| panic!("{name}: {}", o.all()));
+        h.flip(slice_pos(&t, UNIT_B, first + 1), 4000);
+        let up = h.dest("up");
+        let boxed = up.join("box");
+        std::fs::create_dir_all(&boxed).unwrap();
+        std::fs::write(up.join("victim"), b"keep up").unwrap();
+        let to = boxed.join("to");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &kb,
+            "--to",
+            dest_str(&to),
+            "--unit",
+            UNIT_B,
+            "--path",
+            &large,
+        ]);
+        let all = o.all();
+        assert_eq!(listing(&up), ["box", "victim"], "{name}: {all}");
+        assert_eq!(std::fs::read(up.join("victim")).unwrap(), b"keep up");
+        assert_eq!(o.code, 1, "{name}: {all}");
+        assert!(
+            o.stderr.contains(&format!(
+                "the file table of unit {UNIT_B} holds a path this script will not write: {large} (its row's field 5 is empty)"
+            )),
+            "{name}: {}",
+            o.stderr
+        );
+        assert_eq!(listing(&boxed), ["to"], "{name}");
+        assert_eq!(listing(&to), Vec::<String>::new(), "{name}");
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
+/// The recorded tape's file tables (`tests/fixtures/recorded-2.0.0`), as the
+/// script reads them out of its envelopes: a `--list` of each tenant's units
+/// with an `awk` that keeps a copy of every table it is given.
+fn recorded_tables(dir: &Path) -> Vec<std::path::PathBuf> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recorded-2.0.0");
+    let expected: toml::Value =
+        toml::from_str(&std::fs::read_to_string(fixture.join("EXPECTED.toml")).unwrap()).unwrap();
+    let label = expected["tape"]["label"].as_str().unwrap().to_string();
+    let mut files = Vec::new();
+    while let Ok(b) = std::fs::read(fixture.join(format!("file-{:03}", files.len()))) {
+        files.push(b);
+    }
+    let keys: Vec<(&'static str, std::path::PathBuf)> = ["tenant-alpha", "tenant-bravo"]
+        .into_iter()
+        .map(|n| (n, fixture.join("keys").join(format!("{n}.key"))))
+        .collect();
+    let key_refs: Vec<(&'static str, &Path)> =
+        keys.iter().map(|(n, p)| (*n, p.as_path())).collect();
+    let h = Heir::recorded(
+        &files,
+        tapectl::volume::heir::RESTORE_SH.as_bytes(),
+        &label,
+        &key_refs,
+    );
+    let real = heir::host_tool("awk").expect("awk");
+    let kept = dir.join("tables");
+    std::fs::create_dir_all(&kept).unwrap();
+    h.put_tool(
+        "awk",
+        &format!(
+            "#!/bin/bash\n\
+             for a; do\n\
+               case $a in\n\
+               *.ids.tsv) ;;\n\
+               */tables/*.tsv) cp \"$a\" {k}/ ;;\n\
+               esac\n\
+             done\n\
+             exec \"{r}\" \"$@\"\n",
+            k = kept.display(),
+            r = real.display()
+        ),
+    );
+    for who in ["tenant-alpha", "tenant-bravo"] {
+        let k = h.keys[who].to_string_lossy().into_owned();
+        let o = h.run(&["--list", "--key", &k]);
+        assert_eq!(o.code, 0, "{who}: {}", o.all());
+    }
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(&kept)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// #611 G1 (ADR-0012 item 313): the table check (`AWK_TABLE_PATHS`) under
+/// every awk refuses a row with an empty field at each of positions 1 to 7,
+/// by name (tapectl writes a letter, four numbers, a hash or `-`, and a path,
+/// the root `.`: `filetable::write`), and holds field 8 to the path rule
+/// whenever it is not empty, whatever the row's kind (tapectl's reader,
+/// `filetable::Reader`'s `row`, does). The recorded tape's tables, whose
+/// rows are of every kind, still pass.
+#[test]
+fn the_table_check_refuses_an_empty_field_and_any_field_8_that_leaves_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = script_parts(&["AWK_INDEX_COMMON", "AWK_TABLE_PATHS"]);
+    let sha = "a".repeat(64);
+    let sound = [
+        "d\t1\t0\t512\t0\t-\t.\t".to_string(),
+        format!("f\t1\t512\t2048\t1000\t{sha}\tsafe.txt\t"),
+        format!("h\t1\t2048\t2560\t1000\t{sha}\tlink.txt\tsafe.txt"),
+    ];
+    // (rows, what the check prints: words TAB path, or nothing).
+    let mut cases: Vec<(Vec<String>, String)> = Vec::new();
+    for i in 0..7 {
+        let mut f: Vec<String> = sound[1].split('\t').map(str::to_string).collect();
+        f[i] = String::new();
+        let shown = if i == 6 { "" } else { "safe.txt" };
+        cases.push((
+            vec![sound[0].clone(), f.join("\t")],
+            format!("its row's field {} is empty\t{shown}", i + 1),
+        ));
+    }
+    // The reader's row, and a row that is not `h` with a field 8 that leaves.
+    cases.push((
+        vec![
+            sound[0].clone(),
+            format!("f\t1\t512\t2600\t\t{sha}\tsafe.txt\t../../victim"),
+        ],
+        "its row's field 5 is empty\tsafe.txt".to_string(),
+    ));
+    cases.push((
+        vec![
+            sound[0].clone(),
+            format!("f\t1\t512\t2048\t1000\t{sha}\tsafe.txt\t../x"),
+        ],
+        "its link target: it has a .. component\t../x".to_string(),
+    ));
+    cases.push((
+        vec![sound[0].clone(), format!("d\t1\t512\t1024\t0\t-\tdir\t/x")],
+        "its link target: it begins with /\t/x".to_string(),
+    ));
+    // The positive controls: the sound rows, and a hard link's target that leaves.
+    cases.push((sound.to_vec(), String::new()));
+    cases.push((
+        vec![
+            sound[0].clone(),
+            format!("h\t1\t512\t1024\t1000\t{sha}\tl\t../x"),
+        ],
+        "its hard link's target: it has a .. component\t../x".to_string(),
+    ));
+    let mut tables: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for (n, (rows, want)) in cases.iter().enumerate() {
+        let p = dir.path().join(format!("case-{n}.tsv"));
+        std::fs::write(
+            &p,
+            format!(
+                "#tapectl-file-table 1\n#stream_bytes 4096\n{}\n",
+                rows.join("\n")
+            ),
+        )
+        .unwrap();
+        tables.push((p, want.clone()));
+    }
+    let recorded = recorded_tables(dir.path());
+    assert!(recorded.len() >= 3, "{recorded:?}");
+    let mut kinds = std::collections::BTreeSet::new();
+    for p in &recorded {
+        for l in std::fs::read_to_string(p).unwrap().lines() {
+            if !l.starts_with('#') {
+                kinds.insert(l.split('\t').next().unwrap().to_string());
+            }
+        }
+        tables.push((p.clone(), String::new()));
+    }
+    assert_eq!(
+        kinds.into_iter().collect::<Vec<_>>(),
+        ["d", "f", "h", "l"],
+        "the recorded tables hold every kind of row a tree gives"
+    );
+    let mut ran = 0;
+    for (name, body) in awks() {
+        let bin = dir.path().join(format!("bin-{ran}"));
+        std::fs::create_dir_all(&bin).unwrap();
+        let awk = bin.join("awk");
+        std::fs::write(&awk, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&awk, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        for (p, want) in &tables {
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "{parts}\nawk -F'\\t' \"$AWK_INDEX_COMMON $AWK_TABLE_PATHS\" {}\n",
+                    shell_quote(&p.to_string_lossy())
+                ))
+                .env("LC_ALL", "C")
+                .env(
+                    "PATH",
+                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                )
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{name} {}", p.display());
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout).trim_end_matches('\n'),
+                want,
+                "{name} {}",
+                p.display()
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
+}
+
 // ---- #611 S-1: a unit's name joined to --to ----
 
 fn u_outside(u: &mut tapectl::volume::build::BuildUnit) {

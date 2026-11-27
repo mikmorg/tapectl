@@ -2770,7 +2770,12 @@ UNITS_DONE=0
 # be ../x), so a row that holds one is refused, shown with it written \x00.
 # gawk and mawk see the NUL; BusyBox awk ends the row at it, so the row it sees
 # has not the eight fields every row has (volume-format-v3.md 1.6), and is
-# refused for that.
+# refused for that. A row with an empty field among the first seven is refused
+# too: tapectl writes none (a letter, four numbers, a hash or -, a path, the
+# root .), and bash's IFS=$'\t' read takes two TABs for one, so a later reader
+# would take a field for the one after it (field 8 for the path). Field 8,
+# when it is not empty, is held to the path rule whatever the row's kind, as
+# tapectl's own reader holds it.
 AWK_TABLE_PATHS='
 BEGIN { for (i = 1; i < 256; i++) ord_of[sprintf("%c", i)] = i; nul = sprintf("%c", 0) }
 function nul_shown(s,    out, i) {
@@ -2823,11 +2828,12 @@ function refused(p,    d, t, nd, np) {
 {
   if (nul != "" && index($0, nul) > 0) { print "its row holds a NUL byte\t" nul_shown($7); exit }
   if (NF != 8) { print "its row has " NF " fields, not eight\t" $7; exit }
+  for (i = 1; i <= 7; i++) if ($i == "") { print "its row\047s field " i " is empty\t" $7; exit }
   w = refused($7)
   if (w != "") { print w "\t" $7; exit }
-  if ($1 == "h") {
+  if ($8 != "") {
     w = refused($8)
-    if (w != "") { print "its hard link\047s target: " w "\t" $8; exit }
+    if (w != "") { print "its " ($1 == "h" ? "hard link\047s" : "link") " target: " w "\t" $8; exit }
   }
 }
 '
