@@ -1009,13 +1009,19 @@ fi
 f="$D/$pos"
 if [ ! -f "$f" ]; then echo "?" >"$T/pos"; exit 0; fi
 if [ -n "$count" ]; then
-  # A part of the file was read: the head is inside it, at no file start.
   if [ -n "$of" ]; then
     head -c $((bs * count)) "$f" >"$of" || { echo "?" >"$T/pos"; exit 1; }
   else
     head -c $((bs * count)) "$f" || { echo "?" >"$T/pos"; exit 1; }
   fi
-  echo "$pos+" >"$T/pos"
+  # A file shorter than the count was read whole, and its filemark with it,
+  # as st does: the head is at the next file. Otherwise dd stopped at the
+  # count, inside the file, at no file start.
+  if [ "$(wc -c <"$f")" -lt $((bs * count)) ]; then
+    echo $((pos + 1)) >"$T/pos"
+  else
+    echo "$pos+" >"$T/pos"
+  fi
   exit 0
 fi
 if [ -n "$of" ]; then

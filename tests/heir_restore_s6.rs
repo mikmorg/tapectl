@@ -2607,3 +2607,175 @@ fn a_cartridge_nothing_of_which_reads_is_not_taken_for_a_start_tape_with_no_file
         assert!(!all.contains(wrong), "{wrong}: {all}");
     }
 }
+
+// ---- ADR-0012 item 313: what the independent read of the fixes found ----
+
+const MIB: usize = 1024 * 1024;
+
+/// The bytes the work directories under `dest` hold in all, and the
+/// cartridge directories (`cart.N`) in them.
+fn work_dirs(dest: &std::path::Path) -> (u64, Vec<String>) {
+    fn walk(d: &std::path::Path, bytes: &mut u64, carts: &mut Vec<String>) {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let Ok(m) = e.path().symlink_metadata() else {
+                continue;
+            };
+            if m.is_dir() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("cart.") {
+                    carts.push(n);
+                }
+                walk(&e.path(), bytes, carts);
+            } else {
+                *bytes += m.len();
+            }
+        }
+    }
+    let (mut bytes, mut carts) = (0, Vec::new());
+    for e in std::fs::read_dir(dest).unwrap().flatten() {
+        if e.file_name().to_string_lossy().starts_with(".tapectl-work") {
+            walk(&e.path(), &mut bytes, &mut carts);
+        }
+    }
+    (bytes, carts)
+}
+
+/// The reads the stand-in `dd` was given a count for: (tape file, blocks).
+fn counted_reads(h: &Heir) -> Vec<(usize, usize)> {
+    std::fs::read_to_string(h.root.path().join("state/dd.counts"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let (p, n) = l.split_once(' ').unwrap();
+            (p.parse().unwrap(), n.parse().unwrap())
+        })
+        .collect()
+}
+
+/// Every read of tape file `n` stopped at 33 blocks (16 MiB and one block),
+/// and there was at least one.
+fn every_read_of_file_is_capped(h: &Heir, n: usize, what: &str) {
+    let reads = h.ops().iter().filter(|l| **l == format!("dd {n}")).count();
+    let capped: Vec<usize> = counted_reads(h)
+        .into_iter()
+        .filter(|(p, _)| *p == n)
+        .map(|(_, c)| c)
+        .collect();
+    assert!(reads > 0, "{what}: file {n} was never read");
+    assert_eq!(
+        capped.len(),
+        reads,
+        "{what}: a read of file {n} had no count: {:?}",
+        h.ops()
+    );
+    assert!(
+        capped.iter().all(|c| *c == 33),
+        "{what}: file {n} read with counts {capped:?}"
+    );
+}
+
+/// F1 of the read of #611's fixes: File 0 and the front index are read no
+/// further than 16 MiB (and one block, to know a longer one), as tapectl's
+/// own reader holds them (`SMALL_FILE_CAP`): a longer file is neither. A
+/// foreign cartridge offered at the prompt, whose file 3 is 64 MiB, is
+/// refused with no more than that read of it; its directory in the work
+/// directory is gone at the next prompt; and the sound cartridge offered
+/// then is taken.
+#[test]
+fn a_foreign_cartridge_at_the_prompt_is_read_no_further_than_16_mib_and_leaves_nothing() {
+    let t = span2();
+    let second = t[1].label.as_str();
+    let base = Heir::of_series(&[&t[0], &t[1]]);
+    let want_dest = base.dest("out");
+    let o = restore_span(&base, &want_dest, &[second]);
+    assert_eq!(o.code, 0, "{}", o.all());
+
+    let h = Heir::of_series(&[&t[0], &t[1]]);
+    h.shelve(
+        "FOREIGN",
+        &[
+            b"AMANDA: TAPESTART DATE 20261127 TAPE DailySet1-07\n".to_vec(),
+            heir::text(2000, 1),
+            heir::text(2000, 2),
+            heir::noise(64 * MIB, 3),
+            heir::text(2000, 4),
+        ],
+    );
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let mut at_prompt = Vec::new();
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, _| {
+            assert!(k <= 2, "asked {k} times");
+            at_prompt.push(work_dirs(&dest));
+            h.load(["FOREIGN", second][k - 1]);
+            Some(String::new())
+        },
+    );
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{all}");
+    assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
+    assert!(
+        all.contains("tape file 3 is longer than 16 MiB")
+            && all.contains("NOTE: this cartridge is not a tapectl volume"),
+        "{all}"
+    );
+    assert_eq!(at_prompt.len(), 2, "{all}");
+    let ((before, _), (after, carts)) = (&at_prompt[0], &at_prompt[1]);
+    assert!(
+        *after <= before + 16 * MIB as u64,
+        "the work directory grew from {before} to {after} bytes"
+    );
+    assert!(carts.is_empty(), "left behind: {carts:?}");
+    every_read_of_file_is_capped(&h, 3, "the run");
+}
+
+/// F1: a start tape whose File 0 is 64 MiB of noise. File 0 is read no
+/// further than 16 MiB and one block, and is said to be no tapectl File 0. On
+/// a tape nothing else of which is a map, the run is refused; on one whose
+/// front index and seal marker are sound, that File 0 is a damaged File 0 as
+/// one that does not read is (`volume-format-v3.md` 1.2 rule 2), and the
+/// tape reads.
+#[test]
+fn a_file_0_longer_than_16_mib_is_no_file_0_and_is_not_read_whole() {
+    let t = two();
+    let long = heir::noise(64 * MIB, 5);
+    let foreign = Heir::with_files(
+        t,
+        vec![
+            long.clone(),
+            heir::text(2000, 1),
+            heir::text(2000, 2),
+            heir::text(2000, 3),
+        ],
+    );
+    let o = foreign.run(&["--info"]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stdout.is_empty(), "{}", o.stdout);
+    assert!(
+        o.stderr.contains(
+            "WARNING: File 0 on /dev/nst0 is longer than 16 MiB, more than a tapectl File 0 can be"
+        ) && o.stderr.contains("FATAL: "),
+        "{}",
+        o.stderr
+    );
+    every_read_of_file_is_capped(&foreign, 0, "a foreign tape");
+
+    let good = Heir::of(t).run(&["--info"]);
+    let h = Heir::of(t);
+    h.replace(0, &long);
+    let o = h.run(&["--info"]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stderr.contains(
+            "WARNING: File 0 on /dev/nst0 is longer than 16 MiB, more than a tapectl File 0 can be"
+        ),
+        "{}",
+        o.stderr
+    );
+    let from_map = |s: &str| -> String { s.lines().skip(2).map(|l| format!("{l}\n")).collect() };
+    assert_eq!(from_map(&o.stdout), from_map(&good.stdout), "{}", o.all());
+    every_read_of_file_is_capped(&h, 0, "a sound tape");
+}

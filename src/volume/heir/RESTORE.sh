@@ -593,10 +593,11 @@ dd_detail() { # [file of dd's words]
 }
 
 # Read tape file $1 into file $2, at most $3 bytes of it (all of it when $3 is
-# empty). Returns 1 when the tape cannot give it. A work directory that
-# cannot take it ends the run, saying that.
-fetch() { # <tape file> <out> [<bytes>]
-  local pos=$1 out=$2 size=${3:-} msg="" rc=0
+# empty), or, with $3 empty, no more than $4 blocks of it: dd stops there and
+# reads no further. Returns 1 when the tape cannot give it. A work directory
+# that cannot take it ends the run, saying that.
+fetch() { # <tape file> <out> [<bytes>] [<blocks>]
+  local pos=$1 out=$2 size=${3:-} blocks=${4:-} msg="" rc=0
   seek_to "$pos" || return 1
   CUR=""
   if [ -n "$size" ]; then
@@ -605,7 +606,7 @@ fetch() { # <tape file> <out> [<bytes>]
       cat >/dev/null
     }; } 2>&1) || rc=$?
   else
-    msg=$({ dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | cat >"$out"; } 2>&1) || rc=$?
+    msg=$({ dd if="$DEVICE" bs="$BLOCK" ${blocks:+"count=$blocks"} 2>"$WORK/dd.err" | cat >"$out"; } 2>&1) || rc=$?
   fi
   # The copy is written by head, whose status the group's last command (cat)
   # hides: what head said is read from its words.
@@ -617,7 +618,21 @@ fetch() { # <tape file> <out> [<bytes>]
     return 1
   fi
   [ -s "$out" ] || return 1
+  # A read cut at its count may have stopped inside the file: the head's
+  # place is not known. A shorter file was read whole, filemark and all.
+  if [ -n "$blocks" ] && [ "$(($(wc -c <"$out")))" -ge $((blocks * BLOCK)) ]; then return 0; fi
   CUR=$((pos + 1))
+}
+
+# File 0 and the front index are read no further than 16 MiB, as tapectl's own
+# reader holds them (SMALL_FILE_CAP): a longer file is neither, and only one
+# block past that is read, to know it. 0: read into $2; 1: not read; 2: longer.
+SMALL_MAX_BLOCKS=32
+SMALL_MAX_BYTES=$((SMALL_MAX_BLOCKS * BLOCK))
+fetch_small() { # <tape file> <out>
+  fetch "$1" "$2" "" $((SMALL_MAX_BLOCKS + 1)) || return 1
+  [ "$(($(wc -c <"$2")))" -gt "$SMALL_MAX_BYTES" ] || return 0
+  return 2
 }
 
 # Read tape file $1 into file $2, its first $3 bytes, as fetch does, and hash
@@ -1013,7 +1028,8 @@ check_seal_claims() {
   check_requires "the seal marker" "$WORK/seal.toml"
 }
 
-# 1 when File 0 gave nothing (a read error, or no bytes). Nothing it states is
+# 1 when File 0 gave nothing (a read error, or no bytes) or more than a File 0
+# can be (fetch_small). Nothing it states is
 # needed to restore, so that is a damaged File 0 and never a hard stop
 # (volume-format-v3.md 1.2 rule 2): the run goes on with no File 0 facts, as
 # for a File 0 that reads and states nothing. Whether a cartridge is loaded at
@@ -1022,12 +1038,15 @@ FILE0_UNREAD=0
 
 bootstrap() {
   tape_init
-  local magic lv why
-  if ! fetch 0 "$WORK/file0.raw"; then
+  local magic lv why got=0
+  fetch_small 0 "$WORK/file0.raw" || got=$?
+  if [ "$got" != 0 ]; then
     FILE0_UNREAD=1
     : >"$WORK/file0.raw"
     why=$(dd_detail)
-    warn "File 0 cannot be read from $DEVICE${why:+ ($why)}. Going on without it, as for a damaged File 0: this is read as a Layout 3 tape, and the seal marker's own claims decide."
+    why="cannot be read from $DEVICE${why:+ ($why)}"
+    [ "$got" = 1 ] || why="on $DEVICE is longer than 16 MiB, more than a tapectl File 0 can be: no more of it is read"
+    warn "File 0 $why. Going on without it, as for a damaged File 0: this is read as a Layout 3 tape, and the seal marker's own claims decide."
   fi
   tr -d '\0' <"$WORK/file0.raw" >"$WORK/file0.txt"
   magic=$(toml_val "$WORK/file0.txt" magic)
@@ -1059,7 +1078,10 @@ file0_fields() {
 
 # Rung 1: File 3. Leaves the parsed map in $WORK/files_from_index.txt.
 try_front_index() {
-  fetch "$FRONT_INDEX" "$WORK/front_index.raw" || return 1
+  local got=0
+  fetch_small "$FRONT_INDEX" "$WORK/front_index.raw" || got=$?
+  [ "$got" != 2 ] || note "the front index is not consistent: tape file $FRONT_INDEX is longer than 16 MiB, more than a tapectl front index can be, and no more of it is read."
+  [ "$got" = 0 ] || return 1
   tr -d '\0' <"$WORK/front_index.raw" >"$WORK/front_index.stripped"
   grep '^\[index\]' "$WORK/front_index.stripped" >/dev/null 2>&1 || return 1
   sed -n '/^\[index\]/,$p' "$WORK/front_index.stripped" >"$WORK/index.toml"
@@ -1083,7 +1105,6 @@ try_front_index() {
 # times that. The last file of an unsealed tape is its last data slice, up to
 # GiBs, and no more of it than this is read.
 SEAL_MAX_BLOCKS=128
-SEAL_MAX_BYTES=$((SEAL_MAX_BLOCKS * BLOCK))
 
 read_seal() {
   local ok=0
@@ -1097,7 +1118,7 @@ read_seal() {
       [ -s "$WORK/seal.stripped" ]; then ok=1; fi
   fi
   if [ "$ok" = 0 ] && [ -n "$SEAL_MARKER" ]; then
-    if fetch "$SEAL_MARKER" "$WORK/seal.raw" "$SEAL_MAX_BYTES"; then
+    if fetch "$SEAL_MARKER" "$WORK/seal.raw" "" "$SEAL_MAX_BLOCKS"; then
       tr -d '\0' <"$WORK/seal.raw" >"$WORK/seal.stripped"
       rm -f "$WORK/seal.raw"
       ok=1
@@ -1801,7 +1822,7 @@ probe_cartridge() { # <dir> <slice>
     echo "NOTE: this cartridge is unreadable: the drive cannot reach its first file. Nothing is taken from it." >&2
     exit 2
   }
-  dd if="$DEVICE" bs="$BLOCK" of="$WORK/file0.raw" 2>"$WORK/dd.err" || rc=$?
+  dd if="$DEVICE" bs="$BLOCK" count=$((SMALL_MAX_BLOCKS + 1)) of="$WORK/file0.raw" 2>"$WORK/dd.err" || rc=$?
   CUR=1
   if [ "$rc" -ne 0 ]; then
     CUR=""
@@ -1810,6 +1831,13 @@ probe_cartridge() { # <dir> <slice>
   elif [ ! -s "$WORK/file0.raw" ]; then
     echo "NOTE: this cartridge is blank: nothing can be read at its first file. Nothing is taken from it." >&2
     exit 2
+  elif [ "$(($(wc -c <"$WORK/file0.raw")))" -gt "$SMALL_MAX_BYTES" ]; then
+    # dd stopped inside it (fetch_small). It is no File 0, to know the
+    # cartridge by or to read: as one that does not read.
+    rc=1
+    CUR=""
+    f0="its first file is longer than 16 MiB, more than a tapectl File 0 can be (no more of it is read)"
+    : >"$WORK/file0.raw"
   fi
   tr -d '\0' <"$WORK/file0.raw" >"$WORK/file0.txt"
   magic=$(toml_val "$WORK/file0.txt" magic)
@@ -1903,6 +1931,8 @@ accept_cartridge() { # <slice>
   (probe_cartridge "$sub" "$k") 2>"$sub/err" || rc=$?
   CUR=""
   sed 's/^FATAL: /NOTE: /' "$sub/err" >&2 || true
+  # What the probe read of a cartridge that is not taken is not kept.
+  { [ "$rc" = 0 ] && [ -f "$sub/vars" ]; } || rm -rf "$sub" || true
   if [ "$rc" = 3 ]; then
     return 1
   fi
@@ -1964,6 +1994,7 @@ recheck_drive() { # <slice asked for>
   NEED_HASH=${SL_SHAE[$1]} NEED_SIZE=${SL_ENC[$1]}
   (probe_cartridge "$sub" "$1") 2>/dev/null || rc=$?
   CUR=""
+  rm -rf "$sub" || true
   DRIVE_HOLDS=""
   if [ "$rc" = 3 ] || [ "$rc" = 4 ]; then
     FOREIGN_LOADED=0
