@@ -7211,3 +7211,112 @@ fn a_table_path_that_leaves_to_is_refused_and_nothing_outside_to_is_touched() {
         assert!(!Path::new("/abs-sentinel.txt").exists());
     }
 }
+
+// ---- #611 D-1: a raw NUL byte in a file-table path ----
+
+fn t_nul_path(p: &Path) {
+    craft_row(p, "f", "..\0/..\0/sentinel.txt")
+}
+fn t_nul_link(p: &Path) {
+    craft_row(p, "h", "..\0/..\0/sentinel.txt")
+}
+fn t_nul_lead(p: &Path) {
+    craft_row(p, "f", "\0/abs-sentinel.txt")
+}
+
+/// #611 D-1 (ADR-0012 item 313): a file-table row whose path, or hard link's
+/// target, holds a raw NUL byte is refused before anything is removed, made or
+/// linked, under every awk: bash drops the NUL from a path it is given
+/// (`..<NUL>/x` would be `../x`), so the row is refused by what each awk sees.
+/// gawk and mawk see the NUL (shown `\x00`); BusyBox awk ends the row at it,
+/// and the row it sees has not the eight fields of §1.6. Nothing of the unit
+/// is written, nothing beside or above `--to` is touched, `--all` goes on.
+#[test]
+fn a_table_path_with_a_nul_byte_is_refused_under_every_awk() {
+    // The case, and the path as gawk and mawk show it (a hard link's target is
+    // not shown: the row's path is).
+    let cases: [(TableEdit, &str, Option<&str>); 3] = [
+        (t_nul_path, "path", Some("..\\x00/..\\x00/sentinel.txt")),
+        (t_nul_link, "target", None),
+        (t_nul_lead, "leading", Some("\\x00/abs-sentinel.txt")),
+    ];
+    let listing = |d: &Path| {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let mut ran = 0;
+    for (edit, shown, printed) in cases {
+        let mut shape = Shape::two();
+        shape.table_edit = Some(edit);
+        let t = Tape::build(&shape);
+        for (name, body) in awks() {
+            let h = Heir::of(&t);
+            put_awk(&h, &body);
+            let ke = key(&h, Who::Escrow);
+            let up = h.dest("up");
+            let boxed = up.join("box");
+            std::fs::create_dir_all(&boxed).unwrap();
+            std::fs::write(up.join("sentinel.txt"), b"keep up").unwrap();
+            std::fs::write(boxed.join("sentinel.txt"), b"keep box").unwrap();
+            let to = boxed.join("to");
+            let o = h.run(&restore_all(&ke, &to));
+            let all = o.all();
+            assert_eq!(o.code, 1, "{name} {shown}: {all}");
+            assert!(
+                o.stderr.contains(&format!(
+                    "the file table of unit {UNIT_A} holds a path this script will not write"
+                )),
+                "{name} {shown}: {}",
+                o.stderr
+            );
+            if name == "busybox awk" {
+                // The row it sees ends at the NUL: short of fields, or, with
+                // the NUL in the last field, a target of `..`.
+                assert!(
+                    o.stderr.contains("fields, not eight")
+                        || o.stderr.contains("target: it has a .. component"),
+                    "{name} {shown}: {}",
+                    o.stderr
+                );
+            } else {
+                assert!(
+                    o.stderr.contains("its row holds a NUL byte"),
+                    "{name} {shown}: {}",
+                    o.stderr
+                );
+                if let Some(p) = printed {
+                    assert!(o.stderr.contains(p), "{name} {shown}: {}", o.stderr);
+                }
+            }
+            assert!(
+                !all.contains("null byte"),
+                "{name} {shown}: bash saw it: {all}"
+            );
+            assert!(
+                o.stdout.contains(&format!(
+                    "RESTORE INCOMPLETE: the file table of unit(s) {UNIT_A} holds a path"
+                )),
+                "{name} {shown}: {all}"
+            );
+            assert!(
+                !to.join(UNIT_A).exists(),
+                "{name} {shown}: nothing of unit A"
+            );
+            assert_restored(&t, UNIT_B, &to.join(UNIT_B));
+            assert_eq!(listing(&boxed), ["sentinel.txt", "to"], "{name} {shown}");
+            assert_eq!(listing(&up), ["box", "sentinel.txt"], "{name} {shown}");
+            assert_eq!(
+                std::fs::read(boxed.join("sentinel.txt")).unwrap(),
+                b"keep box"
+            );
+            assert_eq!(std::fs::read(up.join("sentinel.txt")).unwrap(), b"keep up");
+            assert!(!Path::new("/abs-sentinel.txt").exists());
+            ran += 1;
+        }
+    }
+    assert!(ran >= 3, "at least one awk ran each case");
+}

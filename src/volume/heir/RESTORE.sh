@@ -2573,9 +2573,19 @@ UNITS_DONE=0
 # words, a TAB, and the path as the table writes it; nothing is printed for a
 # table whose every path passes. tesc() is 1.5's escape: a backslash, a TAB, a
 # newline and a carriage return written out, and each byte that is not part
-# of a well-formed UTF-8 sequence \xHH.
+# of a well-formed UTF-8 sequence \xHH. Before them, the row: a NUL byte is in
+# no name, and bash drops one from a path before it is used (..<NUL>/x would
+# be ../x), so a row that holds one is refused, shown with it written \x00.
+# gawk and mawk see the NUL; BusyBox awk ends the row at it, so the row it sees
+# has not the eight fields every row has (volume-format-v3.md 1.6), and is
+# refused for that.
 AWK_TABLE_PATHS='
-BEGIN { for (i = 1; i < 256; i++) ord_of[sprintf("%c", i)] = i }
+BEGIN { for (i = 1; i < 256; i++) ord_of[sprintf("%c", i)] = i; nul = sprintf("%c", 0) }
+function nul_shown(s,    out, i) {
+  out = ""
+  while ((i = index(s, nul)) > 0) { out = out substr(s, 1, i - 1) "\\x00"; s = substr(s, i + 1) }
+  return out s
+}
 function tesc(s,    out, i, n, c, b, k, need, lo, hi, j, ok) {
   out = ""
   n = length(s)
@@ -2619,6 +2629,8 @@ function refused(p,    d, t, nd, np) {
 }
 /^#/ { next }
 {
+  if (nul != "" && index($0, nul) > 0) { print "its row holds a NUL byte\t" nul_shown($7); exit }
+  if (NF != 8) { print "its row has " NF " fields, not eight\t" $7; exit }
   w = refused($7)
   if (w != "") { print w "\t" $7; exit }
   if ($1 == "h") {
