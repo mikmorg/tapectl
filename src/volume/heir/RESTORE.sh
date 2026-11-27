@@ -1888,16 +1888,17 @@ probe_cartridge() { # <dir> <slice>
     f0="its first file states no magic, layout_version, label or uuid"
   fi
   [ -z "$f0" ] || echo "WARNING: this cartridge: $f0 (a damaged File 0?). Its front index and its seal marker decide whether it is taken." >&2
+  # Its own facts, before a refusal: file0_way_on reads ITS seal marker.
+  file0_fields
   if { [ -n "$magic" ] && [ "$magic" != tapectl-volume-v3 ]; } || { [ -n "$lv" ] && [ "$lv" != 3 ]; }; then
-    echo "NOTE: this cartridge is a tapectl volume of Layout $(safe_str "${lv:-unknown}") (magic $(safe_str "${magic:-none}")), label $(safe_str "$label"); this RESTORE.sh reads Layout 3 only, so nothing is taken from it. Read it with the tapectl that wrote it or with the RESTORE.sh in its own File 2." >&2
+    echo "NOTE: this cartridge is a tapectl volume of Layout $(safe_str "${lv:-unknown}") (magic $(safe_str "${magic:-none}")), label $(safe_str "$label"); this RESTORE.sh reads Layout 3 only, so nothing is taken from it. $(file0_way_on "Read it with the tapectl that wrote it or with the RESTORE.sh in its own File 2.")" >&2
     exit 2
   fi
   feats=$(requires_of "$WORK/file0.txt")
   if [ -n "$feats" ]; then
-    echo "NOTE: this cartridge requires feature(s) $(safe_str "$feats"), which this RESTORE.sh does not know, so nothing is taken from it." >&2
+    echo "NOTE: this cartridge requires feature(s) $(safe_str "$feats"), which this RESTORE.sh does not know, so nothing is taken from it. $(file0_way_on "Use a newer tapectl, the tapectl that wrote this tape, or the RESTORE.sh in this tape's own File 2.")" >&2
     exit 2
   fi
-  file0_fields
   F0SHA=$(sha_of_file "$WORK/file0.raw")
   if [ "$rc" -ne 0 ]; then
     # No File 0 to know it by: its front index stands in, as in establish. A

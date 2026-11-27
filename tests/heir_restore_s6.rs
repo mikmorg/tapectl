@@ -3097,3 +3097,69 @@ fn a_tape_whose_file_0_does_not_read_is_named_by_its_front_indexs_label() {
     );
     assert!(!all.contains("the run started on"), "{all}");
 }
+
+/// F2 of the read of #611's fixes: DI-9's words at the prompt. A cartridge
+/// whose File 0 states another layout, or a feature this script does not
+/// know, is still refused (item 313, `volume-format-v3.md` 1.2 rule 1); when
+/// its seal marker reads and states Layout 3 and no feature, the words say so
+/// and point to File 1's steps by hand, as at the start of a run, and no
+/// longer send the heir to the RESTORE.sh in its File 2. With the seal
+/// marker stating the feature too, the old way on stays. The sound cartridge
+/// offered last is taken.
+#[test]
+fn a_cartridge_refused_on_file_0s_word_at_the_prompt_says_what_its_seal_marker_states() {
+    let t = span2();
+    let second = t[1].label.as_str();
+    let last = t[1].files.len() - 1;
+    let base = Heir::of_series(&[&t[0], &t[1]]);
+    let want_dest = base.dest("out");
+    let o = restore_span(&base, &want_dest, &[second]);
+    assert_eq!(o.code, 0, "{}", o.all());
+
+    let h = Heir::of_series(&[&t[0], &t[1]]);
+    let feature = |s: &str| s.replacen("requires = []", "requires = [\"future-thing\"]", 1);
+    h.copy_cart(second, "LAYOUT4");
+    edit_cart_text(&h, "LAYOUT4", 0, |s| {
+        s.replacen("\nlayout_version = 3\n", "\nlayout_version = 4\n", 1)
+    });
+    h.copy_cart(second, "FEATURE");
+    edit_cart_text(&h, "FEATURE", 0, feature);
+    h.copy_cart(second, "BOTH");
+    edit_cart_text(&h, "BOTH", 0, feature);
+    edit_cart_text(&h, "BOTH", last, feature);
+    let dest = h.dest("out");
+    let o = restore_span(&h, &dest, &["LAYOUT4", "FEATURE", "BOTH", second]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert_eq!(all.matches(heir::PROMPT).count(), 4, "{all}");
+    let notes: Vec<&str> = all
+        .split("\n>>> Load the cartridge")
+        .skip(1)
+        .take(3)
+        .collect();
+    assert_eq!(notes.len(), 3, "{all}");
+    let (layout4, feat, both) = (notes[0], notes[1], notes[2]);
+    assert!(
+        layout4.contains(
+            "NOTE: this cartridge is a tapectl volume of Layout 4 (magic tapectl-volume-v3)"
+        ) && layout4.contains(SEAL_VOUCHES)
+            && layout4.contains("by the steps of File 1")
+            && !layout4.contains("RESTORE.sh in its own File 2"),
+        "{layout4}"
+    );
+    assert!(
+        feat.contains("NOTE: this cartridge requires feature(s) future-thing")
+            && feat.contains(SEAL_VOUCHES)
+            && feat.contains("by the steps of File 1")
+            && !feat.contains("own File 2"),
+        "{feat}"
+    );
+    assert!(
+        both.contains("NOTE: this cartridge requires feature(s) future-thing")
+            && both.contains("or the RESTORE.sh in this tape's own File 2.")
+            && !both.contains(SEAL_VOUCHES),
+        "{both}"
+    );
+    assert!(!all.contains("FATAL"), "{all}");
+    assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
+}
