@@ -4097,10 +4097,14 @@ stated options. Each item below gives the option chosen in the CTO's words.
      - the lows: DI-9, S-5, D-3, D-4, D-5, D-6 and D-7.
 
      Three readings the fixes rest on, the coordinator's, for the CTO to overrule:
-     - **DI-4 amends `volume-format-v3.md` §7.2, steps 3 to 5.** Where the tape's two ends
-       disagree, a file is no longer called damaged on File 3's word alone: an envelope that
-       matches the seal's own copy of the map is given to `age`, which authenticates it, and
-       for a slice the manifest's size and hash decide over the front index's.
+     - **DI-4 amends `volume-format-v3.md` §7.2, steps 3 and 4.** Where the tape's two ends
+       disagree, an envelope is no longer called damaged on File 3's word alone: one that
+       matches the seal's own copy of the map is given to `age`, which authenticates it. A
+       number read from a plain-text file is held to plain digits before it is used.
+       **The third form of DI-4 is dropped, by the CTO on 2026-11-27 ("Drop it.").** Letting
+       the manifest decide where a slice's line of File 3 differs would make two sentences of
+       File 1 false in that case, and File 1's pins do not move. Such a slice is left out and
+       its files are listed, as before.
      - **DI-9 keeps the refusal.** A File 0 whose `magic` or `requires` names something this
        script does not know is still refused (§1.2 rule 1; the 2026-10-06 item 15). What
        changes is its words: they say what the seal marker states, where it differs, and they
@@ -4109,6 +4113,13 @@ stated options. Each item below gives the option chosen in the CTO's words.
      - **D-1 is fixed in the script only.** tapectl's own check accepts a NUL in a path too,
        but hands the name whole to the system, which refuses it. Its refusal by name is 2.0.1's
        (item 314).
+     - **DI-1 reaches further than `bootstrap`.** With an unreadable File 0 no longer a stop,
+       what File 0 used to give must come from elsewhere, so the same fix covers: the seal
+       marker's `layout_version` deciding when File 0 states none (§1.2 rule 2); the plan's
+       file count taken from the front index, so a short seal is not called complete; a
+       cartridge at the prompt judged by its front index and seal when its File 0 does not
+       read, and never taken for the one already in the drive because both File 0s fail; and
+       `--verify` on an unsealed tape going on past an unreadable File 0.
 
      With them, by the CTO's choice ("Include it"), the final per-file check is split across
      the machine's cores (C-4). The pin moves in a commit of its own, and the hash it moves to
