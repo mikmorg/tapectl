@@ -5506,6 +5506,12 @@ fn a_signal_just_after_a_slice_was_fed_leaves_no_partial_file_from_that_slice() 
 /// tapectl's, one the drive cannot read, one with no readable seal, one that
 /// lists the slice past its seal, and one that lists no such slice. A
 /// cartridge whose front index is unreadable is read by the seal's copy.
+///
+/// File 0 is no part of that rule (ADR-0012 item 313): a cartridge whose File
+/// 0 alone does not read, or states nothing, is taken or refused by its front
+/// index and seal marker (`tests/heir_restore_s6.rs`). So the cartridge that
+/// is not tapectl's is one NO file of which is tapectl's, and the one the
+/// drive cannot read gives neither its File 0, its front index nor its seal.
 #[test]
 fn a_cartridge_is_taken_only_by_the_next_slices_hash_at_a_position_its_seal_covers() {
     let t = span3();
@@ -5517,11 +5523,17 @@ fn a_cartridge_is_taken_only_by_the_next_slices_hash_at_a_position_its_seal_cove
             .replace("layout_version = 3", "layout_version = 2")
     });
     h.shelve("LAYOUT2", &f);
-    let mut f = t[2].files.clone();
+    let mut f: Vec<Vec<u8>> = t[2]
+        .files
+        .iter()
+        .map(|_| b"a file of some other tape".to_vec())
+        .collect();
     f[0] = b"the first file of some other tape".to_vec();
     h.shelve("NOTTAPE", &f);
     h.copy_cart("HEIR02", "UNREAD");
-    h.fail_file("UNREAD", 0);
+    for n in [0, 3, t[1].files.len() - 1] {
+        h.fail_file("UNREAD", n);
+    }
     let mut f = t[1].files.clone();
     let last = f.len() - 1;
     f[last] = b"junk where the seal marker was".to_vec();

@@ -2172,3 +2172,153 @@ fn a_short_seal_is_classed_short_when_file_0_does_not_give_the_plan() {
         );
     }
 }
+
+/// Rewrite the text of tape file `n` of the shelved cartridge `cart`, keeping
+/// the file's padded length.
+fn edit_cart_text(h: &Heir, cart: &str, n: usize, edit: impl Fn(&str) -> String) {
+    let p = h.cart_file(cart, n);
+    let raw = std::fs::read(&p).unwrap();
+    let text = String::from_utf8_lossy(&raw)
+        .trim_end_matches('\0')
+        .to_string();
+    let mut new = edit(&text).into_bytes();
+    assert!(new.len() <= raw.len());
+    new.resize(raw.len(), 0);
+    std::fs::write(&p, new).unwrap();
+}
+
+/// The whole unit of the span, restored from its first tape with the
+/// cartridges of `offers` loaded one at each prompt.
+fn restore_span(h: &Heir, dest: &std::path::Path, offers: &[&str]) -> heir::Out {
+    let ka = key(h, Who::TenantA);
+    h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(dest)],
+        |k, _| {
+            assert!(k <= offers.len(), "asked {k} times");
+            h.load(offers[k - 1]);
+            Some(String::new())
+        },
+    )
+}
+
+/// File 1's rule for taking a cartridge at the prompt: its front index lists
+/// the next slice's sha256 at a position its own seal marker covers, and "a
+/// label or an index never stands in for the hash". File 0 is no part of it.
+/// A second cartridge whose File 0 gives a read error, or reads and states
+/// nothing, is warned about and taken by that rule, and the unit completes.
+#[test]
+fn a_cartridge_whose_file_0_gives_nothing_is_taken_by_its_front_index_and_seal() {
+    let t = span2();
+    let second = t[1].label.as_str();
+    let base = Heir::of_series(&[&t[0], &t[1]]);
+    let want_dest = base.dest("out");
+    let o = restore_span(&base, &want_dest, &[second]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let want_tree = heir::tree(&want_dest);
+    assert!(!want_tree.is_empty());
+
+    let unread = Heir::of_series(&[&t[0], &t[1]]);
+    unread.fail_file(second, 0);
+    let garbage = Heir::of_series(&[&t[0], &t[1]]);
+    let mut noise = heir::noise(4096, 7);
+    noise.resize(heir::BLOCK, 0);
+    std::fs::write(garbage.cart_file(second, 0), noise).unwrap();
+    for (name, h, warning) in [
+        (
+            "a read error",
+            &unread,
+            "WARNING: this cartridge: its first file cannot be read (",
+        ),
+        (
+            "garbage",
+            &garbage,
+            "WARNING: this cartridge: its first file states no magic, layout_version, label or uuid",
+        ),
+    ] {
+        let dest = h.dest("out");
+        let o = restore_span(h, &dest, &[second]);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{name}: {all}");
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{name}: {all}");
+        assert!(
+            all.contains(warning)
+                && all.contains("Its front index and its seal marker decide whether it is taken")
+                && all.contains("its front index lists each one's sha256")
+                && !all.contains("Nothing is taken from it"),
+            "{name}: {all}"
+        );
+        assert_eq!(all.matches(heir::PROMPT).count(), 1, "{name}: {all}");
+        assert_eq!(heir::tree(&dest), want_tree, "{name}: {all}");
+        assert!(damaged_list(&dest).is_empty(), "{name}: {all}");
+    }
+}
+
+/// The fences hold through the seal marker when the offered cartridge's File 0
+/// does not read: one whose seal marker names a feature this script does not
+/// know, or states another layout, is refused by name, the prompt asks again,
+/// and the sound cartridge is then taken.
+#[test]
+fn a_cartridge_whose_file_0_does_not_read_is_still_fenced_by_its_seal_marker() {
+    let t = span2();
+    let second = t[1].label.as_str();
+    let last = t[1].files.len() - 1;
+    let base = Heir::of_series(&[&t[0], &t[1]]);
+    let want_dest = base.dest("out");
+    let o = restore_span(&base, &want_dest, &[second]);
+    assert_eq!(o.code, 0, "{}", o.all());
+
+    let h = Heir::of_series(&[&t[0], &t[1]]);
+    for (cart, from, to) in [
+        ("FEATURE", "requires = []", "requires = [\"future-thing\"]"),
+        (
+            "LAYOUT4",
+            "\nlayout_version = 3\n",
+            "\nlayout_version = 4\n",
+        ),
+    ] {
+        h.copy_cart(second, cart);
+        h.fail_file(cart, 0);
+        edit_cart_text(&h, cart, last, |s| {
+            assert!(s.contains(from), "{cart}: {s}");
+            s.replacen(from, to, 1)
+        });
+    }
+    let dest = h.dest("out");
+    let o = restore_span(&h, &dest, &["FEATURE", "LAYOUT4", second]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert_eq!(all.matches(heir::PROMPT).count(), 3, "{all}");
+    assert!(
+        all.contains(
+            "NOTE: the seal marker requires feature(s) this RESTORE.sh does not know: future-thing."
+        ) && all.contains("NOTE: the seal marker at the end of this tape states layout_version 4")
+            && !all.contains("FATAL"),
+        "{all}"
+    );
+    assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
+}
+
+/// The other half: the tape the run STARTED on has a File 0 that does not
+/// read, and `done` is answered at the prompt for a slice it does not hold.
+/// It is recognised as the cartridge in the drive (it gave no File 0 then and
+/// gives none now), and what it holds is restored, as on a start tape whose
+/// File 0 reads.
+#[test]
+fn done_on_a_start_tape_whose_file_0_does_not_read_still_restores_what_it_holds() {
+    let t = span2();
+    let base = Heir::of_series(&[&t[1], &t[0]]);
+    let want_dest = base.dest("out");
+    let ka = key(&base, Who::TenantA);
+    base.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&want_dest)]);
+    let want_tree = heir::tree(&want_dest);
+    assert!(!want_tree.is_empty());
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    fail_read(&h, 0);
+    let dest = h.dest("out");
+    let o = h.run(&["--restore", "--key", &ka, "--all", "--to", dstr(&dest)]);
+    let all = o.all();
+    assert!(all.contains(FILE0_WARNING), "{all}");
+    assert!(!all.contains("NOT IN THE DRIVE"), "{all}");
+    assert_eq!(heir::tree(&dest), want_tree, "{all}");
+    assert_eq!(damaged_list(&dest), damaged_list(&want_dest), "{all}");
+}

@@ -1753,9 +1753,14 @@ ask_cartridge() { # <slice>
 # through files in $1, so that nothing it refuses ends the restore (#521).
 # Exit 0: it gives slice $2 (its facts are in $1/vars); 3: it is the cartridge
 # already in the drive; anything else: refused, and the words say why.
+# File 0 is no part of the rule a cartridge is taken by (its front index lists
+# the slice's sha256 at a position its own seal marker covers, R8). One that
+# does not read, or states nothing, is warned about (f0), and that rule
+# decides; the seal marker's layout_version and `requires` are the fences
+# then (check_seal_claims).
 probe_cartridge() { # <dir> <slice>
   trap - EXIT
-  local dir=$1 k=$2 rc=0 magic lv label uuid pos feats v h16
+  local dir=$1 k=$2 rc=0 magic lv label uuid pos feats v h16 f0=""
   WORK=$dir
   tape_init
   CUR=""
@@ -1764,24 +1769,24 @@ probe_cartridge() { # <dir> <slice>
     exit 2
   }
   dd if="$DEVICE" bs="$BLOCK" of="$WORK/file0.raw" 2>"$WORK/dd.err" || rc=$?
+  CUR=1
   if [ "$rc" -ne 0 ]; then
-    echo "NOTE: this cartridge is unreadable: its first file cannot be read ($(dd_detail)). Nothing is taken from it." >&2
-    exit 2
-  fi
-  if [ ! -s "$WORK/file0.raw" ]; then
+    CUR=""
+    f0="its first file cannot be read ($(dd_detail))"
+    : >"$WORK/file0.raw"
+  elif [ ! -s "$WORK/file0.raw" ]; then
     echo "NOTE: this cartridge is blank: nothing can be read at its first file. Nothing is taken from it." >&2
     exit 2
   fi
-  CUR=1
   tr -d '\0' <"$WORK/file0.raw" >"$WORK/file0.txt"
   magic=$(toml_val "$WORK/file0.txt" magic)
   lv=$(toml_val "$WORK/file0.txt" layout_version)
   label=$(toml_val "$WORK/file0.txt" label)
   uuid=$(toml_val "$WORK/file0.txt" uuid)
-  if [ -z "$magic$lv$label$uuid" ]; then
-    echo "NOTE: this cartridge is not a tapectl volume: its first file states no magic, layout_version, label or uuid. Nothing is taken from it." >&2
-    exit 2
+  if [ -z "$f0" ] && [ -z "$magic$lv$label$uuid" ]; then
+    f0="its first file states no magic, layout_version, label or uuid"
   fi
+  [ -z "$f0" ] || echo "WARNING: this cartridge: $f0 (a damaged File 0?). Its front index and its seal marker decide whether it is taken." >&2
   if { [ -n "$magic" ] && [ "$magic" != tapectl-volume-v3 ]; } || { [ -n "$lv" ] && [ "$lv" != 3 ]; }; then
     echo "NOTE: this cartridge is a tapectl volume of Layout $(safe_str "${lv:-unknown}") (magic $(safe_str "${magic:-none}")), label $(safe_str "$label"); this RESTORE.sh reads Layout 3 only, so nothing is taken from it. Read it with the tapectl that wrote it or with the RESTORE.sh in its own File 2." >&2
     exit 2
@@ -1812,7 +1817,11 @@ probe_cartridge() { # <dir> <slice>
     SEAL_STATE=$([ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ] && echo short || echo full)
     SEAL_BINDS=""
   else
-    echo "NOTE: neither the front index nor the seal marker of this cartridge can be read, so nothing is taken from it." >&2
+    case $f0 in
+    *"cannot be read"*) echo "NOTE: this cartridge is unreadable: $f0, and neither its front index nor its seal marker reads. Nothing is taken from it." >&2 ;;
+    ?*) echo "NOTE: this cartridge is not a tapectl volume: $f0, and it has no front index and no seal marker that reads. Nothing is taken from it." >&2 ;;
+    *) echo "NOTE: neither the front index nor the seal marker of this cartridge can be read, so nothing is taken from it." >&2 ;;
+    esac
     exit 2
   fi
   if [ -z "$ENDED_AFTER" ] || { [ "$SEAL_STATE" != full ] && [ "$SEAL_STATE" != short ]; }; then
@@ -1887,7 +1896,7 @@ accept_cartridge() { # <slice>
     [ -n "${SL_HERE[$j]:-}" ] || break
     b=$j
   done
-  echo "This cartridge identifies as: $(safe_str "$LABEL")" >&2
+  echo "This cartridge identifies as: $(safe_str "${LABEL:-a tape whose File 0 gives no label}")" >&2
   echo "It gives slice(s) $a to $b of $(safe_str "$U_NAME"): its front index lists each one's sha256, at positions its seal marker covers." >&2
   return 0
 }
