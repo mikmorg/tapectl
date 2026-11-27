@@ -969,6 +969,7 @@ FILES_TXT="" FILES_SOURCE=""
 ALT_TXT=""
 ENDED_AFTER="" SEAL_STATE="" SEAL_BINDS="" SEAL_FILE_COUNT="" SEAL_SEALED_AT=""
 FRONT_INDEX_HASH=""
+LABEL_FROM="" # where the label came from, when File 0 gave none (label_from_map)
 
 # The way on from a refusal on File 0's word. The refusal stays (volume-
 # format-v3.md 1.2 rule 1); its words are $1 unless the seal marker reads and
@@ -1217,6 +1218,28 @@ learn_end() {
   fi
 }
 
+# Where File 0 gives no label (it is damaged, or did not read), the volume's
+# label as the front index states it, else a valid seal marker (volume-format-
+# v3.md 4 and 5): LABEL_FROM says which. It names the tape in words only; a
+# cartridge is never known by its label. No file but File 0 states the uuid.
+label_from_map() {
+  LABEL_FROM=""
+  [ -z "$LABEL" ] || return 0
+  if [ "$FILES_TXT" = "$WORK/files_from_index.txt" ]; then
+    LABEL=$(toml_val "$WORK/index.toml" volume)
+    LABEL_FROM="the front index"
+  fi
+  case $SEAL_STATE in
+  full | short | disagrees)
+    if [ -z "$LABEL" ]; then
+      LABEL=$(toml_val "$WORK/seal.toml" volume)
+      LABEL_FROM="the seal marker"
+    fi
+    ;;
+  esac
+  [ -n "$LABEL" ] || LABEL_FROM=""
+}
+
 # The files of the plan up to the end of the tape, the seal last (R3: no read
 # is ever sent past it).
 on_tape() { # <position>: is it on this tape?
@@ -1232,12 +1255,13 @@ establish() {
   # A File 0 that did not read is no bytes to know the cartridge by (any
   # cartridge whose File 0 fails gives none): its front index stands in.
   [ "$FILE0_UNREAD" = 0 ] || LOADED_F0SHA=""
-  START_LABEL=$LABEL
   if try_front_index; then
     [ "$FILE0_UNREAD" = 0 ] || LOADED_F0SHA="fi:$FRONT_INDEX_HASH"
     FILES_TXT="$WORK/files_from_index.txt"
     FILES_SOURCE="front index (File $FRONT_INDEX)"
     learn_end
+    label_from_map
+    START_LABEL=$LABEL
     return 0
   fi
   warn "the front index (file $FRONT_INDEX) is unreadable or inconsistent: falling back to the seal marker's own copy of it. The front of the tape may be damaged; treat this recovery as degraded."
@@ -1247,6 +1271,8 @@ establish() {
     FILES_SOURCE="the seal marker's copy of the front index"
     SEAL_STATE=$([ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ] && echo short || echo full)
     SEAL_BINDS=""
+    label_from_map
+    START_LABEL=$LABEL
     return 0
   fi
   local none="neither the front index nor the seal marker can be read, so there is no map of the tape."
@@ -1288,8 +1314,16 @@ info_own_size() { # <type>
 
 do_info() {
   establish
-  local pos type size hash last
-  say "Tape: $(safe_str "$LABEL")   uuid $(safe_str "$UUID")"
+  local pos type size hash last lab uu
+  lab=$(safe_str "$LABEL")
+  if [ -n "$LABEL_FROM" ]; then
+    lab="$lab (File 0 gives no label: this one is $LABEL_FROM's)"
+  elif [ -z "$LABEL" ]; then
+    lab="not known (File 0 gives no label, and neither the front index nor a valid seal marker states one)"
+  fi
+  uu=$(safe_str "$UUID")
+  [ -n "$UUID" ] || uu="not known (File 0 gives none)"
+  say "Tape: $lab   uuid $uu"
   say "Layout 3, written by tapectl $(safe_str "$TAPECTL_VERSION") on $(safe_str "$MEDIA_TYPE") media, $(safe_str "$CREATED_AT")"
   say "The map is read from the $FILES_SOURCE"
   case $SEAL_STATE in
@@ -1915,8 +1949,9 @@ probe_cartridge() { # <dir> <slice>
     echo "NOTE: This cartridge (label $(safe_str "$label")) lists slice $k (sha256 $h16...) at tape file $pos, but the tape ended after file $ENDED_AFTER (its seal marker says so): that slice is not on it. Nothing is taken from it." >&2
     exit 2
   fi
+  label_from_map
   {
-    for v in F0SHA LABEL UUID FILES_TXT FILES_SOURCE ENDED_AFTER SEAL_STATE SEAL_BINDS SEAL_FILE_COUNT TOTAL_FILES FRONT_INDEX SEAL_MARKER; do
+    for v in F0SHA LABEL LABEL_FROM UUID FILES_TXT FILES_SOURCE ENDED_AFTER SEAL_STATE SEAL_BINDS SEAL_FILE_COUNT TOTAL_FILES FRONT_INDEX SEAL_MARKER; do
       printf '%s=%q\n' "$v" "${!v-}"
     done
   } >"$dir/vars"
@@ -1928,7 +1963,7 @@ CART_SEQ=0
 # it is the loaded cartridge: its facts are taken, and SL_HERE says which of
 # the unit's slices it holds.
 accept_cartridge() { # <slice>
-  local k=$1 sub rc=0 a b j
+  local k=$1 sub rc=0 a b j from=""
   CART_SEQ=$((CART_SEQ + 1))
   sub="$WORK/cart.$CART_SEQ"
   mkdir -p "$sub" || die_io "cannot make a directory for the cartridge" "" "$WORK"
@@ -1975,7 +2010,8 @@ accept_cartridge() { # <slice>
     [ -n "${SL_HERE[$j]:-}" ] || break
     b=$j
   done
-  echo "This cartridge identifies as: $(safe_str "${LABEL:-a tape whose File 0 gives no label}")" >&2
+  [ -z "$LABEL_FROM" ] || from=" (its File 0 gives no label: this one is its ${LABEL_FROM#the }'s)"
+  echo "This cartridge identifies as: $(safe_str "${LABEL:-a tape whose File 0 gives no label}")$from" >&2
   echo "It gives slice(s) $a to $b of $(safe_str "$U_NAME"): its front index lists each one's sha256, at positions its seal marker covers." >&2
   return 0
 }

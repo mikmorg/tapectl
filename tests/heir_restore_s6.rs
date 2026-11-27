@@ -2977,3 +2977,123 @@ fn a_cartridge_whose_seal_marker_states_another_layout_is_refused_whatever_file_
     assert!(!all.contains("FATAL"), "{all}");
     assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
 }
+
+/// The first line of `--info`.
+fn tape_line(o: &heir::Out) -> String {
+    o.stdout.lines().next().unwrap_or_default().to_string()
+}
+
+/// F6 of the read of #611's fixes: File 1 tells the heir to read which tape
+/// is in the drive off `--info`'s first line ("Tape: LABEL"). Where File 0
+/// gives no label, the label is the front index's (`[index] volume`), else
+/// a valid seal marker's (`[seal] volume`), and the line says File 0 gave
+/// none. No file but File 0 states the uuid, and the line says that too. A
+/// sound File 0's line is as it was.
+#[test]
+fn with_file_0_unread_the_tape_line_takes_the_label_from_the_front_index_or_the_seal() {
+    let t = two();
+    let last = t.files.len() - 1;
+    let label = &t.label;
+    let sound = Heir::of(t).run(&["--info"]);
+    assert!(
+        tape_line(&sound).starts_with(&format!("Tape: {label}   uuid "))
+            && !tape_line(&sound).contains("not known"),
+        "{}",
+        sound.stdout
+    );
+
+    let index_text = text_of(t, 3);
+    let line = format!("\nvolume = \"{label}\"\n");
+    assert!(index_text.contains(&line), "{index_text}");
+    let no_volume = index_text.replacen(&line, "\n", 1);
+
+    let from_index = Heir::of(t);
+    fail_read(&from_index, 0);
+    let from_seal = Heir::of(t);
+    fail_read(&from_seal, 0);
+    fail_read(&from_seal, 3);
+    let index_says_none = Heir::of(t);
+    fail_read(&index_says_none, 0);
+    index_says_none.replace(3, no_volume.as_bytes());
+    let none = Heir::of(t);
+    fail_read(&none, 0);
+    none.replace(3, no_volume.as_bytes());
+    fail_read(&none, last);
+    let uuid = "   uuid not known (File 0 gives none)";
+    for (name, h, want) in [
+        (
+            "File 0 unread",
+            &from_index,
+            format!("Tape: {label} (File 0 gives no label: this one is the front index's){uuid}"),
+        ),
+        (
+            "File 0 and File 3 unread",
+            &from_seal,
+            format!("Tape: {label} (File 0 gives no label: this one is the seal marker's){uuid}"),
+        ),
+        (
+            "File 3 states no label",
+            &index_says_none,
+            format!("Tape: {label} (File 0 gives no label: this one is the seal marker's){uuid}"),
+        ),
+        (
+            "nothing states a label",
+            &none,
+            format!("Tape: not known (File 0 gives no label, and neither the front index nor a valid seal marker states one){uuid}"),
+        ),
+    ] {
+        let o = h.run(&["--info"]);
+        assert_eq!(o.code, 0, "{name}: {}", o.all());
+        assert_eq!(tape_line(&o), want, "{name}: {}", o.all());
+    }
+}
+
+/// F6 at the prompt and after it: a cartridge taken whose File 0 does not
+/// read says which tape it is by its front index's label, and that label is
+/// the one the run names it by afterwards. The start tape too: with its File
+/// 0 unread, `done` with another cartridge in the drive names it by label,
+/// not as "the run started on".
+#[test]
+fn a_tape_whose_file_0_does_not_read_is_named_by_its_front_indexs_label() {
+    let t = span2();
+    let second = t[1].label.as_str();
+    let h = Heir::of_series(&[&t[0], &t[1]]);
+    h.fail_file(second, 0);
+    let dest = h.dest("out");
+    let o = restore_span(&h, &dest, &[second]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(
+        all.contains(&format!(
+            "This cartridge identifies as: {second} (its File 0 gives no label: this one is its front index's)"
+        )),
+        "{all}"
+    );
+
+    let h = Heir::of_series(&[&t[1], &t[0]]);
+    fail_read(&h, 0);
+    h.shelve_blank("BLANK");
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, _| match k {
+            1 => {
+                h.load("BLANK");
+                Some(String::new())
+            }
+            2 => Some("done".into()),
+            _ => panic!("asked {k} times"),
+        },
+    );
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(
+        all.contains(&format!(
+            "NOT IN THE DRIVE: slices 2-8 of 8 of unit {} (version 1) are on the tape {second}, which is not in the drive now",
+            heir::UNIT_A
+        )) && all.contains(&format!("Load {second} and")),
+        "{all}"
+    );
+    assert!(!all.contains("the run started on"), "{all}");
+}
