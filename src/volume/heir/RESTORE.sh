@@ -2275,10 +2275,12 @@ prepare_slice() { # <slice number>
   if is_full_text "$text"; then
     feeder_fatal "writing slice $k into the work directory failed: $(printf '%s' "$text" | head -n 1). The work directory $WORK is full or not writable. Nothing on the tape is wrong: free space there or give --work DIR on a larger disk."
   fi
-  # tee or sha256sum said something that is not a full disk (a file too large
-  # for the work directory's file system, an I/O error): the work directory did
-  # not take the cut, whatever age said, and the slice is not judged by it.
-  if [ -n "$msg" ]; then
+  # age ended 0, and tee or sha256sum said something that is not a full disk (a
+  # file too large for the work directory's file system, an I/O error): the
+  # work directory did not take the cut, and the slice is not judged by it. An
+  # age that did not end 0 is the slice's verdict, below (bash's own "Killed"
+  # for an age the system killed lands in msg too).
+  if [ -n "$msg" ] && [ "$arc" = 0 ]; then
     die_io "writing slice $k into the work directory failed" "$msg" "$WORK"
   fi
   if [ "$arc" != 0 ]; then

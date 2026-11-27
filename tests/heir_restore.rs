@@ -7985,3 +7985,45 @@ fn a_restore_checked_in_pieces_writes_the_same_list_and_words_as_one_checked_who
     );
     assert_eq!(outs[0], outs[1]);
 }
+
+/// #611 D-4, the other side: an `age` killed while it decrypts a slice (here
+/// by itself, with SIGKILL, as the kernel's out-of-memory killer does) leaves
+/// bash's own "Killed" line where tee's words are read. That is no word of the
+/// work directory: the slice is left out with age's verdict, as before D-4's
+/// fix, and the run goes on to its list; it is never "Nothing on the tape is
+/// wrong".
+#[test]
+fn an_age_killed_on_a_slice_is_no_write_error_of_the_work_directory() {
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::heir_age_binary();
+    h.put_tool(
+        "age",
+        &format!(
+            "#!/bin/bash\n\
+             case $(ls -l /proc/$$/fd/0) in\n\
+             */slice.enc) kill -9 $$ ;;\n\
+             esac\n\
+             exec \"{}\" \"$@\"\n",
+            real.display()
+        ),
+    );
+    let dest = h.dest("out");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dest_str(&dest),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 1, "{all}");
+    assert!(
+        o.stderr.contains("slice 1: age could not decrypt it: "),
+        "{}",
+        o.stderr
+    );
+    assert!(!all.contains("FATAL: writing slice"), "{all}");
+    assert!(!all.contains("Nothing on the tape is wrong"), "{all}");
+    assert!(o.stdout.contains("RESTORE INCOMPLETE: "), "{all}");
+}
