@@ -240,6 +240,59 @@ fn the_work_directory_is_removed_where_a_file_held_open_cannot_be() {
     assert!(!o.stderr.contains("modification time"), "{}", o.stderr);
 }
 
+/// #611 G4 (ADR-0012 item 313): where the work directory cannot be removed
+/// at all (a stand-in `rm` that removes nothing of it, as an immutable file
+/// or a file system gone read-only gives), the WARNING says so and no NOTE
+/// says its removal changed the root's time: nothing was removed, and the
+/// time is the recorded one.
+#[test]
+fn a_work_directory_that_cannot_be_removed_gives_the_warning_and_no_note_on_the_time() {
+    use std::os::unix::fs::MetadataExt;
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::host_tool("rm").expect("rm");
+    h.put_tool(
+        "rm",
+        &format!(
+            "#!/bin/bash\n\
+             for a; do\n\
+               case ${{a##*/}} in\n\
+               .tapectl-work.*) echo \"rm: cannot remove '$a': Operation not permitted\" >&2; exit 1 ;;\n\
+               esac\n\
+             done\n\
+             exec \"{}\" \"$@\"\n",
+            real.display()
+        ),
+    );
+    let dest = h.dest("stuck");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &key(&h, Who::TenantA),
+        "--to",
+        dstr(&dest),
+    ]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{all}");
+    assert!(
+        o.stderr
+            .contains("WARNING: could not remove the work directory"),
+        "{}",
+        o.stderr
+    );
+    assert!(!o.stderr.contains("modification time"), "{}", o.stderr);
+    // The positive control: the stand-in removed nothing.
+    let left: Vec<String> = std::fs::read_dir(&dest)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tapectl-work"))
+        .collect();
+    assert_eq!(left.len(), 1, "{all}");
+    let m = std::fs::metadata(&dest).unwrap();
+    assert_eq!((m.mtime(), m.mtime_nsec()), (heir::ROOT_MTIME_SECS, 0));
+}
+
 // ---- helpers ----
 
 fn unit_files<'a>(t: &'a Tape, name: &str) -> &'a [(String, Vec<u8>)] {

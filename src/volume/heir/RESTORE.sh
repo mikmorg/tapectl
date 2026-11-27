@@ -216,8 +216,9 @@ cleanup() {
       touch -r /proc/self/fd/8 "$WORK_MADE_IN" 2>/dev/null || lost="touch could not set it"
       exec 8<&-
     fi
-    # Said where the work directory was in --to, whose time is the unit root's.
-    if [ -n "$lost" ] && [ "$MODE" = restore ] && [ "$WORK_MADE_IN" = "$TO" ]; then
+    # Said where the work directory was in --to, whose time is the unit root's,
+    # and was removed: one that could not be removed changed nothing of it.
+    if [ -n "$lost" ] && [ "$MODE" = restore ] && [ "$WORK_MADE_IN" = "$TO" ] && [ ! -d "$WORK" ]; then
       note "the work directory's removal changed the modification time of $TO, and it is not set back: $lost."
     fi
   fi
