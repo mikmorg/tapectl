@@ -1274,8 +1274,9 @@ do_info() {
 do_verify() {
   establish
   local pos type size hash fails=0 passed=0 bound="" fi_hash last stop map="the front index"
-  # The map the files are judged against, for the last line: File 3 itself, or
-  # the seal marker's copy of it when File 3 did not read (establish).
+  # The map the files are judged against, for a mismatch and for the last
+  # line: File 3 itself, or the seal marker's copy of it when File 3 did not
+  # read (establish).
   [ -n "$FRONT_INDEX_HASH" ] || map=$FILES_SOURCE
   last=$(last_planned)
   stop=$last
@@ -1316,7 +1317,7 @@ do_verify() {
       printf 'PASS  %4d  %-18s %s bytes\n' "$pos" "$type" "$size"
       passed=$((passed + 1))
     elif [ -n "$TAPE_SHA" ]; then
-      printf 'FAIL  %4d  %-18s hash %s, the front index says %s\n' "$pos" "$type" "$TAPE_SHA" "$(safe_str "$hash")"
+      printf 'FAIL  %4d  %-18s hash %s, %s says %s\n' "$pos" "$type" "$TAPE_SHA" "$map" "$(safe_str "$hash")"
       fails=$((fails + 1))
     else
       printf 'FAIL  %4d  %-18s cannot be read from the tape\n' "$pos" "$type"

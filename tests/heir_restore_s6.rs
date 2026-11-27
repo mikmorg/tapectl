@@ -2372,3 +2372,35 @@ fn verify_on_an_unsealed_tape_does_not_stop_at_a_file_0_that_does_not_read() {
         o.stdout
     );
 }
+
+/// `--verify`'s row for a file whose hash differs names the map it was judged
+/// by: "the front index says" when File 3 read (the words are unchanged), and
+/// "the seal marker's copy of the front index says" when the map is that copy.
+#[test]
+fn verifys_mismatch_row_names_the_map_it_judged_by() {
+    let t = two();
+    let p = t.slice_positions()[1];
+    let row_of = |h: &Heir| -> String {
+        let o = h.run(&["--verify"]);
+        assert_eq!(o.code, 1, "{}", o.all());
+        o.stdout
+            .lines()
+            .find(|l| l.starts_with(&format!("FAIL  {p:4}  data_slice")))
+            .unwrap_or_else(|| panic!("no FAIL row for file {p}: {}", o.all()))
+            .to_string()
+    };
+    let h = Heir::of(t);
+    h.flip(p, 100);
+    let row = row_of(&h);
+    assert!(row.contains(", the front index says "), "{row}");
+
+    let h = Heir::of(t);
+    fail_read(&h, 3);
+    h.flip(p, 100);
+    let row = row_of(&h);
+    assert!(
+        row.contains(", the seal marker's copy of the front index says ")
+            && !row.contains(", the front index says "),
+        "{row}"
+    );
+}
