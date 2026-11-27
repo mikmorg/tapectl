@@ -2553,16 +2553,13 @@ remove_partial() { # <table> <first slice of the run> <dest>
 
 # How many pieces the check of $1 rows is cut into (REPLY): the machine's
 # cores, from nproc, or getconf where there is no nproc, at most 8 and never
-# more than the rows; 1 when the count is not known. TAPECTL_CHECK_PIECES,
-# when set, is the count in the cores' place (the tests set it).
+# more than the rows; 1 when the count is not known.
 check_pieces() { # <rows>
-  local n=${TAPECTL_CHECK_PIECES:-}
-  if [ -z "$n" ]; then
-    if command -v nproc >/dev/null 2>&1; then
-      n=$(nproc 2>/dev/null || true)
-    elif command -v getconf >/dev/null 2>&1; then
-      n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
-    fi
+  local n=""
+  if command -v nproc >/dev/null 2>&1; then
+    n=$(nproc 2>/dev/null || true)
+  elif command -v getconf >/dev/null 2>&1; then
+    n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
   fi
   if tape_uint "$n"; then n=$REPLY; else n=1; fi
   [ "$n" -le 8 ] || n=8

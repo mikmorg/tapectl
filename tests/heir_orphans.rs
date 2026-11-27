@@ -160,7 +160,8 @@ fn a_kill_while_the_check_runs_in_pieces_leaves_no_sha256sum_behind() {
     let dest = h.dest("out");
     let kb = h.key(Who::TenantB).to_string_lossy().into_owned();
     let args = ["--restore", "--key", &kb, "--to", dest.to_str().unwrap()];
-    let mut r = h.spawn(&args, &[("TAPECTL_CHECK_PIECES", "3")]);
+    h.put_tool("nproc", "#!/bin/sh\necho 3\n");
+    let mut r = h.spawn(&args, &[]);
     let until = Instant::now() + Duration::from_secs(60);
     while !h.root.path().join("state/check.slow").exists() {
         assert!(Instant::now() < until, "{}", r.text());

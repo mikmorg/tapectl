@@ -8029,7 +8029,7 @@ fn check_tree(root: &Path) -> std::path::PathBuf {
 }
 
 /// Run `file_check`, cut from the script, on `table` and `<root>/dest` with
-/// TAPECTL_CHECK_PIECES=`pieces` and `path` first on the PATH; the work
+/// an `nproc` that answers `pieces`, and `path`, first on the PATH; the work
 /// directory is `<root>/<work>`. Returns what it printed.
 fn run_file_check(root: &Path, table: &Path, pieces: usize, work: &str, path: &Path) -> String {
     let o = file_check_run(root, table, pieces, work, path, "");
@@ -8061,6 +8061,11 @@ fn file_check_run(
     ]);
     let w = root.join(work);
     std::fs::create_dir_all(&w).unwrap();
+    let cores = root.join(format!("nproc-{work}"));
+    std::fs::create_dir_all(&cores).unwrap();
+    let nproc = cores.join("nproc");
+    std::fs::write(&nproc, format!("#!/bin/sh\necho {pieces}\n")).unwrap();
+    std::fs::set_permissions(&nproc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let script = format!(
         "set -euo pipefail\nexport LC_ALL=C\n{parts}\nWORK={w}\nAHEAD_PID=\"\"\n{pre}\n\
          file_check {t} {d} {w}/failed\necho \"rows=$CHECK_ROWS failed=$CHECK_FAILED\"\n",
@@ -8071,11 +8076,11 @@ fn file_check_run(
     std::process::Command::new("bash")
         .arg("-c")
         .arg(&script)
-        .env("TAPECTL_CHECK_PIECES", pieces.to_string())
         .env(
             "PATH",
             format!(
-                "{}:{}",
+                "{}:{}:{}",
+                cores.display(),
                 path.display(),
                 std::env::var("PATH").unwrap_or_default()
             ),
@@ -8170,14 +8175,16 @@ fn the_split_check_gives_the_one_checks_lines_and_list_byte_for_byte() {
 /// The count of pieces: the machine's cores, from `nproc`, or `getconf
 /// _NPROCESSORS_ONLN` where there is no nproc, at most 8 and never more than
 /// the rows; 1 when neither says (no tool, or an answer that is not a number),
-/// and the one-process check then runs. TAPECTL_CHECK_PIECES takes the
-/// cores' place. Neither tool is required (`check_tools` does not name them).
+/// and the one-process check then runs. Neither tool is required
+/// (`check_tools` does not name them). Nothing else sets the count: the
+/// environment variable TAPECTL_CHECK_PIECES the tests once set is no input
+/// of File 2 (ADR-0012 item 318), and a value of it changes nothing.
 #[test]
 fn the_check_is_cut_into_as_many_pieces_as_cores_at_most_eight() {
     let parts = script_parts(&["is_uint", "tape_uint", "check_pieces"]);
     let text = tapectl::volume::heir::RESTORE_SH;
     assert!(!text.contains("TOOLS_RESTORE=(dd head sha256sum age tar nproc"));
-    // nproc's answer, getconf's, TAPECTL_CHECK_PIECES, the rows, the pieces.
+    // nproc's answer, getconf's, TAPECTL_CHECK_PIECES (ignored), the rows, the pieces.
     type Case = (
         Option<&'static str>,
         Option<&'static str>,
@@ -8194,7 +8201,7 @@ fn the_check_is_cut_into_as_many_pieces_as_cores_at_most_eight() {
         (Some("4"), None, None, 3, 3),
         (Some("6"), None, None, 100, 6),
         (None, Some("6"), None, 100, 6),
-        (Some("8"), None, Some("3"), 100, 3),
+        (Some("8"), None, Some("3"), 100, 8),
     ];
     for (nproc, getconf, forced, rows, want) in cases {
         let dir = tempfile::tempdir().unwrap();
@@ -8226,29 +8233,28 @@ fn the_check_is_cut_into_as_many_pieces_as_cores_at_most_eight() {
     }
 }
 
-/// A whole restore with the check in pieces and in one process: the same
-/// verdict lines, the same damaged-file list, byte for byte (a tar stand-in
-/// drops one file and damages another of the big unit).
+/// A whole restore with the check in one process and in pieces (an `nproc`
+/// that answers 1, then 4): the same verdict lines, the same damaged-file
+/// list, byte for byte (a tar stand-in drops one file and damages another of
+/// the big unit).
 #[test]
 fn a_restore_checked_in_pieces_writes_the_same_list_and_words_as_one_checked_whole() {
     let t = two();
     let mut outs = Vec::new();
     for pieces in ["1", "4"] {
         let h = Heir::of(t);
+        h.put_tool("nproc", &format!("#!/bin/sh\necho {pieces}\n"));
         let real = heir::host_tool("tar").unwrap();
         let victim = &unit_files(t, UNIT_B)[0].0;
         h.put_tool("tar", &heir::dropping_tar(&real, victim));
         let dest = h.dest("out");
-        let o = h.run_with(
-            &[
-                "--restore",
-                "--key",
-                &key(&h, Who::TenantB),
-                "--to",
-                dest_str(&dest),
-            ],
-            &[("TAPECTL_CHECK_PIECES", pieces)],
-        );
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &key(&h, Who::TenantB),
+            "--to",
+            dest_str(&dest),
+        ]);
         assert_eq!(o.code, 1, "{pieces}: {}", o.all());
         let list = std::fs::read(dest.join(".tapectl-damaged-files.txt")).unwrap();
         let words: Vec<String> = o
