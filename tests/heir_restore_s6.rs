@@ -3231,6 +3231,11 @@ fn with_file_0_unread_and_no_end_of_data_the_seal_is_found_by_the_front_index() 
         "{all}"
     );
     assert!(o.stdout.contains("VERIFY FAILED: 1 file(s)"), "{all}");
+    // The read there is the seal's own capped read, by the map's position.
+    assert!(
+        counted_reads(&h).contains(&(t.files.len() - 1, 128)),
+        "{all}"
+    );
 }
 
 /// F10 of the read of #611's fixes: two messages say only what is true in
@@ -3283,4 +3288,77 @@ fn the_words_for_a_tape_with_no_file_0_say_only_what_is_true() {
         "{}",
         o.stderr
     );
+}
+
+/// The cartridge `FOREIGN` on the shelf: a first file of 64 MiB, a third of
+/// 64 MiB, the rest short text; nothing of tapectl's.
+fn shelve_foreign_with_a_long_file_0(h: &Heir) {
+    h.shelve(
+        "FOREIGN",
+        &[
+            heir::noise(64 * MIB, 9),
+            heir::text(2000, 1),
+            heir::text(2000, 2),
+            heir::noise(64 * MIB, 3),
+            heir::text(2000, 4),
+        ],
+    );
+}
+
+/// F1 in the probe's own read of File 0: a cartridge offered at the prompt
+/// whose first file is 64 MiB is read no further than 16 MiB and one block.
+/// A foreign one is refused as no tapectl volume, its first file named as
+/// longer than a File 0 can be; one whose front index and seal marker are
+/// sound is taken by them, as one whose File 0 does not read is. And after
+/// `done`, the probe of the cartridge in the drive reads no further either.
+#[test]
+fn a_cartridge_whose_first_file_is_64_mib_is_read_no_further_than_16_mib() {
+    let t = span2();
+    let second = t[1].label.as_str();
+    let base = Heir::of_series(&[&t[0], &t[1]]);
+    let want_dest = base.dest("out");
+    let o = restore_span(&base, &want_dest, &[second]);
+    assert_eq!(o.code, 0, "{}", o.all());
+
+    let h = Heir::of_series(&[&t[0], &t[1]]);
+    shelve_foreign_with_a_long_file_0(&h);
+    h.copy_cart(second, "LONG0");
+    std::fs::write(h.cart_file("LONG0", 0), heir::noise(64 * MIB, 9)).unwrap();
+    let dest = h.dest("out");
+    let o = restore_span(&h, &dest, &["FOREIGN", "LONG0"]);
+    let all = o.all();
+    assert_eq!(o.code, 0, "{all}");
+    assert_eq!(all.matches(heir::PROMPT).count(), 2, "{all}");
+    let long_words = "its first file is longer than 16 MiB, more than a tapectl File 0 can be";
+    assert!(
+        all.contains(&format!(
+            "NOTE: this cartridge is not a tapectl volume: {long_words}"
+        )) && all.contains(&format!("WARNING: this cartridge: {long_words}")),
+        "{all}"
+    );
+    assert_eq!(heir::tree(&dest), heir::tree(&want_dest), "{all}");
+    every_read_of_file_is_capped(&h, 0, "the prompt");
+    every_read_of_file_is_capped(&h, 3, "the prompt");
+
+    // `done` with the foreign cartridge in the drive.
+    let h = Heir::of_series(&[&t[0], &t[1]]);
+    shelve_foreign_with_a_long_file_0(&h);
+    let dest = h.dest("out");
+    let ka = key(&h, Who::TenantA);
+    let o = h.run_prompted(
+        &["--restore", "--key", &ka, "--all", "--to", dstr(&dest)],
+        |k, _| {
+            assert_eq!(k, 1, "asked {k} times");
+            h.load("FOREIGN");
+            Some("done".into())
+        },
+    );
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        h.reads_by_cartridge().last().unwrap().contains(&3),
+        "the probe after done read the cartridge: {:?}",
+        h.ops()
+    );
+    every_read_of_file_is_capped(&h, 0, "after done");
+    every_read_of_file_is_capped(&h, 3, "after done");
 }
