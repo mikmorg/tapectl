@@ -8791,3 +8791,743 @@ fn a_check_list_cut_short_ends_the_run_with_the_work_directorys_fatal() {
     }
     assert!(ran > 0, "at least one awk ran");
 }
+
+// ---- #611 J1, J2, J3: the check reads no list this call did not make ----
+
+/// Two small units of two tenants, made alike: each lists the same number of
+/// regular files and none has a backslash in its name (every row is a fast
+/// row), so the lists the first unit's check leaves in the work directory
+/// have as many rows as the second unit's.
+fn twins() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.units = vec![
+            (UNIT_A.into(), TENANT_A, false),
+            (UNIT_B.into(), TENANT_B, false),
+        ];
+        Tape::build(&shape)
+    })
+}
+
+/// The file of the later unit the stand-in tar damages (it has no hard
+/// link, so one row fails).
+fn twin_victim() -> String {
+    format!("inner/{UNIT_B}-deep.dat")
+}
+
+/// A tar stand-in for `twins()`: the real tar runs, and when it restored the
+/// later unit (`-C <to>/bravo-unit`) it damages the victim (bytes added) and
+/// runs `act`, shell text with `$w` each work directory beside the unit's
+/// directory and `$S` the state directory. `act` writes `$S/acted` when it
+/// did what it should and `$S/no-bite` when a permission it set did not
+/// bite (uid 0 writes through any mode).
+fn twin_tar(act: &str) -> String {
+    let real = heir::host_tool("tar").unwrap();
+    format!(
+        r#"#!/bin/bash
+dest=""
+args=("$@")
+for ((i = 0; i < ${{#args[@]}}; i++)); do
+  if [ "${{args[$i]}}" = -C ]; then dest=${{args[$((i + 1))]}}; fi
+done
+"{real}" "$@"
+rc=$?
+case $dest in
+*/{unit})
+  S=$FAKE_TAPE
+  chmod u+w "$dest/{victim}" && echo damaged >>"$dest/{victim}"
+  for w in "$(dirname "$dest")"/.tapectl-work.*; do
+    : "$w"
+{act}
+  done ;;
+esac
+exit $rc
+"#,
+        real = real.display(),
+        unit = UNIT_B,
+        victim = twin_victim(),
+        act = act
+    )
+}
+
+/// The shell text that makes each of `names` (left in `$w` by the earlier
+/// unit's check) readable but not writable, and says whether that bit.
+fn unwritable(names: &[&str]) -> String {
+    format!(
+        r#"    for l in {}; do
+      if [ -f "$w/$l" ]; then
+        chmod 444 "$w/$l"
+        if ( : >>"$w/$l" ) 2>/dev/null; then echo "$l" >>"$S/no-bite"; else echo "$l" >>"$S/acted"; fi
+      else
+        echo "$l" >>"$S/missing"
+      fi
+    done"#,
+        names.join(" ")
+    )
+}
+
+/// A heir of `twins()` whose `nproc` answers `pieces`, with the tar stand-in
+/// `tar` (None: the host's).
+fn twin_heir(pieces: usize, tar: Option<&str>) -> Heir {
+    let h = Heir::of(twins());
+    h.put_tool("nproc", &format!("#!/bin/sh\necho {pieces}\n"));
+    if let Some(body) = tar {
+        h.put_tool("tar", body);
+    }
+    h
+}
+
+fn twin_args(h: &Heir, dest: &Path) -> Vec<String> {
+    vec![
+        "--restore".into(),
+        "--key".into(),
+        key(h, Who::Escrow),
+        "--all".into(),
+        "--to".into(),
+        dest_str(dest).into(),
+    ]
+}
+
+/// `--restore --all` of `twins()` with the escrow key into a new `out`.
+fn twin_run(h: &Heir) -> (heir::Out, std::path::PathBuf) {
+    let dest = h.dest("out");
+    let args = twin_args(h, &dest);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    (h.run(&args), dest)
+}
+
+/// What the stand-ins wrote to the state directory under `name`.
+fn state_mark(h: &Heir, name: &str) -> String {
+    std::fs::read_to_string(h.root.path().join("state").join(name)).unwrap_or_default()
+}
+
+/// The stand-in acted, and its permission change bit: a run as uid 0 (which
+/// writes through any mode) proves nothing here and fails loudly.
+fn assert_bit(h: &Heir, what: &str) {
+    assert_eq!(
+        state_mark(h, "no-bite"),
+        "",
+        "{what}: the permission change did not bite (uid 0?): this test cannot run here"
+    );
+    assert_eq!(state_mark(h, "missing"), "", "{what}: a list was not there");
+    assert!(
+        !state_mark(h, "acted").is_empty(),
+        "{what}: the stand-in did not act"
+    );
+}
+
+/// The regular files each unit's check counts, from a sound run's lines
+/// (the two must be equal and at least 4: four pieces each get a row).
+fn twin_rows(o: &heir::Out) -> usize {
+    let counts: Vec<usize> = o
+        .stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("File check: all "))
+        .map(|l| l.split(' ').next().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(counts.len(), 2, "{}", o.all());
+    assert_eq!(
+        counts[0],
+        counts[1],
+        "the units differ in rows: {}",
+        o.all()
+    );
+    assert!(counts[0] >= 4, "{}", o.all());
+    counts[0]
+}
+
+/// The truth of a twin run whose victim was damaged: the earlier unit whole,
+/// the victim alone on the later unit's damaged-file list, RESTORE
+/// INCOMPLETE, no FATAL.
+fn assert_twin_truth(o: &heir::Out, dest: &Path, n: usize, what: &str) {
+    let all = o.all();
+    assert_eq!(o.code, 1, "{what}: {all}");
+    assert!(!all.contains("FATAL"), "{what}: {all}");
+    assert_eq!(
+        o.stdout
+            .matches(&format!("File check: all {n} regular file(s) match"))
+            .count(),
+        1,
+        "{what}: {all}"
+    );
+    assert!(
+        o.stdout.contains(&format!(
+            "File check: 1 of {n} regular file(s) are missing or differ"
+        )),
+        "{what}: {all}"
+    );
+    assert!(
+        o.stdout
+            .contains("RESTORE INCOMPLETE: 1 path(s) are damaged"),
+        "{what}: {all}"
+    );
+    assert!(!o.stdout.contains("RESTORE COMPLETE"), "{what}: {all}");
+    let list = std::fs::read_to_string(dest.join(UNIT_B).join(".tapectl-damaged-files.txt"))
+        .unwrap_or_else(|e| panic!("{what}: no list: {e}\n{all}"));
+    let rows: Vec<&str> = list.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert_eq!(rows, vec![twin_victim().as_str()], "{what}: {all}");
+    assert!(
+        !dest
+            .join(UNIT_A)
+            .join(".tapectl-damaged-files.txt")
+            .exists(),
+        "{what}"
+    );
+}
+
+/// A twin run ended by the work directory's FATAL (`words` its first line's
+/// start), with no verdict for the later unit and none for the run.
+fn assert_twin_fatal(o: &heir::Out, n: usize, words: &str, what: &str) {
+    let all = o.all();
+    assert_eq!(o.code, 1, "{what}: {all}");
+    assert!(
+        o.stderr.contains(&format!("FATAL: {words}")),
+        "{what}: {all}"
+    );
+    assert!(o.stderr.contains("cannot take it"), "{what}: {all}");
+    assert_eq!(o.stdout.matches("File check:").count(), 1, "{what}: {all}");
+    assert_eq!(
+        o.stdout
+            .matches(&format!("File check: all {n} regular file(s) match"))
+            .count(),
+        1,
+        "{what}: {all}"
+    );
+    assert!(!o.stdout.contains("RESTORE COMPLETE"), "{what}: {all}");
+    assert!(!o.stdout.contains("RESTORE INCOMPLETE"), "{what}: {all}");
+}
+
+/// The control of every twin test: a sound run says the truth (RESTORE
+/// COMPLETE, both units all match), and the damaging stand-in alone gives the
+/// damaged truth. Returns the rows each unit counts.
+fn twin_control(pieces: usize) -> usize {
+    let h = twin_heir(pieces, None);
+    let (o, _) = twin_run(&h);
+    assert_eq!(o.code, 0, "{pieces}: {}", o.all());
+    assert!(
+        o.stdout.contains("RESTORE COMPLETE: 2 unit(s)"),
+        "{}",
+        o.all()
+    );
+    let n = twin_rows(&o);
+    let h = twin_heir(pieces, Some(&twin_tar("    echo tar >>\"$S/acted\"")));
+    let (o, dest) = twin_run(&h);
+    assert_twin_truth(&o, &dest, n, &format!("control, {pieces} piece(s)"));
+    assert!(
+        !state_mark(&h, "acted").is_empty(),
+        "the stand-in tar did not run"
+    );
+    n
+}
+
+/// #611 J1 and J2 (ADR-0012 item 313): `file_check` writes its lists in the
+/// one work directory of the run, and nothing removed `check.fast`,
+/// `check.slow` or `check.out` between units, so where the open of one
+/// failed (`|| true` on the list-writing awks, J1; `check.out`'s open in
+/// the one check and the split's join, J2), the list the unit before left
+/// was read in its place: with as many rows as this unit's, "all N regular
+/// file(s) match" and RESTORE COMPLETE for a unit whose damaged file was
+/// never hashed. Each list left by the first unit is made readable but not
+/// writable before the second unit's check, alone and the three together,
+/// at one piece and four: every list is removed at the check's start and
+/// written again, so the verdict is the truth.
+#[test]
+fn a_list_the_unit_before_left_unwritable_is_never_read_as_this_units() {
+    for pieces in [1usize, 4] {
+        let n = twin_control(pieces);
+        let sets: [&[&str]; 4] = [
+            &["check.fast"],
+            &["check.slow"],
+            &["check.out"],
+            &["check.fast", "check.slow", "check.out"],
+        ];
+        for names in sets {
+            let what = format!("{names:?}, {pieces} piece(s)");
+            let h = twin_heir(pieces, Some(&twin_tar(&unwritable(names))));
+            let (o, dest) = twin_run(&h);
+            assert_bit(&h, &what);
+            assert_twin_truth(&o, &dest, n, &what);
+        }
+    }
+}
+
+/// #611 J2's split form (ADR-0012 item 313): with two pieces or more the
+/// join opens `check.out` after the hashing, behind a `2>/dev/null` that
+/// hides its failure. Every open for writing in the work directory fails
+/// from the second unit's first `sha256sum -c` on (a `sha256sum` stand-in
+/// makes every file there and the directory itself read-only, as a file
+/// system gone read-only does): the run ends with the work directory's
+/// FATAL, never with a verdict from the first unit's lines. At one piece
+/// `check.out` is opened before the hashing and the failing write is the
+/// rows' append.
+#[test]
+fn a_work_directory_gone_read_only_during_the_hashing_ends_the_run() {
+    let real = heir::host_tool("sha256sum").unwrap();
+    let sha = format!(
+        r#"#!/bin/bash
+case " $* " in
+*" -c "*)
+  if [ -e "$FAKE_TAPE/midhash.flag" ]; then
+    rm -f "$FAKE_TAPE/midhash.flag"
+    list=${{@: -1}}
+    w=$(dirname "$list")
+    chmod 444 "$w"/*
+    chmod 555 "$w"
+    if ( : >"$w/bite.probe" ) 2>/dev/null; then echo w >>"$FAKE_TAPE/no-bite"; else echo "$list" >>"$FAKE_TAPE/acted"; fi
+  fi ;;
+esac
+exec "{}" "$@"
+"#,
+        real.display()
+    );
+    for (pieces, words) in [
+        (
+            4usize,
+            "the per-file check could not write sha256sum's lines",
+        ),
+        (1, "the per-file check could not add to its list"),
+    ] {
+        let n = twin_control(pieces);
+        let what = format!("{pieces} piece(s)");
+        let h = twin_heir(pieces, Some(&twin_tar("    : >\"$S/midhash.flag\"")));
+        h.put_tool("sha256sum", &sha);
+        let (o, dest) = twin_run(&h);
+        assert_bit(&h, &what);
+        assert!(
+            state_mark(&h, "acted").contains("/check.fast"),
+            "{what}: {}",
+            state_mark(&h, "acted")
+        );
+        assert_twin_fatal(&o, n, words, &what);
+        assert!(
+            !dest
+                .join(UNIT_B)
+                .join(".tapectl-damaged-files.txt")
+                .exists(),
+            "{what}"
+        );
+    }
+}
+
+/// #611 J1 (ADR-0012 item 313): a list that cannot be removed at the
+/// check's start (the work directory made read-only once the second unit's
+/// files are restored, by an awk stand-in as the script lists what the
+/// slices left out, the first unit's lists in it) ends the run with the
+/// work directory's FATAL; the list is never read in place of this unit's.
+#[test]
+fn a_list_that_cannot_be_removed_ends_the_run() {
+    let real = heir::host_tool("awk").unwrap();
+    let awk = format!(
+        r#"#!/bin/bash
+case "$*" in
+*'bad[$1 ""] = 1'*)
+  if [ -e "$FAKE_TAPE/ro.flag" ]; then
+    rm -f "$FAKE_TAPE/ro.flag"
+    w=$(dirname "${{@: -2:1}}")
+    chmod 555 "$w"
+    if ( : >"$w/bite.probe" ) 2>/dev/null; then echo w >>"$FAKE_TAPE/no-bite"; else echo "$w" >>"$FAKE_TAPE/acted"; fi
+  fi ;;
+esac
+exec "{}" "$@"
+"#,
+        real.display()
+    );
+    for pieces in [1usize, 4] {
+        let n = twin_control(pieces);
+        let what = format!("{pieces} piece(s)");
+        let h = twin_heir(pieces, Some(&twin_tar("    : >\"$S/ro.flag\"")));
+        h.put_tool("awk", &awk);
+        let (o, _) = twin_run(&h);
+        assert_bit(&h, &what);
+        assert_twin_fatal(
+            &o,
+            n,
+            "the per-file check could not remove a list an earlier check left",
+            &what,
+        );
+    }
+}
+
+/// #611 J1 (ADR-0012 item 313): the split check's own files left by an
+/// earlier check (`check.fast.N`, `check.out.N`, `check.rc.N`,
+/// `check.piece`, `check.size`), planted with contents that would pass
+/// (the rows and OK lines of the file `empty`, which both units hold alike)
+/// and made readable but not writable before the second unit's check, each
+/// family alone and all together: each is removed and made again, and the
+/// verdict is the truth.
+#[test]
+fn a_piece_file_left_behind_is_never_read_as_this_checks() {
+    let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let plant = |files: &str| {
+        format!(
+            r#"    for f in {files}; do
+      case $f in
+      check.fast.*) for i in 1 2 3 4 5 6 7 8; do echo "{empty}  ./empty"; done >"$w/$f" ;;
+      check.out.*) for i in 1 2 3 4 5 6 7 8; do echo "./empty: OK"; done >"$w/$f" ;;
+      check.rc.*) echo 0 >"$w/$f" ;;
+      check.piece) for i in 1 2 3 4 1 2 3 4; do echo "$i"; done >"$w/$f" ;;
+      check.size) for i in 1 2 3 4 5 6 7 8; do echo 0; done >"$w/$f" ;;
+      esac
+      chmod 444 "$w/$f"
+      if ( : >>"$w/$f" ) 2>/dev/null; then echo "$f" >>"$S/no-bite"; else echo "$f" >>"$S/acted"; fi
+    done"#
+        )
+    };
+    let families = [
+        "check.fast.1 check.fast.2 check.fast.3 check.fast.4",
+        "check.out.1 check.out.2 check.out.3 check.out.4",
+        "check.rc.1 check.rc.2 check.rc.3 check.rc.4",
+        "check.piece",
+        "check.size",
+    ];
+    let all = families.join(" ");
+    for pieces in [1usize, 4] {
+        let n = twin_control(pieces);
+        for files in families.iter().copied().chain([all.as_str()]) {
+            let what = format!("{files}, {pieces} piece(s)");
+            let h = twin_heir(pieces, Some(&twin_tar(&plant(files))));
+            let (o, dest) = twin_run(&h);
+            assert_bit(&h, &what);
+            assert_twin_truth(&o, &dest, n, &what);
+        }
+    }
+}
+
+/// #611 J1 (ADR-0012 item 313): removing every list at the check's start
+/// trips on no sound run: a run of two units (the second unit's check finds
+/// the first's lists), its continuation (a unit with a damaged-file list:
+/// the check runs twice in one run, once for what passes and once for what
+/// was fed again) and a path restore, at one piece and four.
+#[test]
+fn a_sound_run_its_continuation_and_a_path_restore_still_end_whole() {
+    for pieces in [1usize, 4] {
+        let n = twin_control(pieces);
+        // The damaged run, then the same unit continued with the host's tar.
+        let h = twin_heir(pieces, Some(&twin_tar("    echo tar >>\"$S/acted\"")));
+        let (o, dest) = twin_run(&h);
+        assert_twin_truth(&o, &dest, n, "the damaged run");
+        let real = heir::host_tool("tar").unwrap();
+        h.link_tool("tar", &real);
+        let ke = key(&h, Who::Escrow);
+        let unit_dir = dest.join(UNIT_B);
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ke,
+            "--unit",
+            UNIT_B,
+            "--to",
+            dest_str(&unit_dir),
+        ]);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{pieces}: {all}");
+        assert!(!all.contains("FATAL"), "{pieces}: {all}");
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{pieces}: {all}");
+        assert_restored(twins(), UNIT_B, &unit_dir);
+        // A path restore of one file of the first unit, removed.
+        let unit_dir = dest.join(UNIT_A);
+        let small = format!("{UNIT_A}-small.txt");
+        std::fs::remove_file(unit_dir.join(&small)).unwrap();
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ke,
+            "--unit",
+            UNIT_A,
+            "--path",
+            &small,
+            "--to",
+            dest_str(&unit_dir),
+        ]);
+        let all = o.all();
+        assert_eq!(o.code, 0, "{pieces}: {all}");
+        assert!(!all.contains("FATAL"), "{pieces}: {all}");
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{pieces}: {all}");
+        assert_restored(twins(), UNIT_A, &unit_dir);
+    }
+}
+
+/// #611 J1 and J3 (ADR-0012 item 313): an awk that writes one of the
+/// check's lists and ends non-zero (gawk and mawk on a failed open or
+/// write) ends the run with the work directory's FATAL there, though the
+/// lines it left count right: the count cannot see a row altered inside its
+/// line. A stand-in awk runs the host's, alters a row in place so that the
+/// damaged file would pass (line 2 becomes line 1 in `check.fast` or
+/// `check.slow`; the append gives the first fast row instead of the damaged
+/// one) and ends 2. The control: without the stand-in the truth. The
+/// stand-in is seen to have acted in the list it altered.
+#[test]
+fn an_awk_that_ends_non_zero_on_a_list_ends_the_run_whatever_the_count() {
+    let real = heir::host_tool("awk").unwrap();
+    // (the line, its program's mark, the table's damaged row, the stand-in's
+    // output, the list it alters).
+    let cases = [
+        (
+            "check.fast",
+            r#""  ./" $7"#,
+            2usize,
+            "| sed '1h;2g'",
+            "check.fast",
+        ),
+        (
+            "check.slow",
+            r#"print $6 "\t" $7"#,
+            7,
+            "| sed '1h;2g'",
+            "check.slow",
+        ),
+        (
+            "the append",
+            "ok[FNR] != 1",
+            2,
+            ">/dev/null; sed -n '1s#  \\./#\\t#p' \"${@: -1}\"",
+            "check.slow",
+        ),
+    ];
+    for (line, mark, damaged, out, list) in cases {
+        for pieces in [1usize, 4] {
+            let what = format!("{line}, {pieces} piece(s)");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let table = g3_tree(root, 5, 5, &[damaged]);
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            // The control: the truth.
+            let o = file_check_run(root, &table, pieces, "truth", &bin, "");
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout).trim(),
+                "rows=10 failed=1",
+                "{what}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let awk = bin.join("awk");
+            std::fs::write(
+                &awk,
+                format!(
+                    "#!/bin/bash\ncase \"$*\" in\n*'{mark}'*) \"{r}\" \"$@\" {out}; exit 2 ;;\nesac\nexec \"{r}\" \"$@\"\n",
+                    r = real.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&awk, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            let o = file_check_run(root, &table, pieces, "w", &bin, "");
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(!out.contains("rows="), "{what}: a verdict: {out}\n{err}");
+            assert_eq!(o.status.code(), Some(1), "{what}: {out}\n{err}");
+            assert!(
+                err.contains("FATAL: the per-file check could not ")
+                    && err.contains("cannot take it"),
+                "{what}: {err}"
+            );
+            // The stand-in acted: the list holds the first row's line twice
+            // (or, for the append, the first fast row in check.slow).
+            let text = std::fs::read_to_string(root.join("w").join(list)).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            if line == "the append" {
+                assert_eq!(lines.len(), 6, "{what}: {text}");
+                assert!(lines[5].contains("f0001-"), "{what}: {text}");
+            } else {
+                assert!(lines.len() >= 2 && lines[0] == lines[1], "{what}: {text}");
+            }
+        }
+    }
+}
+
+/// #611 J3's other side (ADR-0012 item 313): a status above 128 is a
+/// signal's, never a failed write's: an awk killed alone (here by itself,
+/// with KILL, as the out-of-memory killer does) after it wrote its whole
+/// list is no FATAL of the work directory; the count decides, and it is the
+/// truth.
+#[test]
+fn an_awk_killed_after_its_list_is_written_is_left_to_the_count() {
+    let real = heir::host_tool("awk").unwrap();
+    for (line, mark) in [
+        ("check.fast", r#""  ./" $7"#),
+        ("check.slow", r#"print $6 "\t" $7"#),
+        ("the append", "ok[FNR] != 1"),
+    ] {
+        for pieces in [1usize, 4] {
+            let what = format!("{line}, {pieces} piece(s)");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let table = g3_tree(root, 5, 5, &[2, 7]);
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let awk = bin.join("awk");
+            std::fs::write(
+                &awk,
+                format!(
+                    "#!/bin/bash\ncase \"$*\" in\n*'{mark}'*) \"{r}\" \"$@\"; : >\"$KILLED\"; kill -KILL $$ ;;\nesac\nexec \"{r}\" \"$@\"\n",
+                    r = real.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&awk, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            let killed = root.join("killed");
+            let pre = format!("export KILLED={}", killed.display());
+            let o = file_check_run(root, &table, pieces, "w", &bin, &pre);
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(killed.exists(), "{what}: the stand-in did not act: {err}");
+            assert!(o.status.success(), "{what}: {out}\n{err}");
+            assert_eq!(out.trim(), "rows=10 failed=2", "{what}: {err}");
+            assert!(!err.contains("FATAL"), "{what}: {err}");
+        }
+    }
+}
+
+/// #611 J2 (ADR-0012 item 313): `check.out` was removed at the check's
+/// start, so where its open fails (here the work directory made read-only
+/// once the rows' lists are written) there is none: the run ends with the
+/// work directory's FATAL, at one piece (the one check's open) and at four
+/// (the join's, whose `2>/dev/null` hides bash's line), never with a raw
+/// error of a read of it, and never with a verdict.
+#[test]
+fn a_check_out_that_cannot_be_made_ends_the_run() {
+    for pieces in [1usize, 4] {
+        let what = format!("{pieces} piece(s)");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let table = g3_tree(root, 5, 0, &[2]);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let pre = r#"awk() {
+  local rc=0
+  command awk "$@" || rc=$?
+  case "$*" in
+  *'print $6 "\t" $7'*)
+    chmod 555 "$WORK"
+    if ( : >"$WORK/bite.probe" ) 2>/dev/null; then echo NO-BITE >&2; fi ;;
+  esac
+  return $rc
+}"#;
+        let o = file_check_run(root, &table, pieces, "w", &bin, pre);
+        let out = String::from_utf8_lossy(&o.stdout);
+        let err = String::from_utf8_lossy(&o.stderr);
+        std::fs::set_permissions(
+            root.join("w"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(
+            !err.contains("NO-BITE"),
+            "{what}: the read-only work directory did not bite (uid 0?): this test cannot run here"
+        );
+        assert!(!out.contains("rows="), "{what}: a verdict: {out}\n{err}");
+        assert_eq!(o.status.code(), Some(1), "{what}: {out}\n{err}");
+        assert!(
+            err.contains("FATAL: the per-file check could not write sha256sum's lines")
+                && err.contains("cannot take it"),
+            "{what}: {err}"
+        );
+        assert!(!root.join("w").join("check.out").exists(), "{what}");
+    }
+}
+
+/// #611 J2 (ADR-0012 item 313): where sha256sum's lines are not one for
+/// each row, `check.out` is emptied and every row hashed alone; an emptying
+/// that fails (`check.out` made read-only after a `sha256sum` stand-in
+/// printed one line) ends the run with the work directory's FATAL, never
+/// with bash's line and status alone.
+#[test]
+fn a_check_out_that_cannot_be_emptied_ends_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let table = g3_tree(root, 5, 0, &[2]);
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let pre = r#"sha256sum() {
+  command sha256sum "$@" | head -n 1
+  chmod 444 "$WORK/check.out"
+  if ( : >>"$WORK/check.out" ) 2>/dev/null; then echo NO-BITE >&2; fi
+}"#;
+    let o = file_check_run(root, &table, 1, "w", &bin, pre);
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !err.contains("NO-BITE"),
+        "the read-only check.out did not bite (uid 0?): this test cannot run here"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("w").join("check.out"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the stand-in did not act: {err}"
+    );
+    assert!(!out.contains("rows="), "a verdict: {out}\n{err}");
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}");
+    assert!(
+        err.contains("FATAL: the per-file check could not empty sha256sum's lines")
+            && err.contains("cannot take it"),
+        "{err}"
+    );
+}
+
+/// #611 J1/J3 (ADR-0012 item 313), rule 2: a signal that lands while an awk
+/// writes one of the check's lists (a stand-in awk that sleeps 3 s first),
+/// INT or TERM, sent to the script alone and to its whole process group as
+/// a terminal sends it, ends the run with the signal's status (130, 143)
+/// and none of the work directory's words: the awk's status after a signal
+/// is no failed write. The work directory is gone after.
+#[test]
+fn a_signal_while_a_list_is_written_ends_the_run_with_its_status() {
+    let real = heir::host_tool("awk").unwrap();
+    for (line, mark) in [
+        ("check.fast", r#""  ./" $7"#),
+        ("check.slow", r#"print $6 "\t" $7"#),
+        ("the append", "ok[FNR] != 1"),
+    ] {
+        for (sig, code) in [("INT", 130), ("TERM", 143)] {
+            for group in [false, true] {
+                let what = format!("{line}, {sig}, group {group}");
+                let h = twin_heir(1, Some(&twin_tar("    echo tar >>\"$S/acted\"")));
+                h.put_tool(
+                    "awk",
+                    &format!(
+                        "#!/bin/sh\ncase \"$*\" in\n*'{mark}'*) if [ ! -e \"$FAKE_TAPE/awk.slow\" ]; then : >\"$FAKE_TAPE/awk.slow\"; sleep 3; fi ;;\nesac\nexec \"{}\" \"$@\"\n",
+                        real.display()
+                    ),
+                );
+                let dest = h.dest("out");
+                let args = twin_args(&h, &dest);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let mut r = if group {
+                    h.spawn_group(&args, &[])
+                } else {
+                    h.spawn(&args, &[])
+                };
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !h.root.path().join("state/awk.slow").exists() {
+                    assert!(
+                        std::time::Instant::now() < until && r.try_wait().is_none(),
+                        "{what}: the slow awk never ran: {}",
+                        r.text()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                if group {
+                    r.signal_group(sig);
+                } else {
+                    r.signal(sig);
+                }
+                let o = r.finish();
+                assert_eq!(o.code, code, "{what}: {}", o.stdout);
+                assert!(!o.stdout.contains("FATAL"), "{what}: {}", o.stdout);
+                assert!(!o.stdout.contains("cannot take it"), "{what}: {}", o.stdout);
+                let left: Vec<_> = std::fs::read_dir(&dest)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".tapectl-work"))
+                    .collect();
+                assert!(left.is_empty(), "{what}: {left:?}");
+            }
+        }
+    }
+}

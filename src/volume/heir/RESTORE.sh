@@ -2598,12 +2598,14 @@ check_job() { # <destination> <pieces>
 # each, a blank line, which is no pass, so its rows are hashed alone and no
 # other row's pairing moves. A piece's output missing or short at the join
 # ends it early, and file_check, counting check.out's lines, then hashes
-# every row alone. The reads of a piece that is not there are quiet. The job
-# runs in a process group of its own, as the read ahead's does, and its id is
-# kept in AHEAD_PID while it runs, so that the way out stops every piece
-# (ahead_kill). The piece files are removed once joined, so the split holds
-# no more room than the one check while the rest is hashed. Returns 0 when
-# every piece ended 0 and gave its count.
+# every row alone. The reads of a piece that is not there are quiet, and so
+# is the join's open of check.out: file_check, which removed it first, ends
+# the run when it is not there. The job runs in a process group of its own,
+# as the read ahead's does, and its id is kept in AHEAD_PID while it runs, so
+# that the way out stops every piece (ahead_kill). The piece files are
+# removed once joined, so the split holds no more room than the one check
+# while the rest is hashed. Returns 0 when every piece ended 0 and gave its
+# count.
 check_split() { # <destination> <pieces>
   local n=$2 i rc given got frc=0
   rm -f "$WORK"/check.fast.* "$WORK"/check.out.* "$WORK"/check.rc.* "$WORK/check.piece"
@@ -2649,10 +2651,20 @@ check_split() { # <destination> <pieces>
 CHECK_ROWS=0
 CHECK_FAILED=0
 file_check() { # <table> <destination> <out: escaped paths that fail>
-  local table=$1 dest=$2 out=$3 h esc path sum passed=0
+  local table=$1 dest=$2 out=$3 h esc path sum passed=0 f
   : >"$out"
   CHECK_ROWS=0
   CHECK_FAILED=0
+  # Every list read below is this call's own: check.fast, check.size,
+  # check.slow, check.out, and check_split's check.piece, check.fast.N,
+  # check.out.N and check.rc.N. A list an earlier check left (the unit
+  # before's), read where this call's could not be opened, would judge this
+  # unit by that unit's rows and OK lines; so all are removed first, and one
+  # still there ends the run. ($out is emptied above, or set -e ends it.)
+  rm -f -- "$WORK"/check.* 2>/dev/null || true
+  for f in "$WORK"/check.*; do
+    if [ -e "$f" ] || [ -L "$f" ]; then die_io "the per-file check could not remove a list an earlier check left" "$f"; fi
+  done
   # Rows with no backslash in the path: one sha256sum -c --strict over the
   # list, or over each of its pieces at once (check_split). No name is ever
   # read back from its output (uutils' sha256sum quotes a name with a space
@@ -2662,12 +2674,15 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
   # The lists are files in the work directory, and BusyBox awk ends 0 when a
   # write to one fails (a full disk): a row lost from them is never hashed.
   # So the rows are counted through a pipe too, and the rows passed plus the
-  # rows listed as failing must be that count (below); an awk that ends
-  # non-zero on the same failure is left to that count. Each fast row's
-  # size goes to check.size, by which check_split deals the rows.
-  rm -f "$WORK/check.size"
-  CHECK="$WORK/check" awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") == 0 { print $6 "  ./" $7; print $5 > (ENVIRON["CHECK"] ".size") }' "$table" >"$WORK/check.fast" || true
-  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") > 0 { print $6 "\t" $7 }' "$table" >"$WORK/check.slow" || true
+  # rows listed as failing must be that count (below). A list whose open
+  # fails, or an awk that ends non-zero on a failed write (gawk, mawk), ends
+  # the run there: the count cannot see a row altered inside its line. A
+  # status above 128 is a signal's, left to the trap and the count. Each
+  # fast row's size goes to check.size, by which check_split deals the rows.
+  CHECK="$WORK/check" awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") == 0 { print $6 "  ./" $7; print $5 > (ENVIRON["CHECK"] ".size") }' "$table" >"$WORK/check.fast" ||
+    [ "$?" -gt 128 ] || die_io "the per-file check could not write its list of the files to hash" "$WORK/check.fast"
+  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") > 0 { print $6 "\t" $7 }' "$table" >"$WORK/check.slow" ||
+    [ "$?" -gt 128 ] || die_io "the per-file check could not write its list of the files to hash one by one" "$WORK/check.slow"
   CHECK_ROWS=$(awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ { n++ } END { print n + 0 }' "$table")
   if [ -s "$WORK/check.fast" ]; then
     # A file counts as checked only when sha256sum SAID it matches: what the
@@ -2682,10 +2697,12 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
     else
       (cd "$dest" && sha256sum -c --strict "$WORK/check.fast" 2>/dev/null) >"$WORK/check.out" || frc=$?
     fi
+    # Removed above, check.out is missing only when its open failed.
+    [ -f "$WORK/check.out" ] || die_io "the per-file check could not write sha256sum's lines" "$WORK/check.out"
     flines=$(wc -l <"$WORK/check.out" | tr -d ' ')
     if [ "$flines" -ne "$(wc -l <"$WORK/check.fast" | tr -d ' ')" ]; then
       frc=2
-      : >"$WORK/check.out"
+      : >"$WORK/check.out" || die_io "the per-file check could not empty sha256sum's lines" "$WORK/check.out"
     fi
     passed=$(grep -c ': OK$' "$WORK/check.out" || true)
     if [ "$frc" -eq 0 ] && [ "$passed" -eq "$flines" ]; then
@@ -2696,7 +2713,8 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
       awk -F'\t' '
         FILENAME == ARGV[1] { ok[FNR] = ($0 ~ /: OK$/); next }
         { p = $0; sub(/^[0-9a-f]+  \.\//, "", p); if (ok[FNR] != 1) print substr($0, 1, index($0, "  ") - 1) "\t" p }
-      ' "$WORK/check.out" "$WORK/check.fast" >>"$WORK/check.slow" || true
+      ' "$WORK/check.out" "$WORK/check.fast" >>"$WORK/check.slow" ||
+        [ "$?" -gt 128 ] || die_io "the per-file check could not add to its list of the files to hash one by one" "$WORK/check.slow"
     fi
   fi
   if [ -s "$WORK/check.slow" ]; then
