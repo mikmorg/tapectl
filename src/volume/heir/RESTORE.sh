@@ -976,6 +976,24 @@ check_requires() { # <what> <file>
        $way"
 }
 
+# The seal marker's own claims. Where File 0 states no magic or no
+# layout_version (it is damaged, or did not read), the seal marker's
+# layout_version decides in its place (volume-format-v3.md 1.2 rule 2): one
+# other than 3 is another layout, refused by name as File 0's would be. A File
+# 0 that states its layout is taken at its word, as before. Then the seal's
+# `requires`, whatever File 0 states.
+check_seal_claims() {
+  local lv
+  lv=$(toml_val "$WORK/seal.toml" layout_version)
+  if [ -n "$lv" ] && [ "$lv" != 3 ] &&
+    { [ -z "$(toml_val "$WORK/file0.txt" magic)" ] || [ -z "$(toml_val "$WORK/file0.txt" layout_version)" ]; }; then
+    die "the seal marker at the end of this tape states layout_version $(safe_str "$lv"), and File 0 states no magic or no layout_version: this is read as a tapectl volume of Layout $(safe_str "$lv"). This RESTORE.sh reads Layout 3 only.
+       Read it with the tapectl that wrote it, or with the RESTORE.sh in its own File 2:
+         mt -f $DEVICE rewind; mt -f $DEVICE fsf 2; dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE-OLD.sh"
+  fi
+  check_requires "the seal marker" "$WORK/seal.toml"
+}
+
 # 1 when File 0 gave nothing (a read error, or no bytes). Nothing it states is
 # needed to restore, so that is a damaged File 0 and never a hard stop
 # (volume-format-v3.md 1.2 rule 2): the run goes on with no File 0 facts, as
@@ -1109,7 +1127,7 @@ learn_end() {
     warn "no seal marker found as the last file: the tape is read as unsealed. A planned file that is not on the tape fails when it is read."
     return 0
   fi
-  check_requires "the seal marker" "$WORK/seal.toml"
+  check_seal_claims
   if ! seal_valid; then
     ENDED_AFTER=""
     warn "the last file is not a valid seal marker: the tape is read as unsealed."
@@ -1166,7 +1184,7 @@ establish() {
   fi
   warn "the front index (file $FRONT_INDEX) is unreadable or inconsistent: falling back to the seal marker's own copy of it. The front of the tape may be damaged; treat this recovery as degraded."
   if read_seal && seal_valid; then
-    check_requires "the seal marker" "$WORK/seal.toml"
+    check_seal_claims
     FILES_TXT="$WORK/files_from_seal.txt"
     FILES_SOURCE="the seal marker's copy of the front index"
     SEAL_STATE=$([ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ] && echo short || echo full)
@@ -1780,7 +1798,7 @@ probe_cartridge() { # <dir> <slice>
     learn_end
   elif read_seal && seal_valid; then
     echo "WARNING: the front index of this cartridge is unreadable: using the seal marker's copy of it." >&2
-    check_requires "the seal marker" "$WORK/seal.toml"
+    check_seal_claims
     FILES_TXT="$WORK/files_from_seal.txt"
     FILES_SOURCE="the seal marker's copy of the front index"
     SEAL_STATE=$([ -n "$TOTAL_FILES" ] && [ "$SEAL_FILE_COUNT" -lt "$TOTAL_FILES" ] && echo short || echo full)

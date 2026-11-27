@@ -2038,3 +2038,63 @@ fn no_escape_sequence_of_a_plain_text_file_reaches_the_terminal() {
         }
     }
 }
+
+// ---- ADR-0012 item 313: what an unreadable File 0 now reaches ----
+
+/// `volume-format-v3.md` 1.2 rule 2: where File 0 states no magic or no
+/// layout_version (it did not read, or is damaged), the seal marker's own
+/// `layout_version` decides. One that is not 3 is another layout, refused by
+/// name as File 0's would be. A File 0 that reads and states Layout 3 is
+/// taken at its word, as before: the seal marker's `layout_version` is then
+/// not looked at, and the tape reads as it did.
+#[test]
+fn the_seal_markers_layout_version_decides_when_file_0_states_none() {
+    let t = two();
+    let last = t.files.len() - 1;
+    let seal = text_of(t, last);
+    assert!(seal.contains("\nlayout_version = 3\n"), "{seal}");
+    let seal4 = seal.replacen("\nlayout_version = 3\n", "\nlayout_version = 4\n", 1);
+    let unread = Heir::of(t);
+    unread.replace(last, seal4.as_bytes());
+    fail_read(&unread, 0);
+    let garbage = Heir::of(t);
+    garbage.replace(last, seal4.as_bytes());
+    garbage.replace(0, &heir::noise(4096, 7));
+    for (name, h) in [
+        ("File 0 does not read", &unread),
+        ("File 0 is garbage", &garbage),
+    ] {
+        let dest = h.dest("out");
+        for args in [
+            vec!["--info"],
+            vec![
+                "--restore",
+                "--key",
+                &key(h, Who::TenantA),
+                "--to",
+                dstr(&dest),
+            ],
+        ] {
+            let o = h.run(&args);
+            assert_eq!(o.code, 1, "{name} {args:?}: {}", o.all());
+            assert!(
+                o.stderr.contains(
+                    "FATAL: the seal marker at the end of this tape states layout_version 4"
+                ) && o.stderr.contains("a tapectl volume of Layout 4")
+                    && o.stderr.contains("This RESTORE.sh reads Layout 3 only")
+                    && o.stderr.contains("the RESTORE.sh in its own File 2"),
+                "{name} {args:?}: {}",
+                o.stderr
+            );
+        }
+        assert!(heir::tree(&dest).is_empty(), "{name}: nothing was restored");
+    }
+
+    let good = Heir::of(t).run(&["--info"]);
+    let sound = Heir::of(t);
+    sound.replace(last, seal4.as_bytes());
+    let o = sound.run(&["--info"]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_eq!(o.stdout, good.stdout);
+    assert!(!o.all().contains("Layout 4"), "{}", o.all());
+}
