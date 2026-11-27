@@ -2623,7 +2623,7 @@ check_split() { # <destination> <pieces>
 CHECK_ROWS=0
 CHECK_FAILED=0
 file_check() { # <table> <destination> <out: escaped paths that fail>
-  local table=$1 dest=$2 out=$3 h esc path sum
+  local table=$1 dest=$2 out=$3 h esc path sum passed=0
   : >"$out"
   CHECK_ROWS=0
   CHECK_FAILED=0
@@ -2633,9 +2633,14 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
   # or a non-ASCII byte under LC_ALL=C, GNU's does not):
   # --strict prints exactly one line per entry, in order, so the k-th line
   # ending ": OK" is the k-th row's pass. The rest are done one by one.
-  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") == 0 { print $6 "  ./" $7 }' "$table" >"$WORK/check.fast"
-  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") > 0 { print $6 "\t" $7 }' "$table" >"$WORK/check.slow"
-  CHECK_ROWS=$(($(wc -l <"$WORK/check.fast") + $(wc -l <"$WORK/check.slow")))
+  # The lists are files in the work directory, and BusyBox awk ends 0 when a
+  # write to one fails (a full disk): a row lost from them is never hashed.
+  # So the rows are counted through a pipe too, and the rows passed plus the
+  # rows listed as failing must be that count (below); an awk that ends
+  # non-zero on the same failure is left to that count.
+  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") == 0 { print $6 "  ./" $7 }' "$table" >"$WORK/check.fast" || true
+  awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ && index($7, "\\") > 0 { print $6 "\t" $7 }' "$table" >"$WORK/check.slow" || true
+  CHECK_ROWS=$(awk -F'\t' '!/^#/ && ($1 == "f" || $1 == "h") && $6 ~ /^[0-9a-f]+$/ { n++ } END { print n + 0 }' "$table")
   if [ -s "$WORK/check.fast" ]; then
     # A file counts as checked only when sha256sum SAID it matches: what the
     # check did not positively pass is damaged, so a sha256sum that printed
@@ -2654,7 +2659,8 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
       frc=2
       : >"$WORK/check.out"
     fi
-    if [ "$frc" -eq 0 ] && [ "$(grep -c ': OK$' "$WORK/check.out" || true)" -eq "$flines" ]; then
+    passed=$(grep -c ': OK$' "$WORK/check.out" || true)
+    if [ "$frc" -eq 0 ] && [ "$passed" -eq "$flines" ]; then
       : # every fast row passed
     else
       # Pair each row with its line by position; a row whose line does not
@@ -2662,7 +2668,7 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
       awk -F'\t' '
         FILENAME == ARGV[1] { ok[FNR] = ($0 ~ /: OK$/); next }
         { p = $0; sub(/^[0-9a-f]+  \.\//, "", p); if (ok[FNR] != 1) print substr($0, 1, index($0, "  ") - 1) "\t" p }
-      ' "$WORK/check.out" "$WORK/check.fast" >>"$WORK/check.slow"
+      ' "$WORK/check.out" "$WORK/check.fast" >>"$WORK/check.slow" || true
     fi
   fi
   if [ -s "$WORK/check.slow" ]; then
@@ -2671,10 +2677,16 @@ file_check() { # <table> <destination> <out: escaped paths that fail>
       path=$REPLY
       sum=""
       if [ -f "$dest/$path" ]; then sum=$(sha_of_file "$dest/$path" 2>/dev/null || true); fi
-      [ "$sum" = "$h" ] || printf '%s\n' "$esc" >>"$out"
+      if [ "$sum" = "$h" ]; then
+        passed=$((passed + 1))
+      else
+        printf '%s\n' "$esc" >>"$out" || die_io "the per-file check could not write its list of the files that fail it" "$out"
+      fi
     done <"$WORK/check.slow"
   fi
   CHECK_FAILED=$(wc -l <"$out" | tr -d ' ')
+  [ $((passed + CHECK_FAILED)) -eq "$CHECK_ROWS" ] ||
+    die_io "the per-file check's lists were cut short in the work directory" "$((passed + CHECK_FAILED)) of the $CHECK_ROWS regular file(s) the table lists were checked"
 }
 
 # Extract one tar run's stream from our standard input. It runs as a process

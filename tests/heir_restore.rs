@@ -8032,9 +8032,25 @@ fn check_tree(root: &Path) -> std::path::PathBuf {
 /// TAPECTL_CHECK_PIECES=`pieces` and `path` first on the PATH; the work
 /// directory is `<root>/<work>`. Returns what it printed.
 fn run_file_check(root: &Path, table: &Path, pieces: usize, work: &str, path: &Path) -> String {
+    let o = file_check_run(root, table, pieces, work, path, "");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// `run_file_check`'s run, with the shell text `pre` run just before
+/// `file_check` (a limit, a stand-in function), and whatever its end.
+fn file_check_run(
+    root: &Path,
+    table: &Path,
+    pieces: usize,
+    work: &str,
+    path: &Path,
+    pre: &str,
+) -> std::process::Output {
     let parts = script_parts(&[
         "is_uint",
         "tape_uint",
+        "die_io",
         "AWK_UNESC",
         "unesc",
         "sha_of_file",
@@ -8046,13 +8062,13 @@ fn run_file_check(root: &Path, table: &Path, pieces: usize, work: &str, path: &P
     let w = root.join(work);
     std::fs::create_dir_all(&w).unwrap();
     let script = format!(
-        "set -euo pipefail\nexport LC_ALL=C\n{parts}\nWORK={w}\nAHEAD_PID=\"\"\n\
+        "set -euo pipefail\nexport LC_ALL=C\n{parts}\nWORK={w}\nAHEAD_PID=\"\"\n{pre}\n\
          file_check {t} {d} {w}/failed\necho \"rows=$CHECK_ROWS failed=$CHECK_FAILED\"\n",
         w = w.display(),
         t = table.display(),
         d = root.join("dest").display()
     );
-    let o = std::process::Command::new("bash")
+    std::process::Command::new("bash")
         .arg("-c")
         .arg(&script)
         .env("TAPECTL_CHECK_PIECES", pieces.to_string())
@@ -8065,9 +8081,7 @@ fn run_file_check(root: &Path, table: &Path, pieces: usize, work: &str, path: &P
             ),
         )
         .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    String::from_utf8_lossy(&o.stdout).into_owned()
+        .unwrap()
 }
 
 /// #611 C-4 (ADR-0012 item 313): the check cut into contiguous pieces, run at
@@ -8295,4 +8309,160 @@ fn an_age_killed_on_a_slice_is_no_write_error_of_the_work_directory() {
     assert!(!all.contains("FATAL: writing slice"), "{all}");
     assert!(!all.contains("Nothing on the tape is wrong"), "{all}");
     assert!(o.stdout.contains("RESTORE INCOMPLETE: "), "{all}");
+}
+
+// ---- #611 G3: no row of the check goes unhashed without the run saying so ----
+
+/// A tree under `<root>/dest` and its table: `fast` files with plain names
+/// of 100 bytes (checked by one `sha256sum -c`), then `slow` whose names
+/// hold a backslash (hashed alone); the rows numbered in `damaged` (from 1,
+/// over both) have other bytes on disk.
+fn g3_tree(root: &Path, fast: usize, slow: usize, damaged: &[usize]) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let dest = root.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let mut table = String::from("#tapectl-file-table 1\n#stream_bytes 1\n");
+    for i in 1..=fast + slow {
+        let pad = "p".repeat(94);
+        let (on_disk, esc) = if i <= fast {
+            let n = format!("f{i:04}-{pad}");
+            (n.clone(), n)
+        } else {
+            (format!("b{i:04}\\{pad}"), format!("b{i:04}\\\\{pad}"))
+        };
+        let bytes = format!("content {i}\n");
+        let disk = if damaged.contains(&i) {
+            "damaged\n".to_string()
+        } else {
+            bytes.clone()
+        };
+        std::fs::write(dest.join(&on_disk), disk).unwrap();
+        let sum: String = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        table.push_str(&format!("f\t1\t0\t1\t{}\t{sum}\t{esc}\t\n", bytes.len()));
+    }
+    let t = root.join("table.tsv");
+    std::fs::write(&t, table).unwrap();
+    t
+}
+
+/// #611 G3 (ADR-0012 item 313): BusyBox awk ends 0 when a write fails, so
+/// the check's lists in the work directory (`check.fast`, `check.slow`, the
+/// rows appended to `check.slow` after the fast pass) could be cut short
+/// silently, and the rows lost were never hashed: a damaged file then read
+/// `failed=0`. The rows the check passed plus those it listed as failing
+/// must be every row the table gives it, counted through a pipe; where they
+/// are not, the run ends by the work directory's FATAL, and so it does when
+/// the failed list itself cannot be written. `ulimit -f` stands in for the
+/// full work directory, sized so that the loss falls (a) in `check.fast`,
+/// (b) in `check.slow`, (c) in the append; (d) no size can cut the failed
+/// list first (each of its rows is first a longer row of `check.slow`), so
+/// the limit falls to 0 as the rows hashed alone begin. Under every awk, in
+/// one piece and in four; without the limit, each tree's count is the truth.
+#[test]
+fn a_check_list_cut_short_ends_the_run_with_the_work_directorys_fatal() {
+    // (case, fast rows, slow rows, damaged, limit in KiB, what is cut, truth).
+    type Case = (
+        &'static str,
+        usize,
+        usize,
+        Vec<usize>,
+        &'static str,
+        &'static str,
+    );
+    let all_fast: Vec<usize> = (1..=100).collect();
+    let cases: [Case; 4] = [
+        ("a", 200, 5, vec![150], "ulimit -f 16", "rows=205 failed=1"),
+        ("b", 5, 200, vec![150], "ulimit -f 16", "rows=205 failed=1"),
+        (
+            "c",
+            100,
+            60,
+            all_fast,
+            "ulimit -f 20",
+            "rows=160 failed=100",
+        ),
+        (
+            "d",
+            10,
+            5,
+            vec![2, 5, 9],
+            "eval \"unesc_real() $(declare -f unesc | tail -n +2)\"\n\
+             unesc() { unesc_real \"$1\"; ulimit -f 0; }",
+            "rows=15 failed=3",
+        ),
+    ];
+    let lines = |p: &Path| {
+        std::fs::read(p)
+            .unwrap()
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
+    };
+    let mut ran = 0;
+    for (name, body) in awks() {
+        for (case, fast, slow, damaged, limit, truth) in &cases {
+            for pieces in [1usize, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let table = g3_tree(root, *fast, *slow, damaged);
+                let bin = root.join("bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                let awk = bin.join("awk");
+                std::fs::write(&awk, format!("#!/bin/sh\n{body}")).unwrap();
+                std::fs::set_permissions(&awk, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                    .unwrap();
+                let what = format!("{name} ({case}) {pieces} piece(s)");
+                // The positive control: the tree's truth with room.
+                let o = file_check_run(root, &table, pieces, "room", &bin, "");
+                assert_eq!(
+                    String::from_utf8_lossy(&o.stdout).trim(),
+                    *truth,
+                    "{what}: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                let pre = format!("trap '' XFSZ\n{limit}");
+                let o = file_check_run(root, &table, pieces, "full", &bin, &pre);
+                let out = String::from_utf8_lossy(&o.stdout);
+                let err = String::from_utf8_lossy(&o.stderr);
+                let w = root.join("full");
+                assert!(!out.contains("rows="), "{what}: a count: {out}\n{err}");
+                assert_eq!(o.status.code(), Some(1), "{what}: {out}\n{err}");
+                assert!(
+                    err.contains("FATAL: ")
+                        && err.contains(&format!(
+                            "The work directory {} cannot take it",
+                            w.display()
+                        )),
+                    "{what}: {err}"
+                );
+                // Where the loss fell.
+                let (f, s) = (w.join("check.fast"), w.join("check.slow"));
+                match *case {
+                    "a" => assert!(lines(&f) < *fast, "{what}: check.fast whole"),
+                    "b" => {
+                        assert_eq!(lines(&f), *fast, "{what}");
+                        assert!(lines(&s) < *slow, "{what}: check.slow whole");
+                    }
+                    "c" => {
+                        assert_eq!(lines(&f), *fast, "{what}");
+                        assert!(lines(&s) >= *slow, "{what}: check.slow cut first");
+                        assert!(lines(&s) < *slow + *fast, "{what}: the append whole");
+                    }
+                    _ => {
+                        assert_eq!(lines(&s), *slow + damaged.len(), "{what}");
+                        assert_eq!(
+                            std::fs::metadata(w.join("failed")).unwrap().len(),
+                            0,
+                            "{what}: the failed list was written"
+                        );
+                    }
+                }
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "at least one awk ran");
 }
